@@ -65,6 +65,16 @@ function summarizeItem(item: Record<string, unknown>): string {
   return safeJsonStringify(clone);
 }
 
+function resolvePlanText(item: Record<string, unknown>): string {
+  if (typeof item.text === "string" && item.text.trim().length > 0) {
+    return item.text;
+  }
+  if (typeof item.plan === "string" && item.plan.trim().length > 0) {
+    return item.plan;
+  }
+  return summarizeItem(item);
+}
+
 function MarkdownMessage({ text }: { text: string }): JSX.Element {
   return (
     <ReactMarkdown
@@ -151,7 +161,6 @@ function App(): JSX.Element {
 
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isCheckingSession, setIsCheckingSession] = useState(true);
-  const [composerText, setComposerText] = useState("");
   const [chatgptAuthUrl, setChatgptAuthUrl] = useState<string | null>(null);
   const [mobileThreadsOpen, setMobileThreadsOpen] = useState(false);
   const [mobileContextOpen, setMobileContextOpen] = useState(false);
@@ -166,6 +175,7 @@ function App(): JSX.Element {
   const visibleThreads = showArchived ? archivedThreads : threads;
   const activeThread = (activeThreadArchived ? archivedThreads : threads).find((thread) => thread.id === activeThreadId) || null;
   const activeApproval = pendingApprovals[0] || null;
+  const mobileHeaderTitle = activeThread ? getThreadTitle(activeThread) : "Assistant";
 
   const {
     register,
@@ -284,6 +294,16 @@ function App(): JSX.Element {
             continue;
           }
 
+          if (item.type === "plan") {
+            entries.push({
+              key: `history:${id}`,
+              role: "plan",
+              title: "Plan",
+              text: resolvePlanText(item),
+            });
+            continue;
+          }
+
           entries.push({
             key: `history:${id}`,
             role: "tool",
@@ -355,8 +375,8 @@ function App(): JSX.Element {
     }
   }
 
-  async function sendMessage(): Promise<void> {
-    const text = composerText.trim();
+  async function sendMessage(inputText: string): Promise<void> {
+    const text = inputText.trim();
     if (!text) return;
 
     let threadId = activeThreadId;
@@ -373,8 +393,6 @@ function App(): JSX.Element {
       title: "You",
       text,
     });
-
-    setComposerText("");
 
     try {
       const result = (await rpc("turn/start", {
@@ -478,6 +496,30 @@ function App(): JSX.Element {
     }
   }
 
+  function dedupeOptimisticUserMessage(threadId: string, itemId: string, text: string): boolean {
+    const currentTimeline = useAssistantStore.getState().timelines[threadId] || [];
+    let idx = -1;
+    for (let i = currentTimeline.length - 1; i >= 0; i -= 1) {
+      const entry = currentTimeline[i];
+      if (entry.role === "user" && entry.key.startsWith("local-user-") && entry.text.trim() === text.trim()) {
+        idx = i;
+        break;
+      }
+    }
+
+    if (idx === -1) return false;
+
+    const next = [...currentTimeline];
+    next[idx] = {
+      ...next[idx],
+      key: `item:${itemId}`,
+      title: "You",
+      text,
+    };
+    setThreadTimeline(threadId, next);
+    return true;
+  }
+
   function handleNotification(method: string, params: Record<string, unknown>): void {
     const threadId = (params.threadId as string | undefined) || activeThreadId || null;
 
@@ -517,11 +559,26 @@ function App(): JSX.Element {
       const itemId = typeof item.id === "string" ? item.id : `${Date.now()}-${Math.random()}`;
 
       if (item.type === "userMessage") {
+        const text = coerceTextContent(item.content);
+        if (dedupeOptimisticUserMessage(threadId, itemId, text)) {
+          return;
+        }
+
         upsertTimelineEntry(threadId, `item:${itemId}`, (existing) => ({
           key: `item:${itemId}`,
           role: "user",
           title: "You",
-          text: coerceTextContent(item.content) || existing?.text || "",
+          text: text || existing?.text || "",
+        }));
+        return;
+      }
+
+      if (item.type === "plan") {
+        upsertTimelineEntry(threadId, `item:${itemId}`, (existing) => ({
+          key: `item:${itemId}`,
+          role: "plan",
+          title: "Plan",
+          text: resolvePlanText(item) || existing?.text || "",
         }));
         return;
       }
@@ -548,6 +605,16 @@ function App(): JSX.Element {
     if (method === "item/completed" && isObject(params.item) && threadId) {
       const item = params.item as Record<string, unknown>;
       const itemId = typeof item.id === "string" ? item.id : `${Date.now()}-${Math.random()}`;
+
+      if (item.type === "plan") {
+        upsertTimelineEntry(threadId, `item:${itemId}`, (existing) => ({
+          key: `item:${itemId}`,
+          role: "plan",
+          title: "Plan",
+          text: resolvePlanText(item) || existing?.text || "",
+        }));
+        return;
+      }
 
       if (item.type === "agentMessage") {
         upsertTimelineEntry(threadId, `item:${itemId}`, (existing) => ({
@@ -671,11 +738,6 @@ function App(): JSX.Element {
     };
   }
 
-  async function submitMessageForm(event: React.FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    await sendMessage();
-  }
-
   useEffect(() => {
     void probeSession();
 
@@ -712,7 +774,9 @@ function App(): JSX.Element {
           <Button size="sm" variant="ghost" onClick={() => setMobileThreadsOpen(true)}>
             <PanelLeft className="mr-1.5 h-4 w-4" /> Chats
           </Button>
-          <div className="font-semibold">Assistant</div>
+          <div className="max-w-[48vw] truncate text-sm font-semibold" title={mobileHeaderTitle}>
+            {mobileHeaderTitle}
+          </div>
           <Button size="sm" variant="ghost" onClick={() => setMobileContextOpen(true)}>
             <PanelRight className="mr-1.5 h-4 w-4" /> Context
           </Button>
@@ -733,9 +797,14 @@ function App(): JSX.Element {
         </Card>
 
         <Card className="flex min-h-0 flex-col overflow-hidden">
-          <CardHeader className="flex items-start justify-between gap-3">
-            <div>
-              <CardTitle className="text-base">{activeThread ? getThreadTitle(activeThread) : "No active chat"}</CardTitle>
+          <CardHeader className="hidden items-start justify-between gap-3 lg:flex">
+            <div className="min-w-0">
+              <CardTitle
+                className="truncate text-base"
+                title={activeThread ? getThreadTitle(activeThread) : "No active chat"}
+              >
+                {activeThread ? getThreadTitle(activeThread) : "No active chat"}
+              </CardTitle>
               <p className="mt-1 font-mono text-[11px] text-foreground/70">
                 {activeThread ? `Thread: ${activeThread.id}` : "Create or select a chat to start"}
               </p>
@@ -765,6 +834,7 @@ function App(): JSX.Element {
                     "animate-fade-up rounded-2xl border px-3 py-2 shadow-card",
                     entry.role === "user" && "ml-auto max-w-[90%] border-transparent bg-gradient-to-br from-brand to-brand-dark text-white",
                     entry.role === "agent" && "mr-auto max-w-[90%] border-card-border bg-white",
+                    entry.role === "plan" && "mr-auto max-w-full border-brand/35 bg-brand-soft/55",
                     entry.role === "tool" && "max-w-full border-dashed border-card-border bg-muted font-mono text-xs",
                   )}
                 >
@@ -784,19 +854,7 @@ function App(): JSX.Element {
               <div ref={timelineBottomRef} />
             </div>
 
-            <form className="border-t border-card-border bg-white/75 p-3" onSubmit={submitMessageForm}>
-              <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
-                <textarea
-                  className="min-h-[48px] max-h-44 w-full resize-y rounded-2xl border border-card-border bg-white px-3 py-2 text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
-                  placeholder="Message Codex..."
-                  value={composerText}
-                  onChange={(event) => setComposerText(event.target.value)}
-                />
-                <Button type="submit" className="sm:h-auto">
-                  <Send className="mr-1.5 h-4 w-4" /> Send
-                </Button>
-              </div>
-            </form>
+            <ChatComposer onSend={sendMessage} />
           </CardContent>
         </Card>
 
@@ -806,10 +864,15 @@ function App(): JSX.Element {
             settings={settingsSummary}
             mcpServers={mcpServers}
             chatgptAuthUrl={chatgptAuthUrl}
+            activeThreadId={activeThreadId}
+            activeThreadArchived={activeThreadArchived}
+            activeTurnId={activeTurnId}
             onLogin={() => void startChatGptLogin()}
             onLogout={() => logoutMutation.mutate()}
             onReloadMcp={() => void reloadMcpConfig()}
             onMcpOauth={(name) => void runMcpOauth(name)}
+            onArchiveToggle={() => void archiveOrUnarchiveThread()}
+            onInterrupt={() => void interruptTurn()}
           />
         </Card>
       </div>
@@ -846,10 +909,15 @@ function App(): JSX.Element {
                 settings={settingsSummary}
                 mcpServers={mcpServers}
                 chatgptAuthUrl={chatgptAuthUrl}
+                activeThreadId={activeThreadId}
+                activeThreadArchived={activeThreadArchived}
+                activeTurnId={activeTurnId}
                 onLogin={() => void startChatGptLogin()}
                 onLogout={() => logoutMutation.mutate()}
                 onReloadMcp={() => void reloadMcpConfig()}
                 onMcpOauth={(name) => void runMcpOauth(name)}
+                onArchiveToggle={() => void archiveOrUnarchiveThread()}
+                onInterrupt={() => void interruptTurn()}
               />
             </Card>
           </Dialog.Content>
@@ -920,6 +988,46 @@ function App(): JSX.Element {
         <div className="fixed bottom-4 right-4 z-50 rounded-xl bg-[#102735] px-4 py-2 text-sm text-white shadow-soft">{toastText}</div>
       ) : null}
     </div>
+  );
+}
+
+function ChatComposer({
+  onSend,
+}: {
+  onSend: (text: string) => Promise<void>;
+}): JSX.Element {
+  const [text, setText] = useState("");
+  const [isSending, setIsSending] = useState(false);
+
+  async function onSubmit(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+
+    const value = text.trim();
+    if (!value || isSending) return;
+
+    setIsSending(true);
+    try {
+      await onSend(value);
+      setText("");
+    } finally {
+      setIsSending(false);
+    }
+  }
+
+  return (
+    <form className="border-t border-card-border bg-white/75 p-3" onSubmit={onSubmit}>
+      <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+        <textarea
+          className="min-h-[48px] max-h-44 w-full resize-y rounded-2xl border border-card-border bg-white px-3 py-2 text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
+          placeholder="Message Codex..."
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+        />
+        <Button type="submit" className="sm:h-auto" disabled={isSending}>
+          <Send className="mr-1.5 h-4 w-4" /> Send
+        </Button>
+      </div>
+    </form>
   );
 }
 
@@ -994,19 +1102,29 @@ function ContextPanel({
   settings,
   mcpServers,
   chatgptAuthUrl,
+  activeThreadId,
+  activeThreadArchived,
+  activeTurnId,
   onLogin,
   onLogout,
   onReloadMcp,
   onMcpOauth,
+  onArchiveToggle,
+  onInterrupt,
 }: {
   account: unknown;
   settings: { label: string; value: string }[];
   mcpServers: Record<string, unknown>[];
   chatgptAuthUrl: string | null;
+  activeThreadId: string | null;
+  activeThreadArchived: boolean;
+  activeTurnId: string | null;
   onLogin: () => void;
   onLogout: () => void;
   onReloadMcp: () => void;
   onMcpOauth: (name: string) => void;
+  onArchiveToggle: () => void;
+  onInterrupt: () => void;
 }): JSX.Element {
   const accountLabel = useMemo(() => {
     if (!isObject(account)) return "Not authenticated";
@@ -1020,6 +1138,21 @@ function ContextPanel({
 
   return (
     <div className="space-y-4 p-3">
+      <section className="rounded-2xl border border-card-border bg-white p-3">
+        <div className="mb-2 flex items-center justify-between">
+          <h3 className="text-sm font-bold">Thread controls</h3>
+          <Badge>{activeThreadId ? "active" : "none"}</Badge>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" variant="ghost" onClick={onArchiveToggle} disabled={!activeThreadId}>
+            <Archive className="mr-1.5 h-4 w-4" /> {activeThreadArchived ? "Unarchive" : "Archive"}
+          </Button>
+          <Button size="sm" variant="ghost" onClick={onInterrupt} disabled={!activeThreadId || !activeTurnId}>
+            <CircleStop className="mr-1.5 h-4 w-4" /> Interrupt
+          </Button>
+        </div>
+      </section>
+
       <section className="rounded-2xl border border-card-border bg-white p-3">
         <div className="mb-2 flex items-center justify-between">
           <h3 className="text-sm font-bold">Account</h3>

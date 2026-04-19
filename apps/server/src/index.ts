@@ -36,6 +36,7 @@ type AppConfig = {
   port: number;
   host: string;
   webOrigins: string[];
+  allowLanOrigins: boolean;
   appPassword: string;
   codexPath: string;
   defaultCwd: string;
@@ -48,6 +49,23 @@ type AppConfig = {
   cookieSecure: boolean;
 };
 
+function normalizeApprovalPolicy(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return "on-request";
+  }
+
+  const normalized = value.trim().toLowerCase().replace(/[_\s]+/g, "-");
+
+  if (normalized === "onrequest") return "on-request";
+  if (normalized === "on-request") return "on-request";
+  if (normalized === "onfailure") return "on-failure";
+  if (normalized === "on-failure") return "on-failure";
+  if (normalized === "untrusted") return "untrusted";
+  if (normalized === "never") return "never";
+
+  return normalized;
+}
+
 const config: AppConfig = {
   port: Number(process.env.PORT || 8787),
   host: process.env.HOST || "0.0.0.0",
@@ -55,17 +73,45 @@ const config: AppConfig = {
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean),
+  allowLanOrigins: String(process.env.ALLOW_LAN_ORIGINS || "true").toLowerCase() === "true",
   appPassword: process.env.APP_PASSWORD || "",
   codexPath: process.env.CODEX_PATH || "codex",
   defaultCwd: process.env.DEFAULT_CWD || rootDir,
   defaultModel: process.env.DEFAULT_MODEL || "gpt-5.4",
-  defaultApprovalPolicy: process.env.DEFAULT_APPROVAL_POLICY || "onRequest",
+  defaultApprovalPolicy: normalizeApprovalPolicy(process.env.DEFAULT_APPROVAL_POLICY || "on-request"),
   defaultSandboxType: process.env.DEFAULT_SANDBOX_TYPE || "workspaceWrite",
   defaultNetworkAccess: String(process.env.DEFAULT_NETWORK_ACCESS || "true").toLowerCase() === "true",
   loginRateLimitWindowMs: Number(process.env.LOGIN_RATE_LIMIT_WINDOW_MS || 900000),
   loginRateLimitMaxAttempts: Number(process.env.LOGIN_RATE_LIMIT_MAX_ATTEMPTS || 12),
   cookieSecure: String(process.env.COOKIE_SECURE || "false").toLowerCase() === "true",
 };
+
+const corsPorts = new Set(
+  config.webOrigins
+    .map((origin) => {
+      try {
+        const url = new URL(origin);
+        if (url.port) return url.port;
+        return url.protocol === "https:" ? "443" : "80";
+      } catch {
+        return null;
+      }
+    })
+    .filter((value): value is string => Boolean(value)),
+);
+
+function isPrivateLanHost(host: string): boolean {
+  if (host === "localhost" || host.endsWith(".local")) return true;
+  if (host === "127.0.0.1") return true;
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  const match172 = host.match(/^172\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+  if (match172) {
+    const second = Number(match172[1]);
+    if (second >= 16 && second <= 31) return true;
+  }
+  return false;
+}
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -81,6 +127,20 @@ app.use(
         callback(null, true);
         return;
       }
+
+      if (config.allowLanOrigins) {
+        try {
+          const url = new URL(origin);
+          const port = url.port || (url.protocol === "https:" ? "443" : "80");
+          if (isPrivateLanHost(url.hostname) && (corsPorts.size === 0 || corsPorts.has(port))) {
+            callback(null, true);
+            return;
+          }
+        } catch {
+          // ignore invalid origin format
+        }
+      }
+
       callback(new Error(`Origin not allowed by CORS: ${origin}`));
     },
     credentials: true,
@@ -188,12 +248,14 @@ function applyRpcDefaults(method: AllowedRpcMethod, params: Record<string, unkno
     if (!next.model) next.model = config.defaultModel;
     if (!next.cwd) next.cwd = config.defaultCwd;
     if (!next.approvalPolicy) next.approvalPolicy = config.defaultApprovalPolicy;
+    else next.approvalPolicy = normalizeApprovalPolicy(next.approvalPolicy);
     if (!next.sandbox) next.sandbox = config.defaultSandboxType;
   }
 
   if (method === "turn/start") {
     if (!next.cwd) next.cwd = config.defaultCwd;
     if (!next.approvalPolicy) next.approvalPolicy = config.defaultApprovalPolicy;
+    else next.approvalPolicy = normalizeApprovalPolicy(next.approvalPolicy);
     if (!next.sandboxPolicy) {
       next.sandboxPolicy = {
         type: config.defaultSandboxType,

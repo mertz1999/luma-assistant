@@ -11,7 +11,7 @@ export type ThreadRecord = {
 
 export type TimelineEntry = {
   key: string;
-  role: "user" | "agent" | "tool";
+  role: "user" | "agent" | "tool" | "plan";
   title?: string;
   text: string;
 };

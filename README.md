@@ -33,6 +33,7 @@ cp .env.example .env
 - `APP_PASSWORD`
 - `DEFAULT_CWD`
 - `WEB_ORIGIN` (default `http://localhost:5173`)
+- `ALLOW_LAN_ORIGINS=true` (recommended for phone/LAN access)
 
 3. Install dependencies:
 
@@ -51,6 +52,8 @@ npm run dev
 
 Open from phone on LAN using your machine IP:
 - `http://<LAN_IP>:5173`
+
+If you prefer strict CORS, set `ALLOW_LAN_ORIGINS=false` and include every allowed origin explicitly in `WEB_ORIGIN` (comma-separated).
 
 If LAN access to Vite is blocked by firewall, allow incoming connections.
 
