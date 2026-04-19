@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  @apply bg-background text-foreground antialiased;
+  font-family: "Space Grotesk", sans-serif;
+  background-image:
+    radial-gradient(circle at 12% 8%, #d5f4ed 0%, rgba(213, 244, 237, 0) 35%),
+    radial-gradient(circle at 88% 85%, #ffe8c7 0%, rgba(255, 232, 199, 0) 38%),
+    linear-gradient(145deg, #edf1f4 0%, #e9eef2 100%);
+}
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(13, 34, 48, 0.3) transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(13, 34, 48, 0.3);
+  border-radius: 999px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}

@@ -1,0 +1,25 @@
+{
+  "name": "agentic-assistant-monorepo",
+  "private": true,
+  "version": "0.2.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "predev": "npm run build -w @assistant/shared",
+    "dev": "concurrently -n server,web -c cyan,green \"npm run dev -w @assistant/server\" \"npm run dev -w @assistant/web\"",
+    "dev:server": "npm run build -w @assistant/shared && npm run dev -w @assistant/server",
+    "dev:web": "npm run build -w @assistant/shared && npm run dev -w @assistant/web",
+    "build": "npm run build -w @assistant/shared && npm run build -w @assistant/server && npm run build -w @assistant/web",
+    "start": "npm run start -w @assistant/server",
+    "typecheck": "npm run typecheck -w @assistant/shared && npm run typecheck -w @assistant/server && npm run typecheck -w @assistant/web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
