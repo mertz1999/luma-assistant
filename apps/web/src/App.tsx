@@ -64,7 +64,7 @@ const loginSchema = z.object({
 
 type LoginFormValues = z.infer<typeof loginSchema>;
 
-type ContextTab = "context" | "ops" | "admin";
+type ContextTab = "context" | "admin";
 
 type GuardPromptState = {
   method: AllowedRpcMethod;
@@ -1330,8 +1330,10 @@ function App(): JSX.Element {
 
     if (restoreSelection) {
       const configuredTab = payload.data?.uiState?.panelLayout?.contextTab;
-      if (configuredTab === "context" || configuredTab === "ops" || configuredTab === "admin") {
+      if (configuredTab === "context" || configuredTab === "admin") {
         setActiveContextTab(configuredTab);
+      } else if (configuredTab === "ops") {
+        setActiveContextTab("context");
       }
     }
 
@@ -1637,11 +1639,23 @@ function App(): JSX.Element {
   }
 
   async function interruptTurn(): Promise<void> {
-    if (!activeThreadId || !activeTurnId) return;
+    if (!activeThreadId) return;
     try {
+      let turnId = activeTurnId;
+      if (!turnId) {
+        const readResult = (await safeRpc("thread/read", {
+          threadId: activeThreadId,
+          includeTurns: true,
+        })) as Record<string, unknown> | null;
+        const thread = readResult && isObject(readResult.thread) ? (readResult.thread as ThreadRecord) : null;
+        if (thread) {
+          turnId = extractInProgressTurnId(thread);
+        }
+      }
+
       const result = await safeRpc("turn/interrupt", {
         threadId: activeThreadId,
-        turnId: activeTurnId,
+        ...(turnId ? { turnId } : {}),
       });
       if (!result) return;
       setToast("Interrupt requested");
@@ -3606,12 +3620,9 @@ function RightPanel(props: {
 
   return (
     <div className="space-y-4 p-3">
-      <div className="grid grid-cols-3 gap-1 rounded-2xl border border-card-border bg-muted p-1">
+      <div className="grid grid-cols-2 gap-1 rounded-2xl border border-card-border bg-muted p-1">
         <Button size="sm" variant={tab === "context" ? "primary" : "ghost"} onClick={() => onTabChange("context")}>
           Context
-        </Button>
-        <Button size="sm" variant={tab === "ops" ? "primary" : "ghost"} onClick={() => onTabChange("ops")}>
-          Ops
         </Button>
         <Button size="sm" variant={tab === "admin" ? "primary" : "ghost"} onClick={() => onTabChange("admin")}>
           Admin
@@ -3629,7 +3640,7 @@ function RightPanel(props: {
               <Button size="sm" variant="ghost" onClick={onArchiveToggle} disabled={!activeThreadId}>
                 <Archive className="mr-1.5 h-4 w-4" /> {activeThreadArchived ? "Unarchive" : "Archive"}
               </Button>
-              <Button size="sm" variant="ghost" onClick={onInterrupt} disabled={!activeThreadId || !activeTurnId}>
+              <Button size="sm" variant="ghost" onClick={onInterrupt} disabled={!activeThreadId}>
                 <CircleStop className="mr-1.5 h-4 w-4" /> Interrupt
               </Button>
             </div>
@@ -3805,138 +3816,8 @@ function RightPanel(props: {
         </>
       ) : null}
 
-      {tab === "ops" ? (
-        <>
-          <section className="rounded-2xl border border-card-border bg-white p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Command Exec</h3>
-              <Badge>{capabilities?.groups?.ops ? "enabled" : "disabled"}</Badge>
-            </div>
-            <div className="space-y-2">
-              <input
-                value={commandInput}
-                onChange={(event) => onCommandInputChange(event.target.value)}
-                placeholder="Command to run"
-                className="w-full rounded-xl border border-card-border px-3 py-2 text-sm outline-none focus:border-brand"
-              />
-              <Button size="sm" onClick={onCommandRun} disabled={!capabilities?.groups?.ops}>
-                <Play className="mr-1.5 h-4 w-4" /> Run
-              </Button>
-            </div>
-          </section>
-
-          <section className="rounded-2xl border border-card-border bg-white p-3">
-            <h3 className="mb-2 text-sm font-bold">Command Sessions</h3>
-            <div className="space-y-2">
-              {!commandSessions.length ? (
-                <div className="rounded-xl border border-dashed border-card-border bg-muted px-3 py-2 text-xs text-foreground/70">No command sessions.</div>
-              ) : null}
-
-              {commandSessions.map((session) => (
-                <button
-                  key={session.sessionId}
-                  type="button"
-                  className={cn(
-                    "w-full rounded-xl border px-2 py-1 text-left text-xs",
-                    activeSessionId === session.sessionId ? "border-brand bg-brand-soft/60" : "border-card-border bg-muted",
-                  )}
-                  onClick={() => onSelectCommandSession(session.sessionId)}
-                >
-                  <div className="truncate font-medium">{session.title}</div>
-                  <div className="font-mono text-[11px] text-foreground/70">{session.running ? "running" : "stopped"}</div>
-                </button>
-              ))}
-            </div>
-
-            {activeSession ? (
-              <>
-                <pre className="scrollbar-thin mt-2 max-h-56 overflow-auto rounded-xl border border-card-border bg-[#0f2433] p-2 font-mono text-xs text-slate-100">
-                  {activeSession.output || "(no output)"}
-                </pre>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  <input
-                    value={stdinInput}
-                    onChange={(event) => onStdinInputChange(event.target.value)}
-                    placeholder="stdin"
-                    className="min-w-0 flex-1 rounded-xl border border-card-border px-2 py-1 text-sm outline-none"
-                  />
-                  <Button size="sm" variant="ghost" onClick={onCommandWrite}>
-                    Send stdin
-                  </Button>
-                  <Button size="sm" variant="ghost" onClick={onCommandCloseStdin}>
-                    Close stdin
-                  </Button>
-                  <Button size="sm" variant="ghost" onClick={onCommandTerminate}>
-                    Terminate
-                  </Button>
-                </div>
-              </>
-            ) : null}
-          </section>
-
-          <section className="rounded-2xl border border-card-border bg-white p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Filesystem</h3>
-              <Badge>{capabilities?.groups?.filesystem ? "enabled" : "disabled"}</Badge>
-            </div>
-
-            <div className="flex gap-2">
-              <input
-                value={fileRoot}
-                onChange={(event) => onFileRootChange(event.target.value)}
-                placeholder="Absolute path"
-                className="min-w-0 flex-1 rounded-xl border border-card-border px-2 py-1 text-sm outline-none"
-              />
-              <Button size="sm" variant="ghost" onClick={() => onBrowseDirectory(fileRoot)}>
-                <FolderOpen className="mr-1.5 h-4 w-4" /> Browse
-              </Button>
-            </div>
-
-            <div className="mt-2 max-h-36 space-y-1 overflow-auto">
-              {fileEntries.map((entry) => (
-                <div key={entry.path} className="flex items-center justify-between rounded-lg border border-card-border px-2 py-1 text-xs">
-                  <button type="button" className="flex min-w-0 items-center gap-1 text-left" onClick={() => (entry.isDirectory ? onBrowseDirectory(entry.path) : onOpenFile(entry.path))}>
-                    {entry.isDirectory ? <Folder className="h-3.5 w-3.5" /> : <Terminal className="h-3.5 w-3.5" />}
-                    <span className="truncate">{entry.name}</span>
-                  </button>
-                  <Button size="sm" variant="ghost" onClick={() => onRemovePath(entry.path)}>
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </Button>
-                </div>
-              ))}
-            </div>
-
-            {selectedFilePath ? (
-              <>
-                <div className="mt-2 truncate font-mono text-[11px] text-foreground/70" title={selectedFilePath}>
-                  {selectedFilePath}
-                </div>
-                <textarea
-                  value={selectedFileText}
-                  onChange={(event) => onSelectedFileTextChange(event.target.value)}
-                  className="mt-1 h-36 w-full rounded-xl border border-card-border p-2 font-mono text-xs outline-none"
-                />
-                <Button size="sm" className="mt-2" onClick={onSaveFile}>
-                  <Save className="mr-1.5 h-4 w-4" /> Save file
-                </Button>
-              </>
-            ) : null}
-          </section>
-        </>
-      ) : null}
-
       {tab === "admin" ? (
         <>
-          <section className="rounded-2xl border border-card-border bg-white p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Method Groups</h3>
-              <Badge>capabilities</Badge>
-            </div>
-            <pre className="scrollbar-thin max-h-40 overflow-auto rounded-xl border border-card-border bg-muted p-2 text-xs">
-              {safeJsonStringify(capabilities?.groups || {})}
-            </pre>
-          </section>
-
           <section className="rounded-2xl border border-card-border bg-white p-3">
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-bold">Plugins</h3>
@@ -3952,47 +3833,6 @@ function RightPanel(props: {
                   <div className="text-foreground/70">{String(row.version || row.marketplacePath || "")}</div>
                 </div>
               ))}
-            </div>
-          </section>
-
-          <section className="rounded-2xl border border-card-border bg-white p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Config</h3>
-              <Button size="sm" variant="ghost" onClick={onLoadConfig}>
-                Load
-              </Button>
-            </div>
-            <pre className="scrollbar-thin max-h-64 overflow-auto rounded-xl border border-card-border bg-muted p-2 text-xs">{configText || "No config loaded."}</pre>
-          </section>
-
-          <section className="rounded-2xl border border-card-border bg-white p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">RPC Console</h3>
-              <Badge>advanced</Badge>
-            </div>
-            <div className="space-y-2">
-              <select
-                value={adminMethod}
-                onChange={(event) => onAdminMethodChange(event.target.value as AllowedRpcMethod)}
-                className="w-full rounded-xl border border-card-border px-2 py-1 text-sm outline-none"
-              >
-                {allowedRpcMethods.map((method) => (
-                  <option key={method} value={method}>
-                    {method}
-                  </option>
-                ))}
-              </select>
-              <textarea
-                value={adminParamsText}
-                onChange={(event) => onAdminParamsTextChange(event.target.value)}
-                className="h-28 w-full rounded-xl border border-card-border p-2 font-mono text-xs outline-none"
-              />
-              <Button size="sm" onClick={onAdminRun}>
-                Run method
-              </Button>
-              <pre className="scrollbar-thin max-h-52 overflow-auto rounded-xl border border-card-border bg-muted p-2 text-xs">
-                {adminResultText || "(no result yet)"}
-              </pre>
             </div>
           </section>
         </>
