@@ -9,7 +9,11 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import {
   Archive,
   Check,
+  ChevronsUpDown,
+  Circle,
   CircleStop,
+  Command,
+  X,
   Folder,
   FolderOpen,
   Layers,
@@ -793,8 +797,7 @@ function App(): JSX.Element {
     }
   }
 
-  async function togglePlanMode(): Promise<void> {
-    const next = !planModeEnabled;
+  async function setPlanMode(next: boolean): Promise<void> {
     if (next) {
       const resolved = await resolvePlanModeId();
       setPlanModeId(resolved);
@@ -2337,7 +2340,12 @@ function App(): JSX.Element {
               <div ref={timelineBottomRef} />
             </div>
 
-            <ChatComposer onSend={sendMessage} planModeEnabled={planModeEnabled} onTogglePlanMode={() => void togglePlanMode()} />
+            <ChatComposer
+              onSend={sendMessage}
+              planModeEnabled={planModeEnabled}
+              planModeId={planModeId}
+              onSetPlanMode={(next) => void setPlanMode(next)}
+            />
           </CardContent>
         </Card>
 
@@ -2609,20 +2617,64 @@ function App(): JSX.Element {
 function ChatComposer({
   onSend,
   planModeEnabled,
-  onTogglePlanMode,
+  planModeId,
+  onSetPlanMode,
 }: {
   onSend: (text: string) => Promise<void>;
   planModeEnabled: boolean;
-  onTogglePlanMode: () => void;
+  planModeId: string;
+  onSetPlanMode: (next: boolean) => void | Promise<void>;
 }): JSX.Element {
   const [text, setText] = useState("");
   const [isSending, setIsSending] = useState(false);
+  const [isRunningSlashCommand, setIsRunningSlashCommand] = useState(false);
+
+  const slashMode = useMemo(() => {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("/")) return null;
+    if (trimmed.includes(" ")) return null;
+    return trimmed.slice(1).toLowerCase();
+  }, [text]);
+
+  const slashCommands = useMemo(
+    () => [
+      {
+        id: "plan",
+        token: "/plan",
+        title: planModeEnabled ? "Disable Plan Mode" : "Enable Plan Mode",
+        description: planModeEnabled ? "Next messages use normal mode." : `Next messages use plan mode (${planModeId}).`,
+      },
+    ],
+    [planModeEnabled, planModeId],
+  );
+
+  const visibleSlashCommands = useMemo(() => {
+    if (slashMode === null) return [];
+    return slashCommands.filter((command) => command.token.slice(1).startsWith(slashMode) || command.id.startsWith(slashMode));
+  }, [slashCommands, slashMode]);
+
+  async function runSlashCommand(token: string): Promise<boolean> {
+    if (token !== "/plan") return false;
+    setIsRunningSlashCommand(true);
+    try {
+      await onSetPlanMode(!planModeEnabled);
+      setText("");
+      return true;
+    } finally {
+      setIsRunningSlashCommand(false);
+    }
+  }
 
   async function onSubmit(event: React.FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
 
     const value = text.trim();
-    if (!value || isSending) return;
+    if (!value || isSending || isRunningSlashCommand) return;
+
+    if (value.startsWith("/")) {
+      const handled = await runSlashCommand(value.toLowerCase());
+      if (handled) return;
+    }
 
     setIsSending(true);
     try {
@@ -2635,28 +2687,58 @@ function ChatComposer({
 
   return (
     <form className="border-t border-card-border bg-white/75 p-3" onSubmit={onSubmit}>
-      <div className="flex items-end gap-2">
-        <Button
-          type="button"
-          variant={planModeEnabled ? "primary" : "ghost"}
-          className="h-[44px] shrink-0 rounded-2xl px-3"
-          onClick={onTogglePlanMode}
-          disabled={isSending}
-          title={planModeEnabled ? "Disable plan mode" : "Enable plan mode"}
-        >
-          <Sparkles className="h-4 w-4" />
-          <span className="ml-1.5 text-xs">{planModeEnabled ? "Plan on" : "Plan"}</span>
-        </Button>
+      {planModeEnabled ? (
+        <div className="mb-2 inline-flex items-center gap-2 rounded-full border border-brand/40 bg-brand-soft/70 px-2.5 py-1 text-xs text-foreground">
+          <Sparkles className="h-3.5 w-3.5 text-brand-dark" />
+          <span>Plan mode: {planModeId}</span>
+          <button
+            type="button"
+            className="rounded-full p-0.5 text-foreground/70 transition hover:bg-black/10 hover:text-foreground"
+            onClick={() => void onSetPlanMode(false)}
+            aria-label="Disable plan mode"
+            title="Disable plan mode"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      ) : null}
+
+      <div className="relative flex items-end gap-2">
         <textarea
           className="min-h-[44px] max-h-40 w-full resize-y rounded-2xl border border-card-border bg-white px-3 py-2 text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
           placeholder="Message Codex..."
           value={text}
           onChange={(event) => setText(event.target.value)}
         />
+        {visibleSlashCommands.length > 0 ? (
+          <div className="absolute bottom-[calc(100%+8px)] left-0 right-14 z-20 overflow-hidden rounded-2xl border border-card-border bg-white shadow-soft">
+            <div className="border-b border-card-border/70 px-3 py-2 text-[11px] font-mono uppercase tracking-wide text-foreground/65">Commands</div>
+            <div className="p-1">
+              {visibleSlashCommands.map((command) => (
+                <button
+                  key={command.id}
+                  type="button"
+                  className="flex w-full items-start gap-2 rounded-xl px-2 py-2 text-left transition hover:bg-muted"
+                  onClick={() => void runSlashCommand(command.token)}
+                >
+                  <Command className="mt-0.5 h-4 w-4 shrink-0 text-foreground/65" />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-xs text-brand-dark">{command.token}</span>
+                      <span className="text-xs font-semibold text-foreground">{command.title}</span>
+                    </div>
+                    <div className="mt-0.5 text-xs text-foreground/70">{command.description}</div>
+                  </div>
+                  <ChevronsUpDown className="ml-auto mt-0.5 h-3.5 w-3.5 shrink-0 text-foreground/45" />
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
         <Button
           type="submit"
           className="h-[44px] w-[44px] shrink-0 rounded-full p-0"
-          disabled={isSending}
+          disabled={isSending || isRunningSlashCommand}
           aria-label="Send message"
           title="Send"
         >
