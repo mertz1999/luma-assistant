@@ -73,6 +73,19 @@ type FileEntry = {
   isDirectory: boolean;
 };
 
+type RequestUserInputOption = {
+  label: string;
+  description?: string;
+  isOther?: boolean;
+};
+
+type RequestUserInputQuestion = {
+  id: string;
+  header?: string;
+  question?: string;
+  options: RequestUserInputOption[];
+};
+
 const UI_DEBUG_LOGS = String(import.meta.env.VITE_DEBUG_LOGS ?? "false").toLowerCase() === "true";
 
 function uiDebug(event: string, payload: Record<string, unknown> = {}): void {
@@ -107,6 +120,44 @@ function parseLoadedThreadIds(raw: unknown): string[] {
   if (Array.isArray(raw.data)) return raw.data.filter((entry): entry is string => typeof entry === "string");
   if (Array.isArray(raw.threadIds)) return raw.threadIds.filter((entry): entry is string => typeof entry === "string");
   return [];
+}
+
+function parseRequestUserInputQuestions(params: Record<string, unknown>): RequestUserInputQuestion[] {
+  const rawQuestions = Array.isArray(params.questions) ? params.questions : [];
+  const questions: RequestUserInputQuestion[] = [];
+
+  for (const rawQuestion of rawQuestions) {
+    if (!isObject(rawQuestion)) continue;
+    const id = typeof rawQuestion.id === "string" ? rawQuestion.id : "";
+    if (!id) continue;
+
+    const rawOptions = Array.isArray(rawQuestion.options) ? rawQuestion.options : [];
+    const options: RequestUserInputOption[] = [];
+    for (const rawOption of rawOptions) {
+      if (!isObject(rawOption)) continue;
+      const label = typeof rawOption.label === "string" ? rawOption.label : "";
+      if (!label) continue;
+      const option: RequestUserInputOption = {
+        label,
+      };
+      if (typeof rawOption.description === "string") {
+        option.description = rawOption.description;
+      }
+      if (Boolean(rawOption.isOther)) {
+        option.isOther = true;
+      }
+      options.push(option);
+    }
+
+    questions.push({
+      id,
+      header: typeof rawQuestion.header === "string" ? rawQuestion.header : undefined,
+      question: typeof rawQuestion.question === "string" ? rawQuestion.question : undefined,
+      options,
+    });
+  }
+
+  return questions;
 }
 
 function detectPlanModeId(raw: unknown): string | null {
@@ -694,6 +745,9 @@ function App(): JSX.Element {
   const [toastText, setToastText] = useState<string | null>(null);
   const [planModeEnabled, setPlanModeEnabled] = useState(false);
   const [planModeId, setPlanModeId] = useState("plan");
+  const [requestInputSelections, setRequestInputSelections] = useState<Record<string, string>>({});
+  const [requestInputOtherText, setRequestInputOtherText] = useState<Record<string, string>>({});
+  const [isSubmittingRequestInput, setIsSubmittingRequestInput] = useState(false);
   const [activeContextTab, setActiveContextTab] = useState<ContextTab>("context");
   const [guardPrompt, setGuardPrompt] = useState<GuardPromptState | null>(null);
   const [guardAcceptForSession, setGuardAcceptForSession] = useState(true);
@@ -728,6 +782,10 @@ function App(): JSX.Element {
   const activeTimeline = activeThreadId ? timelines[activeThreadId] || [] : [];
   const activeThread = (activeThreadArchived ? archivedThreads : threads).find((thread) => thread.id === activeThreadId) || null;
   const activeApproval = pendingApprovals[0] || null;
+  const activeApprovalQuestions = useMemo(
+    () => (activeApproval && activeApproval.method === "tool/requestUserInput" ? parseRequestUserInputQuestions(activeApproval.params) : []),
+    [activeApproval],
+  );
   const mobileHeaderTitle = activeThread ? getThreadTitle(activeThread) : "Assistant";
 
   const {
@@ -781,6 +839,24 @@ function App(): JSX.Element {
   useEffect(() => {
     commandSessionsRef.current = commandSessions;
   }, [commandSessions]);
+
+  useEffect(() => {
+    if (!activeApproval || activeApproval.method !== "tool/requestUserInput") {
+      setRequestInputSelections({});
+      setRequestInputOtherText({});
+      return;
+    }
+
+    const questions = parseRequestUserInputQuestions(activeApproval.params);
+    const nextSelections: Record<string, string> = {};
+    for (const question of questions) {
+      if (question.options.length > 0) {
+        nextSelections[question.id] = question.options[0].label;
+      }
+    }
+    setRequestInputSelections(nextSelections);
+    setRequestInputOtherText({});
+  }, [activeApproval]);
 
   function setToast(message: string): void {
     setToastText(message);
@@ -1429,6 +1505,46 @@ function App(): JSX.Element {
       setPendingApprovals((prev) => prev.filter((item) => item.id !== activeApproval.id));
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Failed to submit decision");
+    }
+  }
+
+  async function handleRequestUserInputSubmit(): Promise<void> {
+    if (!activeApproval || activeApproval.method !== "tool/requestUserInput") return;
+    const questions = parseRequestUserInputQuestions(activeApproval.params);
+    if (questions.length === 0) return;
+
+    const answers = questions.map((question) => {
+      const selectedLabel = requestInputSelections[question.id] || "";
+      const selectedOption = question.options.find((option) => option.label === selectedLabel) || null;
+      const otherText = requestInputOtherText[question.id] || "";
+      return {
+        id: question.id,
+        value: selectedOption
+          ? {
+              label: selectedOption.label,
+              ...(selectedOption.isOther ? { isOther: true, text: otherText } : {}),
+            }
+          : {
+              label: selectedLabel,
+            },
+      };
+    });
+
+    setIsSubmittingRequestInput(true);
+    try {
+      await respondToServerRequest({
+        requestId: activeApproval.id,
+        result: {
+          answers,
+        },
+      });
+      setPendingApprovals((prev) => prev.filter((item) => item.id !== activeApproval.id));
+      setRequestInputSelections({});
+      setRequestInputOtherText({});
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Failed to submit answers");
+    } finally {
+      setIsSubmittingRequestInput(false);
     }
   }
 
@@ -2518,21 +2634,88 @@ function App(): JSX.Element {
             <Dialog.Description className="mb-2 text-sm text-foreground/70">
               {activeApproval ? activeApproval.method : "Pending request"}
             </Dialog.Description>
-            <pre className="scrollbar-thin max-h-[40vh] overflow-auto rounded-2xl border border-card-border bg-muted p-3 font-mono text-xs">
-              {activeApproval ? safeJsonStringify(activeApproval.params) : ""}
-            </pre>
-            <div className="mt-4 flex flex-wrap gap-2">
-              <Button onClick={() => void handleApprovalDecision("accept")}>Accept</Button>
-              <Button variant="ghost" onClick={() => void handleApprovalDecision("acceptForSession")}>
-                Accept for session
-              </Button>
-              <Button variant="ghost" onClick={() => void handleApprovalDecision("decline")}>
-                Decline
-              </Button>
-              <Button variant="ghost" onClick={() => void handleApprovalDecision("cancel")}>
-                Cancel
-              </Button>
-            </div>
+            {activeApproval?.method === "tool/requestUserInput" && activeApprovalQuestions.length > 0 ? (
+              <div className="space-y-3">
+                <div className="max-h-[44vh] space-y-3 overflow-auto pr-1">
+                  {activeApprovalQuestions.map((question) => {
+                    const selectedLabel = requestInputSelections[question.id] || "";
+                    const selectedOption = question.options.find((option) => option.label === selectedLabel) || null;
+                    return (
+                      <div key={question.id} className="rounded-2xl border border-card-border bg-muted/50 p-3">
+                        {question.header ? <div className="font-mono text-[11px] uppercase tracking-wide text-foreground/70">{question.header}</div> : null}
+                        {question.question ? <p className="mt-1 text-sm font-medium text-foreground">{question.question}</p> : null}
+                        <div className="mt-2 space-y-2">
+                          {question.options.map((option) => (
+                            <label key={option.label} className="flex cursor-pointer items-start gap-2 rounded-xl border border-card-border bg-white px-2 py-2">
+                              <input
+                                type="radio"
+                                name={`rui-${question.id}`}
+                                checked={selectedLabel === option.label}
+                                onChange={() =>
+                                  setRequestInputSelections((prev) => ({
+                                    ...prev,
+                                    [question.id]: option.label,
+                                  }))
+                                }
+                                className="mt-0.5"
+                              />
+                              <span className="min-w-0">
+                                <span className="text-sm font-medium">{option.label}</span>
+                                {option.description ? <span className="mt-0.5 block text-xs text-foreground/70">{option.description}</span> : null}
+                              </span>
+                            </label>
+                          ))}
+                        </div>
+                        {selectedOption?.isOther ? (
+                          <div className="mt-2">
+                            <input
+                              type="text"
+                              value={requestInputOtherText[question.id] || ""}
+                              onChange={(event) =>
+                                setRequestInputOtherText((prev) => ({
+                                  ...prev,
+                                  [question.id]: event.target.value,
+                                }))
+                              }
+                              placeholder="Type your answer..."
+                              className="w-full rounded-xl border border-card-border bg-white px-3 py-2 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                            />
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <Button onClick={() => void handleRequestUserInputSubmit()} disabled={isSubmittingRequestInput}>
+                    {isSubmittingRequestInput ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                    Submit answers
+                  </Button>
+                  <Button variant="ghost" onClick={() => void handleApprovalDecision("cancel")}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <pre className="scrollbar-thin max-h-[40vh] overflow-auto rounded-2xl border border-card-border bg-muted p-3 font-mono text-xs">
+                  {activeApproval ? safeJsonStringify(activeApproval.params) : ""}
+                </pre>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <Button onClick={() => void handleApprovalDecision("accept")}>Accept</Button>
+                  <Button variant="ghost" onClick={() => void handleApprovalDecision("acceptForSession")}>
+                    Accept for session
+                  </Button>
+                  <Button variant="ghost" onClick={() => void handleApprovalDecision("decline")}>
+                    Decline
+                  </Button>
+                  <Button variant="ghost" onClick={() => void handleApprovalDecision("cancel")}>
+                    Cancel
+                  </Button>
+                </div>
+              </>
+            )}
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
