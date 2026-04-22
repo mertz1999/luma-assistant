@@ -42,55 +42,29 @@ export class CodexBridge extends EventEmitter {
   private nextId = 1;
   private pending = new Map<number, PendingRequest>();
   private pendingServerRequests = new Map<string | number, PendingServerRequest>();
+  private restartTimer: NodeJS.Timeout | null = null;
+  private restartDelayMs: number;
+  private maxRestarts: number;
+  private restartAttempts = 0;
+  private startedOnce = false;
+  private stoppedByUser = false;
+  private clientInfo: { name: string; title: string; version: string } | null = null;
 
-  constructor(options: { codexPath?: string; cwd?: string } = {}) {
+  constructor(options: { codexPath?: string; cwd?: string; restartDelayMs?: number; maxRestarts?: number } = {}) {
     super();
     this.codexPath = options.codexPath || "codex";
     this.cwd = options.cwd || process.cwd();
+    this.restartDelayMs = options.restartDelayMs ?? 1_500;
+    this.maxRestarts = options.maxRestarts ?? 5;
   }
 
   async start(): Promise<void> {
-    if (this.proc && !this.proc.killed) {
-      return;
-    }
-
-    this.proc = spawn(this.codexPath, ["app-server"], {
-      cwd: this.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    this.proc.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8").trim();
-      if (!text) return;
-      this.emit("status", { type: "stderr", message: text, at: Date.now() } satisfies BridgeStatusEvent);
-    });
-
-    this.proc.on("exit", (code, signal) => {
-      const error = new Error(`codex app-server exited (code=${code ?? "null"}, signal=${signal ?? "null"})`);
-      for (const [id, pending] of this.pending.entries()) {
-        clearTimeout(pending.timeout);
-        pending.reject(error);
-        this.pending.delete(id);
-      }
-
-      this.ready = false;
-      this.proc = null;
-      this.rl = null;
-      this.emit("status", {
-        type: "exit",
-        code: code ?? null,
-        signal: signal ?? null,
-        at: Date.now(),
-      } satisfies BridgeStatusEvent);
-    });
-
-    this.rl = readline.createInterface({ input: this.proc.stdout });
-    this.rl.on("line", (line) => this.handleLine(line));
-
-    this.emit("status", { type: "started", at: Date.now() } satisfies BridgeStatusEvent);
+    this.stoppedByUser = false;
+    await this.spawnProcess();
   }
 
   async initialize(clientInfo: { name: string; title: string; version: string }): Promise<void> {
+    this.clientInfo = clientInfo;
     if (this.ready) return;
 
     const initResult = (await this.request("initialize", {
@@ -102,6 +76,7 @@ export class CodexBridge extends EventEmitter {
 
     this.sendNotification("initialized", {});
     this.ready = true;
+    this.restartAttempts = 0;
 
     this.emit("status", {
       type: "initialized",
@@ -165,6 +140,13 @@ export class CodexBridge extends EventEmitter {
   }
 
   stop(): void {
+    this.stoppedByUser = true;
+
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+
     if (this.rl) {
       this.rl.close();
       this.rl = null;
@@ -174,6 +156,98 @@ export class CodexBridge extends EventEmitter {
     }
     this.proc = null;
     this.ready = false;
+  }
+
+  private async spawnProcess(): Promise<void> {
+    if (this.proc && !this.proc.killed) return;
+
+    this.proc = spawn(this.codexPath, ["app-server"], {
+      cwd: this.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    this.startedOnce = true;
+
+    this.proc.stderr.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8").trim();
+      if (!text) return;
+      this.emit("status", { type: "stderr", message: text, at: Date.now() } satisfies BridgeStatusEvent);
+    });
+
+    this.proc.on("exit", (code, signal) => {
+      const error = new Error(`codex app-server exited (code=${code ?? "null"}, signal=${signal ?? "null"})`);
+      for (const [id, pending] of this.pending.entries()) {
+        clearTimeout(pending.timeout);
+        pending.reject(error);
+        this.pending.delete(id);
+      }
+
+      this.ready = false;
+      this.proc = null;
+      this.rl = null;
+      this.emit("status", {
+        type: "exit",
+        code: code ?? null,
+        signal: signal ?? null,
+        at: Date.now(),
+      } satisfies BridgeStatusEvent);
+
+      this.scheduleRestart();
+    });
+
+    this.rl = readline.createInterface({ input: this.proc.stdout });
+    this.rl.on("line", (line) => this.handleLine(line));
+
+    this.emit("status", { type: "started", at: Date.now() } satisfies BridgeStatusEvent);
+  }
+
+  private scheduleRestart(): void {
+    if (this.stoppedByUser || !this.startedOnce) return;
+    if (this.restartTimer) return;
+
+    if (this.restartAttempts >= this.maxRestarts) {
+      this.emit("status", {
+        type: "restart_giveup",
+        at: Date.now(),
+        attempts: this.restartAttempts,
+      } satisfies BridgeStatusEvent);
+      return;
+    }
+
+    this.restartAttempts += 1;
+    this.emit("status", {
+      type: "restart_scheduled",
+      at: Date.now(),
+      attempt: this.restartAttempts,
+      delayMs: this.restartDelayMs,
+    } satisfies BridgeStatusEvent);
+
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      void this.restartNow();
+    }, this.restartDelayMs);
+  }
+
+  private async restartNow(): Promise<void> {
+    try {
+      await this.spawnProcess();
+      if (this.clientInfo) {
+        await this.initialize(this.clientInfo);
+      }
+      this.emit("status", {
+        type: "restart_completed",
+        at: Date.now(),
+        attempts: this.restartAttempts,
+      } satisfies BridgeStatusEvent);
+    } catch (error) {
+      this.emit("status", {
+        type: "restart_failed",
+        at: Date.now(),
+        attempts: this.restartAttempts,
+        message: error instanceof Error ? error.message : "Unknown restart error",
+      } satisfies BridgeStatusEvent);
+      this.scheduleRestart();
+    }
   }
 
   private handleLine(line: string): void {

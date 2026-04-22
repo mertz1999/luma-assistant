@@ -1,3 +1,5 @@
+import type { BootstrapCapabilities } from "@assistant/shared";
+
 export type ThreadRecord = {
   id: string;
   name?: string | null;
@@ -14,12 +16,33 @@ export type TimelineEntry = {
   role: "user" | "agent" | "tool" | "plan";
   title?: string;
   text: string;
+  pending?: boolean;
+  meta?: {
+    type?: string;
+    status?: string | null;
+    command?: string | null;
+    path?: string | null;
+  };
 };
 
 export type PendingApproval = {
   id: string | number;
   method: string;
   params: Record<string, unknown>;
+};
+
+export type PersistedUiState = {
+  lastActiveThreadId: string | null;
+  pinnedThreadIds: string[];
+  panelLayout: {
+    contextTab: "context" | "ops" | "admin";
+  };
+  filters: {
+    showArchived: boolean;
+  };
+  composer: {
+    draftByThread: Record<string, string>;
+  };
 };
 
 export type BootstrapPayload = {
@@ -38,7 +61,12 @@ export type BootstrapPayload = {
     account?: { account?: unknown };
     threads?: { data?: ThreadRecord[] };
     archivedThreads?: { data?: ThreadRecord[] };
+    loadedThreads?: { data?: string[]; threadIds?: string[] };
     models?: { data?: unknown[] };
     mcpServers?: { data?: unknown[]; servers?: unknown[] };
+    featureFlags?: { data?: unknown[] };
+    collaborationModes?: { data?: unknown[] };
+    capabilities?: BootstrapCapabilities;
+    uiState?: PersistedUiState;
   };
 };

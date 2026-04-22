@@ -18,8 +18,9 @@ body,
 }
 
 body {
-  @apply bg-background text-foreground antialiased;
-  font-family: "Space Grotesk", sans-serif;
+  @apply bg-background font-sans text-foreground antialiased;
+  text-rendering: optimizeLegibility;
+  line-height: 1.45;
   background-image:
     radial-gradient(circle at 12% 8%, #d5f4ed 0%, rgba(213, 244, 237, 0) 35%),
     radial-gradient(circle at 88% 85%, #ffe8c7 0%, rgba(255, 232, 199, 0) 38%),
@@ -43,4 +44,36 @@ body {
 
 .scrollbar-thin::-webkit-scrollbar-track {
   background: transparent;
+}
+
+.dot-wave {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+}
+
+.dot-wave span {
+  animation: dot-wave 1.2s infinite ease-in-out;
+  font-weight: 700;
+}
+
+.dot-wave span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.dot-wave span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes dot-wave {
+  0%,
+  70%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.35;
+  }
+  35% {
+    transform: translateY(-2px);
+    opacity: 1;
+  }
 }

@@ -19,8 +19,21 @@ export default {
         muted: "#f5f9fc",
       },
       fontFamily: {
-        sans: ["Space Grotesk", "sans-serif"],
-        mono: ["Azeret Mono", "monospace"],
+        sans: [
+          "-apple-system",
+          "BlinkMacSystemFont",
+          "Segoe UI",
+          "Roboto",
+          "Helvetica Neue",
+          "Arial",
+          "Noto Sans",
+          "sans-serif",
+          "Apple Color Emoji",
+          "Segoe UI Emoji",
+          "Segoe UI Symbol",
+          "Noto Color Emoji",
+        ],
+        mono: ["ui-monospace", "SFMono-Regular", "Menlo", "Monaco", "Consolas", "monospace"],
       },
       boxShadow: {
         soft: "0 16px 46px rgba(15,34,48,0.14)",

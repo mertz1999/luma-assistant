@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import type { MethodGroup } from "@assistant/shared";
 
 type Session = {
   ip: string;
@@ -13,6 +14,7 @@ export class SessionStore {
   private sessions = new Map<string, Session>();
   private loginAttemptsByIp = new Map<string, number[]>();
   private sessionTtlMs: number;
+  private riskAcceptances = new Map<string, Map<MethodGroup, number>>();
 
   constructor(options: {
     password?: string;
@@ -73,7 +75,7 @@ export class SessionStore {
     if (!session) return false;
 
     if (Date.now() - session.createdAt > this.sessionTtlMs) {
-      this.sessions.delete(token);
+      this.deleteSession(token);
       return false;
     }
 
@@ -84,6 +86,7 @@ export class SessionStore {
   deleteSession(token: string | null): void {
     if (!token) return;
     this.sessions.delete(token);
+    this.riskAcceptances.delete(token);
   }
 
   cleanupExpiredSessions(): void {
@@ -91,8 +94,57 @@ export class SessionStore {
 
     for (const [token, session] of this.sessions.entries()) {
       if (now - session.createdAt > this.sessionTtlMs) {
-        this.sessions.delete(token);
+        this.deleteSession(token);
       }
     }
+
+    for (const [token, groups] of this.riskAcceptances.entries()) {
+      if (!this.sessions.has(token)) {
+        this.riskAcceptances.delete(token);
+        continue;
+      }
+
+      for (const [group, expiresAt] of groups.entries()) {
+        if (now > expiresAt) groups.delete(group);
+      }
+
+      if (groups.size === 0) this.riskAcceptances.delete(token);
+    }
+  }
+
+  grantRiskAcceptance(sessionToken: string, group: MethodGroup, ttlMs: number): number {
+    const now = Date.now();
+    const expiresAt = now + ttlMs;
+
+    const scoped = this.riskAcceptances.get(sessionToken) || new Map<MethodGroup, number>();
+    scoped.set(group, expiresAt);
+    this.riskAcceptances.set(sessionToken, scoped);
+
+    return expiresAt;
+  }
+
+  hasActiveRiskAcceptance(sessionToken: string, group: MethodGroup): boolean {
+    const scoped = this.riskAcceptances.get(sessionToken);
+    if (!scoped) return false;
+
+    const expiresAt = scoped.get(group);
+    if (!expiresAt) return false;
+
+    if (Date.now() > expiresAt) {
+      scoped.delete(group);
+      if (scoped.size === 0) this.riskAcceptances.delete(sessionToken);
+      return false;
+    }
+
+    return true;
+  }
+
+  getRiskAcceptanceExpiry(sessionToken: string, group: MethodGroup): number | null {
+    const scoped = this.riskAcceptances.get(sessionToken);
+    if (!scoped) return null;
+    const expiresAt = scoped.get(group);
+    if (!expiresAt) return null;
+    if (Date.now() > expiresAt) return null;
+    return expiresAt;
   }
 }

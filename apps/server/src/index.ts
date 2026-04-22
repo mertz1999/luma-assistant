@@ -5,17 +5,25 @@ import cookieParser from "cookie-parser";
 import cors from "cors";
 import dotenv from "dotenv";
 import express, { type NextFunction, type Request, type Response } from "express";
+import { z } from "zod";
 import {
   allowedRpcMethods,
   loginRequestSchema,
+  methodGroups,
   rpcRequestSchema,
   serverRequestRespondSchema,
   type AllowedRpcMethod,
   type ApiError,
+  type BootstrapCapabilities,
   type BridgeState,
+  type GuardRequirement,
+  type MethodGroup,
+  type RiskTier,
   type SseEvent,
 } from "@assistant/shared";
 import { CodexBridge, type BridgeNotificationEvent, type BridgeServerRequestEvent, type BridgeStatusEvent } from "./codexBridge.js";
+import { getCapabilityDescriptors, getMethodPolicy, type MethodPolicy } from "./methodPolicy.js";
+import { AuditLogger, UiStateStore, type PersistedUiState } from "./persistence.js";
 import { SessionStore } from "./sessionStore.js";
 
 declare global {
@@ -47,7 +55,15 @@ type AppConfig = {
   loginRateLimitWindowMs: number;
   loginRateLimitMaxAttempts: number;
   cookieSecure: boolean;
+  riskAcceptTtlMs: number;
+  groupEnabled: Record<MethodGroup, boolean>;
+  debugLogs: boolean;
 };
+
+function parseBool(input: string | undefined, fallback: boolean): boolean {
+  if (typeof input !== "string") return fallback;
+  return input.trim().toLowerCase() === "true";
+}
 
 function normalizeApprovalPolicy(value: unknown): string {
   if (typeof value !== "string" || value.trim().length === 0) {
@@ -65,6 +81,40 @@ function normalizeApprovalPolicy(value: unknown): string {
 
   return normalized;
 }
+
+function normalizeThreadSandbox(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return "workspace-write";
+  }
+
+  const normalized = value.trim().toLowerCase().replace(/[_\s]+/g, "-");
+  if (normalized === "workspacewrite" || normalized === "workspace-write") return "workspace-write";
+  if (normalized === "readonly" || normalized === "read-only") return "read-only";
+  if (normalized === "dangerfullaccess" || normalized === "danger-full-access") return "danger-full-access";
+  return normalized;
+}
+
+function normalizeTurnSandboxType(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return "workspaceWrite";
+  }
+
+  const normalized = value.trim().toLowerCase().replace(/[_\s]+/g, "-");
+  if (normalized === "workspacewrite" || normalized === "workspace-write") return "workspaceWrite";
+  if (normalized === "readonly" || normalized === "read-only") return "readOnly";
+  if (normalized === "dangerfullaccess" || normalized === "danger-full-access") return "dangerFullAccess";
+  if (normalized === "externalsandbox" || normalized === "external-sandbox") return "externalSandbox";
+  return value;
+}
+
+const groupEnabled: Record<MethodGroup, boolean> = {
+  read: parseBool(process.env.ENABLE_GROUP_READ, true),
+  thread_control: parseBool(process.env.ENABLE_GROUP_THREAD_CONTROL, true),
+  ops: parseBool(process.env.ENABLE_GROUP_OPS, true),
+  config_write: parseBool(process.env.ENABLE_GROUP_CONFIG_WRITE, true),
+  filesystem: parseBool(process.env.ENABLE_GROUP_FILESYSTEM, true),
+  experimental: parseBool(process.env.ENABLE_GROUP_EXPERIMENTAL, false),
+};
 
 const config: AppConfig = {
   port: Number(process.env.PORT || 8787),
@@ -84,7 +134,16 @@ const config: AppConfig = {
   loginRateLimitWindowMs: Number(process.env.LOGIN_RATE_LIMIT_WINDOW_MS || 900000),
   loginRateLimitMaxAttempts: Number(process.env.LOGIN_RATE_LIMIT_MAX_ATTEMPTS || 12),
   cookieSecure: String(process.env.COOKIE_SECURE || "false").toLowerCase() === "true",
+  riskAcceptTtlMs: Number(process.env.RISK_ACCEPT_TTL_MS || 15 * 60 * 1000),
+  groupEnabled,
+  debugLogs: parseBool(process.env.DEBUG_LOGS, false),
 };
+
+function debugLog(event: string, payload: Record<string, unknown> = {}): void {
+  if (!config.debugLogs) return;
+  // eslint-disable-next-line no-console
+  console.log(`[debug] ${event}`, payload);
+}
 
 const corsPorts = new Set(
   config.webOrigins
@@ -158,6 +217,8 @@ const bridge = new CodexBridge({
   cwd: rootDir,
 });
 
+const uiStateStore = new UiStateStore(rootDir);
+const auditLogger = new AuditLogger(rootDir);
 const sseClients = new Set<{ id: string; res: Response }>();
 const allowedMethods = new Set<AllowedRpcMethod>(allowedRpcMethods);
 
@@ -166,6 +227,26 @@ let bridgeState: BridgeState = {
   initialized: false,
   lastStatus: null,
 };
+
+const uiStatePatchSchema = z.object({
+  lastActiveThreadId: z.string().nullable().optional(),
+  pinnedThreadIds: z.array(z.string()).optional(),
+  panelLayout: z
+    .object({
+      contextTab: z.enum(["context", "ops", "admin"]).optional(),
+    })
+    .optional(),
+  filters: z
+    .object({
+      showArchived: z.boolean().optional(),
+    })
+    .optional(),
+  composer: z
+    .object({
+      draftByThread: z.record(z.string(), z.string()).optional(),
+    })
+    .optional(),
+});
 
 function sanitizeError(error: unknown): ApiError {
   if (error instanceof Error) {
@@ -184,6 +265,16 @@ function sanitizeError(error: unknown): ApiError {
   };
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isThreadNotFoundError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return message.includes("thread not found");
+}
+
 function clientIp(req: Request): string {
   const forwarded = req.headers["x-forwarded-for"];
   if (typeof forwarded === "string" && forwarded.length > 0) {
@@ -196,6 +287,11 @@ function clientIp(req: Request): string {
 function extractSessionToken(req: Request): string | null {
   const cookieToken = req.cookies?.session_token as string | undefined;
   if (cookieToken) return cookieToken;
+
+  const queryToken = typeof req.query.sessionToken === "string" ? req.query.sessionToken : null;
+  if (queryToken && queryToken.trim().length > 0) {
+    return queryToken.trim();
+  }
 
   const auth = req.headers.authorization || "";
   if (auth.toLowerCase().startsWith("bearer ")) {
@@ -216,6 +312,14 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
 
   const token = extractSessionToken(req);
   if (!sessionStore.isValidSession(token)) {
+    debugLog("auth.unauthorized", {
+      path: req.path,
+      method: req.method,
+      hasCookieToken: Boolean(req.cookies?.session_token),
+      hasQueryToken: typeof req.query.sessionToken === "string",
+      hasBearer: typeof req.headers.authorization === "string" && req.headers.authorization.toLowerCase().startsWith("bearer "),
+      ip: clientIp(req),
+    });
     res.status(401).json({
       ok: false,
       error: { message: "Unauthorized" },
@@ -249,7 +353,8 @@ function applyRpcDefaults(method: AllowedRpcMethod, params: Record<string, unkno
     if (!next.cwd) next.cwd = config.defaultCwd;
     if (!next.approvalPolicy) next.approvalPolicy = config.defaultApprovalPolicy;
     else next.approvalPolicy = normalizeApprovalPolicy(next.approvalPolicy);
-    if (!next.sandbox) next.sandbox = config.defaultSandboxType;
+    if (!next.sandbox) next.sandbox = normalizeThreadSandbox(config.defaultSandboxType);
+    else next.sandbox = normalizeThreadSandbox(next.sandbox);
   }
 
   if (method === "turn/start") {
@@ -258,11 +363,20 @@ function applyRpcDefaults(method: AllowedRpcMethod, params: Record<string, unkno
     else next.approvalPolicy = normalizeApprovalPolicy(next.approvalPolicy);
     if (!next.sandboxPolicy) {
       next.sandboxPolicy = {
-        type: config.defaultSandboxType,
+        type: normalizeTurnSandboxType(config.defaultSandboxType),
         writableRoots: [config.defaultCwd],
         networkAccess: config.defaultNetworkAccess,
       };
+    } else if (isObject(next.sandboxPolicy)) {
+      next.sandboxPolicy = {
+        ...next.sandboxPolicy,
+        type: normalizeTurnSandboxType((next.sandboxPolicy as Record<string, unknown>).type),
+      };
     }
+  }
+
+  if (method === "command/exec") {
+    if (!next.cwd) next.cwd = config.defaultCwd;
   }
 
   if (method === "account/login/start") {
@@ -270,6 +384,115 @@ function applyRpcDefaults(method: AllowedRpcMethod, params: Record<string, unkno
   }
 
   return next;
+}
+
+function normalizePathLike(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  if (!path.isAbsolute(value)) return null;
+  return path.resolve(value);
+}
+
+function isPathWithinWorkspace(candidate: string): boolean {
+  const workspace = path.resolve(config.defaultCwd);
+  const target = path.resolve(candidate);
+  return target === workspace || target.startsWith(`${workspace}${path.sep}`);
+}
+
+function collectWorkspacePaths(params: Record<string, unknown>): string[] {
+  const candidates: string[] = [];
+  for (const key of ["path", "source", "sourcePath", "from", "destination", "to", "targetPath", "cwd"]) {
+    const normalized = normalizePathLike(params[key]);
+    if (normalized) candidates.push(normalized);
+  }
+  return Array.from(new Set(candidates));
+}
+
+function getCapabilities(): BootstrapCapabilities {
+  return {
+    methods: getCapabilityDescriptors(config.groupEnabled),
+    groups: config.groupEnabled,
+  };
+}
+
+function guardRequirement(policy: MethodPolicy, reason: string, expiresInMs?: number): GuardRequirement {
+  return {
+    required: true,
+    tier: policy.riskTier,
+    group: policy.group,
+    reason,
+    allowAcceptForSession: true,
+    requiresReauthPassword: policy.riskTier >= 3,
+    ...(typeof expiresInMs === "number" ? { expiresInMs } : {}),
+  };
+}
+
+function enforceGuards(input: {
+  policy: MethodPolicy;
+  method: AllowedRpcMethod;
+  params: Record<string, unknown>;
+  sessionToken: string;
+  guard?: {
+    acceptRisk?: boolean;
+    acceptForSession?: boolean;
+    reauthPassword?: string;
+  };
+}): { ok: true; expiresAt: number | null } | { ok: false; guard: GuardRequirement; status: number } {
+  const { policy, params, sessionToken, guard } = input;
+
+  if (!config.groupEnabled[policy.group]) {
+    return {
+      ok: false,
+      status: 403,
+      guard: guardRequirement(policy, `Method group disabled: ${policy.group}`),
+    };
+  }
+
+  if (policy.group === "filesystem") {
+    const touchedPaths = collectWorkspacePaths(params);
+    const outside = touchedPaths.find((entry) => !isPathWithinWorkspace(entry));
+    if (outside) {
+      return {
+        ok: false,
+        status: 403,
+        guard: guardRequirement(policy, `Path is outside DEFAULT_CWD workspace: ${outside}`),
+      };
+    }
+  }
+
+  if (policy.riskTier <= 1) {
+    return { ok: true, expiresAt: null };
+  }
+
+  if (sessionStore.hasActiveRiskAcceptance(sessionToken, policy.group)) {
+    const expiresAt = sessionStore.getRiskAcceptanceExpiry(sessionToken, policy.group);
+    return { ok: true, expiresAt };
+  }
+
+  if (!guard?.acceptRisk) {
+    return {
+      ok: false,
+      status: 409,
+      guard: guardRequirement(policy, `Risk acknowledgement required for ${policy.group} operations`, config.riskAcceptTtlMs),
+    };
+  }
+
+  if (policy.riskTier >= 3) {
+    const password = guard.reauthPassword || "";
+    if (!sessionStore.verifyPassword(password)) {
+      return {
+        ok: false,
+        status: 401,
+        guard: guardRequirement(policy, "Password re-authentication required", config.riskAcceptTtlMs),
+      };
+    }
+  }
+
+  if (guard.acceptForSession) {
+    const expiresAt = sessionStore.grantRiskAcceptance(sessionToken, policy.group, config.riskAcceptTtlMs);
+    return { ok: true, expiresAt };
+  }
+
+  return { ok: true, expiresAt: null };
 }
 
 async function bootstrapData(): Promise<Record<string, unknown>> {
@@ -287,6 +510,7 @@ async function bootstrapData(): Promise<Record<string, unknown>> {
       sortKey: "updated_at",
       archived: true,
     }),
+    loadedThreads: bridge.request("thread/loaded/list", {}),
     models: bridge.request("model/list", {
       limit: 20,
       includeHidden: false,
@@ -296,11 +520,18 @@ async function bootstrapData(): Promise<Record<string, unknown>> {
       limit: 100,
       detail: "toolsAndAuthOnly",
     }),
+    featureFlags: bridge.request("experimentalFeature/list", {
+      limit: 100,
+    }),
+    collaborationModes: bridge.request("collaborationMode/list", {}),
   };
 
   const settled = await Promise.allSettled(Object.values(requests));
   const keys = Object.keys(requests);
-  const result: Record<string, unknown> = {};
+  const result: Record<string, unknown> = {
+    uiState: uiStateStore.read(),
+    capabilities: getCapabilities(),
+  };
 
   settled.forEach((entry, index) => {
     const key = keys[index];
@@ -317,10 +548,29 @@ async function bootstrapData(): Promise<Record<string, unknown>> {
 }
 
 bridge.on("notification", (message: BridgeNotificationEvent) => {
+  if (
+    message.method.startsWith("turn/") ||
+    message.method.startsWith("item/") ||
+    message.method === "serverRequest/resolved"
+  ) {
+    debugLog("bridge.notification", {
+      method: message.method,
+      threadId: message.params.threadId ?? null,
+      turnId: message.params.turnId ?? null,
+      itemId: message.params.itemId ?? null,
+    });
+  }
   broadcast({ kind: "notification", ...message, at: Date.now() });
 });
 
 bridge.on("serverRequest", (request: BridgeServerRequestEvent) => {
+  debugLog("bridge.serverRequest", {
+    id: request.id,
+    method: request.method,
+    threadId: request.params.threadId ?? null,
+    turnId: request.params.turnId ?? null,
+    itemId: request.params.itemId ?? null,
+  });
   broadcast({ kind: "serverRequest", ...request, at: Date.now() });
 });
 
@@ -334,6 +584,7 @@ bridge.on("status", (status: BridgeStatusEvent) => {
     bridgeState.initialized = false;
   }
 
+  auditLogger.log("bridge.status", status);
   broadcast({ kind: "bridgeStatus", ...status, at: Date.now() });
 });
 
@@ -341,6 +592,17 @@ app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     bridgeState,
+  });
+});
+
+app.get("/api/session", (req, res) => {
+  const token = extractSessionToken(req);
+  const authenticated = sessionStore.isValidSession(token);
+  res.json({
+    ok: true,
+    result: {
+      authenticated,
+    },
   });
 });
 
@@ -356,6 +618,7 @@ app.post("/api/login", (req, res) => {
 
   const ip = clientIp(req);
   if (!sessionStore.canAttemptLogin(ip)) {
+    auditLogger.log("auth.login.rate_limited", { ip });
     res.status(429).json({
       ok: false,
       error: { message: "Too many login attempts. Please wait and retry." },
@@ -366,6 +629,7 @@ app.post("/api/login", (req, res) => {
   sessionStore.trackLoginAttempt(ip);
 
   if (!sessionStore.verifyPassword(parsed.data.password)) {
+    auditLogger.log("auth.login.failed", { ip });
     res.status(401).json({
       ok: false,
       error: { message: "Invalid password" },
@@ -382,12 +646,14 @@ app.post("/api/login", (req, res) => {
     maxAge: 24 * 60 * 60 * 1000,
   });
 
+  auditLogger.log("auth.login.success", { ip });
   res.json({ ok: true, sessionToken: token });
 });
 
 app.post("/api/logout", requireAuth, (req, res) => {
   sessionStore.deleteSession(req.sessionToken || null);
   res.clearCookie("session_token");
+  auditLogger.log("auth.logout", { ip: clientIp(req) });
   res.json({ ok: true });
 });
 
@@ -403,6 +669,11 @@ app.get("/api/events", requireAuth, (req, res) => {
   };
 
   sseClients.add(client);
+  debugLog("sse.connected", {
+    clientId: client.id,
+    totalClients: sseClients.size,
+    ip: clientIp(req),
+  });
   sendSse(client, {
     kind: "connected",
     bridgeState,
@@ -420,10 +691,46 @@ app.get("/api/events", requireAuth, (req, res) => {
   req.on("close", () => {
     clearInterval(keepAlive);
     sseClients.delete(client);
+    debugLog("sse.disconnected", {
+      clientId: client.id,
+      totalClients: sseClients.size,
+      ip: clientIp(req),
+    });
   });
 });
 
 app.use("/api", requireAuth);
+
+app.get("/api/capabilities", (_req, res) => {
+  res.json({
+    ok: true,
+    result: getCapabilities(),
+  });
+});
+
+app.get("/api/ui-state", (_req, res) => {
+  res.json({
+    ok: true,
+    result: uiStateStore.read(),
+  });
+});
+
+app.post("/api/ui-state", (req, res) => {
+  const parsed = uiStatePatchSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json({
+      ok: false,
+      error: { message: "Invalid ui-state payload" },
+    });
+    return;
+  }
+
+  const next = uiStateStore.patch(parsed.data as Partial<PersistedUiState>);
+  res.json({
+    ok: true,
+    result: next,
+  });
+});
 
 app.get("/api/bootstrap", async (_req, res) => {
   try {
@@ -440,6 +747,7 @@ app.get("/api/bootstrap", async (_req, res) => {
       data,
     });
   } catch (error) {
+    auditLogger.log("bootstrap.error", { error: sanitizeError(error) });
     res.status(500).json({
       ok: false,
       error: sanitizeError(error),
@@ -461,7 +769,7 @@ app.post("/api/rpc", async (req, res) => {
   if (!allowedMethods.has(method)) {
     res.status(403).json({
       ok: false,
-      error: { message: `Method is not allowed in MVP: ${method}` },
+      error: { message: `Method is not allowed: ${method}` },
     });
     return;
   }
@@ -474,11 +782,100 @@ app.post("/api/rpc", async (req, res) => {
     return;
   }
 
+  const sessionToken = req.sessionToken;
+  if (!sessionToken) {
+    res.status(401).json({
+      ok: false,
+      error: { message: "Unauthorized" },
+    });
+    return;
+  }
+
+  const policy = getMethodPolicy(method);
+  const guardResult = enforceGuards({
+    policy,
+    method,
+    params: parsed.data.params,
+    sessionToken,
+    guard: parsed.data.guard,
+  });
+
+  if (!guardResult.ok) {
+    auditLogger.log("rpc.guard_required", {
+      method,
+      group: policy.group,
+      tier: policy.riskTier,
+      reason: guardResult.guard.reason,
+      ip: clientIp(req),
+    });
+    res.status(guardResult.status).json({
+      ok: false,
+      error: { message: guardResult.guard.reason, code: guardResult.status },
+      guard: guardResult.guard,
+    });
+    return;
+  }
+
   try {
     const params = applyRpcDefaults(method, parsed.data.params);
-    const result = await bridge.request(method, params);
+    debugLog("rpc.request", {
+      method,
+      hasGuard: Boolean(parsed.data.guard),
+      threadId: typeof params.threadId === "string" ? params.threadId : null,
+    });
+
+    if (method === "turn/start") {
+      debugLog("rpc.turn.start.request", {
+        threadId: params.threadId ?? null,
+        inputCount: Array.isArray(params.input) ? params.input.length : 0,
+      });
+    }
+
+    if (policy.riskTier >= 2) {
+      auditLogger.log("rpc.risky", {
+        method,
+        group: policy.group,
+        tier: policy.riskTier,
+        sessionAcceptedUntil: guardResult.expiresAt,
+      });
+    }
+
+    let result: unknown;
+
+    if (method === "turn/start" && typeof params.threadId === "string") {
+      try {
+        result = await bridge.request(method, params);
+      } catch (error) {
+        if (!isThreadNotFoundError(error)) {
+          throw error;
+        }
+
+        await bridge.request("thread/resume", { threadId: params.threadId });
+        result = await bridge.request(method, params);
+      }
+    } else {
+      result = await bridge.request(method, params);
+    }
+
+    if (method === "turn/start") {
+      const response = result as Record<string, unknown>;
+      const turn = isObject(response.turn) ? response.turn : null;
+      debugLog("rpc.turn.start.response", {
+        threadId: params.threadId ?? null,
+        turnId: turn ? turn.id ?? null : null,
+        status: turn ? turn.status ?? null : null,
+      });
+    }
+
     res.json({ ok: true, result });
   } catch (error) {
+    auditLogger.log("rpc.error", {
+      method,
+      group: policy.group,
+      tier: policy.riskTier,
+      error: sanitizeError(error),
+    });
+
     res.status(500).json({
       ok: false,
       error: sanitizeError(error),
@@ -501,6 +898,11 @@ app.post("/api/server-request/respond", (req, res) => {
       requestId: parsed.data.requestId,
       result: parsed.data.result,
       error: parsed.data.error,
+    });
+
+    auditLogger.log("server_request.responded", {
+      requestId: parsed.data.requestId,
+      hasError: Boolean(parsed.data.error),
     });
 
     res.json({ ok: true });
@@ -534,7 +936,7 @@ async function start(): Promise<void> {
   await bridge.initialize({
     name: "personal_codex_assistant",
     title: "Personal Codex Assistant",
-    version: "0.2.0",
+    version: "0.3.0",
   });
 
   app.listen(config.port, config.host, () => {

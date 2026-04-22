@@ -13,7 +13,7 @@
     "dev:web": "npm run build -w @assistant/shared && npm run dev -w @assistant/web",
     "build": "npm run build -w @assistant/shared && npm run build -w @assistant/server && npm run build -w @assistant/web",
     "start": "npm run start -w @assistant/server",
-    "typecheck": "npm run typecheck -w @assistant/shared && npm run typecheck -w @assistant/server && npm run typecheck -w @assistant/web"
+    "typecheck": "npm run build -w @assistant/shared && npm run typecheck -w @assistant/server && npm run typecheck -w @assistant/web"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",

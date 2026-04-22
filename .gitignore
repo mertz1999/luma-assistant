@@ -5,3 +5,5 @@ npm-debug.log*
 apps/*/dist/
 packages/*/dist/
 apps/web/.vite/
+
+data/
