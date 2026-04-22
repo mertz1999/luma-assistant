@@ -627,7 +627,7 @@ function App(): JSX.Element {
 
         if (isUserLikeItem(item)) {
           entries.push({
-            key: `history:${id}`,
+            key: `item:${id}`,
             role: "user",
             title: "You",
             text: extractItemText(item),
@@ -637,7 +637,7 @@ function App(): JSX.Element {
 
         if (isAgentLikeItem(item)) {
           entries.push({
-            key: `history:${id}`,
+            key: `item:${id}`,
             role: "agent",
             title: "Assistant",
             text: extractItemText(item),
@@ -648,7 +648,7 @@ function App(): JSX.Element {
         if (isPlanLikeItem(item)) {
           const text = resolvePlanText(item);
           entries.push({
-            key: `history:${id}`,
+            key: `item:${id}`,
             role: "plan",
             title: "Plan",
             text: text || planFallbackText(item, false),
@@ -659,7 +659,7 @@ function App(): JSX.Element {
         }
 
         entries.push({
-          key: `history:${id}`,
+          key: `item:${id}`,
           role: "tool",
           title: formatToolTitle(item, false),
           text: summarizeToolItem(item),
@@ -743,20 +743,47 @@ function App(): JSX.Element {
       if (state.activeTurnId && (entry.role === "plan" || entry.role === "agent")) return true;
       return false;
     });
+    const optimisticKeysToKeep = new Set(
+      optimisticEntries
+        .filter((optimistic) => {
+          const exists = serverEntries.some(
+            (entry) => entry.role === "user" && entry.text.trim().toLowerCase() === optimistic.text.trim().toLowerCase(),
+          );
+          return !exists;
+        })
+        .map((entry) => entry.key),
+    );
+    const preservedKeys = new Set(preservedItemEntries.map((entry) => entry.key));
+    const serverByKey = new Map(serverEntries.map((entry) => [entry.key, entry] as const));
 
-    const mergedEntries = [...serverEntries];
-    for (const optimistic of optimisticEntries) {
-      const exists = serverEntries.some(
-        (entry) => entry.role === "user" && entry.text.trim().toLowerCase() === optimistic.text.trim().toLowerCase(),
-      );
-      if (!exists) {
-        mergedEntries.push(optimistic);
+    const mergedEntries: TimelineEntry[] = [];
+    const pushedKeys = new Set<string>();
+    const pushIfMissing = (entry: TimelineEntry): void => {
+      if (pushedKeys.has(entry.key)) return;
+      pushedKeys.add(entry.key);
+      mergedEntries.push(entry);
+    };
+
+    // Keep the visible order from live timeline first, but replace entries
+    // with authoritative server versions when available.
+    for (const entry of currentTimeline) {
+      if (optimisticKeysToKeep.has(entry.key)) {
+        pushIfMissing(entry);
+      }
+
+      if (preservedKeys.has(entry.key)) {
+        pushIfMissing(entry);
+      }
+
+      const serverEntry = serverByKey.get(entry.key);
+      if (serverEntry) {
+        pushIfMissing(serverEntry);
       }
     }
-    for (const preserved of preservedItemEntries) {
-      if (!mergedEntries.some((entry) => entry.key === preserved.key)) {
-        mergedEntries.push(preserved);
-      }
+
+    // Append any new server entries not seen in the previous local timeline.
+    for (const serverEntry of serverEntries) {
+      pushIfMissing(serverEntry);
     }
 
     setThreadTimeline(thread.id, mergedEntries);
