@@ -38,7 +38,18 @@ import {
   UserRoundPen,
 } from "lucide-react";
 import { allowedRpcMethods, type AllowedRpcMethod, type GuardRequirement, type MethodGroup, type SseEvent } from "@assistant/shared";
-import { ApiRequestError, bootstrap, checkSession, getSessionToken, login, logout, patchUiState, respondToServerRequest, rpc } from "@/lib/api";
+import {
+  ApiRequestError,
+  bootstrap,
+  checkSession,
+  getSessionToken,
+  login,
+  logout,
+  patchUiState,
+  respondToServerRequest,
+  rpc,
+  setWorkspaceRoot,
+} from "@/lib/api";
 import { cn, isObject, safeJsonStringify } from "@/lib/utils";
 import { useAssistantStore } from "@/store/useAssistantStore";
 import type { PendingApproval, ThreadRecord, TimelineEntry } from "@/types";
@@ -957,6 +968,8 @@ function App(): JSX.Element {
   const [stdinInput, setStdinInput] = useState("");
 
   const [fileRoot, setFileRoot] = useState("");
+  const [workspaceRootInput, setWorkspaceRootInput] = useState("");
+  const [isUpdatingWorkspaceRoot, setIsUpdatingWorkspaceRoot] = useState(false);
   const [fileEntries, setFileEntries] = useState<FileEntry[]>([]);
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [selectedFileText, setSelectedFileText] = useState("");
@@ -1019,6 +1032,7 @@ function App(): JSX.Element {
       setGuardPrompt(null);
       setCommandSessions([]);
       setActiveSessionId(null);
+      setWorkspaceRootInput("");
       setFileEntries([]);
       setSelectedFilePath(null);
       setSelectedFileText("");
@@ -1209,6 +1223,7 @@ function App(): JSX.Element {
     }
 
     const cwd = payload.defaults?.cwd || "";
+    setWorkspaceRootInput(cwd);
     setFileRoot((prev) => prev || cwd);
 
     const preferredThreadId = payload.data?.uiState?.lastActiveThreadId || null;
@@ -1414,7 +1429,6 @@ function App(): JSX.Element {
         if (!result) return;
         moveThreadToArchive(activeThreadId);
         setActiveThread(activeThreadId, true);
-        setShowArchived(true);
       }
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Archive operation failed");
@@ -1673,6 +1687,27 @@ function App(): JSX.Element {
         setToast(error instanceof Error ? error.message : "Failed to refresh rate limits");
       }
       return null;
+    }
+  }
+
+  async function applyWorkspacePath(inputPath?: string): Promise<void> {
+    const requested = (inputPath ?? workspaceRootInput).trim();
+    if (!requested) {
+      setToast("Workspace path is required");
+      return;
+    }
+
+    setIsUpdatingWorkspaceRoot(true);
+    try {
+      const root = await setWorkspaceRoot(requested);
+      setWorkspaceRootInput(root);
+      setFileRoot(root);
+      await hydrateFromBootstrap({ restoreSelection: false });
+      setToast("Workspace updated");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Failed to update workspace");
+    } finally {
+      setIsUpdatingWorkspaceRoot(false);
     }
   }
 
@@ -2760,6 +2795,8 @@ function App(): JSX.Element {
             account={account}
             rateLimitsSnapshot={rateLimitsSnapshot}
             activeThreadTokenUsage={activeThreadTokenUsage}
+            workspaceRootInput={workspaceRootInput}
+            isUpdatingWorkspaceRoot={isUpdatingWorkspaceRoot}
             settings={settingsSummary}
             mcpServers={mcpServers}
             chatgptAuthUrl={chatgptAuthUrl}
@@ -2800,6 +2837,9 @@ function App(): JSX.Element {
             onAdminRun={() => void executeAdminRpc()}
             onLogin={() => void startChatGptLogin()}
             onLogout={() => logoutMutation.mutate()}
+            onWorkspaceRootInputChange={setWorkspaceRootInput}
+            onWorkspaceApply={() => void applyWorkspacePath()}
+            onUseFileRootAsWorkspace={() => void applyWorkspacePath(fileRoot)}
             onRefreshStatus={() => void refreshRateLimits(true)}
             onReloadMcp={() => void reloadMcpConfig()}
             onMcpOauth={(name) => void runMcpOauth(name)}
@@ -2855,6 +2895,8 @@ function App(): JSX.Element {
                 account={account}
                 rateLimitsSnapshot={rateLimitsSnapshot}
                 activeThreadTokenUsage={activeThreadTokenUsage}
+                workspaceRootInput={workspaceRootInput}
+                isUpdatingWorkspaceRoot={isUpdatingWorkspaceRoot}
                 settings={settingsSummary}
                 mcpServers={mcpServers}
                 chatgptAuthUrl={chatgptAuthUrl}
@@ -2895,6 +2937,9 @@ function App(): JSX.Element {
                 onAdminRun={() => void executeAdminRpc()}
                 onLogin={() => void startChatGptLogin()}
                 onLogout={() => logoutMutation.mutate()}
+                onWorkspaceRootInputChange={setWorkspaceRootInput}
+                onWorkspaceApply={() => void applyWorkspacePath()}
+                onUseFileRootAsWorkspace={() => void applyWorkspacePath(fileRoot)}
                 onRefreshStatus={() => void refreshRateLimits(true)}
                 onReloadMcp={() => void reloadMcpConfig()}
                 onMcpOauth={(name) => void runMcpOauth(name)}
@@ -3363,6 +3408,8 @@ function RightPanel(props: {
   account: unknown;
   rateLimitsSnapshot: Record<string, unknown> | null;
   activeThreadTokenUsage: Record<string, unknown> | null;
+  workspaceRootInput: string;
+  isUpdatingWorkspaceRoot: boolean;
   settings: { label: string; value: string }[];
   mcpServers: Record<string, unknown>[];
   chatgptAuthUrl: string | null;
@@ -3403,6 +3450,9 @@ function RightPanel(props: {
   onAdminRun: () => void;
   onLogin: () => void;
   onLogout: () => void;
+  onWorkspaceRootInputChange: (value: string) => void;
+  onWorkspaceApply: () => void;
+  onUseFileRootAsWorkspace: () => void;
   onRefreshStatus: () => void;
   onReloadMcp: () => void;
   onMcpOauth: (name: string) => void;
@@ -3415,6 +3465,8 @@ function RightPanel(props: {
     account,
     rateLimitsSnapshot,
     activeThreadTokenUsage,
+    workspaceRootInput,
+    isUpdatingWorkspaceRoot,
     settings,
     mcpServers,
     chatgptAuthUrl,
@@ -3455,6 +3507,9 @@ function RightPanel(props: {
     onAdminRun,
     onLogin,
     onLogout,
+    onWorkspaceRootInputChange,
+    onWorkspaceApply,
+    onUseFileRootAsWorkspace,
     onRefreshStatus,
     onReloadMcp,
     onMcpOauth,
@@ -3577,6 +3632,31 @@ function RightPanel(props: {
                 )}
               </div>
             </div>
+          </section>
+
+          <section className="rounded-2xl border border-card-border bg-white p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-bold">Workspace root</h3>
+              <Badge>active</Badge>
+            </div>
+            <input
+              value={workspaceRootInput}
+              onChange={(event) => onWorkspaceRootInputChange(event.target.value)}
+              placeholder="/absolute/path/to/workspace"
+              className="w-full rounded-xl border border-card-border px-3 py-2 text-sm outline-none focus:border-brand"
+            />
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button size="sm" onClick={onWorkspaceApply} disabled={isUpdatingWorkspaceRoot}>
+                {isUpdatingWorkspaceRoot ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                Apply workspace
+              </Button>
+              <Button size="sm" variant="ghost" onClick={onUseFileRootAsWorkspace} disabled={isUpdatingWorkspaceRoot || !fileRoot.trim()}>
+                Use file browser path
+              </Button>
+            </div>
+            <p className="mt-2 text-xs text-foreground/70">
+              This updates defaults for new turns/threads and filesystem guard scope.
+            </p>
           </section>
 
           <section className="rounded-2xl border border-card-border bg-white p-3">

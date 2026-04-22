@@ -82,6 +82,64 @@ function normalizeApprovalPolicy(value: unknown): string {
   return normalized;
 }
 
+function stripOuterQuotes(value: string): string {
+  const trimmed = value.trim();
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function resolveConfigPath(baseDir: string): string {
+  const homeDir = process.env.HOME || "";
+  const fixedPath = homeDir ? path.join(homeDir, "config", "agentic-assistant", "config.yaml") : "";
+  if (fixedPath && fs.existsSync(fixedPath)) return fixedPath;
+  return path.resolve(baseDir, "config.yaml");
+}
+
+function readDefaultWorkspaceFromConfig(baseDir: string): string | null {
+  const cfgPath = resolveConfigPath(baseDir);
+  if (!fs.existsSync(cfgPath)) return null;
+
+  try {
+    const text = fs.readFileSync(cfgPath, "utf8");
+    const line = text
+      .split(/\r?\n/)
+      .find((row) => row.trim().startsWith("default_workspace:"));
+    if (!line) return null;
+
+    const raw = line
+      .split(":")
+      .slice(1)
+      .join(":")
+      .trim();
+    if (!raw) return null;
+
+    let workspace = stripOuterQuotes(raw);
+    if (workspace.startsWith("~")) {
+      const home = process.env.HOME || "";
+      workspace = home ? path.join(home, workspace.slice(1)) : workspace;
+    }
+
+    const resolved = path.resolve(workspace);
+    if (!fs.existsSync(resolved)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[server] ${cfgPath} default_workspace does not exist: ${resolved}. Falling back to DEFAULT_CWD/env.`);
+      return null;
+    }
+    if (!fs.statSync(resolved).isDirectory()) {
+      // eslint-disable-next-line no-console
+      console.warn(`[server] ${cfgPath} default_workspace is not a directory: ${resolved}. Falling back to DEFAULT_CWD/env.`);
+      return null;
+    }
+    return resolved;
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn(`[server] Failed to read ${cfgPath} default_workspace. Falling back to DEFAULT_CWD/env.`, error);
+    return null;
+  }
+}
+
 function normalizeThreadSandbox(value: unknown): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     return "workspace-write";
@@ -116,6 +174,8 @@ const groupEnabled: Record<MethodGroup, boolean> = {
   experimental: parseBool(process.env.ENABLE_GROUP_EXPERIMENTAL, false),
 };
 
+const defaultWorkspaceFromConfig = readDefaultWorkspaceFromConfig(rootDir);
+
 const config: AppConfig = {
   port: Number(process.env.PORT || 8787),
   host: process.env.HOST || "0.0.0.0",
@@ -126,7 +186,7 @@ const config: AppConfig = {
   allowLanOrigins: String(process.env.ALLOW_LAN_ORIGINS || "true").toLowerCase() === "true",
   appPassword: process.env.APP_PASSWORD || "",
   codexPath: process.env.CODEX_PATH || "codex",
-  defaultCwd: process.env.DEFAULT_CWD || rootDir,
+  defaultCwd: defaultWorkspaceFromConfig || process.env.DEFAULT_CWD || rootDir,
   defaultModel: process.env.DEFAULT_MODEL || "gpt-5.4",
   defaultApprovalPolicy: normalizeApprovalPolicy(process.env.DEFAULT_APPROVAL_POLICY || "on-request"),
   defaultSandboxType: process.env.DEFAULT_SANDBOX_TYPE || "workspaceWrite",
@@ -227,6 +287,7 @@ let bridgeState: BridgeState = {
   initialized: false,
   lastStatus: null,
 };
+let selectedWorkspaceRoot = path.resolve(config.defaultCwd);
 
 const uiStatePatchSchema = z.object({
   lastActiveThreadId: z.string().nullable().optional(),
@@ -246,6 +307,10 @@ const uiStatePatchSchema = z.object({
       draftByThread: z.record(z.string(), z.string()).optional(),
     })
     .optional(),
+});
+
+const workspaceSelectSchema = z.object({
+  root: z.string().min(1, "Workspace path is required"),
 });
 
 function sanitizeError(error: unknown): ApiError {
@@ -345,12 +410,17 @@ function broadcast(payload: SseEvent): void {
   }
 }
 
+function getWorkspaceRoot(): string {
+  return selectedWorkspaceRoot;
+}
+
 function applyRpcDefaults(method: AllowedRpcMethod, params: Record<string, unknown>): Record<string, unknown> {
   const next = { ...params };
+  const workspaceRoot = getWorkspaceRoot();
 
   if (method === "thread/start") {
     if (!next.model) next.model = config.defaultModel;
-    if (!next.cwd) next.cwd = config.defaultCwd;
+    if (!next.cwd) next.cwd = workspaceRoot;
     if (!next.approvalPolicy) next.approvalPolicy = config.defaultApprovalPolicy;
     else next.approvalPolicy = normalizeApprovalPolicy(next.approvalPolicy);
     if (!next.sandbox) next.sandbox = normalizeThreadSandbox(config.defaultSandboxType);
@@ -358,13 +428,13 @@ function applyRpcDefaults(method: AllowedRpcMethod, params: Record<string, unkno
   }
 
   if (method === "turn/start") {
-    if (!next.cwd) next.cwd = config.defaultCwd;
+    if (!next.cwd) next.cwd = workspaceRoot;
     if (!next.approvalPolicy) next.approvalPolicy = config.defaultApprovalPolicy;
     else next.approvalPolicy = normalizeApprovalPolicy(next.approvalPolicy);
     if (!next.sandboxPolicy) {
       next.sandboxPolicy = {
         type: normalizeTurnSandboxType(config.defaultSandboxType),
-        writableRoots: [config.defaultCwd],
+        writableRoots: [workspaceRoot],
         networkAccess: config.defaultNetworkAccess,
       };
     } else if (isObject(next.sandboxPolicy)) {
@@ -376,7 +446,7 @@ function applyRpcDefaults(method: AllowedRpcMethod, params: Record<string, unkno
   }
 
   if (method === "command/exec") {
-    if (!next.cwd) next.cwd = config.defaultCwd;
+    if (!next.cwd) next.cwd = workspaceRoot;
   }
 
   if (method === "account/login/start") {
@@ -393,7 +463,7 @@ function normalizePathLike(value: unknown): string | null {
 }
 
 function isPathWithinWorkspace(candidate: string): boolean {
-  const workspace = path.resolve(config.defaultCwd);
+  const workspace = getWorkspaceRoot();
   const target = path.resolve(candidate);
   return target === workspace || target.startsWith(`${workspace}${path.sep}`);
 }
@@ -454,7 +524,7 @@ function enforceGuards(input: {
       return {
         ok: false,
         status: 403,
-        guard: guardRequirement(policy, `Path is outside DEFAULT_CWD workspace: ${outside}`),
+        guard: guardRequirement(policy, `Path is outside selected workspace root: ${outside}`),
       };
     }
   }
@@ -733,14 +803,82 @@ app.post("/api/ui-state", (req, res) => {
   });
 });
 
+app.get("/api/workspace", (_req, res) => {
+  res.json({
+    ok: true,
+    result: {
+      root: getWorkspaceRoot(),
+    },
+  });
+});
+
+app.post("/api/workspace", (req, res) => {
+  const parsed = workspaceSelectSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json({
+      ok: false,
+      error: { message: "Invalid workspace payload" },
+    });
+    return;
+  }
+
+  const root = path.resolve(parsed.data.root.trim());
+  if (!path.isAbsolute(root)) {
+    res.status(400).json({
+      ok: false,
+      error: { message: "Workspace root must be an absolute path" },
+    });
+    return;
+  }
+
+  if (!fs.existsSync(root)) {
+    res.status(400).json({
+      ok: false,
+      error: { message: `Workspace path does not exist: ${root}` },
+    });
+    return;
+  }
+
+  try {
+    const stat = fs.statSync(root);
+    if (!stat.isDirectory()) {
+      res.status(400).json({
+        ok: false,
+        error: { message: `Workspace path is not a directory: ${root}` },
+      });
+      return;
+    }
+  } catch {
+    res.status(400).json({
+      ok: false,
+      error: { message: `Workspace path is not accessible: ${root}` },
+    });
+    return;
+  }
+
+  selectedWorkspaceRoot = root;
+  auditLogger.log("workspace.updated", {
+    root,
+    ip: clientIp(req),
+  });
+
+  res.json({
+    ok: true,
+    result: {
+      root,
+    },
+  });
+});
+
 app.get("/api/bootstrap", async (_req, res) => {
   try {
     const data = await bootstrapData();
+    const workspaceRoot = getWorkspaceRoot();
     res.json({
       ok: true,
       bridgeState,
       defaults: {
-        cwd: config.defaultCwd,
+        cwd: workspaceRoot,
         model: config.defaultModel,
         approvalPolicy: config.defaultApprovalPolicy,
         sandboxType: config.defaultSandboxType,

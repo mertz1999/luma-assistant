@@ -213,3 +213,26 @@ export async function patchUiState(input: Partial<PersistedUiState>): Promise<Pe
   });
   return (response.result || response.data) as PersistedUiState;
 }
+
+export async function readWorkspaceRoot(): Promise<string> {
+  const response = await apiRequest<{ root?: string }>("/api/workspace", {
+    method: "GET",
+  });
+  const payload = (response.result || response.data) as { root?: string } | undefined;
+  if (!payload?.root || typeof payload.root !== "string") {
+    throw new ApiRequestError("Workspace root not returned by server");
+  }
+  return payload.root;
+}
+
+export async function setWorkspaceRoot(root: string): Promise<string> {
+  const response = await apiRequest<{ root?: string }>("/api/workspace", {
+    method: "POST",
+    body: JSON.stringify({ root }),
+  });
+  const payload = (response.result || response.data) as { root?: string } | undefined;
+  if (!payload?.root || typeof payload.root !== "string") {
+    throw new ApiRequestError("Workspace update did not return a root path");
+  }
+  return payload.root;
+}

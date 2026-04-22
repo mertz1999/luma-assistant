@@ -8,13 +8,15 @@ WEB_PORT := $(if $(WEB_PORT),$(WEB_PORT),5173)
 
 PROJECT_PORTS := $(PORT) $(WEB_PORT)
 
-.PHONY: help install install-if-needed kill-ports run
+.PHONY: help install install-if-needed kill-ports sync-config sync-agents run
 
 help:
 	@echo "Available targets:"
 	@echo "  make install           - install dependencies"
 	@echo "  make install-if-needed - install dependencies only when node_modules is missing"
 	@echo "  make kill-ports        - kill processes listening on project ports ($(PROJECT_PORTS))"
+	@echo "  make sync-config       - copy config.yaml to ~/config/agentic-assistant/config.yaml"
+	@echo "  make sync-agents       - copy AGENTS.md to default_workspace from config.yaml"
 	@echo "  make run               - install-if-needed, kill ports, then start dev mode"
 
 install:
@@ -46,5 +48,11 @@ kill-ports:
 		fi; \
 	done
 
-run: install-if-needed kill-ports
+sync-config:
+	npm run sync:config
+
+sync-agents:
+	npm run sync:agents
+
+run: install-if-needed kill-ports sync-agents
 	npm run dev

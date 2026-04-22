@@ -21,8 +21,10 @@ A personal LAN-first Codex assistant with:
 - ChatGPT auth flow UI (`account/login/start`)
 - Slash commands in composer: `/plan`, `/status` (rate limits + active thread token usage)
 - MCP server panel (`mcpServerStatus/list`, reload, OAuth)
+- Workspace root selector (switch active workspace path at runtime)
 - Mobile-responsive drawers for chats/context
 - JSON persistence: `data/ui-state.json` and audit logs `data/audit-log-*.jsonl`
+- Config-driven repo map in `config.yaml` + `AGENTS.md` sync to default workspace on startup
 
 ## Requirements
 - Node.js 22+
@@ -37,7 +39,6 @@ cp .env.example .env
 
 2. Edit `.env` at minimum:
 - `APP_PASSWORD`
-- `DEFAULT_CWD`
 - `WEB_ORIGIN` (default `http://localhost:5173`)
 - `ALLOW_LAN_ORIGINS=true` (recommended for phone/LAN access)
 
@@ -61,6 +62,25 @@ Open from phone on LAN using your machine IP:
 
 If you prefer strict CORS, set `ALLOW_LAN_ORIGINS=false` and include every allowed origin explicitly in `WEB_ORIGIN` (comma-separated).
 
+## Workspace Config
+- Repo config file: `./config.yaml`
+- Fixed runtime config file: `~/config/agentic-assistant/config.yaml`
+- `npm run dev` / `make run` copy repo config to fixed runtime path automatically.
+- `config.yaml` includes:
+  - `default_workspace`
+  - `repos` map for important local repositories.
+- Runtime default workspace precedence:
+  - `~/config/agentic-assistant/config.yaml` `default_workspace` (primary)
+  - `./config.yaml` `default_workspace` (fallback)
+  - `.env DEFAULT_CWD` (fallback)
+  - repo root (final fallback)
+- `AGENTS.md` explains how to resolve repos from `config.yaml`.
+- Startup automation copies this repo's `AGENTS.md` into `default_workspace/AGENTS.md` via:
+  - `make run`
+  - `npm run dev`
+  - `npm run build`
+  - `npm run start`
+
 ## Run (production-like)
 
 ```bash
@@ -77,6 +97,8 @@ Server listens on `HOST:PORT` and serves `apps/web/dist` when present.
 - `GET /api/capabilities`
 - `GET /api/ui-state`
 - `POST /api/ui-state`
+- `GET /api/workspace`
+- `POST /api/workspace`
 - `POST /api/rpc`
 - `POST /api/server-request/respond`
 - `GET /api/events`

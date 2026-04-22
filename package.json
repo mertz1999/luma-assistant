@@ -7,7 +7,11 @@
     "packages/*"
   ],
   "scripts": {
-    "predev": "npm run build -w @assistant/shared",
+    "sync:config": "node ./scripts/sync-config.mjs",
+    "sync:agents": "npm run sync:config && node ./scripts/sync-agents.mjs",
+    "predev": "npm run sync:agents && npm run build -w @assistant/shared",
+    "prebuild": "npm run sync:agents",
+    "prestart": "npm run sync:agents",
     "dev": "concurrently -n server,web -c cyan,green \"npm run dev -w @assistant/server\" \"npm run dev -w @assistant/web\"",
     "dev:server": "npm run build -w @assistant/shared && npm run dev -w @assistant/server",
     "dev:web": "npm run build -w @assistant/shared && npm run dev -w @assistant/web",
