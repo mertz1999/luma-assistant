@@ -4,6 +4,7 @@ export const allowedRpcMethods = [
   "initialize",
   "initialized",
   "account/read",
+  "account/rateLimits/read",
   "account/login/start",
   "account/login/cancel",
   "account/logout",
@@ -210,6 +211,7 @@ export type AppDefaults = {
 
 export type BootstrapData = {
   account: unknown;
+  rateLimits: unknown;
   threads: unknown;
   archivedThreads: unknown;
   loadedThreads: unknown;

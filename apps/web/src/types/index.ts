@@ -71,6 +71,7 @@ export type BootstrapPayload = {
   };
   data?: {
     account?: { account?: unknown };
+    rateLimits?: Record<string, unknown>;
     threads?: { data?: ThreadRecord[] };
     archivedThreads?: { data?: ThreadRecord[] };
     loadedThreads?: { data?: string[]; threadIds?: string[] };

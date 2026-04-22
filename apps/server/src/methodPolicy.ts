@@ -11,6 +11,7 @@ const methodPolicyMap: Record<AllowedRpcMethod, MethodPolicy> = {
   "initialize": { method: "initialize", group: "read", riskTier: 0, requiresExperimentalApi: false },
   "initialized": { method: "initialized", group: "read", riskTier: 0, requiresExperimentalApi: false },
   "account/read": { method: "account/read", group: "read", riskTier: 0, requiresExperimentalApi: false },
+  "account/rateLimits/read": { method: "account/rateLimits/read", group: "read", riskTier: 0, requiresExperimentalApi: false },
   "account/login/start": { method: "account/login/start", group: "read", riskTier: 0, requiresExperimentalApi: false },
   "account/login/cancel": { method: "account/login/cancel", group: "read", riskTier: 0, requiresExperimentalApi: false },
   "account/logout": { method: "account/logout", group: "read", riskTier: 0, requiresExperimentalApi: false },

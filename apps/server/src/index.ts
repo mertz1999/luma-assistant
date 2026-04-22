@@ -498,6 +498,7 @@ function enforceGuards(input: {
 async function bootstrapData(): Promise<Record<string, unknown>> {
   const requests = {
     account: bridge.request("account/read", { refreshToken: false }),
+    rateLimits: bridge.request("account/rateLimits/read", {}),
     threads: bridge.request("thread/list", {
       cursor: null,
       limit: 50,

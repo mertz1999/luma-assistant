@@ -19,6 +19,7 @@ A personal LAN-first Codex assistant with:
 - Plugin/config admin inspectors
 - Approval dialog for command/file/tool approvals
 - ChatGPT auth flow UI (`account/login/start`)
+- Slash commands in composer: `/plan`, `/status` (rate limits + active thread token usage)
 - MCP server panel (`mcpServerStatus/list`, reload, OAuth)
 - Mobile-responsive drawers for chats/context
 - JSON persistence: `data/ui-state.json` and audit logs `data/audit-log-*.jsonl`

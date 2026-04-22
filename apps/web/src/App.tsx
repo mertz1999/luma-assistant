@@ -204,6 +204,200 @@ function buildPlanCollaborationMode(mode: string, model: string): Record<string,
   };
 }
 
+type RateLimitView = {
+  id: string;
+  name: string;
+  usedPercent: number | null;
+  remainingPercent: number | null;
+  windowDurationMins: number | null;
+  resetsAt: number | null;
+  secondaryUsedPercent: number | null;
+  secondaryRemainingPercent: number | null;
+  secondaryWindowDurationMins: number | null;
+  secondaryResetsAt: number | null;
+};
+
+function parseNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function clampPercent(value: number | null): number | null {
+  if (value === null) return null;
+  return Math.max(0, Math.min(100, value));
+}
+
+function parseRateLimitBucket(rawBucket: unknown, fallbackId = "default"): RateLimitView | null {
+  if (!isObject(rawBucket)) return null;
+  const id = typeof rawBucket.limitId === "string" && rawBucket.limitId.trim().length > 0 ? rawBucket.limitId : fallbackId;
+  const name = typeof rawBucket.limitName === "string" && rawBucket.limitName.trim().length > 0 ? rawBucket.limitName : id;
+
+  const primary = isObject(rawBucket.primary) ? rawBucket.primary : {};
+  const secondary = isObject(rawBucket.secondary) ? rawBucket.secondary : {};
+
+  const usedPercent = clampPercent(parseNumber(primary.usedPercent));
+  const secondaryUsedPercent = clampPercent(parseNumber(secondary.usedPercent));
+
+  return {
+    id,
+    name,
+    usedPercent,
+    remainingPercent: usedPercent === null ? null : clampPercent(100 - usedPercent),
+    windowDurationMins: parseNumber(primary.windowDurationMins),
+    resetsAt: parseNumber(primary.resetsAt),
+    secondaryUsedPercent,
+    secondaryRemainingPercent: secondaryUsedPercent === null ? null : clampPercent(100 - secondaryUsedPercent),
+    secondaryWindowDurationMins: parseNumber(secondary.windowDurationMins),
+    secondaryResetsAt: parseNumber(secondary.resetsAt),
+  };
+}
+
+function parseRateLimits(raw: unknown): RateLimitView[] {
+  if (!isObject(raw)) return [];
+  const buckets: RateLimitView[] = [];
+
+  const byId = isObject(raw.rateLimitsByLimitId) ? raw.rateLimitsByLimitId : null;
+  if (byId) {
+    for (const [limitId, bucket] of Object.entries(byId)) {
+      const parsed = parseRateLimitBucket(bucket, limitId);
+      if (parsed) buckets.push(parsed);
+    }
+  }
+
+  if (buckets.length === 0 && raw.rateLimits !== undefined) {
+    const fallback = parseRateLimitBucket(raw.rateLimits, "codex");
+    if (fallback) buckets.push(fallback);
+  }
+
+  return buckets;
+}
+
+function formatResetTime(epochSeconds: number | null): string {
+  if (epochSeconds === null) return "unknown";
+  const millis = epochSeconds * 1000;
+  if (!Number.isFinite(millis)) return "unknown";
+  return new Date(millis).toLocaleString();
+}
+
+function parseThreadTokenUsageRows(raw: unknown): Array<{ label: string; value: number }> {
+  if (!isObject(raw)) return [];
+  const labelByKey: Record<string, string> = {
+    totalTokens: "Total tokens",
+    totalInputTokens: "Input tokens",
+    totalOutputTokens: "Output tokens",
+    inputTokens: "Input tokens",
+    outputTokens: "Output tokens",
+    promptTokens: "Prompt tokens",
+    completionTokens: "Completion tokens",
+    cachedInputTokens: "Cached input tokens",
+    cacheReadInputTokens: "Cache read tokens",
+    reasoningTokens: "Reasoning tokens",
+  };
+
+  const values = new Map<string, number>();
+  const pushTokenValue = (key: string, value: unknown): void => {
+    const parsed = parseNumber(value);
+    if (parsed === null) return;
+    const normalized = key.trim();
+    if (!normalized.toLowerCase().includes("token")) return;
+    if (values.has(normalized)) return;
+    values.set(normalized, parsed);
+  };
+
+  for (const [key, value] of Object.entries(raw)) {
+    pushTokenValue(key, value);
+  }
+
+  const nested = [raw.usage, raw.tokenUsage, raw.totals];
+  for (const candidate of nested) {
+    if (!isObject(candidate)) continue;
+    for (const [key, value] of Object.entries(candidate)) {
+      pushTokenValue(key, value);
+    }
+  }
+
+  const preferredOrder = [
+    "totalTokens",
+    "totalInputTokens",
+    "inputTokens",
+    "promptTokens",
+    "cachedInputTokens",
+    "cacheReadInputTokens",
+    "totalOutputTokens",
+    "outputTokens",
+    "completionTokens",
+    "reasoningTokens",
+  ];
+  const sorted = Array.from(values.entries()).sort((a, b) => {
+    const ai = preferredOrder.indexOf(a[0]);
+    const bi = preferredOrder.indexOf(b[0]);
+    if (ai !== -1 || bi !== -1) {
+      if (ai === -1) return 1;
+      if (bi === -1) return -1;
+      return ai - bi;
+    }
+    return a[0].localeCompare(b[0]);
+  });
+
+  return sorted.map(([key, value]) => ({
+    label: labelByKey[key] || key,
+    value,
+  }));
+}
+
+function buildStatusMarkdown(input: {
+  threadId: string;
+  activeTurnId: string | null;
+  bridgeState: { running: boolean; initialized: boolean; lastStatus: Record<string, unknown> | null } | null;
+  rateLimits: unknown;
+  tokenUsage: unknown;
+}): string {
+  const sections: string[] = [];
+  sections.push("### Status");
+  sections.push(`- Bridge: ${input.bridgeState?.running ? "running" : "stopped"} / ${input.bridgeState?.initialized ? "initialized" : "not initialized"}`);
+  sections.push(`- Thread: \`${input.threadId}\``);
+  sections.push(`- Turn: ${input.activeTurnId ? `\`${input.activeTurnId}\`` : "idle"}`);
+
+  const rateLimits = parseRateLimits(input.rateLimits);
+  sections.push("");
+  sections.push("#### Rate limits");
+  if (rateLimits.length === 0) {
+    sections.push("- Not available (login may be required).");
+  } else {
+    for (const bucket of rateLimits) {
+      const used = bucket.usedPercent === null ? "unknown" : `${bucket.usedPercent.toFixed(1)}%`;
+      const remaining = bucket.remainingPercent === null ? "unknown" : `${bucket.remainingPercent.toFixed(1)}%`;
+      sections.push(
+        `- ${bucket.name}: used ${used}, remaining ${remaining}, reset ${formatResetTime(bucket.resetsAt)}${bucket.windowDurationMins !== null ? `, window ${bucket.windowDurationMins}m` : ""}`,
+      );
+      if (bucket.secondaryUsedPercent !== null || bucket.secondaryRemainingPercent !== null) {
+        const secondaryUsed = bucket.secondaryUsedPercent === null ? "unknown" : `${bucket.secondaryUsedPercent.toFixed(1)}%`;
+        const secondaryRemaining = bucket.secondaryRemainingPercent === null ? "unknown" : `${bucket.secondaryRemainingPercent.toFixed(1)}%`;
+        sections.push(
+          `  - secondary: used ${secondaryUsed}, remaining ${secondaryRemaining}, reset ${formatResetTime(bucket.secondaryResetsAt)}${bucket.secondaryWindowDurationMins !== null ? `, window ${bucket.secondaryWindowDurationMins}m` : ""}`,
+        );
+      }
+    }
+  }
+
+  const tokenRows = parseThreadTokenUsageRows(input.tokenUsage);
+  sections.push("");
+  sections.push("#### Thread token usage");
+  if (tokenRows.length === 0) {
+    sections.push("- No token usage event received for this thread yet.");
+  } else {
+    for (const row of tokenRows) {
+      sections.push(`- ${row.label}: ${Math.round(row.value)}`);
+    }
+  }
+
+  return sections.join("\n");
+}
+
 function getThreadTitle(thread: ThreadRecord): string {
   return thread.name || thread.preview || thread.id;
 }
@@ -704,6 +898,7 @@ function ToolMessage({ entry }: { entry: TimelineEntry }): JSX.Element {
 
 function App(): JSX.Element {
   const {
+    bridgeState,
     defaults,
     capabilities,
     uiState,
@@ -745,6 +940,8 @@ function App(): JSX.Element {
   const [toastText, setToastText] = useState<string | null>(null);
   const [planModeEnabled, setPlanModeEnabled] = useState(false);
   const [planModeId, setPlanModeId] = useState("plan");
+  const [rateLimitsSnapshot, setRateLimitsSnapshot] = useState<Record<string, unknown> | null>(null);
+  const [threadTokenUsageById, setThreadTokenUsageById] = useState<Record<string, Record<string, unknown>>>({});
   const [requestInputSelections, setRequestInputSelections] = useState<Record<string, string>>({});
   const [requestInputOtherText, setRequestInputOtherText] = useState<Record<string, string>>({});
   const [isSubmittingRequestInput, setIsSubmittingRequestInput] = useState(false);
@@ -781,6 +978,7 @@ function App(): JSX.Element {
 
   const activeTimeline = activeThreadId ? timelines[activeThreadId] || [] : [];
   const activeThread = (activeThreadArchived ? archivedThreads : threads).find((thread) => thread.id === activeThreadId) || null;
+  const activeThreadTokenUsage = activeThreadId ? threadTokenUsageById[activeThreadId] || null : null;
   const activeApproval = pendingApprovals[0] || null;
   const activeApprovalQuestions = useMemo(
     () => (activeApproval && activeApproval.method === "tool/requestUserInput" ? parseRequestUserInputQuestions(activeApproval.params) : []),
@@ -816,6 +1014,8 @@ function App(): JSX.Element {
       setPendingApprovals([]);
       setIsAuthenticated(false);
       setChatgptAuthUrl(null);
+      setRateLimitsSnapshot(null);
+      setThreadTokenUsageById({});
       setGuardPrompt(null);
       setCommandSessions([]);
       setActiveSessionId(null);
@@ -995,6 +1195,7 @@ function App(): JSX.Element {
     uiDebug("bootstrap.start", { restoreSelection });
     const payload = await bootstrap();
     setBootstrap(payload);
+    setRateLimitsSnapshot(isObject(payload.data?.rateLimits) ? (payload.data?.rateLimits as Record<string, unknown>) : null);
     const detectedPlanModeId = detectPlanModeId(payload.data?.collaborationModes);
     if (detectedPlanModeId) {
       setPlanModeId(detectedPlanModeId);
@@ -1414,6 +1615,43 @@ function App(): JSX.Element {
     }
   }
 
+  async function showStatusSummaryInTimeline(): Promise<void> {
+    if (activeThreadArchived) {
+      setToast("This thread is archived. Unarchive it before running /status.");
+      return;
+    }
+
+    let threadId = activeThreadId;
+    if (!threadId) {
+      await createThread();
+      threadId = useAssistantStore.getState().activeThreadId;
+      if (!threadId) return;
+    }
+
+    const latestRateLimits = (await refreshRateLimits(false)) || rateLimitsSnapshot;
+    const tokenUsage = threadTokenUsageById[threadId] || null;
+    const text = buildStatusMarkdown({
+      threadId,
+      activeTurnId,
+      bridgeState,
+      rateLimits: latestRateLimits,
+      tokenUsage,
+    });
+
+    appendTimelineEntry(threadId, {
+      key: `item:local-status-${Date.now()}`,
+      role: "tool",
+      title: "Status",
+      text,
+      pending: false,
+      meta: {
+        type: "statusSummary",
+        threadId,
+        turnId: activeTurnId || null,
+      },
+    });
+  }
+
   async function refreshAccount(): Promise<void> {
     try {
       const result = (await safeRpc("account/read", { refreshToken: false })) as Record<string, unknown> | null;
@@ -1421,6 +1659,20 @@ function App(): JSX.Element {
       setAccount(result.account || null);
     } catch {
       setAccount(null);
+    }
+  }
+
+  async function refreshRateLimits(showErrorToast = false): Promise<Record<string, unknown> | null> {
+    try {
+      const result = (await safeRpc("account/rateLimits/read", {})) as Record<string, unknown> | null;
+      if (!result) return null;
+      setRateLimitsSnapshot(result);
+      return result;
+    } catch (error) {
+      if (showErrorToast) {
+        setToast(error instanceof Error ? error.message : "Failed to refresh rate limits");
+      }
+      return null;
     }
   }
 
@@ -1629,6 +1881,8 @@ function App(): JSX.Element {
       method.startsWith("turn/") ||
       method.startsWith("item/") ||
       method === "thread/status/changed" ||
+      method === "thread/tokenUsage/updated" ||
+      method === "account/rateLimits/updated" ||
       method === "serverRequest/resolved"
     ) {
       uiDebug("sse.notification", {
@@ -1886,6 +2140,7 @@ function App(): JSX.Element {
     if (method === "account/login/completed") {
       if (params.success === true) {
         void refreshAccount();
+        void refreshRateLimits(false);
         setToast("ChatGPT login completed");
       } else {
         setToast(typeof params.error === "string" ? params.error : "Login failed");
@@ -1895,6 +2150,23 @@ function App(): JSX.Element {
 
     if (method === "account/updated") {
       void refreshAccount();
+      void refreshRateLimits(false);
+      return;
+    }
+
+    if (method === "account/rateLimits/updated") {
+      setRateLimitsSnapshot({ ...params });
+      return;
+    }
+
+    if (method === "thread/tokenUsage/updated") {
+      const targetThreadId = typeof params.threadId === "string" ? params.threadId : threadId;
+      if (targetThreadId) {
+        setThreadTokenUsageById((prev) => ({
+          ...prev,
+          [targetThreadId]: { ...params },
+        }));
+      }
       return;
     }
 
@@ -2472,6 +2744,8 @@ function App(): JSX.Element {
 
             <ChatComposer
               onSend={sendMessage}
+              onShowStatus={showStatusSummaryInTimeline}
+              statusAvailable={Boolean(capabilities?.methods?.some((entry) => entry.method === "account/rateLimits/read" && entry.enabled))}
               planModeEnabled={planModeEnabled}
               planModeId={planModeId}
               onSetPlanMode={(next) => void setPlanMode(next)}
@@ -2484,6 +2758,8 @@ function App(): JSX.Element {
             tab={activeContextTab}
             onTabChange={setActiveContextTab}
             account={account}
+            rateLimitsSnapshot={rateLimitsSnapshot}
+            activeThreadTokenUsage={activeThreadTokenUsage}
             settings={settingsSummary}
             mcpServers={mcpServers}
             chatgptAuthUrl={chatgptAuthUrl}
@@ -2524,6 +2800,7 @@ function App(): JSX.Element {
             onAdminRun={() => void executeAdminRpc()}
             onLogin={() => void startChatGptLogin()}
             onLogout={() => logoutMutation.mutate()}
+            onRefreshStatus={() => void refreshRateLimits(true)}
             onReloadMcp={() => void reloadMcpConfig()}
             onMcpOauth={(name) => void runMcpOauth(name)}
             onArchiveToggle={() => void archiveOrUnarchiveThread()}
@@ -2576,6 +2853,8 @@ function App(): JSX.Element {
                 tab={activeContextTab}
                 onTabChange={setActiveContextTab}
                 account={account}
+                rateLimitsSnapshot={rateLimitsSnapshot}
+                activeThreadTokenUsage={activeThreadTokenUsage}
                 settings={settingsSummary}
                 mcpServers={mcpServers}
                 chatgptAuthUrl={chatgptAuthUrl}
@@ -2616,6 +2895,7 @@ function App(): JSX.Element {
                 onAdminRun={() => void executeAdminRpc()}
                 onLogin={() => void startChatGptLogin()}
                 onLogout={() => logoutMutation.mutate()}
+                onRefreshStatus={() => void refreshRateLimits(true)}
                 onReloadMcp={() => void reloadMcpConfig()}
                 onMcpOauth={(name) => void runMcpOauth(name)}
                 onArchiveToggle={() => void archiveOrUnarchiveThread()}
@@ -2813,11 +3093,15 @@ function App(): JSX.Element {
 
 function ChatComposer({
   onSend,
+  onShowStatus,
+  statusAvailable,
   planModeEnabled,
   planModeId,
   onSetPlanMode,
 }: {
   onSend: (text: string) => Promise<void>;
+  onShowStatus: () => Promise<void>;
+  statusAvailable: boolean;
   planModeEnabled: boolean;
   planModeId: string;
   onSetPlanMode: (next: boolean) => void | Promise<void>;
@@ -2841,8 +3125,14 @@ function ChatComposer({
         title: planModeEnabled ? "Disable Plan Mode" : "Enable Plan Mode",
         description: planModeEnabled ? "Next messages use normal mode." : `Next messages use plan mode (${planModeId}).`,
       },
+      {
+        id: "status",
+        token: "/status",
+        title: "Show usage status",
+        description: statusAvailable ? "Show ChatGPT rate-limit usage and thread token usage." : "Status unavailable on this server.",
+      },
     ],
-    [planModeEnabled, planModeId],
+    [planModeEnabled, planModeId, statusAvailable],
   );
 
   const visibleSlashCommands = useMemo(() => {
@@ -2851,15 +3141,33 @@ function ChatComposer({
   }, [slashCommands, slashMode]);
 
   async function runSlashCommand(token: string): Promise<boolean> {
-    if (token !== "/plan") return false;
-    setIsRunningSlashCommand(true);
-    try {
-      await onSetPlanMode(!planModeEnabled);
-      setText("");
-      return true;
-    } finally {
-      setIsRunningSlashCommand(false);
+    if (token === "/plan") {
+      setIsRunningSlashCommand(true);
+      try {
+        await onSetPlanMode(!planModeEnabled);
+        setText("");
+        return true;
+      } finally {
+        setIsRunningSlashCommand(false);
+      }
     }
+
+    if (token === "/status") {
+      if (!statusAvailable) {
+        setText("");
+        return true;
+      }
+      setIsRunningSlashCommand(true);
+      try {
+        await onShowStatus();
+        setText("");
+        return true;
+      } finally {
+        setIsRunningSlashCommand(false);
+      }
+    }
+
+    return false;
   }
 
   async function onSubmit(event: React.FormEvent<HTMLFormElement>): Promise<void> {
@@ -3053,6 +3361,8 @@ function RightPanel(props: {
   tab: ContextTab;
   onTabChange: (tab: ContextTab) => void;
   account: unknown;
+  rateLimitsSnapshot: Record<string, unknown> | null;
+  activeThreadTokenUsage: Record<string, unknown> | null;
   settings: { label: string; value: string }[];
   mcpServers: Record<string, unknown>[];
   chatgptAuthUrl: string | null;
@@ -3093,6 +3403,7 @@ function RightPanel(props: {
   onAdminRun: () => void;
   onLogin: () => void;
   onLogout: () => void;
+  onRefreshStatus: () => void;
   onReloadMcp: () => void;
   onMcpOauth: (name: string) => void;
   onArchiveToggle: () => void;
@@ -3102,6 +3413,8 @@ function RightPanel(props: {
     tab,
     onTabChange,
     account,
+    rateLimitsSnapshot,
+    activeThreadTokenUsage,
     settings,
     mcpServers,
     chatgptAuthUrl,
@@ -3142,6 +3455,7 @@ function RightPanel(props: {
     onAdminRun,
     onLogin,
     onLogout,
+    onRefreshStatus,
     onReloadMcp,
     onMcpOauth,
     onArchiveToggle,
@@ -3157,6 +3471,9 @@ function RightPanel(props: {
     }
     return `Authenticated: ${String(account.type || "unknown")}`;
   }, [account]);
+
+  const rateLimitRows = useMemo(() => parseRateLimits(rateLimitsSnapshot), [rateLimitsSnapshot]);
+  const tokenUsageRows = useMemo(() => parseThreadTokenUsageRows(activeThreadTokenUsage), [activeThreadTokenUsage]);
 
   const activeSession = commandSessions.find((entry) => entry.sessionId === activeSessionId) || null;
 
@@ -3210,6 +3527,56 @@ function RightPanel(props: {
                 Open ChatGPT auth link
               </a>
             ) : null}
+          </section>
+
+          <section className="rounded-2xl border border-card-border bg-white p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-bold">Usage status</h3>
+              <Button size="sm" variant="ghost" onClick={onRefreshStatus}>
+                <RefreshCcw className="mr-1.5 h-4 w-4" /> Refresh
+              </Button>
+            </div>
+
+            <div className="space-y-2">
+              <div className="space-y-1">
+                <div className="text-xs font-semibold text-foreground/80">Rate limits</div>
+                {rateLimitRows.length === 0 ? (
+                  <div className="text-xs text-foreground/70">No rate-limit data yet.</div>
+                ) : (
+                  <div className="space-y-1">
+                    {rateLimitRows.map((bucket) => (
+                      <div key={bucket.id} className="rounded-lg border border-card-border bg-muted/70 px-2 py-1 text-xs">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-medium">{bucket.name}</span>
+                          <span className="font-mono text-foreground/75">
+                            {bucket.remainingPercent === null ? "remaining ?" : `${bucket.remainingPercent.toFixed(1)}% remaining`}
+                          </span>
+                        </div>
+                        <div className="mt-1 text-foreground/70">
+                          used {bucket.usedPercent === null ? "?" : `${bucket.usedPercent.toFixed(1)}%`} / reset {formatResetTime(bucket.resetsAt)}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-1">
+                <div className="text-xs font-semibold text-foreground/80">Active thread tokens</div>
+                {tokenUsageRows.length === 0 ? (
+                  <div className="text-xs text-foreground/70">No token-usage update yet.</div>
+                ) : (
+                  <dl className="grid grid-cols-[1fr_auto] gap-x-2 gap-y-1 text-xs">
+                    {tokenUsageRows.map((row) => (
+                      <Fragment key={row.label}>
+                        <dt className="text-foreground/70">{row.label}</dt>
+                        <dd className="font-mono text-right">{Math.round(row.value)}</dd>
+                      </Fragment>
+                    ))}
+                  </dl>
+                )}
+              </div>
+            </div>
           </section>
 
           <section className="rounded-2xl border border-card-border bg-white p-3">
