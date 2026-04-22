@@ -105,6 +105,39 @@ function parseLoadedThreadIds(raw: unknown): string[] {
   return [];
 }
 
+function detectPlanModeId(raw: unknown): string | null {
+  const rows = isObject(raw)
+    ? Array.isArray(raw.data)
+      ? raw.data
+      : Array.isArray(raw.items)
+        ? raw.items
+        : Array.isArray(raw.modes)
+          ? raw.modes
+          : []
+    : Array.isArray(raw)
+      ? raw
+      : [];
+
+  const candidates: string[] = [];
+  for (const row of rows) {
+    if (typeof row === "string") {
+      candidates.push(row);
+      continue;
+    }
+    if (!isObject(row)) continue;
+    for (const key of ["id", "name", "key", "slug", "mode", "value"]) {
+      const value = row[key];
+      if (typeof value === "string" && value.trim().length > 0) {
+        candidates.push(value.trim());
+      }
+    }
+  }
+
+  const planCandidate = candidates.find((value) => value.toLowerCase().includes("plan"));
+  if (planCandidate) return planCandidate;
+  return null;
+}
+
 function getThreadTitle(thread: ThreadRecord): string {
   return thread.name || thread.preview || thread.id;
 }
@@ -644,6 +677,8 @@ function App(): JSX.Element {
   const [mobileContextOpen, setMobileContextOpen] = useState(false);
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
   const [toastText, setToastText] = useState<string | null>(null);
+  const [planModeEnabled, setPlanModeEnabled] = useState(false);
+  const [planModeId, setPlanModeId] = useState("plan");
   const [activeContextTab, setActiveContextTab] = useState<ContextTab>("context");
   const [guardPrompt, setGuardPrompt] = useState<GuardPromptState | null>(null);
   const [guardAcceptForSession, setGuardAcceptForSession] = useState(true);
@@ -740,6 +775,36 @@ function App(): JSX.Element {
     toastTimerRef.current = window.setTimeout(() => {
       setToastText(null);
     }, 2300);
+  }
+
+  async function resolvePlanModeId(): Promise<string> {
+    if (planModeId.trim().length > 0) {
+      return planModeId;
+    }
+
+    try {
+      const result = (await safeRpc("collaborationMode/list", {})) as Record<string, unknown> | null;
+      const detected = detectPlanModeId(result);
+      const next = detected || "plan";
+      setPlanModeId(next);
+      return next;
+    } catch {
+      return "plan";
+    }
+  }
+
+  async function togglePlanMode(): Promise<void> {
+    const next = !planModeEnabled;
+    if (next) {
+      const resolved = await resolvePlanModeId();
+      setPlanModeId(resolved);
+      setPlanModeEnabled(true);
+      setToast(`Plan mode enabled (${resolved})`);
+      return;
+    }
+
+    setPlanModeEnabled(false);
+    setToast("Plan mode disabled");
   }
 
   async function safeRpc<T = unknown>(
@@ -840,6 +905,10 @@ function App(): JSX.Element {
     uiDebug("bootstrap.start", { restoreSelection });
     const payload = await bootstrap();
     setBootstrap(payload);
+    const detectedPlanModeId = detectPlanModeId(payload.data?.collaborationModes);
+    if (detectedPlanModeId) {
+      setPlanModeId(detectedPlanModeId);
+    }
 
     if (restoreSelection) {
       const configuredTab = payload.data?.uiState?.panelLayout?.contextTab;
@@ -1194,10 +1263,34 @@ function App(): JSX.Element {
       }
       uiDebug("message.send.resumed", { threadId });
 
-      const result = (await safeRpc("turn/start", {
+      const baseTurnParams: Record<string, unknown> = {
         threadId,
         input: [{ type: "text", text }],
-      })) as Record<string, unknown> | null;
+      };
+
+      let result: Record<string, unknown> | null = null;
+      const selectedPlanMode = planModeEnabled ? await resolvePlanModeId() : null;
+
+      try {
+        result = (await safeRpc("turn/start", {
+          ...baseTurnParams,
+          ...(selectedPlanMode ? { collaborationMode: selectedPlanMode } : {}),
+        })) as Record<string, unknown> | null;
+      } catch (error) {
+        const message = error instanceof Error ? error.message.toLowerCase() : "";
+        const canFallback =
+          Boolean(selectedPlanMode) &&
+          (message.includes("collaboration") || message.includes("mode") || message.includes("unknown variant"));
+
+        if (!canFallback) {
+          throw error;
+        }
+
+        setPlanModeEnabled(false);
+        setToast("Plan mode is not available on this server, sent as normal mode.");
+        result = (await safeRpc("turn/start", baseTurnParams)) as Record<string, unknown> | null;
+      }
+
       if (!result) {
         uiDebug("message.send.turn_start_skipped", { threadId });
         return;
@@ -1209,6 +1302,7 @@ function App(): JSX.Element {
           threadId,
           turnId: result.turn.id,
           status: typeof result.turn.status === "string" ? result.turn.status : null,
+          collaborationMode: selectedPlanMode,
         });
       } else {
         uiDebug("message.send.turn_started_without_id", {
@@ -2243,7 +2337,7 @@ function App(): JSX.Element {
               <div ref={timelineBottomRef} />
             </div>
 
-            <ChatComposer onSend={sendMessage} />
+            <ChatComposer onSend={sendMessage} planModeEnabled={planModeEnabled} onTogglePlanMode={() => void togglePlanMode()} />
           </CardContent>
         </Card>
 
@@ -2514,8 +2608,12 @@ function App(): JSX.Element {
 
 function ChatComposer({
   onSend,
+  planModeEnabled,
+  onTogglePlanMode,
 }: {
   onSend: (text: string) => Promise<void>;
+  planModeEnabled: boolean;
+  onTogglePlanMode: () => void;
 }): JSX.Element {
   const [text, setText] = useState("");
   const [isSending, setIsSending] = useState(false);
@@ -2538,6 +2636,17 @@ function ChatComposer({
   return (
     <form className="border-t border-card-border bg-white/75 p-3" onSubmit={onSubmit}>
       <div className="flex items-end gap-2">
+        <Button
+          type="button"
+          variant={planModeEnabled ? "primary" : "ghost"}
+          className="h-[44px] shrink-0 rounded-2xl px-3"
+          onClick={onTogglePlanMode}
+          disabled={isSending}
+          title={planModeEnabled ? "Disable plan mode" : "Enable plan mode"}
+        >
+          <Sparkles className="h-4 w-4" />
+          <span className="ml-1.5 text-xs">{planModeEnabled ? "Plan on" : "Plan"}</span>
+        </Button>
         <textarea
           className="min-h-[44px] max-h-40 w-full resize-y rounded-2xl border border-card-border bg-white px-3 py-2 text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
           placeholder="Message Codex..."
