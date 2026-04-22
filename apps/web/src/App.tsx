@@ -129,7 +129,8 @@ function detectPlanModeId(raw: unknown): string | null {
       continue;
     }
     if (!isObject(row)) continue;
-    for (const key of ["id", "name", "key", "slug", "mode", "value"]) {
+    // Prefer wire-safe identifiers before display labels (name).
+    for (const key of ["mode", "id", "key", "slug", "value", "name"]) {
       const value = row[key];
       if (typeof value === "string" && value.trim().length > 0) {
         candidates.push(value.trim());
@@ -140,6 +141,16 @@ function detectPlanModeId(raw: unknown): string | null {
   const planCandidate = candidates.find((value) => value.toLowerCase().includes("plan"));
   if (planCandidate) return planCandidate;
   return null;
+}
+
+function buildPlanCollaborationMode(mode: string, model: string): Record<string, unknown> {
+  return {
+    mode,
+    settings: {
+      model,
+      developer_instructions: null,
+    },
+  };
 }
 
 function getThreadTitle(thread: ThreadRecord): string {
@@ -1273,11 +1284,14 @@ function App(): JSX.Element {
 
       let result: Record<string, unknown> | null = null;
       const selectedPlanMode = planModeEnabled ? await resolvePlanModeId() : null;
+      const planModel = defaults?.model || "gpt-5.4";
+      const collaborationModePayload =
+        selectedPlanMode ? buildPlanCollaborationMode(selectedPlanMode, planModel) : null;
 
       try {
         result = (await safeRpc("turn/start", {
           ...baseTurnParams,
-          ...(selectedPlanMode ? { collaborationMode: selectedPlanMode } : {}),
+          ...(collaborationModePayload ? { collaborationMode: collaborationModePayload } : {}),
         })) as Record<string, unknown> | null;
       } catch (error) {
         const message = error instanceof Error ? error.message.toLowerCase() : "";
@@ -1305,7 +1319,7 @@ function App(): JSX.Element {
           threadId,
           turnId: result.turn.id,
           status: typeof result.turn.status === "string" ? result.turn.status : null,
-          collaborationMode: selectedPlanMode,
+          collaborationMode: collaborationModePayload,
         });
       } else {
         uiDebug("message.send.turn_started_without_id", {
