@@ -254,7 +254,72 @@ function planFallbackText(item: Record<string, unknown>, inProgress: boolean): s
   return inProgress ? "Planning" : "Plan updated";
 }
 
-function createToolMeta(item: Record<string, unknown>): TimelineEntry["meta"] {
+type ToolMetaContext = {
+  threadId?: string | null;
+  turnId?: string | null;
+};
+
+type FileChangeDetail = NonNullable<NonNullable<TimelineEntry["meta"]>["fileChanges"]>[number];
+
+function countDiffChanges(diff: string): { added: number; removed: number } {
+  const lines = diff.split("\n");
+  let added = 0;
+  let removed = 0;
+  for (const line of lines) {
+    if (!line) continue;
+    if (line.startsWith("+++ ") || line.startsWith("--- ")) continue;
+    if (line.startsWith("+")) added += 1;
+    if (line.startsWith("-")) removed += 1;
+  }
+  return { added, removed };
+}
+
+function parseFileChangeDetails(item: Record<string, unknown>): FileChangeDetail[] {
+  const rawChanges = Array.isArray(item.changes) ? item.changes : [];
+  const details = rawChanges
+    .map((change) => {
+      if (!isObject(change)) return null;
+      const path =
+        typeof change.path === "string"
+          ? change.path
+          : typeof change.filePath === "string"
+            ? change.filePath
+            : typeof change.targetPath === "string"
+              ? change.targetPath
+              : "";
+      if (!path) return null;
+
+      const kind =
+        typeof change.kind === "string"
+          ? change.kind
+          : typeof change.type === "string"
+            ? change.type
+            : typeof change.action === "string"
+              ? change.action
+              : "modify";
+
+      const diff =
+        typeof change.diff === "string"
+          ? change.diff
+          : typeof change.patch === "string"
+            ? change.patch
+            : "";
+
+      const counts = countDiffChanges(diff);
+      return {
+        path,
+        kind,
+        diff,
+        added: counts.added,
+        removed: counts.removed,
+      };
+    })
+    .filter((entry): entry is FileChangeDetail => Boolean(entry));
+
+  return details;
+}
+
+function createToolMeta(item: Record<string, unknown>, ctx: ToolMetaContext = {}): TimelineEntry["meta"] {
   const type = normalizeItemType(item);
   const status = extractItemStatus(item);
   const command =
@@ -269,12 +334,27 @@ function createToolMeta(item: Record<string, unknown>): TimelineEntry["meta"] {
       : isObject(item.file) && typeof item.file.path === "string"
         ? item.file.path
         : null;
+  const durationMs = typeof item.durationMs === "number" ? item.durationMs : null;
+  const grantRoot = typeof item.grantRoot === "string" ? item.grantRoot : null;
+  const errorMessage =
+    typeof item.error === "string"
+      ? item.error
+      : isObject(item.error) && typeof item.error.message === "string"
+        ? item.error.message
+        : null;
+  const fileChanges = normalizeItemTypeLower(item) === "filechange" ? parseFileChangeDetails(item) : undefined;
 
   return {
     type,
     status,
     command,
     path,
+    threadId: ctx.threadId ?? null,
+    turnId: ctx.turnId ?? null,
+    durationMs,
+    grantRoot,
+    errorMessage,
+    fileChanges,
   };
 }
 
@@ -375,6 +455,8 @@ function ToolMessage({ entry }: { entry: TimelineEntry }): JSX.Element {
   const type = (entry.meta?.type || "").toLowerCase();
   const status = entry.meta?.status || null;
   const statusLabelText = status ? String(status).replace(/[-_]/g, " ") : null;
+  const fileChanges = entry.meta?.fileChanges || [];
+  const fileChangeCount = fileChanges.length;
 
   const preview = (() => {
     if (type === "commandexecution") {
@@ -384,6 +466,9 @@ function ToolMessage({ entry }: { entry: TimelineEntry }): JSX.Element {
       return entry.pending ? "Running command" : "Command update";
     }
     if (type === "filechange") {
+      if (fileChangeCount > 0) {
+        return `${entry.pending ? "Applying" : "Applied"} file changes (${fileChangeCount} file${fileChangeCount > 1 ? "s" : ""})`;
+      }
       if (entry.meta?.path) {
         return `${entry.pending ? "Updating" : "File change"}: ${entry.meta.path}`;
       }
@@ -422,11 +507,83 @@ function ToolMessage({ entry }: { entry: TimelineEntry }): JSX.Element {
           <summary className="cursor-pointer list-none text-sm font-medium text-foreground">
             <span className="block truncate">{preview}</span>
           </summary>
-          <div className="mt-2 space-y-1">
-            <div className="font-mono text-xs break-all">{entry.meta?.path || entry.text}</div>
-            <div className="text-xs text-foreground/70">
-              {statusLabelText ? `Status: ${statusLabelText}` : entry.pending ? "Applying changes" : "Updated"}
+          <div className="mt-2 space-y-2">
+            <div className="grid grid-cols-2 gap-2 text-xs text-foreground/75 sm:grid-cols-3">
+              <div>
+                <span className="font-semibold text-foreground/85">Status:</span> {statusLabelText || (entry.pending ? "in progress" : "completed")}
+              </div>
+              <div>
+                <span className="font-semibold text-foreground/85">Files:</span> {fileChangeCount || 1}
+              </div>
+              {typeof entry.meta?.durationMs === "number" ? (
+                <div>
+                  <span className="font-semibold text-foreground/85">Duration:</span> {entry.meta.durationMs} ms
+                </div>
+              ) : null}
+              {entry.meta?.threadId ? (
+                <div className="col-span-2 sm:col-span-3">
+                  <span className="font-semibold text-foreground/85">Thread:</span>{" "}
+                  <span className="font-mono">{entry.meta.threadId}</span>
+                </div>
+              ) : null}
+              {entry.meta?.turnId ? (
+                <div className="col-span-2 sm:col-span-3">
+                  <span className="font-semibold text-foreground/85">Turn:</span>{" "}
+                  <span className="font-mono">{entry.meta.turnId}</span>
+                </div>
+              ) : null}
+              {entry.meta?.grantRoot ? (
+                <div className="col-span-2 sm:col-span-3">
+                  <span className="font-semibold text-foreground/85">Grant root:</span>{" "}
+                  <span className="font-mono break-all">{entry.meta.grantRoot}</span>
+                </div>
+              ) : null}
+              {entry.meta?.errorMessage ? (
+                <div className="col-span-2 sm:col-span-3 rounded-lg border border-red-200 bg-red-50 px-2 py-1 text-red-700">
+                  <span className="font-semibold">Error:</span> {entry.meta.errorMessage}
+                </div>
+              ) : null}
             </div>
+
+            {fileChangeCount > 0 ? (
+              <div className="space-y-2">
+                {fileChanges.map((change, index) => {
+                  const changeKind = (change.kind || "modify").replace(/[-_]/g, " ");
+                  return (
+                    <details key={`${change.path}-${index}`} className="rounded-lg border border-card-border bg-muted/70 px-2 py-1">
+                      <summary className="flex cursor-pointer items-center justify-between gap-2 text-xs">
+                        <span className="min-w-0 truncate font-mono" title={change.path}>
+                          {change.path}
+                        </span>
+                        <span className="shrink-0 text-foreground/75">
+                          {changeKind}  +{change.added}  -{change.removed}
+                        </span>
+                      </summary>
+                      <div className="mt-2">
+                        {change.diff ? (
+                          <pre className="max-h-52 overflow-auto rounded-lg border border-card-border bg-[#0f2433] p-2 font-mono text-[11px] text-slate-100">
+                            {change.diff}
+                          </pre>
+                        ) : (
+                          <div className="text-xs text-foreground/65">No diff payload returned for this file.</div>
+                        )}
+                      </div>
+                    </details>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="text-xs text-foreground/70">
+                <span className="font-semibold text-foreground/80">Path:</span>{" "}
+                <span className="font-mono break-all">{entry.meta?.path || entry.text || "-"}</span>
+              </div>
+            )}
+
+            {entry.pending ? (
+              <div className="pt-1">
+                <ThinkingDots label="Applying changes" />
+              </div>
+            ) : null}
           </div>
         </details>
       </div>
@@ -653,7 +810,10 @@ function App(): JSX.Element {
             title: "Plan",
             text: text || planFallbackText(item, false),
             pending: false,
-            meta: createToolMeta(item),
+            meta: createToolMeta(item, {
+              threadId: thread.id,
+              turnId: typeof turn.id === "string" ? turn.id : null,
+            }),
           });
           continue;
         }
@@ -664,7 +824,10 @@ function App(): JSX.Element {
           title: formatToolTitle(item, false),
           text: summarizeToolItem(item),
           pending: false,
-          meta: createToolMeta(item),
+          meta: createToolMeta(item, {
+            threadId: thread.id,
+            turnId: typeof turn.id === "string" ? turn.id : null,
+          }),
         });
       }
     }
@@ -1344,7 +1507,10 @@ function App(): JSX.Element {
           title: normalizeItemTypeLower(item) === "reasoning" ? "Reasoning" : "Plan",
           text: text || existing?.text || planFallbackText(item, true),
           pending: true,
-          meta: createToolMeta(item),
+          meta: createToolMeta(item, {
+            threadId: typeof params.threadId === "string" ? params.threadId : threadId,
+            turnId: typeof params.turnId === "string" ? params.turnId : null,
+          }),
         }));
         return;
       }
@@ -1365,7 +1531,10 @@ function App(): JSX.Element {
         title: formatToolTitle(item, true),
         text: summarizeToolItem(item),
         pending: true,
-        meta: createToolMeta(item),
+        meta: createToolMeta(item, {
+          threadId: typeof params.threadId === "string" ? params.threadId : threadId,
+          turnId: typeof params.turnId === "string" ? params.turnId : null,
+        }),
       }));
       return;
     }
@@ -1393,7 +1562,10 @@ function App(): JSX.Element {
           title: normalizeItemTypeLower(item) === "reasoning" ? "Reasoning" : "Plan",
           text: text || existing?.text || planFallbackText(item, false),
           pending: false,
-          meta: createToolMeta(item),
+          meta: createToolMeta(item, {
+            threadId: typeof params.threadId === "string" ? params.threadId : threadId,
+            turnId: typeof params.turnId === "string" ? params.turnId : null,
+          }),
         }));
         return;
       }
@@ -1414,7 +1586,10 @@ function App(): JSX.Element {
         title: formatToolTitle(item, false),
         text: summarizeToolItem(item),
         pending: false,
-        meta: createToolMeta(item),
+        meta: createToolMeta(item, {
+          threadId: typeof params.threadId === "string" ? params.threadId : threadId,
+          turnId: typeof params.turnId === "string" ? params.turnId : null,
+        }),
       }));
       return;
     }

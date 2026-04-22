@@ -22,6 +22,18 @@ export type TimelineEntry = {
     status?: string | null;
     command?: string | null;
     path?: string | null;
+    threadId?: string | null;
+    turnId?: string | null;
+    durationMs?: number | null;
+    errorMessage?: string | null;
+    grantRoot?: string | null;
+    fileChanges?: Array<{
+      path: string;
+      kind: string;
+      diff: string;
+      added: number;
+      removed: number;
+    }>;
   };
 };
 
