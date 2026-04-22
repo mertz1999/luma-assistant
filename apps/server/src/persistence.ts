@@ -189,3 +189,72 @@ export class AuditLogger {
 }
 
 export type PersistedUiState = UiState;
+
+export type MessageQueueStatus = "pending" | "processing" | "completed" | "failed";
+
+export type PersistedQueuedMessage = {
+  id: string;
+  threadId: string;
+  text: string;
+  collaborationMode?: Record<string, unknown> | null;
+  status: MessageQueueStatus;
+  attempts: number;
+  lastError: string | null;
+  nextAttemptAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+};
+
+export class MessageQueueStore {
+  private filePath: string;
+
+  constructor(rootDir: string) {
+    this.filePath = path.join(rootDir, "data", "message-queue.json");
+    ensureDir(path.dirname(this.filePath));
+    if (!fs.existsSync(this.filePath)) {
+      writeJsonAtomic(this.filePath, { items: [] });
+    }
+  }
+
+  read(): PersistedQueuedMessage[] {
+    const parsed = readJsonSafe<{ items?: unknown }>(this.filePath, { items: [] });
+    const rawItems = Array.isArray(parsed.items) ? parsed.items : [];
+    const items: PersistedQueuedMessage[] = [];
+
+    for (const raw of rawItems) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const row = raw as Record<string, unknown>;
+
+      if (typeof row.id !== "string" || row.id.trim().length === 0) continue;
+      if (typeof row.threadId !== "string" || row.threadId.trim().length === 0) continue;
+      if (typeof row.text !== "string") continue;
+
+      const status: MessageQueueStatus =
+        row.status === "processing" || row.status === "completed" || row.status === "failed" ? row.status : "pending";
+
+      items.push({
+        id: row.id,
+        threadId: row.threadId,
+        text: row.text,
+        collaborationMode:
+          row.collaborationMode && typeof row.collaborationMode === "object" && !Array.isArray(row.collaborationMode)
+            ? (row.collaborationMode as Record<string, unknown>)
+            : null,
+        status,
+        attempts: typeof row.attempts === "number" ? row.attempts : 0,
+        lastError: typeof row.lastError === "string" ? row.lastError : null,
+        nextAttemptAt: typeof row.nextAttemptAt === "number" ? row.nextAttemptAt : null,
+        createdAt: typeof row.createdAt === "number" ? row.createdAt : Date.now(),
+        updatedAt: typeof row.updatedAt === "number" ? row.updatedAt : Date.now(),
+        completedAt: typeof row.completedAt === "number" ? row.completedAt : null,
+      });
+    }
+
+    return items;
+  }
+
+  write(items: PersistedQueuedMessage[]): void {
+    writeJsonAtomic(this.filePath, { items });
+  }
+}

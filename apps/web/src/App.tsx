@@ -42,6 +42,7 @@ import {
   ApiRequestError,
   bootstrap,
   checkSession,
+  enqueueThreadMessage,
   getSessionToken,
   login,
   logout,
@@ -1675,64 +1676,21 @@ function App(): JSX.Element {
     uiDebug("message.send.optimistic", { threadId, textLength: text.length });
 
     try {
-      const resumeResult = await safeRpc("thread/resume", { threadId });
-      if (!resumeResult) {
-        uiDebug("message.send.resume_skipped", { threadId });
-        return;
-      }
-      uiDebug("message.send.resumed", { threadId });
-
-      const baseTurnParams: Record<string, unknown> = {
-        threadId,
-        input: [{ type: "text", text }],
-      };
-
-      let result: Record<string, unknown> | null = null;
       const selectedPlanMode = planModeEnabled ? await resolvePlanModeId() : null;
       const planModel = defaults?.model || "gpt-5.4";
       const collaborationModePayload =
         selectedPlanMode ? buildPlanCollaborationMode(selectedPlanMode, planModel) : null;
-
-      try {
-        result = (await safeRpc("turn/start", {
-          ...baseTurnParams,
-          ...(collaborationModePayload ? { collaborationMode: collaborationModePayload } : {}),
-        })) as Record<string, unknown> | null;
-      } catch (error) {
-        const message = error instanceof Error ? error.message.toLowerCase() : "";
-        const canFallback =
-          Boolean(selectedPlanMode) &&
-          (message.includes("collaboration") || message.includes("mode") || message.includes("unknown variant"));
-
-        if (!canFallback) {
-          throw error;
-        }
-
-        setPlanModeEnabled(false);
-        setToast("Plan mode is not available on this server, sent as normal mode.");
-        result = (await safeRpc("turn/start", baseTurnParams)) as Record<string, unknown> | null;
-      }
-
-      if (!result) {
-        uiDebug("message.send.turn_start_skipped", { threadId });
-        return;
-      }
-
-      if (isObject(result.turn) && typeof result.turn.id === "string") {
-        setActiveTurnId(result.turn.id);
-        uiDebug("message.send.turn_started", {
-          threadId,
-          turnId: result.turn.id,
-          status: typeof result.turn.status === "string" ? result.turn.status : null,
-          collaborationMode: collaborationModePayload,
-        });
-      } else {
-        uiDebug("message.send.turn_started_without_id", {
-          threadId,
-          hasTurn: isObject(result.turn),
-        });
-      }
-
+      const queueResult = await enqueueThreadMessage({
+        threadId,
+        text,
+        ...(collaborationModePayload ? { collaborationMode: collaborationModePayload } : {}),
+      });
+      uiDebug("message.send.enqueued", {
+        threadId,
+        queueItemId: queueResult.queueItemId,
+        collaborationMode: collaborationModePayload,
+      });
+      // Non-blocking refresh keeps timeline state aligned when queue starts processing.
       void syncActiveThreadFromServer();
     } catch (error) {
       uiDebug("message.send.error", {

@@ -236,3 +236,35 @@ export async function setWorkspaceRoot(root: string): Promise<string> {
   }
   return payload.root;
 }
+
+export async function enqueueThreadMessage(input: {
+  threadId: string;
+  text: string;
+  collaborationMode?: Record<string, unknown>;
+}): Promise<{ queueItemId: string; threadId: string; status: string; createdAt: number }> {
+  const response = await apiRequest<{
+    queueItemId?: string;
+    threadId?: string;
+    status?: string;
+    createdAt?: number;
+  }>("/api/message/enqueue", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  const payload = (response.result || response.data) as {
+    queueItemId?: string;
+    threadId?: string;
+    status?: string;
+    createdAt?: number;
+  } | null;
+  if (!payload || typeof payload.queueItemId !== "string" || typeof payload.threadId !== "string") {
+    throw new ApiRequestError("Queue enqueue response is missing required fields");
+  }
+
+  return {
+    queueItemId: payload.queueItemId,
+    threadId: payload.threadId,
+    status: typeof payload.status === "string" ? payload.status : "pending",
+    createdAt: typeof payload.createdAt === "number" ? payload.createdAt : Date.now(),
+  };
+}

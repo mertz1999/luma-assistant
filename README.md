@@ -22,6 +22,7 @@ A personal LAN-first Codex assistant with:
 - Slash commands in composer: `/plan`, `/status` (rate limits + active thread token usage)
 - MCP server panel (`mcpServerStatus/list`, reload, OAuth)
 - Workspace root selector (switch active workspace path at runtime)
+- Persistent backend message queue (`/api/message/enqueue`) for per-thread sequential processing
 - Mobile-responsive drawers for chats/context
 - JSON persistence: `data/ui-state.json` and audit logs `data/audit-log-*.jsonl`
 - Config-driven repo map in `config.yaml` + `AGENTS.md` sync to default workspace on startup
@@ -99,6 +100,8 @@ Server listens on `HOST:PORT` and serves `apps/web/dist` when present.
 - `POST /api/ui-state`
 - `GET /api/workspace`
 - `POST /api/workspace`
+- `GET /api/message/queue`
+- `POST /api/message/enqueue`
 - `POST /api/rpc`
 - `POST /api/server-request/respond`
 - `GET /api/events`

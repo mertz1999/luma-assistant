@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import cookieParser from "cookie-parser";
@@ -23,7 +24,13 @@ import {
 } from "@assistant/shared";
 import { CodexBridge, type BridgeNotificationEvent, type BridgeServerRequestEvent, type BridgeStatusEvent } from "./codexBridge.js";
 import { getCapabilityDescriptors, getMethodPolicy, type MethodPolicy } from "./methodPolicy.js";
-import { AuditLogger, UiStateStore, type PersistedUiState } from "./persistence.js";
+import {
+  AuditLogger,
+  MessageQueueStore,
+  UiStateStore,
+  type PersistedQueuedMessage,
+  type PersistedUiState,
+} from "./persistence.js";
 import { SessionStore } from "./sessionStore.js";
 
 declare global {
@@ -278,6 +285,7 @@ const bridge = new CodexBridge({
 });
 
 const uiStateStore = new UiStateStore(rootDir);
+const messageQueueStore = new MessageQueueStore(rootDir);
 const auditLogger = new AuditLogger(rootDir);
 const sseClients = new Set<{ id: string; res: Response }>();
 const allowedMethods = new Set<AllowedRpcMethod>(allowedRpcMethods);
@@ -288,6 +296,14 @@ let bridgeState: BridgeState = {
   lastStatus: null,
 };
 let selectedWorkspaceRoot = path.resolve(config.defaultCwd);
+let queuedMessages: PersistedQueuedMessage[] = messageQueueStore.read().map((item) => ({
+  ...item,
+  status: item.status === "processing" ? "pending" : item.status,
+  nextAttemptAt: item.status === "processing" ? Date.now() : item.nextAttemptAt ?? null,
+  updatedAt: item.status === "processing" ? Date.now() : item.updatedAt,
+}));
+const queueThreadsInFlight = new Set<string>();
+let queueProcessTimer: NodeJS.Timeout | null = null;
 
 const uiStatePatchSchema = z.object({
   lastActiveThreadId: z.string().nullable().optional(),
@@ -312,6 +328,15 @@ const uiStatePatchSchema = z.object({
 const workspaceSelectSchema = z.object({
   root: z.string().min(1, "Workspace path is required"),
 });
+
+const messageEnqueueSchema = z.object({
+  threadId: z.string().min(1, "threadId is required"),
+  text: z.string().min(1, "text is required"),
+  collaborationMode: z.record(z.string(), z.unknown()).optional(),
+});
+
+const QUEUE_MAX_ATTEMPTS = 8;
+const QUEUE_RETRY_DELAY_MS = 5000;
 
 function sanitizeError(error: unknown): ApiError {
   if (error instanceof Error) {
@@ -413,6 +438,242 @@ function broadcast(payload: SseEvent): void {
 function getWorkspaceRoot(): string {
   return selectedWorkspaceRoot;
 }
+
+function persistQueuedMessages(): void {
+  const sorted = [...queuedMessages].sort((a, b) => a.createdAt - b.createdAt);
+  // Keep history bounded.
+  const retained = sorted.slice(-1500);
+  queuedMessages = retained;
+  messageQueueStore.write(retained);
+}
+
+function broadcastQueueNotification(method: string, params: Record<string, unknown>): void {
+  broadcast({
+    kind: "notification",
+    method,
+    params,
+    at: Date.now(),
+  });
+}
+
+function queueSnapshot(): { pending: number; processing: number; failed: number } {
+  let pending = 0;
+  let processing = 0;
+  let failed = 0;
+  for (const item of queuedMessages) {
+    if (item.status === "pending") pending += 1;
+    if (item.status === "processing") processing += 1;
+    if (item.status === "failed") failed += 1;
+  }
+  return { pending, processing, failed };
+}
+
+function updateQueuedMessage(
+  id: string,
+  updater: (item: PersistedQueuedMessage) => PersistedQueuedMessage,
+): PersistedQueuedMessage | null {
+  const index = queuedMessages.findIndex((entry) => entry.id === id);
+  if (index === -1) return null;
+  const next = updater(queuedMessages[index]);
+  queuedMessages[index] = next;
+  persistQueuedMessages();
+  return next;
+}
+
+function scheduleQueueProcessing(delayMs = 0): void {
+  if (queueProcessTimer) return;
+  queueProcessTimer = setTimeout(() => {
+    queueProcessTimer = null;
+    void processQueue();
+  }, Math.max(0, delayMs));
+}
+
+async function startQueuedTurn(item: PersistedQueuedMessage, includeCollaborationMode = true): Promise<void> {
+  const baseParams: Record<string, unknown> = {
+    threadId: item.threadId,
+    input: [{ type: "text", text: item.text }],
+  };
+  if (includeCollaborationMode && item.collaborationMode) {
+    baseParams.collaborationMode = item.collaborationMode;
+  }
+
+  const params = applyRpcDefaults("turn/start", baseParams);
+
+  try {
+    await bridge.request("turn/start", params);
+  } catch (error) {
+    if (!isThreadNotFoundError(error)) {
+      throw error;
+    }
+    await bridge.request("thread/resume", { threadId: item.threadId });
+    await bridge.request("turn/start", params);
+  }
+}
+
+async function processQueuedMessage(itemId: string): Promise<void> {
+  const item = queuedMessages.find((entry) => entry.id === itemId);
+  if (!item || item.status !== "processing") return;
+
+  try {
+    await startQueuedTurn(item, true);
+
+    updateQueuedMessage(item.id, (existing) => ({
+      ...existing,
+      status: "completed",
+      lastError: null,
+      nextAttemptAt: null,
+      completedAt: Date.now(),
+      updatedAt: Date.now(),
+    }));
+
+    auditLogger.log("queue.completed", {
+      queueItemId: item.id,
+      threadId: item.threadId,
+      attempts: item.attempts,
+    });
+    broadcastQueueNotification("queue/item/completed", {
+      queueItemId: item.id,
+      threadId: item.threadId,
+    });
+    return;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown queue error";
+
+    // Gracefully retry queue items that fail only because collaboration mode isn't supported.
+    if (item.collaborationMode) {
+      const lowered = message.toLowerCase();
+      const collaborationMismatch =
+        lowered.includes("collaboration") ||
+        lowered.includes("unknown variant") ||
+        lowered.includes("invalid type") ||
+        lowered.includes("missing field settings");
+
+      if (collaborationMismatch) {
+        try {
+          await startQueuedTurn(item, false);
+          updateQueuedMessage(item.id, (existing) => ({
+            ...existing,
+            status: "completed",
+            lastError: "Completed after collaboration-mode fallback",
+            nextAttemptAt: null,
+            completedAt: Date.now(),
+            updatedAt: Date.now(),
+          }));
+          auditLogger.log("queue.completed.with_fallback", {
+            queueItemId: item.id,
+            threadId: item.threadId,
+          });
+          broadcastQueueNotification("queue/item/completed", {
+            queueItemId: item.id,
+            threadId: item.threadId,
+            fallback: "withoutCollaborationMode",
+          });
+          return;
+        } catch (fallbackError) {
+          const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : "Unknown fallback queue error";
+          updateQueuedMessage(item.id, (existing) => ({
+            ...existing,
+            status: "pending",
+            lastError: fallbackMessage,
+            nextAttemptAt: Date.now() + QUEUE_RETRY_DELAY_MS,
+            updatedAt: Date.now(),
+            completedAt: null,
+          }));
+          auditLogger.log("queue.retry", {
+            queueItemId: item.id,
+            threadId: item.threadId,
+            message: fallbackMessage,
+            nextAttemptAt: Date.now() + QUEUE_RETRY_DELAY_MS,
+          });
+          scheduleQueueProcessing(QUEUE_RETRY_DELAY_MS);
+          return;
+        }
+      }
+    }
+
+    const latest = queuedMessages.find((entry) => entry.id === item.id);
+    const attempts = latest?.attempts ?? item.attempts;
+    if (isThreadNotFoundError(error) || attempts >= QUEUE_MAX_ATTEMPTS) {
+      updateQueuedMessage(item.id, (existing) => ({
+        ...existing,
+        status: "failed",
+        lastError: message,
+        nextAttemptAt: null,
+        updatedAt: Date.now(),
+        completedAt: null,
+      }));
+      auditLogger.log("queue.failed", {
+        queueItemId: item.id,
+        threadId: item.threadId,
+        attempts,
+        message,
+      });
+      broadcastQueueNotification("queue/item/failed", {
+        queueItemId: item.id,
+        threadId: item.threadId,
+        error: message,
+      });
+      return;
+    }
+
+    const nextAttemptAt = Date.now() + QUEUE_RETRY_DELAY_MS;
+    updateQueuedMessage(item.id, (existing) => ({
+      ...existing,
+      status: "pending",
+      lastError: message,
+      nextAttemptAt,
+      updatedAt: Date.now(),
+      completedAt: null,
+    }));
+    auditLogger.log("queue.retry", {
+      queueItemId: item.id,
+      threadId: item.threadId,
+      attempts,
+      message,
+      nextAttemptAt,
+    });
+    scheduleQueueProcessing(QUEUE_RETRY_DELAY_MS);
+  }
+}
+
+async function processQueue(): Promise<void> {
+  if (!bridgeState.running || !bridgeState.initialized) {
+    scheduleQueueProcessing(1_000);
+    return;
+  }
+
+  const now = Date.now();
+  const candidates = queuedMessages
+    .filter((entry) => entry.status === "pending" && (!entry.nextAttemptAt || entry.nextAttemptAt <= now))
+    .sort((a, b) => a.createdAt - b.createdAt);
+
+  for (const candidate of candidates) {
+    if (queueThreadsInFlight.has(candidate.threadId)) continue;
+
+    const transitioned = updateQueuedMessage(candidate.id, (existing) => ({
+      ...existing,
+      status: "processing",
+      attempts: existing.attempts + 1,
+      nextAttemptAt: null,
+      updatedAt: Date.now(),
+      completedAt: null,
+    }));
+    if (!transitioned) continue;
+
+    queueThreadsInFlight.add(transitioned.threadId);
+    broadcastQueueNotification("queue/item/processing", {
+      queueItemId: transitioned.id,
+      threadId: transitioned.threadId,
+      attempts: transitioned.attempts,
+    });
+    void processQueuedMessage(transitioned.id).finally(() => {
+      queueThreadsInFlight.delete(transitioned.threadId);
+      scheduleQueueProcessing(0);
+    });
+  }
+}
+
+persistQueuedMessages();
 
 function applyRpcDefaults(method: AllowedRpcMethod, params: Record<string, unknown>): Record<string, unknown> {
   const next = { ...params };
@@ -602,6 +863,7 @@ async function bootstrapData(): Promise<Record<string, unknown>> {
   const result: Record<string, unknown> = {
     uiState: uiStateStore.read(),
     capabilities: getCapabilities(),
+    queue: queueSnapshot(),
   };
 
   settled.forEach((entry, index) => {
@@ -653,6 +915,9 @@ bridge.on("status", (status: BridgeStatusEvent) => {
   if (status.type === "exit") {
     bridgeState.running = false;
     bridgeState.initialized = false;
+  }
+  if (status.type === "initialized" || status.type === "restart_completed") {
+    scheduleQueueProcessing(0);
   }
 
   auditLogger.log("bridge.status", status);
@@ -870,6 +1135,92 @@ app.post("/api/workspace", (req, res) => {
   });
 });
 
+app.get("/api/message/queue", (_req, res) => {
+  const snapshot = queueSnapshot();
+  const recent = [...queuedMessages]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 200)
+    .map((item) => ({
+      id: item.id,
+      threadId: item.threadId,
+      status: item.status,
+      attempts: item.attempts,
+      lastError: item.lastError,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      completedAt: item.completedAt,
+    }));
+
+  res.json({
+    ok: true,
+    result: {
+      ...snapshot,
+      items: recent,
+    },
+  });
+});
+
+app.post("/api/message/enqueue", (req, res) => {
+  const parsed = messageEnqueueSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json({
+      ok: false,
+      error: { message: "Invalid message enqueue payload" },
+    });
+    return;
+  }
+
+  const text = parsed.data.text.trim();
+  if (!text) {
+    res.status(400).json({
+      ok: false,
+      error: { message: "Message text must not be empty" },
+    });
+    return;
+  }
+
+  const now = Date.now();
+  const queueItem: PersistedQueuedMessage = {
+    id: crypto.randomUUID(),
+    threadId: parsed.data.threadId,
+    text,
+    collaborationMode: parsed.data.collaborationMode || null,
+    status: "pending",
+    attempts: 0,
+    lastError: null,
+    nextAttemptAt: null,
+    createdAt: now,
+    updatedAt: now,
+    completedAt: null,
+  };
+  queuedMessages.push(queueItem);
+  persistQueuedMessages();
+  scheduleQueueProcessing(0);
+
+  auditLogger.log("queue.enqueued", {
+    queueItemId: queueItem.id,
+    threadId: queueItem.threadId,
+    textLength: queueItem.text.length,
+    hasCollaborationMode: Boolean(queueItem.collaborationMode),
+  });
+  broadcastQueueNotification("queue/item/enqueued", {
+    queueItemId: queueItem.id,
+    threadId: queueItem.threadId,
+    createdAt: queueItem.createdAt,
+  });
+
+  res.json({
+    ok: true,
+    result: {
+      queueItemId: queueItem.id,
+      threadId: queueItem.threadId,
+      status: queueItem.status,
+      createdAt: queueItem.createdAt,
+      queue: queueSnapshot(),
+    },
+  });
+});
+
 app.get("/api/bootstrap", async (_req, res) => {
   try {
     const data = await bootstrapData();
@@ -1077,6 +1428,7 @@ async function start(): Promise<void> {
     title: "Personal Codex Assistant",
     version: "0.3.0",
   });
+  scheduleQueueProcessing(0);
 
   app.listen(config.port, config.host, () => {
     // eslint-disable-next-line no-console
