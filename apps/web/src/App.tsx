@@ -98,6 +98,7 @@ type RequestUserInputQuestion = {
 };
 
 const UI_DEBUG_LOGS = String(import.meta.env.VITE_DEBUG_LOGS ?? "false").toLowerCase() === "true";
+const TOOL_TIMELINE_CACHE_KEY = "assistant_tool_timeline_cache_v1";
 
 function uiDebug(event: string, payload: Record<string, unknown> = {}): void {
   if (!UI_DEBUG_LOGS) return;
@@ -169,6 +170,82 @@ function parseRequestUserInputQuestions(params: Record<string, unknown>): Reques
   }
 
   return questions;
+}
+
+function parseCachedTimelineEntry(raw: unknown): TimelineEntry | null {
+  if (!isObject(raw)) return null;
+  if (typeof raw.key !== "string" || raw.key.trim().length === 0) return null;
+  const role = raw.role;
+  if (role !== "tool" && role !== "plan") return null;
+
+  return {
+    key: raw.key,
+    role,
+    title: typeof raw.title === "string" ? raw.title : undefined,
+    text: typeof raw.text === "string" ? raw.text : "",
+    pending: raw.pending === true,
+    meta: isObject(raw.meta) ? (raw.meta as TimelineEntry["meta"]) : undefined,
+  };
+}
+
+function loadToolTimelineCache(): Record<string, TimelineEntry[]> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(TOOL_TIMELINE_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isObject(parsed)) return {};
+
+    const cache: Record<string, TimelineEntry[]> = {};
+    for (const [threadId, entries] of Object.entries(parsed)) {
+      if (typeof threadId !== "string" || !Array.isArray(entries)) continue;
+      const normalized = entries.map(parseCachedTimelineEntry).filter((entry): entry is TimelineEntry => Boolean(entry));
+      if (normalized.length > 0) {
+        cache[threadId] = normalized;
+      }
+    }
+    return cache;
+  } catch {
+    return {};
+  }
+}
+
+function saveToolTimelineCache(cache: Record<string, TimelineEntry[]>): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(TOOL_TIMELINE_CACHE_KEY, JSON.stringify(cache));
+  } catch {
+    // ignore storage failures
+  }
+}
+
+function isPersistableToolEntry(entry: TimelineEntry): boolean {
+  if (!entry.key.startsWith("item:")) return false;
+  return entry.role === "tool" || entry.role === "plan";
+}
+
+function mergeThreadEntriesWithToolCache(serverEntries: TimelineEntry[], cachedEntries: TimelineEntry[]): TimelineEntry[] {
+  if (cachedEntries.length === 0) return serverEntries;
+
+  const serverByKey = new Map(serverEntries.map((entry) => [entry.key, entry] as const));
+  const merged: TimelineEntry[] = [];
+  const seen = new Set<string>();
+
+  const push = (entry: TimelineEntry): void => {
+    if (seen.has(entry.key)) return;
+    seen.add(entry.key);
+    merged.push(entry);
+  };
+
+  for (const cached of cachedEntries) {
+    push(serverByKey.get(cached.key) || cached);
+  }
+
+  for (const serverEntry of serverEntries) {
+    push(serverEntry);
+  }
+
+  return merged;
 }
 
 function detectPlanModeId(raw: unknown): string | null {
@@ -984,6 +1061,7 @@ function App(): JSX.Element {
   const toastTimerRef = useRef<number | null>(null);
   const skipNextUiSyncRef = useRef(true);
   const commandSessionsRef = useRef<CommandSession[]>([]);
+  const toolTimelineCacheRef = useRef<Record<string, TimelineEntry[]>>(loadToolTimelineCache());
   const syncInFlightRef = useRef(false);
   const syncTimerRef = useRef<number | null>(null);
   const lastBootstrapSyncRef = useRef(0);
@@ -1053,6 +1131,40 @@ function App(): JSX.Element {
   useEffect(() => {
     commandSessionsRef.current = commandSessions;
   }, [commandSessions]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const threadIds = Object.keys(timelines);
+    if (threadIds.length === 0) return;
+
+    const nextCache = { ...toolTimelineCacheRef.current };
+    let changed = false;
+
+    for (const threadId of threadIds) {
+      const entries = timelines[threadId] || [];
+      const persistable = entries.filter(isPersistableToolEntry).slice(-200);
+      const previous = toolTimelineCacheRef.current[threadId] || [];
+      const prevJson = JSON.stringify(previous);
+      const nextJson = JSON.stringify(persistable);
+
+      if (persistable.length === 0) {
+        if (previous.length > 0) {
+          delete nextCache[threadId];
+          changed = true;
+        }
+        continue;
+      }
+
+      if (prevJson !== nextJson) {
+        nextCache[threadId] = persistable;
+        changed = true;
+      }
+    }
+
+    if (!changed) return;
+    toolTimelineCacheRef.current = nextCache;
+    saveToolTimelineCache(nextCache);
+  }, [isAuthenticated, timelines]);
 
   useEffect(() => {
     if (!activeApproval || activeApproval.method !== "tool/requestUserInput") {
@@ -1380,9 +1492,11 @@ function App(): JSX.Element {
       if (!thread?.id) return;
 
       const entries = buildTimelineEntries(thread);
+      const cached = toolTimelineCacheRef.current[thread.id] || [];
+      const mergedEntries = mergeThreadEntriesWithToolCache(entries, cached);
 
       setActiveThread(thread.id, archived);
-      setThreadTimeline(thread.id, entries);
+      setThreadTimeline(thread.id, mergedEntries);
       closeMobilePanels();
       await refreshLoadedThreads();
     } catch (error) {
