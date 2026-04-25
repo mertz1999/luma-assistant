@@ -1,0 +1,8 @@
+default_workspace: /Users/applestation/Project
+
+repos:
+  insurance-verificatin: /Users/applestation/Project/deepspring/PI_insurance_verification
+  coding: /Users/applestation/Project/deepspring/PI_coding
+  atlas: /Users/applestation/Project/deepspring/deepspring-atlas/PI
+  agentfa-admin: /Users/applestation/Project/archive/agentfa-admin
+  agentic-assistant: /Users/applestation/Project/archive/agentic-assistant
