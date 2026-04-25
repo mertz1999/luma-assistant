@@ -1,6 +1,9 @@
 import type {
   ApprovalQueueItem,
   AppBootstrap,
+  CodexAccountStatusResponse,
+  CodexMcpStatusResponse,
+  CodexSystemStatusResponse,
   DiffSnapshot,
   FileTreeNode,
   RunRecord,
@@ -30,6 +33,18 @@ export function getBootstrap(): Promise<AppBootstrap> {
 
 export function getRuns(): Promise<{ runs: RunRecord[]; approvals: ApprovalQueueItem[] }> {
   return request("/api/runs");
+}
+
+export function getMcpStatus(): Promise<CodexMcpStatusResponse> {
+  return request("/api/system/mcp-status");
+}
+
+export function getAccountStatus(): Promise<CodexAccountStatusResponse> {
+  return request("/api/system/account-status");
+}
+
+export function getSystemStatus(): Promise<CodexSystemStatusResponse> {
+  return request("/api/system/status");
 }
 
 export function startRun(input: StartRunInput): Promise<{ run: RunRecord }> {

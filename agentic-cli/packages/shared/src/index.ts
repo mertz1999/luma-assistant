@@ -126,6 +126,38 @@ export type AppBootstrap = {
   approvals: ApprovalQueueItem[];
 };
 
+export type CodexCommandStatus = {
+  command: string;
+  ok: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+};
+
+export type CodexTokenStatus = {
+  source: "codex-login-status";
+  remainingTokens: number | null;
+  note: string | null;
+};
+
+export type CodexMcpStatusResponse = {
+  at: number;
+  mcp: CodexCommandStatus;
+};
+
+export type CodexAccountStatusResponse = {
+  at: number;
+  account: CodexCommandStatus;
+  tokenStatus: CodexTokenStatus;
+};
+
+export type CodexSystemStatusResponse = {
+  at: number;
+  account: CodexCommandStatus;
+  mcp: CodexCommandStatus;
+  tokenStatus: CodexTokenStatus;
+};
+
 export type ApiError = {
   message: string;
 };

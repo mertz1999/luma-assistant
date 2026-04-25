@@ -35,10 +35,13 @@ import {
   archiveSession,
   connectEvents,
   deleteSession,
+  getAccountStatus,
   getBootstrap,
   getDiff,
   getFileTree,
+  getMcpStatus,
   getRuns,
+  getSystemStatus,
   rerun,
   setActiveWorkspace,
   startRun,
@@ -96,6 +99,115 @@ const sandboxOptions: SandboxMode[] = ["read-only", "workspace-write", "danger-f
 const approvalPolicies: ApprovalPolicy[] = ["untrusted", "on-failure", "on-request", "never"];
 const modelOptions = ["gpt-5.3-codex", "gpt-5.4", "gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o", "o4-mini"];
 const toolOutputModalLimit = 2500;
+const draftSessionKey = "__draft__";
+
+type SlashCommandKey = "/mcp" | "/account" | "/status" | "/help";
+
+type SlashCommandSuggestion = {
+  key: SlashCommandKey;
+  title: string;
+  description: string;
+};
+
+const slashCommandSuggestions: SlashCommandSuggestion[] = [
+  { key: "/status", title: "System status", description: "Show both account and MCP status." },
+  { key: "/account", title: "Account status", description: "Show Codex account/login status." },
+  { key: "/mcp", title: "MCP status", description: "Show configured MCP servers and auth status." },
+  { key: "/help", title: "Slash help", description: "List available slash commands." },
+];
+
+function normalizeSlashCommand(raw: string): SlashCommandKey | null {
+  const lower = raw.toLowerCase();
+  if (lower === "/status") return "/status";
+  if (lower === "/account" || lower === "/account-status") return "/account";
+  if (lower === "/mcp" || lower === "/mcp-status") return "/mcp";
+  if (lower === "/help" || lower === "/?") return "/help";
+  return null;
+}
+
+function parseSlashCommand(rawPrompt: string): SlashCommandKey | null {
+  const trimmed = rawPrompt.trim();
+  if (!trimmed.startsWith("/")) return null;
+  const commandToken = trimmed.split(/\s+/)[0];
+  return normalizeSlashCommand(commandToken);
+}
+
+function escapeMarkdownCell(value: string): string {
+  return value.replace(/\|/g, "\\|").trim();
+}
+
+function splitColumns(line: string): string[] {
+  return line.trim().split(/\s{2,}/).map((part) => part.trim()).filter(Boolean);
+}
+
+function parseCliTables(raw: string): Array<{ headers: string[]; rows: string[][] }> {
+  const blocks = raw
+    .split(/\n\s*\n/)
+    .map((block) => block.split(/\r?\n/).map((line) => line.trimRight()).filter(Boolean))
+    .filter((lines) => lines.length >= 2);
+
+  const tables: Array<{ headers: string[]; rows: string[][] }> = [];
+  for (const lines of blocks) {
+    const headers = splitColumns(lines[0]);
+    if (!headers.length) continue;
+
+    const rows = lines
+      .slice(1)
+      .map((line) => splitColumns(line))
+      .filter((row) => row.length > 0);
+
+    if (!rows.length) continue;
+    tables.push({ headers, rows });
+  }
+  return tables;
+}
+
+function toMarkdownTable(headers: string[], rows: string[][]): string {
+  const normalizedRows = rows.map((row) =>
+    headers.map((_, index) => escapeMarkdownCell(row[index] || "-")),
+  );
+  const headerRow = `| ${headers.map((cell) => escapeMarkdownCell(cell)).join(" | ")} |`;
+  const divider = `| ${headers.map(() => "---").join(" | ")} |`;
+  const body = normalizedRows.map((row) => `| ${row.join(" | ")} |`).join("\n");
+  return [headerRow, divider, body].join("\n");
+}
+
+function formatTokenStatus(tokenStatus: { remainingTokens: number | null; note: string | null }): string {
+  if (typeof tokenStatus.remainingTokens === "number") {
+    return `Remaining tokens: **${tokenStatus.remainingTokens.toLocaleString()}**`;
+  }
+  return tokenStatus.note
+    ? `Remaining tokens: unavailable\nNote: ${tokenStatus.note}`
+    : "Remaining tokens: unavailable";
+}
+
+function formatStatusBlock(title: string, status: { ok: boolean; exitCode: number; stdout: string; stderr: string; command: string }, preferTable = false): string {
+  const rawContent = status.stdout || status.stderr || "No output returned.";
+  const statusLine = status.ok ? "ok" : `failed (exit ${status.exitCode})`;
+  const tables = preferTable ? parseCliTables(rawContent) : [];
+
+  if (!tables.length) {
+    return `### ${title}\nStatus: ${statusLine}\nCommand: \`${status.command}\`\n\n\`\`\`text\n${rawContent}\n\`\`\``;
+  }
+
+  const renderedTables = tables
+    .map((table, index) => {
+      const sectionTitle = tables.length > 1
+        ? `#### ${index === 0 ? "Local MCP servers" : "Remote MCP servers"}`
+        : "#### MCP servers";
+      return `${sectionTitle}\n${toMarkdownTable(table.headers, table.rows)}`;
+    })
+    .join("\n\n");
+
+  return `### ${title}\nStatus: ${statusLine}\nCommand: \`${status.command}\`\n\n${renderedTables}`;
+}
+
+function buildSlashHelpText(): string {
+  return [
+    "Available slash commands:",
+    ...slashCommandSuggestions.map((item) => `- \`${item.key}\` - ${item.description}`),
+  ].join("\n");
+}
 
 function runSessionId(run: RunRecord): string {
   return run.sessionId || run.threadId || run.id;
@@ -774,6 +886,7 @@ export function App(): JSX.Element {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [isDraftSession, setIsDraftSession] = useState(false);
+  const [slashEntriesBySession, setSlashEntriesBySession] = useState<Record<string, TimelineEntry[]>>({});
   const [toolDetailModal, setToolDetailModal] = useState<ToolDetailModalState | null>(null);
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
 
@@ -871,8 +984,19 @@ export function App(): JSX.Element {
       .sort((a, b) => a.createdAt - b.createdAt);
   }, [runs, selectedSessionId]);
 
-  const timeline = useMemo(() => buildSessionTimeline(selectedSessionRuns), [selectedSessionRuns]);
+  const sessionTimelineKey = selectedSessionId || draftSessionKey;
+  const timeline = useMemo(() => {
+    const base = buildSessionTimeline(selectedSessionRuns);
+    const slashEntries = slashEntriesBySession[sessionTimelineKey] || [];
+    return [...base, ...slashEntries].sort((a, b) => a.at - b.at);
+  }, [selectedSessionRuns, sessionTimelineKey, slashEntriesBySession]);
   const pendingApprovals = useMemo(() => approvals.filter((item) => item.status === "pending"), [approvals]);
+  const slashSuggestions = useMemo(() => {
+    const trimmed = prompt.trimStart();
+    if (!trimmed.startsWith("/")) return [] as SlashCommandSuggestion[];
+    const token = trimmed.split(/\s+/)[0].toLowerCase();
+    return slashCommandSuggestions.filter((item) => item.key.startsWith(token) || item.key.includes(token));
+  }, [prompt]);
 
   const mobileHeaderTitle = selectedSession
     ? truncatePreview(selectedSession.summary || `Session ${selectedSession.id}`, 34)
@@ -973,11 +1097,137 @@ export function App(): JSX.Element {
     setFileNodes(payload.nodes);
   }
 
+  function pushSlashEntries(sessionKey: string, entries: TimelineEntry[]): void {
+    setSlashEntriesBySession((prev) => {
+      const current = prev[sessionKey] || [];
+      const nextEntries = [...current, ...entries].slice(-200);
+      return { ...prev, [sessionKey]: nextEntries };
+    });
+  }
+
+  async function runSlashCommand(command: SlashCommandKey, sessionKey: string): Promise<void> {
+    const now = Date.now();
+    const messageId = `${now}_${Math.random().toString(36).slice(2, 7)}`;
+    const input = prompt.trim();
+    pushSlashEntries(sessionKey, [
+      {
+        key: `slash_${messageId}_user`,
+        role: "user",
+        title: "You",
+        text: input,
+        pending: false,
+        at: now,
+      },
+    ]);
+
+    if (command === "/help") {
+      pushSlashEntries(sessionKey, [
+        {
+          key: `slash_${messageId}_help`,
+          role: "assistant",
+          title: "System",
+          text: buildSlashHelpText(),
+          pending: false,
+          at: now + 1,
+        },
+      ]);
+      return;
+    }
+
+    if (command === "/account") {
+      const payload = await getAccountStatus();
+      pushSlashEntries(sessionKey, [
+        {
+          key: `slash_${messageId}_account`,
+          role: "assistant",
+          title: "System",
+          text: [
+            "### Token quota",
+            formatTokenStatus(payload.tokenStatus),
+            "",
+            formatStatusBlock("Codex Account", payload.account, false),
+          ].join("\n"),
+          pending: false,
+          at: Date.now(),
+        },
+      ]);
+      return;
+    }
+
+    if (command === "/mcp") {
+      const payload = await getMcpStatus();
+      pushSlashEntries(sessionKey, [
+        {
+          key: `slash_${messageId}_mcp`,
+          role: "assistant",
+          title: "System",
+          text: formatStatusBlock("Codex MCP", payload.mcp, true),
+          pending: false,
+          at: Date.now(),
+        },
+      ]);
+      return;
+    }
+
+    const payload = await getSystemStatus();
+    pushSlashEntries(sessionKey, [
+      {
+        key: `slash_${messageId}_status`,
+        role: "assistant",
+        title: "System",
+        text: [
+          "### Token quota",
+          formatTokenStatus(payload.tokenStatus),
+          "",
+          formatStatusBlock("Codex Account", payload.account, false),
+          formatStatusBlock("Codex MCP", payload.mcp, true),
+        ].join("\n\n"),
+        pending: false,
+        at: Date.now(),
+      },
+    ]);
+  }
+
   async function onStartRun(): Promise<void> {
     if (!prompt.trim()) return;
+    const trimmedPrompt = prompt.trim();
+    const slashCommand = parseSlashCommand(prompt);
     setSubmitting(true);
 
     try {
+      if (trimmedPrompt.startsWith("/") && !slashCommand) {
+        const sessionKey = selectedSessionId || draftSessionKey;
+        const now = Date.now();
+        const messageId = `${now}_${Math.random().toString(36).slice(2, 7)}`;
+        pushSlashEntries(sessionKey, [
+          {
+            key: `slash_${messageId}_user`,
+            role: "user",
+            title: "You",
+            text: trimmedPrompt,
+            pending: false,
+            at: now,
+          },
+          {
+            key: `slash_${messageId}_error`,
+            role: "error",
+            title: "System",
+            text: `Unknown slash command. Try \`/help\`.\n\n${buildSlashHelpText()}`,
+            pending: false,
+            at: now + 1,
+          },
+        ]);
+        setPrompt("");
+        return;
+      }
+
+      if (slashCommand) {
+        const sessionKey = selectedSessionId || draftSessionKey;
+        await runSlashCommand(slashCommand, sessionKey);
+        setPrompt("");
+        return;
+      }
+
       const input: StartRunInput = {
         prompt,
         workspace: activeWorkspace,
@@ -1127,6 +1377,8 @@ export function App(): JSX.Element {
             ansi={ansi}
             timelineBottomRef={timelineBottomRef}
             setToolDetailModal={setToolDetailModal}
+            slashSuggestions={slashSuggestions}
+            onInsertSlashCommand={(command) => setPrompt(`${command} `)}
           />
         </Card>
 
@@ -1327,6 +1579,8 @@ type CenterPanelProps = {
   ansi: Convert;
   timelineBottomRef: React.RefObject<HTMLDivElement>;
   setToolDetailModal: (state: ToolDetailModalState | null) => void;
+  slashSuggestions: SlashCommandSuggestion[];
+  onInsertSlashCommand: (command: SlashCommandKey) => void;
 };
 
 function CenterPanel(props: CenterPanelProps): JSX.Element {
@@ -1422,9 +1676,25 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           }}
         >
           <div className="relative flex items-end gap-2">
+            {props.slashSuggestions.length > 0 ? (
+              <div className="absolute bottom-full left-0 right-12 z-10 mb-2 space-y-1 rounded-2xl border border-card-border bg-white/95 p-2 shadow-lg backdrop-blur">
+                {props.slashSuggestions.map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    className="w-full rounded-xl border border-transparent px-2 py-2 text-left transition hover:border-card-border hover:bg-muted"
+                    onClick={() => props.onInsertSlashCommand(item.key)}
+                  >
+                    <div className="text-xs font-semibold">{item.key}</div>
+                    <div className="text-[11px] text-foreground/70">{item.title} - {item.description}</div>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+
             <textarea
               className="min-h-[44px] max-h-40 w-full resize-y rounded-2xl border border-card-border bg-white px-3 py-2 text-base md:text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
-              placeholder="Message Codex..."
+              placeholder="Message Codex... (type / for commands)"
               value={props.prompt}
               onChange={(event) => props.setPrompt(event.target.value)}
             />

@@ -14,6 +14,11 @@ import {
   type ApiResponse,
   type ApprovalQueueItem,
   type AppBootstrap,
+  type CodexAccountStatusResponse,
+  type CodexCommandStatus,
+  type CodexMcpStatusResponse,
+  type CodexSystemStatusResponse,
+  type CodexTokenStatus,
   type DiffSnapshot,
   type FileTreeNode,
   type RunConfig,
@@ -818,6 +823,70 @@ function apiErr(message: string): ApiResponse<never> {
   return { ok: false, error: { message } };
 }
 
+function runCodexCommandStatus(args: string[]): CodexCommandStatus {
+  const command = [CODEX_PATH, ...args].join(" ");
+  const result = spawnSync(CODEX_PATH, args, {
+    cwd: uiState.activeWorkspace,
+    encoding: "utf8",
+    timeout: 15000,
+  });
+
+  const statusCode = typeof result.status === "number" ? result.status : 1;
+  const errorText = result.error ? (result.error instanceof Error ? result.error.message : String(result.error)) : "";
+  const stdout = (result.stdout || "").trim();
+  const stderr = [result.stderr || "", errorText].filter(Boolean).join("\n").trim();
+
+  return {
+    command,
+    ok: statusCode === 0,
+    exitCode: statusCode,
+    stdout,
+    stderr,
+  };
+}
+
+function extractRemainingTokens(raw: string): number | null {
+  const patterns = [
+    /remaining\s+tokens?\s*[:=]\s*([0-9][0-9,]*)/i,
+    /tokens?\s+remaining\s*[:=]\s*([0-9][0-9,]*)/i,
+    /remaining\s*[:=]\s*([0-9][0-9,]*)\s*tokens?/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    if (!match?.[1]) continue;
+    const value = Number(match[1].replace(/,/g, ""));
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function resolveTokenStatus(accountStatus: CodexCommandStatus): CodexTokenStatus {
+  if (!accountStatus.ok) {
+    return {
+      source: "codex-login-status",
+      remainingTokens: null,
+      note: "Unable to read account status from Codex CLI.",
+    };
+  }
+
+  const combined = `${accountStatus.stdout}\n${accountStatus.stderr}`.trim();
+  const remainingTokens = extractRemainingTokens(combined);
+  if (remainingTokens !== null) {
+    return {
+      source: "codex-login-status",
+      remainingTokens,
+      note: null,
+    };
+  }
+
+  return {
+    source: "codex-login-status",
+    remainingTokens: null,
+    note: "Codex CLI does not expose remaining tokens for this account.",
+  };
+}
+
 function getWorkspaces(): WorkspaceOption[] {
   const merged = new Map<string, WorkspaceOption>();
   for (const option of configWorkspaceOptions) merged.set(option.path, option);
@@ -859,6 +928,35 @@ app.get("/api/bootstrap", (_req, res) => {
 
 app.get("/api/workspaces", (_req, res) => {
   res.json(apiOk({ activeWorkspace: uiState.activeWorkspace, workspaces: getWorkspaces() }));
+});
+
+app.get("/api/system/mcp-status", (_req, res) => {
+  const payload: CodexMcpStatusResponse = {
+    at: Date.now(),
+    mcp: runCodexCommandStatus(["mcp", "list"]),
+  };
+  res.json(apiOk(payload));
+});
+
+app.get("/api/system/account-status", (_req, res) => {
+  const account = runCodexCommandStatus(["login", "status"]);
+  const payload: CodexAccountStatusResponse = {
+    at: Date.now(),
+    account,
+    tokenStatus: resolveTokenStatus(account),
+  };
+  res.json(apiOk(payload));
+});
+
+app.get("/api/system/status", (_req, res) => {
+  const account = runCodexCommandStatus(["login", "status"]);
+  const payload: CodexSystemStatusResponse = {
+    at: Date.now(),
+    account,
+    mcp: runCodexCommandStatus(["mcp", "list"]),
+    tokenStatus: resolveTokenStatus(account),
+  };
+  res.json(apiOk(payload));
 });
 
 app.post("/api/workspaces/active", (req, res) => {
