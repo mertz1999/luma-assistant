@@ -100,6 +100,7 @@ const approvalPolicies: ApprovalPolicy[] = ["untrusted", "on-failure", "on-reque
 const modelOptions = ["gpt-5.3-codex", "gpt-5.4", "gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o", "o4-mini"];
 const toolOutputModalLimit = 2500;
 const draftSessionKey = "__draft__";
+const queueStorageKey = "agentic_cli_queue_v1";
 
 type SlashCommandKey = "/mcp" | "/account" | "/status" | "/help";
 
@@ -107,6 +108,18 @@ type SlashCommandSuggestion = {
   key: SlashCommandKey;
   title: string;
   description: string;
+};
+
+type QueuedMessage = {
+  id: string;
+  sessionKey: string;
+  prompt: string;
+  createdAt: number;
+  workspace: string;
+  model: string;
+  sandbox: SandboxMode;
+  approvalPolicy: ApprovalPolicy;
+  planMode: boolean;
 };
 
 const slashCommandSuggestions: SlashCommandSuggestion[] = [
@@ -207,6 +220,64 @@ function buildSlashHelpText(): string {
     "Available slash commands:",
     ...slashCommandSuggestions.map((item) => `- \`${item.key}\` - ${item.description}`),
   ].join("\n");
+}
+
+function isSandboxMode(value: unknown): value is SandboxMode {
+  return value === "read-only" || value === "workspace-write" || value === "danger-full-access";
+}
+
+function isApprovalPolicy(value: unknown): value is ApprovalPolicy {
+  return value === "untrusted" || value === "on-failure" || value === "on-request" || value === "never";
+}
+
+function loadQueuedMessages(): Record<string, QueuedMessage[]> {
+  if (typeof window === "undefined") return {};
+
+  try {
+    const raw = window.localStorage.getItem(queueStorageKey);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) return {};
+
+    const next: Record<string, QueuedMessage[]> = {};
+    for (const [sessionKey, queue] of Object.entries(parsed)) {
+      if (!Array.isArray(queue)) continue;
+
+      const normalized: QueuedMessage[] = [];
+      for (const item of queue) {
+        if (!isRecord(item)) continue;
+
+        const id = typeof item.id === "string" ? item.id : "";
+        const prompt = typeof item.prompt === "string" ? item.prompt : "";
+        const workspace = typeof item.workspace === "string" ? item.workspace : "";
+        const model = typeof item.model === "string" ? item.model : "";
+        const createdAt = typeof item.createdAt === "number" ? item.createdAt : Date.now();
+        const planMode = typeof item.planMode === "boolean" ? item.planMode : false;
+
+        if (!id || !prompt || !workspace || !model || !isSandboxMode(item.sandbox) || !isApprovalPolicy(item.approvalPolicy)) {
+          continue;
+        }
+
+        normalized.push({
+          id,
+          sessionKey,
+          prompt,
+          createdAt,
+          workspace,
+          model,
+          sandbox: item.sandbox,
+          approvalPolicy: item.approvalPolicy,
+          planMode,
+        });
+      }
+
+      if (normalized.length) next[sessionKey] = normalized;
+    }
+
+    return next;
+  } catch {
+    return {};
+  }
 }
 
 function runSessionId(run: RunRecord): string {
@@ -887,6 +958,8 @@ export function App(): JSX.Element {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [isDraftSession, setIsDraftSession] = useState(false);
   const [slashEntriesBySession, setSlashEntriesBySession] = useState<Record<string, TimelineEntry[]>>({});
+  const [queuedBySession, setQueuedBySession] = useState<Record<string, QueuedMessage[]>>(() => loadQueuedMessages());
+  const [processingQueueItemId, setProcessingQueueItemId] = useState<string | null>(null);
   const [toolDetailModal, setToolDetailModal] = useState<ToolDetailModalState | null>(null);
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
 
@@ -898,6 +971,20 @@ export function App(): JSX.Element {
     root.setAttribute("data-theme", theme);
     root.classList.toggle("dark", theme === "dark");
   }, [theme]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    try {
+      if (Object.keys(queuedBySession).length === 0) {
+        window.localStorage.removeItem(queueStorageKey);
+        return;
+      }
+      window.localStorage.setItem(queueStorageKey, JSON.stringify(queuedBySession));
+    } catch {
+      // ignore localStorage write errors
+    }
+  }, [queuedBySession]);
 
   useEffect(() => {
     void loadBootstrap();
@@ -997,6 +1084,14 @@ export function App(): JSX.Element {
     const token = trimmed.split(/\s+/)[0].toLowerCase();
     return slashCommandSuggestions.filter((item) => item.key.startsWith(token) || item.key.includes(token));
   }, [prompt]);
+  const runningSessionIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const run of runs) {
+      if (run.status === "running") ids.add(runSessionId(run));
+    }
+    return ids;
+  }, [runs]);
+  const queuedMessagesForActiveSession = queuedBySession[sessionTimelineKey] || [];
 
   const mobileHeaderTitle = selectedSession
     ? truncatePreview(selectedSession.summary || `Session ${selectedSession.id}`, 34)
@@ -1035,6 +1130,20 @@ export function App(): JSX.Element {
 
     setSelectedRunId(null);
   }, [allSessions, isDraftSession, selectedSessionId, setSelectedRunId]);
+
+  useEffect(() => {
+    if (submitting || processingQueueItemId) return;
+
+    for (const [sessionKey, queued] of Object.entries(queuedBySession)) {
+      if (!queued.length) continue;
+      if (sessionKey === draftSessionKey) continue;
+      if (runningSessionIds.has(sessionKey)) continue;
+
+      setProcessingQueueItemId(queued[0].id);
+      void runQueuedMessage(queued[0]);
+      return;
+    }
+  }, [queuedBySession, runningSessionIds, submitting, processingQueueItemId]);
 
   async function loadBootstrap(): Promise<void> {
     setLoading(true);
@@ -1095,6 +1204,93 @@ export function App(): JSX.Element {
   async function loadFileTree(): Promise<void> {
     const payload = await getFileTree(".", 2);
     setFileNodes(payload.nodes);
+  }
+
+  function removeQueuedMessage(sessionKey: string, messageId: string): void {
+    setQueuedBySession((prev) => {
+      const current = prev[sessionKey] || [];
+      const next = current.filter((item) => item.id !== messageId);
+      if (next.length === current.length) return prev;
+      const copy = { ...prev };
+      if (next.length) {
+        copy[sessionKey] = next;
+      } else {
+        delete copy[sessionKey];
+      }
+      return copy;
+    });
+  }
+
+  function enqueueMessage(promptValue: string): void {
+    const sessionKey = selectedSessionId || draftSessionKey;
+    const queued: QueuedMessage = {
+      id: `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      sessionKey,
+      prompt: promptValue,
+      createdAt: Date.now(),
+      workspace: activeWorkspace,
+      model,
+      sandbox,
+      approvalPolicy,
+      planMode,
+    };
+
+    setQueuedBySession((prev) => ({
+      ...prev,
+      [sessionKey]: [...(prev[sessionKey] || []), queued],
+    }));
+  }
+
+  async function startCodexRun(request: QueuedMessage, focusSession: boolean): Promise<void> {
+    const input: StartRunInput = {
+      prompt: request.prompt,
+      workspace: request.workspace,
+      model: request.model,
+      sandbox: request.sandbox,
+      approvalPolicy: request.approvalPolicy,
+      planMode: request.planMode,
+      sessionId: request.sessionKey === draftSessionKey ? undefined : request.sessionKey,
+    };
+
+    const payload = await startRun(input);
+    await refreshRuns();
+    setIsDraftSession(false);
+
+    if (focusSession) {
+      setSelectedSessionId(runSessionId(payload.run));
+      setSelectedRunId(payload.run.id);
+      setRightPanelTab("tools");
+      setMobileThreadsOpen(false);
+      return;
+    }
+
+    if (selectedSessionId && runSessionId(payload.run) === selectedSessionId) {
+      setSelectedRunId(payload.run.id);
+    }
+  }
+
+  async function runQueuedMessage(queued: QueuedMessage): Promise<void> {
+    const focusSession = selectedSessionId === queued.sessionKey;
+    try {
+      setSubmitting(true);
+      await startCodexRun(queued, focusSession);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to run queued message";
+      pushSlashEntries(queued.sessionKey, [
+        {
+          key: `queue_${queued.id}_error`,
+          role: "error",
+          title: "System",
+          text: `Queued message failed: ${message}`,
+          pending: false,
+          at: Date.now(),
+        },
+      ]);
+    } finally {
+      removeQueuedMessage(queued.sessionKey, queued.id);
+      setProcessingQueueItemId((current) => (current === queued.id ? null : current));
+      setSubmitting(false);
+    }
   }
 
   function pushSlashEntries(sessionKey: string, entries: TimelineEntry[]): void {
@@ -1192,59 +1388,71 @@ export function App(): JSX.Element {
     if (!prompt.trim()) return;
     const trimmedPrompt = prompt.trim();
     const slashCommand = parseSlashCommand(prompt);
-    setSubmitting(true);
+    const sessionKey = selectedSessionId || draftSessionKey;
 
-    try {
-      if (trimmedPrompt.startsWith("/") && !slashCommand) {
-        const sessionKey = selectedSessionId || draftSessionKey;
-        const now = Date.now();
-        const messageId = `${now}_${Math.random().toString(36).slice(2, 7)}`;
-        pushSlashEntries(sessionKey, [
-          {
-            key: `slash_${messageId}_user`,
-            role: "user",
-            title: "You",
-            text: trimmedPrompt,
-            pending: false,
-            at: now,
-          },
-          {
-            key: `slash_${messageId}_error`,
-            role: "error",
-            title: "System",
-            text: `Unknown slash command. Try \`/help\`.\n\n${buildSlashHelpText()}`,
-            pending: false,
-            at: now + 1,
-          },
-        ]);
-        setPrompt("");
-        return;
-      }
+    if (trimmedPrompt.startsWith("/") && !slashCommand) {
+      const now = Date.now();
+      const messageId = `${now}_${Math.random().toString(36).slice(2, 7)}`;
+      pushSlashEntries(sessionKey, [
+        {
+          key: `slash_${messageId}_user`,
+          role: "user",
+          title: "You",
+          text: trimmedPrompt,
+          pending: false,
+          at: now,
+        },
+        {
+          key: `slash_${messageId}_error`,
+          role: "error",
+          title: "System",
+          text: `Unknown slash command. Try \`/help\`.\n\n${buildSlashHelpText()}`,
+          pending: false,
+          at: now + 1,
+        },
+      ]);
+      setPrompt("");
+      return;
+    }
 
-      if (slashCommand) {
-        const sessionKey = selectedSessionId || draftSessionKey;
+    if (slashCommand) {
+      setSubmitting(true);
+      try {
         await runSlashCommand(slashCommand, sessionKey);
         setPrompt("");
-        return;
+      } finally {
+        setSubmitting(false);
       }
+      return;
+    }
 
-      const input: StartRunInput = {
-        prompt,
-        workspace: activeWorkspace,
-        model,
-        sandbox,
-        approvalPolicy,
-        planMode,
-        sessionId: selectedSessionId || undefined,
-      };
-      const payload = await startRun(input);
+    const isRealSession = sessionKey !== draftSessionKey;
+    const hasRunningSessionTask = isRealSession && runningSessionIds.has(sessionKey);
+    if (isRealSession && (hasRunningSessionTask || submitting || processingQueueItemId !== null)) {
+      enqueueMessage(trimmedPrompt);
       setPrompt("");
-      await refreshRuns();
-      setIsDraftSession(false);
-      setSelectedSessionId(runSessionId(payload.run));
-      setSelectedRunId(payload.run.id);
-      setRightPanelTab("tools");
-      setMobileThreadsOpen(false);
+      return;
+    }
+
+    const request: QueuedMessage = {
+      id: `direct_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      sessionKey,
+      prompt: trimmedPrompt,
+      createdAt: Date.now(),
+      workspace: activeWorkspace,
+      model,
+      sandbox,
+      approvalPolicy,
+      planMode,
+    };
+
+    setSubmitting(true);
+    try {
+      await startCodexRun(request, true);
+      setPrompt("");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to start run";
+      window.alert(message);
     } finally {
       setSubmitting(false);
     }
@@ -1379,6 +1587,8 @@ export function App(): JSX.Element {
             setToolDetailModal={setToolDetailModal}
             slashSuggestions={slashSuggestions}
             onInsertSlashCommand={(command) => setPrompt(`${command} `)}
+            queueItems={queuedMessagesForActiveSession}
+            onRemoveQueueItem={(messageId) => removeQueuedMessage(sessionTimelineKey, messageId)}
           />
         </Card>
 
@@ -1581,6 +1791,8 @@ type CenterPanelProps = {
   setToolDetailModal: (state: ToolDetailModalState | null) => void;
   slashSuggestions: SlashCommandSuggestion[];
   onInsertSlashCommand: (command: SlashCommandKey) => void;
+  queueItems: QueuedMessage[];
+  onRemoveQueueItem: (messageId: string) => void;
 };
 
 function CenterPanel(props: CenterPanelProps): JSX.Element {
@@ -1720,6 +1932,30 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             </Button>
             {selectedRun ? <span className="text-xs text-foreground/70">Run: {selectedRun.id.slice(0, 12)}</span> : null}
           </div>
+
+          {props.queueItems.length > 0 ? (
+            <div className="mt-2 rounded-xl border border-card-border bg-white/85 p-2">
+              <div className="mb-1 text-xs font-semibold text-foreground/80">Queued messages ({props.queueItems.length})</div>
+              <div className="space-y-1">
+                {props.queueItems.slice(0, 5).map((item) => (
+                  <div key={item.id} className="flex items-center gap-2 rounded-lg bg-muted/60 px-2 py-1">
+                    <span className="min-w-0 flex-1 truncate text-xs text-foreground/80" title={item.prompt}>
+                      {truncatePreview(item.prompt, 140)}
+                    </span>
+                    <button
+                      type="button"
+                      className="rounded p-1 text-foreground/70 transition hover:bg-black/5 hover:text-foreground"
+                      onClick={() => props.onRemoveQueueItem(item.id)}
+                      aria-label="Remove queued message"
+                      title="Remove"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
         </form>
       </CardContent>
     </>
