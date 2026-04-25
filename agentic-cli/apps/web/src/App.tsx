@@ -11,6 +11,8 @@ import {
   Layers,
   LoaderCircle,
   MessageSquare,
+  Mic,
+  MicOff,
   Moon,
   PanelLeft,
   PanelRight,
@@ -121,6 +123,44 @@ type QueuedMessage = {
   approvalPolicy: ApprovalPolicy;
   planMode: boolean;
 };
+
+type SpeechRecognitionAlternativeLike = {
+  transcript?: string;
+};
+
+type SpeechRecognitionResultLike = ArrayLike<SpeechRecognitionAlternativeLike> & {
+  isFinal?: boolean;
+};
+
+type SpeechRecognitionEventLike = Event & {
+  resultIndex?: number;
+  results: ArrayLike<SpeechRecognitionResultLike>;
+};
+
+type SpeechRecognitionErrorEventLike = Event & {
+  error?: string;
+};
+
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onstart: (() => void) | null;
+  onend: (() => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+
+type SpeechRecognitionCtor = new () => SpeechRecognitionLike;
+
+declare global {
+  interface Window {
+    SpeechRecognition?: SpeechRecognitionCtor;
+    webkitSpeechRecognition?: SpeechRecognitionCtor;
+  }
+}
 
 const slashCommandSuggestions: SlashCommandSuggestion[] = [
   { key: "/status", title: "System status", description: "Show both account and MCP status." },
@@ -360,6 +400,30 @@ function truncatePreview(input: string, max = 120): string {
   const normalized = input.replace(/\s+/g, " ").trim();
   if (normalized.length <= max) return normalized;
   return `${normalized.slice(0, max - 3)}...`;
+}
+
+function appendTranscriptToPrompt(currentPrompt: string, transcript: string): string {
+  const next = transcript.trim();
+  if (!next) return currentPrompt;
+  if (!currentPrompt.trim()) return next;
+  const suffix = /[\s\n]$/.test(currentPrompt) ? "" : " ";
+  return `${currentPrompt}${suffix}${next}`;
+}
+
+function toSpeechErrorMessage(error?: string): string {
+  if (error === "not-allowed" || error === "service-not-allowed") {
+    return "Microphone permission was denied.";
+  }
+  if (error === "audio-capture") {
+    return "No microphone was found for voice input.";
+  }
+  if (error === "network") {
+    return "Voice input failed because of a network issue.";
+  }
+  if (error === "aborted") {
+    return "Voice input was stopped.";
+  }
+  return error ? `Voice input error: ${error}` : "Voice input failed.";
 }
 
 function parseFileChanges(item: Record<string, unknown>): FileChangeDetail[] {
@@ -962,15 +1026,94 @@ export function App(): JSX.Element {
   const [processingQueueItemId, setProcessingQueueItemId] = useState<string | null>(null);
   const [toolDetailModal, setToolDetailModal] = useState<ToolDetailModalState | null>(null);
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
+  const [voiceSupported, setVoiceSupported] = useState(false);
+  const [voiceListening, setVoiceListening] = useState(false);
+  const [voiceInterim, setVoiceInterim] = useState("");
+  const [voiceError, setVoiceError] = useState<string | null>(null);
 
   const ansi = useMemo(() => new Convert({ newline: true, escapeXML: true }), []);
   const timelineBottomRef = useRef<HTMLDivElement | null>(null);
+  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
 
   useEffect(() => {
     const root = document.documentElement;
     root.setAttribute("data-theme", theme);
     root.classList.toggle("dark", theme === "dark");
   }, [theme]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognitionImpl) {
+      setVoiceSupported(false);
+      return;
+    }
+
+    setVoiceSupported(true);
+    const recognition = new SpeechRecognitionImpl();
+    recognition.lang = window.navigator.language || "en-US";
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    recognition.onstart = () => {
+      setVoiceListening(true);
+      setVoiceError(null);
+    };
+
+    recognition.onend = () => {
+      setVoiceListening(false);
+      setVoiceInterim("");
+    };
+
+    recognition.onerror = (event) => {
+      setVoiceError(toSpeechErrorMessage(event.error));
+      setVoiceListening(false);
+    };
+
+    recognition.onresult = (event) => {
+      const start = typeof event.resultIndex === "number" ? event.resultIndex : 0;
+      let interim = "";
+      let finalized = "";
+
+      for (let index = start; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        if (!result) continue;
+        const transcript = (result[0]?.transcript || "").trim();
+        if (!transcript) continue;
+        if (result.isFinal) {
+          finalized += `${transcript} `;
+        } else {
+          interim += `${transcript} `;
+        }
+      }
+
+      const interimText = interim.trim();
+      setVoiceInterim(interimText);
+
+      const finalizedText = finalized.trim();
+      if (finalizedText) {
+        setPrompt((current) => appendTranscriptToPrompt(current, finalizedText));
+      }
+    };
+
+    speechRecognitionRef.current = recognition;
+
+    return () => {
+      recognition.onstart = null;
+      recognition.onend = null;
+      recognition.onerror = null;
+      recognition.onresult = null;
+      try {
+        recognition.stop();
+      } catch {
+        // ignore stop errors during teardown
+      }
+      if (speechRecognitionRef.current === recognition) {
+        speechRecognitionRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1386,6 +1529,14 @@ export function App(): JSX.Element {
 
   async function onStartRun(): Promise<void> {
     if (!prompt.trim()) return;
+    if (voiceListening) {
+      try {
+        speechRecognitionRef.current?.stop();
+      } catch {
+        // ignore stop errors while submitting
+      }
+    }
+
     const trimmedPrompt = prompt.trim();
     const slashCommand = parseSlashCommand(prompt);
     const sessionKey = selectedSessionId || draftSessionKey;
@@ -1506,6 +1657,32 @@ export function App(): JSX.Element {
     setMobileThreadsOpen(false);
   }
 
+  function onToggleVoiceInput(): void {
+    if (!voiceSupported || !speechRecognitionRef.current) {
+      setVoiceError("Voice input is not supported in this browser.");
+      return;
+    }
+
+    if (voiceListening) {
+      try {
+        speechRecognitionRef.current.stop();
+      } catch {
+        // ignore stop errors
+      }
+      return;
+    }
+
+    setVoiceError(null);
+    try {
+      speechRecognitionRef.current.start();
+    } catch (error) {
+      if (error instanceof Error && error.name === "InvalidStateError") {
+        return;
+      }
+      setVoiceError("Unable to start voice input.");
+    }
+  }
+
   async function onArchiveSession(): Promise<void> {
     if (!selectedSessionId || sessionAction || !selectedSession) return;
     const ok = window.confirm("Archive this session? It will be hidden from Chats.");
@@ -1589,6 +1766,11 @@ export function App(): JSX.Element {
             onInsertSlashCommand={(command) => setPrompt(`${command} `)}
             queueItems={queuedMessagesForActiveSession}
             onRemoveQueueItem={(messageId) => removeQueuedMessage(sessionTimelineKey, messageId)}
+            voiceSupported={voiceSupported}
+            voiceListening={voiceListening}
+            voiceInterim={voiceInterim}
+            voiceError={voiceError}
+            onToggleVoiceInput={onToggleVoiceInput}
           />
         </Card>
 
@@ -1793,6 +1975,11 @@ type CenterPanelProps = {
   onInsertSlashCommand: (command: SlashCommandKey) => void;
   queueItems: QueuedMessage[];
   onRemoveQueueItem: (messageId: string) => void;
+  voiceSupported: boolean;
+  voiceListening: boolean;
+  voiceInterim: string;
+  voiceError: string | null;
+  onToggleVoiceInput: () => void;
 };
 
 function CenterPanel(props: CenterPanelProps): JSX.Element {
@@ -1911,10 +2098,36 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               onChange={(event) => props.setPrompt(event.target.value)}
             />
 
+            <Button
+              type="button"
+              variant={props.voiceListening ? "primary" : "ghost"}
+              className="h-[44px] w-[44px] shrink-0 rounded-full p-0"
+              onClick={props.onToggleVoiceInput}
+              disabled={!props.voiceSupported}
+              aria-label={props.voiceListening ? "Stop voice input" : "Start voice input"}
+              title={props.voiceSupported ? (props.voiceListening ? "Stop voice input" : "Start voice input") : "Voice input unavailable"}
+            >
+              {props.voiceListening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+            </Button>
+
             <Button type="submit" className="h-[44px] w-[44px] shrink-0 rounded-full p-0" disabled={props.submitting || !props.prompt.trim()} aria-label="Send message" title="Send">
               {props.submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
             </Button>
           </div>
+
+          {props.voiceSupported || props.voiceError ? (
+            <div className="mt-2 rounded-xl border border-card-border bg-muted/40 px-2.5 py-2">
+              <p className="text-[11px] text-foreground/80">
+                {props.voiceListening ? "Listening..." : "Voice input ready"}
+              </p>
+              {props.voiceInterim ? (
+                <p className="mt-1 truncate text-xs text-foreground/70" title={props.voiceInterim}>
+                  {props.voiceInterim}
+                </p>
+              ) : null}
+              {props.voiceError ? <p className="mt-1 text-xs text-rose-700">{props.voiceError}</p> : null}
+            </div>
+          ) : null}
 
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <Button type="button" variant="ghost" size="sm" onClick={props.onNewSession}>
