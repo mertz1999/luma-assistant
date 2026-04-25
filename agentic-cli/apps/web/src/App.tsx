@@ -11,7 +11,6 @@ import {
   Layers,
   LoaderCircle,
   MessageSquare,
-  Mic,
   MicOff,
   Moon,
   PanelLeft,
@@ -1028,12 +1027,15 @@ export function App(): JSX.Element {
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
   const [voiceSupported, setVoiceSupported] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
-  const [voiceInterim, setVoiceInterim] = useState("");
   const [voiceError, setVoiceError] = useState<string | null>(null);
 
   const ansi = useMemo(() => new Convert({ newline: true, escapeXML: true }), []);
   const timelineBottomRef = useRef<HTMLDivElement | null>(null);
   const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const voiceHoldTimerRef = useRef<number | null>(null);
+  const voiceHoldSuppressResetTimerRef = useRef<number | null>(null);
+  const voiceHoldTriggeredRef = useRef(false);
+  const suppressNextSendClickRef = useRef(false);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -1063,7 +1065,6 @@ export function App(): JSX.Element {
 
     recognition.onend = () => {
       setVoiceListening(false);
-      setVoiceInterim("");
     };
 
     recognition.onerror = (event) => {
@@ -1073,7 +1074,6 @@ export function App(): JSX.Element {
 
     recognition.onresult = (event) => {
       const start = typeof event.resultIndex === "number" ? event.resultIndex : 0;
-      let interim = "";
       let finalized = "";
 
       for (let index = start; index < event.results.length; index += 1) {
@@ -1083,13 +1083,8 @@ export function App(): JSX.Element {
         if (!transcript) continue;
         if (result.isFinal) {
           finalized += `${transcript} `;
-        } else {
-          interim += `${transcript} `;
         }
       }
-
-      const interimText = interim.trim();
-      setVoiceInterim(interimText);
 
       const finalizedText = finalized.trim();
       if (finalizedText) {
@@ -1104,6 +1099,14 @@ export function App(): JSX.Element {
       recognition.onend = null;
       recognition.onerror = null;
       recognition.onresult = null;
+      if (voiceHoldTimerRef.current !== null) {
+        window.clearTimeout(voiceHoldTimerRef.current);
+        voiceHoldTimerRef.current = null;
+      }
+      if (voiceHoldSuppressResetTimerRef.current !== null) {
+        window.clearTimeout(voiceHoldSuppressResetTimerRef.current);
+        voiceHoldSuppressResetTimerRef.current = null;
+      }
       try {
         recognition.stop();
       } catch {
@@ -1657,18 +1660,9 @@ export function App(): JSX.Element {
     setMobileThreadsOpen(false);
   }
 
-  function onToggleVoiceInput(): void {
+  function startVoiceInput(): void {
     if (!voiceSupported || !speechRecognitionRef.current) {
       setVoiceError("Voice input is not supported in this browser.");
-      return;
-    }
-
-    if (voiceListening) {
-      try {
-        speechRecognitionRef.current.stop();
-      } catch {
-        // ignore stop errors
-      }
       return;
     }
 
@@ -1681,6 +1675,65 @@ export function App(): JSX.Element {
       }
       setVoiceError("Unable to start voice input.");
     }
+  }
+
+  function stopVoiceInput(): void {
+    if (!speechRecognitionRef.current) return;
+    try {
+      speechRecognitionRef.current.stop();
+    } catch {
+      // ignore stop errors
+    }
+  }
+
+  function onSendButtonPressStart(): void {
+    if (typeof window === "undefined") return;
+    if (submitting || !voiceSupported || !speechRecognitionRef.current) return;
+
+    if (voiceHoldTimerRef.current !== null) {
+      window.clearTimeout(voiceHoldTimerRef.current);
+      voiceHoldTimerRef.current = null;
+    }
+    if (voiceHoldSuppressResetTimerRef.current !== null) {
+      window.clearTimeout(voiceHoldSuppressResetTimerRef.current);
+      voiceHoldSuppressResetTimerRef.current = null;
+    }
+
+    voiceHoldTriggeredRef.current = false;
+    voiceHoldTimerRef.current = window.setTimeout(() => {
+      voiceHoldTriggeredRef.current = true;
+      suppressNextSendClickRef.current = true;
+      startVoiceInput();
+    }, 2000);
+  }
+
+  function onSendButtonPressEnd(): void {
+    if (typeof window === "undefined") return;
+
+    if (voiceHoldTimerRef.current !== null) {
+      window.clearTimeout(voiceHoldTimerRef.current);
+      voiceHoldTimerRef.current = null;
+    }
+
+    if (!voiceHoldTriggeredRef.current) return;
+    voiceHoldTriggeredRef.current = false;
+    stopVoiceInput();
+    voiceHoldSuppressResetTimerRef.current = window.setTimeout(() => {
+      suppressNextSendClickRef.current = false;
+      voiceHoldSuppressResetTimerRef.current = null;
+    }, 300);
+  }
+
+  function onSendButtonClick(): void {
+    if (typeof window !== "undefined" && voiceHoldSuppressResetTimerRef.current !== null) {
+      window.clearTimeout(voiceHoldSuppressResetTimerRef.current);
+      voiceHoldSuppressResetTimerRef.current = null;
+    }
+    if (suppressNextSendClickRef.current) {
+      suppressNextSendClickRef.current = false;
+      return;
+    }
+    void onStartRun();
   }
 
   async function onArchiveSession(): Promise<void> {
@@ -1755,7 +1808,6 @@ export function App(): JSX.Element {
             setPrompt={setPrompt}
             submitting={submitting}
             stopping={stopping}
-            onStartRun={onStartRun}
             onStopRun={onStopRun}
             onNewSession={onNewSession}
             hasPendingIndicator={Boolean(selectedRun && selectedRun.status === "running" && !hasPendingTimelineEntry)}
@@ -1768,9 +1820,10 @@ export function App(): JSX.Element {
             onRemoveQueueItem={(messageId) => removeQueuedMessage(sessionTimelineKey, messageId)}
             voiceSupported={voiceSupported}
             voiceListening={voiceListening}
-            voiceInterim={voiceInterim}
             voiceError={voiceError}
-            onToggleVoiceInput={onToggleVoiceInput}
+            onSendButtonPressStart={onSendButtonPressStart}
+            onSendButtonPressEnd={onSendButtonPressEnd}
+            onSendButtonClick={onSendButtonClick}
           />
         </Card>
 
@@ -1964,7 +2017,6 @@ type CenterPanelProps = {
   setPrompt: (value: string) => void;
   submitting: boolean;
   stopping: boolean;
-  onStartRun: () => Promise<void>;
   onStopRun: () => Promise<void>;
   onNewSession: () => void;
   hasPendingIndicator: boolean;
@@ -1977,9 +2029,10 @@ type CenterPanelProps = {
   onRemoveQueueItem: (messageId: string) => void;
   voiceSupported: boolean;
   voiceListening: boolean;
-  voiceInterim: string;
   voiceError: string | null;
-  onToggleVoiceInput: () => void;
+  onSendButtonPressStart: () => void;
+  onSendButtonPressEnd: () => void;
+  onSendButtonClick: () => void;
 };
 
 function CenterPanel(props: CenterPanelProps): JSX.Element {
@@ -2071,7 +2124,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           className="border-t border-card-border bg-white/75 p-3"
           onSubmit={(event) => {
             event.preventDefault();
-            void props.onStartRun();
+            props.onSendButtonClick();
           }}
         >
           <div className="relative flex items-end gap-2">
@@ -2100,34 +2153,19 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 
             <Button
               type="button"
-              variant={props.voiceListening ? "primary" : "ghost"}
               className="h-[44px] w-[44px] shrink-0 rounded-full p-0"
-              onClick={props.onToggleVoiceInput}
-              disabled={!props.voiceSupported}
-              aria-label={props.voiceListening ? "Stop voice input" : "Start voice input"}
-              title={props.voiceSupported ? (props.voiceListening ? "Stop voice input" : "Start voice input") : "Voice input unavailable"}
+              disabled={props.submitting || (!props.prompt.trim() && !props.voiceSupported)}
+              aria-label={props.voiceListening ? "Recording (release to stop)" : "Send message (hold 2s for voice input)"}
+              title={props.voiceListening ? "Recording (release to stop)" : props.voiceError || "Send message (hold 2s for voice input)"}
+              onPointerDown={props.onSendButtonPressStart}
+              onPointerUp={props.onSendButtonPressEnd}
+              onPointerCancel={props.onSendButtonPressEnd}
+              onPointerLeave={props.onSendButtonPressEnd}
+              onClick={props.onSendButtonClick}
             >
-              {props.voiceListening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
-            </Button>
-
-            <Button type="submit" className="h-[44px] w-[44px] shrink-0 rounded-full p-0" disabled={props.submitting || !props.prompt.trim()} aria-label="Send message" title="Send">
-              {props.submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              {props.submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : props.voiceListening ? <MicOff className="h-4 w-4" /> : <Send className="h-4 w-4" />}
             </Button>
           </div>
-
-          {props.voiceSupported || props.voiceError ? (
-            <div className="mt-2 rounded-xl border border-card-border bg-muted/40 px-2.5 py-2">
-              <p className="text-[11px] text-foreground/80">
-                {props.voiceListening ? "Listening..." : "Voice input ready"}
-              </p>
-              {props.voiceInterim ? (
-                <p className="mt-1 truncate text-xs text-foreground/70" title={props.voiceInterim}>
-                  {props.voiceInterim}
-                </p>
-              ) : null}
-              {props.voiceError ? <p className="mt-1 text-xs text-rose-700">{props.voiceError}</p> : null}
-            </div>
-          ) : null}
 
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <Button type="button" variant="ghost" size="sm" onClick={props.onNewSession}>
