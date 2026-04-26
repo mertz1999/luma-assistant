@@ -1848,7 +1848,6 @@ export function App(): JSX.Element {
       const payload = await startTerminal(selectedSessionId, workspace);
       setTerminalsBySession((prev) => ({ ...prev, [selectedSessionId]: payload.terminal }));
       setRightPanelTab("tools");
-      setMobileContextOpen(false);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "Failed to start terminal");
     } finally {
@@ -2679,9 +2678,9 @@ function RightPanel(props: RightPanelProps): JSX.Element {
 
                 <div
                   ref={props.terminalOutputRef}
-                  className="h-56 overflow-auto rounded-xl border border-card-border bg-slate-950 p-2 font-mono text-[11px] leading-5 text-slate-100"
+                  className="h-[20rem] overflow-auto rounded-xl border border-card-border bg-slate-950 p-2 font-mono text-[11px] leading-5 text-slate-100 md:h-[24rem]"
                 >
-                  <pre className="whitespace-pre-wrap break-words">
+                  <pre className="min-w-max whitespace-pre">
                     {props.selectedTerminal?.output
                       || (props.selectedTerminal
                         ? (props.selectedTerminal.status === "running" ? "$ terminal ready" : "$ terminal stopped")
@@ -2697,7 +2696,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
                   }}
                 >
                   <input
-                    className="h-10 w-full rounded-xl border border-card-border bg-white px-3 font-mono text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                    className="h-10 w-full rounded-xl border border-card-border bg-white px-3 font-mono text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
                     value={props.terminalInput}
                     onChange={(event) => props.setTerminalInput(event.target.value)}
                     placeholder={terminalRunning ? "Type command and press Enter" : "Start terminal to run commands"}
