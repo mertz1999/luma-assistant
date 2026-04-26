@@ -7,8 +7,10 @@ WEB_PORT ?= $(shell awk -F= '/^WEB_PORT=/{print $$2}' .env 2>/dev/null | tail -n
 WEB_PORT := $(if $(WEB_PORT),$(WEB_PORT),5175)
 
 PROJECT_PORTS := $(API_PORT) $(WEB_PORT)
+PM2_BIN := npx pm2
+PM2_ECOSYSTEM := scripts/pm2/ecosystem.config.cjs
 
-.PHONY: install install-if-needed kill-ports run
+.PHONY: install install-if-needed install-pm2 kill-ports run deploy-start deploy-stop deploy-status deploy-logs
 
 install:
 	npm install --include=optional --no-audit --no-fund
@@ -27,6 +29,14 @@ install-if-needed:
 		fi; \
 	else \
 		echo "Dependencies already installed."; \
+	fi
+
+install-pm2:
+	@if [ ! -x node_modules/.bin/pm2 ]; then \
+		echo "Installing pm2 locally (project-scoped)..."; \
+		npm install --no-save --no-package-lock --no-audit --no-fund pm2; \
+	else \
+		echo "pm2 already available in node_modules/.bin"; \
 	fi
 
 kill-ports:
@@ -48,3 +58,22 @@ kill-ports:
 
 run: install-if-needed kill-ports
 	npm run dev
+
+deploy-start: install-if-needed install-pm2 kill-ports
+	@mkdir -p data/logs
+	npm run build
+	API_PORT=$(API_PORT) WEB_PORT=$(WEB_PORT) HOST=$(HOST) NODE_ENV=production $(PM2_BIN) startOrReload $(PM2_ECOSYSTEM) --update-env
+	$(PM2_BIN) save
+	$(PM2_BIN) status
+
+deploy-stop: install-pm2
+	-$(PM2_BIN) delete agentic-cli-server
+	-$(PM2_BIN) delete agentic-cli-web
+	-$(PM2_BIN) save
+	$(PM2_BIN) status
+
+deploy-status: install-pm2
+	$(PM2_BIN) status
+
+deploy-logs: install-pm2
+	$(PM2_BIN) logs --lines 150

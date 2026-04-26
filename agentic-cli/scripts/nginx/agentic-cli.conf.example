@@ -1,0 +1,65 @@
+# Copy to /etc/nginx/sites-available/agentic-cli.conf and customize domain + SSL paths.
+# Then symlink into /etc/nginx/sites-enabled and reload nginx.
+
+upstream agentic_cli_web {
+  server 127.0.0.1:5175;
+}
+
+upstream agentic_cli_api {
+  server 127.0.0.1:9001;
+}
+
+server {
+  listen 80;
+  listen [::]:80;
+  server_name your-domain.example.com;
+
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+  server_name your-domain.example.com;
+
+  ssl_certificate /path/to/fullchain.pem;
+  ssl_certificate_key /path/to/privkey.pem;
+
+  # Recommended TLS settings (optional hardening)
+  ssl_session_timeout 1d;
+  ssl_session_cache shared:MozSSL:10m;
+  ssl_session_tickets off;
+
+  # API and SSE
+  location /api/events {
+    proxy_pass http://agentic_cli_api;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_read_timeout 3600;
+  }
+
+  location /api/ {
+    proxy_pass http://agentic_cli_api;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+  }
+
+  # Web app (Vite preview)
+  location / {
+    proxy_pass http://agentic_cli_web;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+  }
+}
