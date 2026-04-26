@@ -1,9 +1,7 @@
-node_modules/
+node_modules
+apps/*/dist
+packages/*/dist
 .env
-npm-debug.log*
 .DS_Store
-apps/*/dist/
-packages/*/dist/
-apps/web/.vite/
-
-data/
+data/*.json
+!data/.gitkeep

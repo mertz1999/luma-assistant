@@ -1,6 +1,6 @@
 {
-  "name": "@assistant/web",
-  "version": "0.2.0",
+  "name": "@agentic/web",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,20 +10,19 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@assistant/shared": "0.2.0",
-    "@hookform/resolvers": "^3.10.0",
-    "@radix-ui/react-dialog": "^1.1.6",
+    "@agentic/shared": "0.1.0",
+    "@radix-ui/react-dialog": "^1.1.15",
     "@tanstack/react-query": "^5.72.2",
+    "ansi-to-html": "^0.7.2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^0.503.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
-    "react-hook-form": "^7.56.4",
+    "react-diff-viewer-continued": "^3.4.0",
+    "react-dom": "^18.3.1",
     "remark-gfm": "^4.0.0",
     "tailwind-merge": "^3.2.0",
-    "zod": "^3.24.3",
     "zustand": "^5.0.3"
   },
   "devDependencies": {

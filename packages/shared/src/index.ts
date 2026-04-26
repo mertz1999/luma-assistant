@@ -1,223 +1,212 @@
 import { z } from "zod";
 
-export const allowedRpcMethods = [
-  "initialize",
-  "initialized",
-  "account/read",
-  "account/rateLimits/read",
-  "account/login/start",
-  "account/login/cancel",
-  "account/logout",
-  "thread/start",
-  "thread/resume",
-  "thread/fork",
-  "thread/name/set",
-  "thread/list",
-  "thread/read",
-  "thread/loaded/list",
-  "thread/archive",
-  "thread/unarchive",
-  "thread/unsubscribe",
-  "thread/compact/start",
-  "thread/rollback",
-  "thread/shellCommand",
-  "turn/start",
-  "turn/steer",
-  "turn/interrupt",
-  "review/start",
-  "command/exec",
-  "command/exec/write",
-  "command/exec/resize",
-  "command/exec/terminate",
-  "model/list",
-  "experimentalFeature/list",
-  "collaborationMode/list",
-  "app/list",
-  "skills/list",
-  "plugin/list",
-  "plugin/read",
-  "plugin/install",
-  "plugin/uninstall",
-  "skills/config/write",
-  "mcpServerStatus/list",
-  "mcpServer/resource/read",
-  "config/mcpServer/reload",
-  "mcpServer/oauth/login",
-  "config/read",
-  "config/value/write",
-  "config/batchWrite",
-  "configRequirements/read",
-  "externalAgentConfig/detect",
-  "externalAgentConfig/import",
-  "feedback/upload",
-  "tool/requestUserInput",
-  "thread/backgroundTerminals/clean",
-  "fs/readFile",
-  "fs/writeFile",
-  "fs/createDirectory",
-  "fs/getMetadata",
-  "fs/readDirectory",
-  "fs/remove",
-  "fs/copy",
-] as const;
+export const runStatusSchema = z.enum(["queued", "running", "completed", "failed", "stopped"]);
+export type RunStatus = z.infer<typeof runStatusSchema>;
 
-export type AllowedRpcMethod = (typeof allowedRpcMethods)[number];
+export const sandboxSchema = z.enum(["read-only", "workspace-write", "danger-full-access"]);
+export type SandboxMode = z.infer<typeof sandboxSchema>;
 
-export const methodGroups = ["read", "thread_control", "ops", "config_write", "filesystem", "experimental"] as const;
+export const approvalPolicySchema = z.enum(["untrusted", "on-failure", "on-request", "never"]);
+export type ApprovalPolicy = z.infer<typeof approvalPolicySchema>;
 
-export type MethodGroup = (typeof methodGroups)[number];
-
-export const riskTiers = [0, 1, 2, 3] as const;
-export type RiskTier = (typeof riskTiers)[number];
-
-export type Json =
-  | string
-  | number
-  | boolean
-  | null
-  | Json[]
-  | { [key: string]: Json };
-
-export const rpcGuardSchema = z
-  .object({
-    acceptRisk: z.boolean().optional(),
-    acceptForSession: z.boolean().optional(),
-    reauthPassword: z.string().min(1).optional(),
-  })
-  .optional();
-
-export const rpcRequestSchema = z.object({
-  method: z.enum(allowedRpcMethods),
-  params: z.record(z.string(), z.unknown()).optional().default({}),
-  guard: rpcGuardSchema,
+export const runConfigSchema = z.object({
+  workspace: z.string().min(1),
+  prompt: z.string().min(1),
+  model: z.string().min(1),
+  sandbox: sandboxSchema,
+  approvalPolicy: approvalPolicySchema,
+  planMode: z.boolean().default(false),
+  sessionId: z.string().optional(),
 });
+export type RunConfig = z.infer<typeof runConfigSchema>;
 
-export const loginRequestSchema = z.object({
-  password: z.string().min(1),
+export const startRunSchema = z.object({
+  prompt: z.string().min(1),
+  workspace: z.string().min(1),
+  model: z.string().min(1),
+  sandbox: sandboxSchema.default("read-only"),
+  approvalPolicy: approvalPolicySchema.default("on-request"),
+  planMode: z.boolean().default(false),
+  sessionId: z.string().optional(),
 });
+export type StartRunInput = z.infer<typeof startRunSchema>;
 
-export const serverRequestRespondSchema = z
-  .object({
-    requestId: z.union([z.string(), z.number()]),
-    result: z.unknown().optional(),
-    error: z
-      .object({
-        code: z.number().optional(),
-        message: z.string(),
-        data: z.unknown().optional(),
-      })
-      .optional(),
-  })
-  .refine((data) => data.result !== undefined || data.error !== undefined, {
-    message: "Either result or error must be provided",
-    path: ["result"],
-  });
+export const rerunSchema = z.object({
+  sandbox: sandboxSchema.optional(),
+  approvalPolicy: approvalPolicySchema.optional(),
+});
+export type RerunInput = z.infer<typeof rerunSchema>;
+
+export const setWorkspaceSchema = z.object({
+  workspace: z.string().min(1),
+  persist: z.boolean().optional().default(true),
+});
+export type SetWorkspaceInput = z.infer<typeof setWorkspaceSchema>;
+
+export type RunEventEntry = {
+  id: string;
+  at: number;
+  source: "stdout" | "stderr" | "system";
+  text?: string;
+  payload?: Record<string, unknown>;
+};
+
+export type RunRecord = {
+  id: string;
+  createdAt: number;
+  updatedAt: number;
+  status: RunStatus;
+  config: RunConfig;
+  sessionId: string | null;
+  threadId: string | null;
+  summary: string;
+  events: RunEventEntry[];
+  lastError: string | null;
+  changedFiles: string[];
+  archivedAt: number | null;
+  usage: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedInputTokens?: number;
+  } | null;
+};
+
+export type ApprovalQueueItem = {
+  id: string;
+  runId: string;
+  createdAt: number;
+  reason: string;
+  suggestedSandbox: SandboxMode;
+  suggestedApprovalPolicy: ApprovalPolicy;
+  command: string | null;
+  status: "pending" | "accepted" | "dismissed";
+};
+
+export type DiffSnapshot = {
+  runId: string;
+  at: number;
+  isGitRepo: boolean;
+  diffText: string;
+  changedFiles: string[];
+  fallbackMessage: string | null;
+};
+
+export type FileTreeNode = {
+  name: string;
+  path: string;
+  type: "file" | "directory";
+  children?: FileTreeNode[];
+};
+
+export type WorkspaceOption = {
+  id: string;
+  name: string;
+  path: string;
+  source: "config-default" | "config-repo" | "manual";
+};
+
+export type SessionHistoryEntry = {
+  id: string;
+  timestamp: string;
+  cwd: string;
+  source: string;
+  model?: string;
+  cliVersion?: string;
+  summary: string;
+};
+
+export type TerminalSessionStatus = "running" | "stopped";
+
+export type TerminalSessionSnapshot = {
+  sessionId: string;
+  status: TerminalSessionStatus;
+  workspace: string;
+  shell: string;
+  pid: number | null;
+  createdAt: number;
+  updatedAt: number;
+  output: string;
+};
+
+export type AppBootstrap = {
+  defaults: {
+    model: string;
+    sandbox: SandboxMode;
+  };
+  activeWorkspace: string;
+  workspaces: WorkspaceOption[];
+  runs: RunRecord[];
+  approvals: ApprovalQueueItem[];
+};
+
+export type CodexCommandStatus = {
+  command: string;
+  ok: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+};
+
+export type CodexTokenStatus = {
+  source: "codex-login-status";
+  remainingTokens: number | null;
+  note: string | null;
+};
+
+export type CodexMcpStatusResponse = {
+  at: number;
+  mcp: CodexCommandStatus;
+};
+
+export type CodexAccountStatusResponse = {
+  at: number;
+  account: CodexCommandStatus;
+  tokenStatus: CodexTokenStatus;
+};
+
+export type CodexSystemStatusResponse = {
+  at: number;
+  account: CodexCommandStatus;
+  mcp: CodexCommandStatus;
+  tokenStatus: CodexTokenStatus;
+};
 
 export type ApiError = {
   message: string;
-  code?: number | null;
-  data?: unknown;
 };
 
-export type GuardRequirement = {
-  required: boolean;
-  tier: RiskTier;
-  group: MethodGroup;
-  reason: string;
-  allowAcceptForSession: boolean;
-  requiresReauthPassword: boolean;
-  expiresInMs?: number;
-};
-
-export type ApiResponse<T = unknown> =
+export type ApiResponse<T> =
   | {
       ok: true;
-      result?: T;
-      data?: T;
-      defaults?: Record<string, unknown>;
-      bridgeState?: BridgeState;
-      sessionToken?: string;
+      data: T;
     }
   | {
       ok: false;
       error: ApiError;
-      guard?: GuardRequirement;
     };
 
-export type CapabilityDescriptor = {
-  method: AllowedRpcMethod;
-  group: MethodGroup;
-  riskTier: RiskTier;
-  enabled: boolean;
-  reason: string | null;
-  requiresExperimentalApi: boolean;
-};
+export const sseEventKinds = [
+  "run.started",
+  "run.stdout",
+  "run.stderr",
+  "run.item",
+  "run.approvalQueued",
+  "run.diffUpdated",
+  "run.completed",
+  "run.failed",
+  "run.stopped",
+  "terminal.started",
+  "terminal.output",
+  "terminal.stopped",
+  "heartbeat",
+] as const;
 
-export type BootstrapCapabilities = {
-  methods: CapabilityDescriptor[];
-  groups: Record<MethodGroup, boolean>;
-};
+export type SseEventKind = (typeof sseEventKinds)[number];
 
-export type NotificationEvent = {
-  kind: "notification";
-  method: string;
-  params: Record<string, unknown>;
+export type SseEvent = {
+  kind: SseEventKind;
   at: number;
-};
-
-export type ServerRequestEvent = {
-  kind: "serverRequest";
-  id: string | number;
-  method: string;
-  params: Record<string, unknown>;
-  at: number;
-};
-
-export type BridgeStatus = {
-  type: string;
-  at: number;
-  [key: string]: unknown;
-};
-
-export type BridgeStatusEvent = BridgeStatus & {
-  kind: "bridgeStatus";
-};
-
-export type ConnectedEvent = {
-  kind: "connected";
-  bridgeState: BridgeState;
-  at: number;
-};
-
-export type HeartbeatEvent = {
-  kind: "heartbeat";
-  at: number;
-};
-
-export type SseEvent = NotificationEvent | ServerRequestEvent | BridgeStatusEvent | ConnectedEvent | HeartbeatEvent;
-
-export type BridgeState = {
-  running: boolean;
-  initialized: boolean;
-  lastStatus: BridgeStatus | null;
-};
-
-export type AppDefaults = {
-  cwd: string;
-  model: string;
-  approvalPolicy: string;
-  sandboxType: string;
-};
-
-export type BootstrapData = {
-  account: unknown;
-  rateLimits: unknown;
-  threads: unknown;
-  archivedThreads: unknown;
-  loadedThreads: unknown;
-  models: unknown;
-  mcpServers: unknown;
-  featureFlags: unknown;
-  collaborationModes: unknown;
-  uiState: unknown;
+  runId?: string;
+  sessionId?: string;
+  payload?: Record<string, unknown>;
 };

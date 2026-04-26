@@ -1,6 +1,6 @@
 {
-  "name": "@assistant/shared",
-  "version": "0.2.0",
+  "name": "@agentic/shared",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -9,7 +9,6 @@
     "dist"
   ],
   "scripts": {
-    "dev": "tsc -p tsconfig.json --watch",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

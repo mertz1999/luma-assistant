@@ -13,7 +13,7 @@ export default {
         brand: {
           DEFAULT: "#12867d",
           dark: "#0f6a63",
-          soft: "#daf1ed"
+          soft: "#daf1ed",
         },
         accent: "#ea5c38",
         muted: "#f5f9fc",
@@ -41,7 +41,7 @@ export default {
       },
       animation: {
         "fade-up": "fadeUp .2s ease-out",
-        "slide-in": "slideIn .2s ease-out"
+        "slide-in": "slideIn .2s ease-out",
       },
       keyframes: {
         fadeUp: {
@@ -51,8 +51,8 @@ export default {
         slideIn: {
           from: { opacity: "0", transform: "translateY(8px)" },
           to: { opacity: "1", transform: "translateY(0)" },
-        }
-      }
+        },
+      },
     },
   },
   plugins: [],

@@ -1,7 +1,0 @@
-node_modules
-apps/*/dist
-packages/*/dist
-.env
-.DS_Store
-data/*.json
-!data/.gitkeep

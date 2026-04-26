@@ -1,23 +1,16 @@
 {
-  "name": "agentic-assistant-monorepo",
+  "name": "agentic-cli-wrapper",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.1.0",
   "workspaces": [
     "apps/*",
     "packages/*"
   ],
   "scripts": {
-    "sync:config": "node ./scripts/sync-config.mjs",
-    "sync:agents": "npm run sync:config && node ./scripts/sync-agents.mjs",
-    "predev": "npm run sync:agents && npm run build -w @assistant/shared",
-    "prebuild": "npm run sync:agents",
-    "prestart": "npm run sync:agents",
-    "dev": "concurrently -n server,web -c cyan,green \"npm run dev -w @assistant/server\" \"npm run dev -w @assistant/web\"",
-    "dev:server": "npm run build -w @assistant/shared && npm run dev -w @assistant/server",
-    "dev:web": "npm run build -w @assistant/shared && npm run dev -w @assistant/web",
-    "build": "npm run build -w @assistant/shared && npm run build -w @assistant/server && npm run build -w @assistant/web",
-    "start": "npm run start -w @assistant/server",
-    "typecheck": "npm run build -w @assistant/shared && npm run typecheck -w @assistant/server && npm run typecheck -w @assistant/web"
+    "dev": "concurrently -n server,web -c cyan,green \"npm run dev -w @agentic/server\" \"npm run dev -w @agentic/web\"",
+    "build": "npm run build -w @agentic/shared && npm run build -w @agentic/server && npm run build -w @agentic/web",
+    "typecheck": "npm run build -w @agentic/shared && npm run typecheck -w @agentic/server && npm run typecheck -w @agentic/web",
+    "start": "npm run start -w @agentic/server"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",
@@ -25,5 +18,8 @@
   },
   "engines": {
     "node": ">=22.0.0"
+  },
+  "optionalDependencies": {
+    "@esbuild/darwin-arm64": "^0.27.7"
   }
 }

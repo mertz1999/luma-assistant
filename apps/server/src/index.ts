@@ -1,1457 +1,1523 @@
 import fs from "node:fs";
-import crypto from "node:crypto";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import cookieParser from "cookie-parser";
+import os from "node:os";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import cors from "cors";
 import dotenv from "dotenv";
-import express, { type NextFunction, type Request, type Response } from "express";
-import { z } from "zod";
+import express from "express";
 import {
-  allowedRpcMethods,
-  loginRequestSchema,
-  methodGroups,
-  rpcRequestSchema,
-  serverRequestRespondSchema,
-  type AllowedRpcMethod,
-  type ApiError,
-  type BootstrapCapabilities,
-  type BridgeState,
-  type GuardRequirement,
-  type MethodGroup,
-  type RiskTier,
+  approvalPolicySchema,
+  rerunSchema,
+  setWorkspaceSchema,
+  startRunSchema,
+  type ApiResponse,
+  type ApprovalQueueItem,
+  type AppBootstrap,
+  type CodexAccountStatusResponse,
+  type CodexCommandStatus,
+  type CodexMcpStatusResponse,
+  type CodexSystemStatusResponse,
+  type CodexTokenStatus,
+  type DiffSnapshot,
+  type FileTreeNode,
+  type RunConfig,
+  type RunEventEntry,
+  type RunRecord,
+  type SessionHistoryEntry,
   type SseEvent,
-} from "@assistant/shared";
-import { CodexBridge, type BridgeNotificationEvent, type BridgeServerRequestEvent, type BridgeStatusEvent } from "./codexBridge.js";
-import { getCapabilityDescriptors, getMethodPolicy, type MethodPolicy } from "./methodPolicy.js";
-import {
-  AuditLogger,
-  MessageQueueStore,
-  UiStateStore,
-  type PersistedQueuedMessage,
-  type PersistedUiState,
-} from "./persistence.js";
-import { SessionStore } from "./sessionStore.js";
+  type TerminalSessionSnapshot,
+  type WorkspaceOption,
+} from "@agentic/shared";
 
-declare global {
-  namespace Express {
-    interface Request {
-      sessionToken?: string;
-    }
-  }
-}
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const rootDir = path.resolve(__dirname, "../../..");
-
+const rootDir = path.resolve(process.env.INIT_CWD || process.cwd());
 dotenv.config({ path: path.resolve(rootDir, ".env") });
 
-type AppConfig = {
-  port: number;
-  host: string;
-  webOrigins: string[];
-  allowLanOrigins: boolean;
-  appPassword: string;
-  codexPath: string;
-  defaultCwd: string;
-  defaultModel: string;
-  defaultApprovalPolicy: string;
-  defaultSandboxType: string;
-  defaultNetworkAccess: boolean;
-  loginRateLimitWindowMs: number;
-  loginRateLimitMaxAttempts: number;
-  cookieSecure: boolean;
-  riskAcceptTtlMs: number;
-  groupEnabled: Record<MethodGroup, boolean>;
-  debugLogs: boolean;
+const APP_STATE_PATH = path.resolve(rootDir, "data/ui-state.json");
+const RUNS_PATH = path.resolve(rootDir, "data/runs.json");
+
+const API_PORT = Number(process.env.API_PORT || 9001);
+const WEB_PORT = Number(process.env.WEB_PORT || 5175);
+const HOST = process.env.HOST || "0.0.0.0";
+const CODEX_PATH = process.env.CODEX_PATH || "codex";
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "gpt-5.3-codex";
+const DEFAULT_REASONING_EFFORT = process.env.DEFAULT_REASONING_EFFORT || "high";
+const DEFAULT_SANDBOX = process.env.DEFAULT_SANDBOX || "read-only";
+const MAX_CONCURRENT_RUNS = Number(process.env.MAX_CONCURRENT_RUNS || 8);
+
+type PersistedUiState = {
+  activeWorkspace: string;
+  manualWorkspaces: string[];
 };
 
-function parseBool(input: string | undefined, fallback: boolean): boolean {
-  if (typeof input !== "string") return fallback;
-  return input.trim().toLowerCase() === "true";
-}
-
-function normalizeApprovalPolicy(value: unknown): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    return "on-request";
-  }
-
-  const normalized = value.trim().toLowerCase().replace(/[_\s]+/g, "-");
-
-  if (normalized === "onrequest") return "on-request";
-  if (normalized === "on-request") return "on-request";
-  if (normalized === "onfailure") return "on-failure";
-  if (normalized === "on-failure") return "on-failure";
-  if (normalized === "untrusted") return "untrusted";
-  if (normalized === "never") return "never";
-
-  return normalized;
-}
-
-function stripOuterQuotes(value: string): string {
-  const trimmed = value.trim();
-  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
-    return trimmed.slice(1, -1);
-  }
-  return trimmed;
-}
-
-function resolveConfigPath(baseDir: string): string {
-  const homeDir = process.env.HOME || "";
-  const fixedPath = homeDir ? path.join(homeDir, "config", "agentic-assistant", "config.yaml") : "";
-  if (fixedPath && fs.existsSync(fixedPath)) return fixedPath;
-  return path.resolve(baseDir, "config.yaml");
-}
-
-function readDefaultWorkspaceFromConfig(baseDir: string): string | null {
-  const cfgPath = resolveConfigPath(baseDir);
-  if (!fs.existsSync(cfgPath)) return null;
-
-  try {
-    const text = fs.readFileSync(cfgPath, "utf8");
-    const line = text
-      .split(/\r?\n/)
-      .find((row) => row.trim().startsWith("default_workspace:"));
-    if (!line) return null;
-
-    const raw = line
-      .split(":")
-      .slice(1)
-      .join(":")
-      .trim();
-    if (!raw) return null;
-
-    let workspace = stripOuterQuotes(raw);
-    if (workspace.startsWith("~")) {
-      const home = process.env.HOME || "";
-      workspace = home ? path.join(home, workspace.slice(1)) : workspace;
-    }
-
-    const resolved = path.resolve(workspace);
-    if (!fs.existsSync(resolved)) {
-      // eslint-disable-next-line no-console
-      console.warn(`[server] ${cfgPath} default_workspace does not exist: ${resolved}. Falling back to DEFAULT_CWD/env.`);
-      return null;
-    }
-    if (!fs.statSync(resolved).isDirectory()) {
-      // eslint-disable-next-line no-console
-      console.warn(`[server] ${cfgPath} default_workspace is not a directory: ${resolved}. Falling back to DEFAULT_CWD/env.`);
-      return null;
-    }
-    return resolved;
-  } catch (error) {
-    // eslint-disable-next-line no-console
-    console.warn(`[server] Failed to read ${cfgPath} default_workspace. Falling back to DEFAULT_CWD/env.`, error);
-    return null;
-  }
-}
-
-function normalizeThreadSandbox(value: unknown): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    return "workspace-write";
-  }
-
-  const normalized = value.trim().toLowerCase().replace(/[_\s]+/g, "-");
-  if (normalized === "workspacewrite" || normalized === "workspace-write") return "workspace-write";
-  if (normalized === "readonly" || normalized === "read-only") return "read-only";
-  if (normalized === "dangerfullaccess" || normalized === "danger-full-access") return "danger-full-access";
-  return normalized;
-}
-
-function normalizeTurnSandboxType(value: unknown): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    return "workspaceWrite";
-  }
-
-  const normalized = value.trim().toLowerCase().replace(/[_\s]+/g, "-");
-  if (normalized === "workspacewrite" || normalized === "workspace-write") return "workspaceWrite";
-  if (normalized === "readonly" || normalized === "read-only") return "readOnly";
-  if (normalized === "dangerfullaccess" || normalized === "danger-full-access") return "dangerFullAccess";
-  if (normalized === "externalsandbox" || normalized === "external-sandbox") return "externalSandbox";
-  return value;
-}
-
-const groupEnabled: Record<MethodGroup, boolean> = {
-  read: parseBool(process.env.ENABLE_GROUP_READ, true),
-  thread_control: parseBool(process.env.ENABLE_GROUP_THREAD_CONTROL, true),
-  ops: parseBool(process.env.ENABLE_GROUP_OPS, true),
-  config_write: parseBool(process.env.ENABLE_GROUP_CONFIG_WRITE, true),
-  filesystem: parseBool(process.env.ENABLE_GROUP_FILESYSTEM, true),
-  experimental: parseBool(process.env.ENABLE_GROUP_EXPERIMENTAL, false),
+type ActiveRun = {
+  process: ChildProcess;
+  stdoutBuffer: string;
+  stopRequested: boolean;
 };
 
-const defaultWorkspaceFromConfig = readDefaultWorkspaceFromConfig(rootDir);
-
-const config: AppConfig = {
-  port: Number(process.env.PORT || 8787),
-  host: process.env.HOST || "0.0.0.0",
-  webOrigins: (process.env.WEB_ORIGIN || "http://localhost:5173")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean),
-  allowLanOrigins: String(process.env.ALLOW_LAN_ORIGINS || "true").toLowerCase() === "true",
-  appPassword: process.env.APP_PASSWORD || "",
-  codexPath: process.env.CODEX_PATH || "codex",
-  defaultCwd: defaultWorkspaceFromConfig || process.env.DEFAULT_CWD || rootDir,
-  defaultModel: process.env.DEFAULT_MODEL || "gpt-5.4",
-  defaultApprovalPolicy: normalizeApprovalPolicy(process.env.DEFAULT_APPROVAL_POLICY || "on-request"),
-  defaultSandboxType: process.env.DEFAULT_SANDBOX_TYPE || "workspaceWrite",
-  defaultNetworkAccess: String(process.env.DEFAULT_NETWORK_ACCESS || "true").toLowerCase() === "true",
-  loginRateLimitWindowMs: Number(process.env.LOGIN_RATE_LIMIT_WINDOW_MS || 900000),
-  loginRateLimitMaxAttempts: Number(process.env.LOGIN_RATE_LIMIT_MAX_ATTEMPTS || 12),
-  cookieSecure: String(process.env.COOKIE_SECURE || "false").toLowerCase() === "true",
-  riskAcceptTtlMs: Number(process.env.RISK_ACCEPT_TTL_MS || 15 * 60 * 1000),
-  groupEnabled,
-  debugLogs: parseBool(process.env.DEBUG_LOGS, false),
+type ActiveTerminal = {
+  process: ChildProcess;
+  session: TerminalSessionSnapshot;
 };
 
-function debugLog(event: string, payload: Record<string, unknown> = {}): void {
-  if (!config.debugLogs) return;
-  // eslint-disable-next-line no-console
-  console.log(`[debug] ${event}`, payload);
+const TERMINAL_HISTORY_MAX_CHARS = Number(process.env.TERMINAL_HISTORY_MAX_CHARS || 220000);
+
+function runSessionId(run: RunRecord): string {
+  return run.sessionId || run.threadId || run.id;
 }
 
-const corsPorts = new Set(
-  config.webOrigins
-    .map((origin) => {
-      try {
-        const url = new URL(origin);
-        if (url.port) return url.port;
-        return url.protocol === "https:" ? "443" : "80";
-      } catch {
-        return null;
-      }
-    })
-    .filter((value): value is string => Boolean(value)),
-);
+class RunManager extends EventEmitter {
+  private runs = new Map<string, RunRecord>();
 
-function isPrivateLanHost(host: string): boolean {
-  if (host === "localhost" || host.endsWith(".local")) return true;
-  if (host === "127.0.0.1") return true;
-  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
-  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
-  const match172 = host.match(/^172\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
-  if (match172) {
-    const second = Number(match172[1]);
-    if (second >= 16 && second <= 31) return true;
-  }
-  return false;
-}
+  private approvals = new Map<string, ApprovalQueueItem>();
 
-const app = express();
-app.use(express.json({ limit: "1mb" }));
-app.use(cookieParser());
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin) {
-        callback(null, true);
-        return;
-      }
-      if (config.webOrigins.includes(origin)) {
-        callback(null, true);
-        return;
-      }
+  private diffs = new Map<string, DiffSnapshot>();
 
-      if (config.allowLanOrigins) {
-        try {
-          const url = new URL(origin);
-          const port = url.port || (url.protocol === "https:" ? "443" : "80");
-          if (isPrivateLanHost(url.hostname) && (corsPorts.size === 0 || corsPorts.has(port))) {
-            callback(null, true);
-            return;
-          }
-        } catch {
-          // ignore invalid origin format
-        }
-      }
+  private activeRuns = new Map<string, ActiveRun>();
 
-      callback(new Error(`Origin not allowed by CORS: ${origin}`));
-    },
-    credentials: true,
-  }),
-);
-
-const sessionStore = new SessionStore({
-  password: config.appPassword,
-  rateWindowMs: config.loginRateLimitWindowMs,
-  rateMaxAttempts: config.loginRateLimitMaxAttempts,
-});
-
-const bridge = new CodexBridge({
-  codexPath: config.codexPath,
-  cwd: rootDir,
-});
-
-const uiStateStore = new UiStateStore(rootDir);
-const messageQueueStore = new MessageQueueStore(rootDir);
-const auditLogger = new AuditLogger(rootDir);
-const sseClients = new Set<{ id: string; res: Response }>();
-const allowedMethods = new Set<AllowedRpcMethod>(allowedRpcMethods);
-
-let bridgeState: BridgeState = {
-  running: false,
-  initialized: false,
-  lastStatus: null,
-};
-let selectedWorkspaceRoot = path.resolve(config.defaultCwd);
-let queuedMessages: PersistedQueuedMessage[] = messageQueueStore.read().map((item) => ({
-  ...item,
-  status: item.status === "processing" ? "pending" : item.status,
-  nextAttemptAt: item.status === "processing" ? Date.now() : item.nextAttemptAt ?? null,
-  updatedAt: item.status === "processing" ? Date.now() : item.updatedAt,
-}));
-const queueThreadsInFlight = new Set<string>();
-let queueProcessTimer: NodeJS.Timeout | null = null;
-
-const uiStatePatchSchema = z.object({
-  lastActiveThreadId: z.string().nullable().optional(),
-  pinnedThreadIds: z.array(z.string()).optional(),
-  panelLayout: z
-    .object({
-      contextTab: z.enum(["context", "ops", "admin"]).optional(),
-    })
-    .optional(),
-  filters: z
-    .object({
-      showArchived: z.boolean().optional(),
-    })
-    .optional(),
-  composer: z
-    .object({
-      draftByThread: z.record(z.string(), z.string()).optional(),
-    })
-    .optional(),
-});
-
-const workspaceSelectSchema = z.object({
-  root: z.string().min(1, "Workspace path is required"),
-});
-
-const messageEnqueueSchema = z.object({
-  threadId: z.string().min(1, "threadId is required"),
-  text: z.string().min(1, "text is required"),
-  collaborationMode: z.record(z.string(), z.unknown()).optional(),
-});
-
-const QUEUE_MAX_ATTEMPTS = 8;
-const QUEUE_RETRY_DELAY_MS = 5000;
-
-function sanitizeError(error: unknown): ApiError {
-  if (error instanceof Error) {
-    const ext = error as Error & { code?: number; data?: unknown };
-    return {
-      message: ext.message,
-      code: ext.code ?? null,
-      data: ext.data ?? null,
-    };
+  constructor(private codexPath: string) {
+    super();
   }
 
-  return {
-    message: "Unknown error",
-    code: null,
-    data: null,
-  };
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isThreadNotFoundError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const message = error.message.toLowerCase();
-  return message.includes("thread not found");
-}
-
-function clientIp(req: Request): string {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded.length > 0) {
-    return forwarded.split(",")[0].trim();
-  }
-
-  return req.socket.remoteAddress || "unknown";
-}
-
-function extractSessionToken(req: Request): string | null {
-  const cookieToken = req.cookies?.session_token as string | undefined;
-  if (cookieToken) return cookieToken;
-
-  const queryToken = typeof req.query.sessionToken === "string" ? req.query.sessionToken : null;
-  if (queryToken && queryToken.trim().length > 0) {
-    return queryToken.trim();
-  }
-
-  const auth = req.headers.authorization || "";
-  if (auth.toLowerCase().startsWith("bearer ")) {
-    return auth.slice(7).trim();
-  }
-
-  return null;
-}
-
-function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  if (!sessionStore.isConfigured()) {
-    res.status(500).json({
-      ok: false,
-      error: { message: "APP_PASSWORD is not configured" },
-    });
-    return;
-  }
-
-  const token = extractSessionToken(req);
-  if (!sessionStore.isValidSession(token)) {
-    debugLog("auth.unauthorized", {
-      path: req.path,
-      method: req.method,
-      hasCookieToken: Boolean(req.cookies?.session_token),
-      hasQueryToken: typeof req.query.sessionToken === "string",
-      hasBearer: typeof req.headers.authorization === "string" && req.headers.authorization.toLowerCase().startsWith("bearer "),
-      ip: clientIp(req),
-    });
-    res.status(401).json({
-      ok: false,
-      error: { message: "Unauthorized" },
-    });
-    return;
-  }
-
-  req.sessionToken = token || undefined;
-  next();
-}
-
-function sendSse(client: { id: string; res: Response }, payload: SseEvent): void {
-  client.res.write(`data: ${JSON.stringify(payload)}\n\n`);
-}
-
-function broadcast(payload: SseEvent): void {
-  for (const client of sseClients) {
-    try {
-      sendSse(client, payload);
-    } catch {
-      sseClients.delete(client);
+  loadPersisted(runs: RunRecord[], approvals: ApprovalQueueItem[]): void {
+    for (const run of runs) {
+      this.runs.set(run.id, {
+        ...run,
+        sessionId: typeof run.sessionId === "string"
+          ? run.sessionId
+          : typeof run.threadId === "string"
+            ? run.threadId
+            : null,
+        archivedAt: typeof run.archivedAt === "number" ? run.archivedAt : null,
+      });
     }
-  }
-}
-
-function getWorkspaceRoot(): string {
-  return selectedWorkspaceRoot;
-}
-
-function persistQueuedMessages(): void {
-  const sorted = [...queuedMessages].sort((a, b) => a.createdAt - b.createdAt);
-  // Keep history bounded.
-  const retained = sorted.slice(-1500);
-  queuedMessages = retained;
-  messageQueueStore.write(retained);
-}
-
-function broadcastQueueNotification(method: string, params: Record<string, unknown>): void {
-  broadcast({
-    kind: "notification",
-    method,
-    params,
-    at: Date.now(),
-  });
-}
-
-function queueSnapshot(): { pending: number; processing: number; failed: number } {
-  let pending = 0;
-  let processing = 0;
-  let failed = 0;
-  for (const item of queuedMessages) {
-    if (item.status === "pending") pending += 1;
-    if (item.status === "processing") processing += 1;
-    if (item.status === "failed") failed += 1;
-  }
-  return { pending, processing, failed };
-}
-
-function updateQueuedMessage(
-  id: string,
-  updater: (item: PersistedQueuedMessage) => PersistedQueuedMessage,
-): PersistedQueuedMessage | null {
-  const index = queuedMessages.findIndex((entry) => entry.id === id);
-  if (index === -1) return null;
-  const next = updater(queuedMessages[index]);
-  queuedMessages[index] = next;
-  persistQueuedMessages();
-  return next;
-}
-
-function scheduleQueueProcessing(delayMs = 0): void {
-  if (queueProcessTimer) return;
-  queueProcessTimer = setTimeout(() => {
-    queueProcessTimer = null;
-    void processQueue();
-  }, Math.max(0, delayMs));
-}
-
-async function startQueuedTurn(item: PersistedQueuedMessage, includeCollaborationMode = true): Promise<void> {
-  const baseParams: Record<string, unknown> = {
-    threadId: item.threadId,
-    input: [{ type: "text", text: item.text }],
-  };
-  if (includeCollaborationMode && item.collaborationMode) {
-    baseParams.collaborationMode = item.collaborationMode;
+    for (const item of approvals) this.approvals.set(item.id, item);
   }
 
-  const params = applyRpcDefaults("turn/start", baseParams);
+  getRuns(includeArchived = true): RunRecord[] {
+    return [...this.runs.values()]
+      .filter((run) => includeArchived || run.archivedAt === null)
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }
 
-  try {
-    await bridge.request("turn/start", params);
-  } catch (error) {
-    if (!isThreadNotFoundError(error)) {
-      throw error;
+  getRun(runId: string): RunRecord | null {
+    return this.runs.get(runId) || null;
+  }
+
+  getApprovals(): ApprovalQueueItem[] {
+    return [...this.approvals.values()].sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  getDiff(runId: string): DiffSnapshot | null {
+    return this.diffs.get(runId) || null;
+  }
+
+  archiveSession(sessionId: string): { archivedRuns: number } | null {
+    const sessionRuns = this.getSessionRuns(sessionId);
+    if (sessionRuns.length === 0) return null;
+    if (this.hasActiveRunInSession(sessionId)) {
+      throw new Error("Cannot archive a session with a running task");
     }
-    await bridge.request("thread/resume", { threadId: item.threadId });
-    await bridge.request("turn/start", params);
+
+    const archivedAt = Date.now();
+    for (const run of sessionRuns) {
+      this.runs.set(run.id, { ...run, archivedAt, updatedAt: archivedAt });
+    }
+
+    this.removeApprovalsForRunIds(new Set(sessionRuns.map((run) => run.id)));
+    this.persistState();
+    return { archivedRuns: sessionRuns.length };
   }
-}
 
-async function processQueuedMessage(itemId: string): Promise<void> {
-  const item = queuedMessages.find((entry) => entry.id === itemId);
-  if (!item || item.status !== "processing") return;
+  deleteSession(sessionId: string): { removedRuns: number; removedApprovals: number } | null {
+    const sessionRuns = this.getSessionRuns(sessionId);
+    if (sessionRuns.length === 0) return null;
+    if (this.hasActiveRunInSession(sessionId)) {
+      throw new Error("Cannot delete a session with a running task");
+    }
 
-  try {
-    await startQueuedTurn(item, true);
+    const runIds = new Set(sessionRuns.map((run) => run.id));
+    for (const runId of runIds) {
+      this.runs.delete(runId);
+      this.diffs.delete(runId);
+    }
 
-    updateQueuedMessage(item.id, (existing) => ({
-      ...existing,
-      status: "completed",
-      lastError: null,
-      nextAttemptAt: null,
-      completedAt: Date.now(),
+    const removedApprovals = this.removeApprovalsForRunIds(runIds);
+    this.persistState();
+    return { removedRuns: runIds.size, removedApprovals };
+  }
+
+  hasCapacity(): boolean {
+    return this.activeRuns.size < MAX_CONCURRENT_RUNS;
+  }
+
+  startRun(config: RunConfig): RunRecord {
+    if (!this.hasCapacity()) {
+      throw new Error(`Maximum concurrent runs reached (${MAX_CONCURRENT_RUNS})`);
+    }
+
+    const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const prompt = config.planMode ? `${PLAN_MODE_PREAMBLE}\n\n${config.prompt}` : config.prompt;
+
+    const record: RunRecord = {
+      id: runId,
+      createdAt: Date.now(),
       updatedAt: Date.now(),
-    }));
+      status: "queued",
+      config,
+      sessionId: config.sessionId || null,
+      threadId: null,
+      summary: prompt.slice(0, 140),
+      events: [],
+      lastError: null,
+      changedFiles: [],
+      archivedAt: null,
+      usage: null,
+    };
 
-    auditLogger.log("queue.completed", {
-      queueItemId: item.id,
-      threadId: item.threadId,
-      attempts: item.attempts,
+    this.runs.set(runId, record);
+
+    const args = config.sessionId
+      ? [
+          "exec",
+          "resume",
+          "--json",
+          "--skip-git-repo-check",
+          "-m",
+          config.model,
+          "-c",
+          `reasoning_effort=${JSON.stringify(DEFAULT_REASONING_EFFORT)}`,
+          "-c",
+          `approval_policy=${JSON.stringify(config.approvalPolicy)}`,
+          "-c",
+          `sandbox_mode=${JSON.stringify(config.sandbox)}`,
+          config.sessionId,
+          prompt,
+        ]
+      : [
+          "exec",
+          "--json",
+          "--skip-git-repo-check",
+          "-C",
+          config.workspace,
+          "-m",
+          config.model,
+          "-c",
+          `reasoning_effort=${JSON.stringify(DEFAULT_REASONING_EFFORT)}`,
+          "-s",
+          config.sandbox,
+          "-c",
+          `approval_policy=${JSON.stringify(config.approvalPolicy)}`,
+          prompt,
+        ];
+
+    const child = spawn(this.codexPath, args, {
+      cwd: config.workspace,
+      stdio: ["ignore", "pipe", "pipe"],
     });
-    broadcastQueueNotification("queue/item/completed", {
-      queueItemId: item.id,
-      threadId: item.threadId,
-    });
-    return;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown queue error";
-
-    // Gracefully retry queue items that fail only because collaboration mode isn't supported.
-    if (item.collaborationMode) {
-      const lowered = message.toLowerCase();
-      const collaborationMismatch =
-        lowered.includes("collaboration") ||
-        lowered.includes("unknown variant") ||
-        lowered.includes("invalid type") ||
-        lowered.includes("missing field settings");
-
-      if (collaborationMismatch) {
-        try {
-          await startQueuedTurn(item, false);
-          updateQueuedMessage(item.id, (existing) => ({
-            ...existing,
-            status: "completed",
-            lastError: "Completed after collaboration-mode fallback",
-            nextAttemptAt: null,
-            completedAt: Date.now(),
-            updatedAt: Date.now(),
-          }));
-          auditLogger.log("queue.completed.with_fallback", {
-            queueItemId: item.id,
-            threadId: item.threadId,
-          });
-          broadcastQueueNotification("queue/item/completed", {
-            queueItemId: item.id,
-            threadId: item.threadId,
-            fallback: "withoutCollaborationMode",
-          });
-          return;
-        } catch (fallbackError) {
-          const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : "Unknown fallback queue error";
-          updateQueuedMessage(item.id, (existing) => ({
-            ...existing,
-            status: "pending",
-            lastError: fallbackMessage,
-            nextAttemptAt: Date.now() + QUEUE_RETRY_DELAY_MS,
-            updatedAt: Date.now(),
-            completedAt: null,
-          }));
-          auditLogger.log("queue.retry", {
-            queueItemId: item.id,
-            threadId: item.threadId,
-            message: fallbackMessage,
-            nextAttemptAt: Date.now() + QUEUE_RETRY_DELAY_MS,
-          });
-          scheduleQueueProcessing(QUEUE_RETRY_DELAY_MS);
-          return;
-        }
-      }
+    if (!child.stdout || !child.stderr) {
+      throw new Error("Failed to initialize codex process streams");
     }
 
-    const latest = queuedMessages.find((entry) => entry.id === item.id);
-    const attempts = latest?.attempts ?? item.attempts;
-    if (isThreadNotFoundError(error) || attempts >= QUEUE_MAX_ATTEMPTS) {
-      updateQueuedMessage(item.id, (existing) => ({
-        ...existing,
-        status: "failed",
-        lastError: message,
-        nextAttemptAt: null,
-        updatedAt: Date.now(),
-        completedAt: null,
-      }));
-      auditLogger.log("queue.failed", {
-        queueItemId: item.id,
-        threadId: item.threadId,
-        attempts,
-        message,
-      });
-      broadcastQueueNotification("queue/item/failed", {
-        queueItemId: item.id,
-        threadId: item.threadId,
-        error: message,
-      });
+    this.activeRuns.set(runId, { process: child, stdoutBuffer: "", stopRequested: false });
+    this.updateRun(runId, { status: "running" });
+    this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config } });
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      const active = this.activeRuns.get(runId);
+      if (!active) return;
+      active.stdoutBuffer += chunk.toString("utf8");
+      let idx = active.stdoutBuffer.indexOf("\n");
+      while (idx >= 0) {
+        const line = active.stdoutBuffer.slice(0, idx).trim();
+        active.stdoutBuffer = active.stdoutBuffer.slice(idx + 1);
+        if (line.length > 0) this.handleStdoutLine(runId, line);
+        idx = active.stdoutBuffer.indexOf("\n");
+      }
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      for (const line of text.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        if (isBenignCodexStderr(line)) continue;
+        const rendered = `${line}\n`;
+        this.appendEvent(runId, { source: "stderr", text: rendered });
+        this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: rendered } });
+        this.checkApprovalSignal(runId, line, null);
+      }
+    });
+
+    child.on("exit", (code) => {
+      const active = this.activeRuns.get(runId);
+      const stopRequested = Boolean(active?.stopRequested);
+      this.activeRuns.delete(runId);
+
+      const run = this.runs.get(runId);
+      if (!run) return;
+
+      if (stopRequested) {
+        this.updateRun(runId, { status: "stopped" });
+        this.emitSse({ kind: "run.stopped", runId, at: Date.now() });
+      } else if (code === 0 && run.status !== "failed") {
+        this.updateRun(runId, { status: "completed" });
+        this.emitSse({ kind: "run.completed", runId, at: Date.now() });
+      } else if (run.status !== "stopped") {
+        this.updateRun(runId, { status: "failed" });
+        this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code } });
+      }
+
+      this.refreshDiff(runId);
+      this.persistState();
+    });
+
+    this.persistState();
+    return record;
+  }
+
+  stopRun(runId: string): boolean {
+    const active = this.activeRuns.get(runId);
+    if (!active) return false;
+
+    active.stopRequested = true;
+    active.process.kill("SIGINT");
+
+    setTimeout(() => {
+      const running = this.activeRuns.get(runId);
+      if (!running) return;
+      running.process.kill("SIGTERM");
+      setTimeout(() => {
+        const stillRunning = this.activeRuns.get(runId);
+        if (!stillRunning) return;
+        stillRunning.process.kill("SIGKILL");
+      }, 2500);
+    }, 2500);
+
+    return true;
+  }
+
+  acceptApproval(id: string): ApprovalQueueItem | null {
+    const item = this.approvals.get(id);
+    if (!item) return null;
+    item.status = "accepted";
+    this.approvals.set(id, item);
+    this.persistState();
+    return item;
+  }
+
+  private handleStdoutLine(runId: string, line: string): void {
+    this.appendEvent(runId, { source: "stdout", text: line });
+    this.emitSse({ kind: "run.stdout", runId, at: Date.now(), payload: { text: line } });
+
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      parsed = JSON.parse(line) as Record<string, unknown>;
+    } catch {
       return;
     }
 
-    const nextAttemptAt = Date.now() + QUEUE_RETRY_DELAY_MS;
-    updateQueuedMessage(item.id, (existing) => ({
-      ...existing,
+    const run = this.runs.get(runId);
+    if (!run) return;
+
+    const type = typeof parsed.type === "string" ? parsed.type : "";
+    if (type === "thread.started" && typeof parsed.thread_id === "string") {
+      const patch: Partial<RunRecord> = { threadId: parsed.thread_id };
+      if (!run.sessionId) {
+        patch.sessionId = parsed.thread_id;
+      }
+      this.updateRun(runId, patch);
+    }
+
+    if (type === "turn.completed") {
+      const usage = parsed.usage as Record<string, unknown> | undefined;
+      this.updateRun(runId, {
+        usage: usage
+          ? {
+              inputTokens: toOptionalNumber(usage.input_tokens),
+              outputTokens: toOptionalNumber(usage.output_tokens),
+              cachedInputTokens: toOptionalNumber(usage.cached_input_tokens),
+            }
+          : null,
+      });
+    }
+
+    if (type.startsWith("item.")) {
+      const item = parsed.item as Record<string, unknown> | undefined;
+      const itemType = typeof item?.type === "string" ? item.type : "unknown";
+      this.emitSse({ kind: "run.item", runId, at: Date.now(), payload: { type, item } });
+
+      if (itemType === "agent_message") {
+        const text = typeof item?.text === "string" ? item.text : "";
+        if (text) this.updateRun(runId, { summary: text.slice(0, 240) });
+      }
+
+      if (itemType === "file_change") {
+        const changes = Array.isArray(item?.changes) ? item.changes : [];
+        const current = new Set(run.changedFiles);
+        for (const change of changes) {
+          const row = change as Record<string, unknown>;
+          if (typeof row.path === "string") current.add(row.path);
+        }
+        this.updateRun(runId, { changedFiles: [...current] });
+        this.refreshDiff(runId);
+      }
+
+      if (itemType === "command_execution") {
+        const output = typeof item?.aggregated_output === "string" ? item.aggregated_output : "";
+        const status = typeof item?.status === "string" ? item.status : "";
+        if (status === "failed" && output) {
+          this.updateRun(runId, { lastError: output.slice(0, 600) });
+          this.checkApprovalSignal(runId, output, item || null);
+        }
+      }
+
+      if (itemType === "error") {
+        const message = typeof item?.message === "string" ? item.message : "Unknown error";
+        this.updateRun(runId, { lastError: message, status: "failed" });
+        this.checkApprovalSignal(runId, message, item || null);
+      }
+    }
+  }
+
+  private checkApprovalSignal(runId: string, text: string, item: Record<string, unknown> | null): void {
+    const lower = text.toLowerCase();
+    if (!looksLikeApprovalIssue(lower)) return;
+
+    const command = item && typeof item.command === "string" ? item.command : null;
+    const suggestedSandbox =
+      lower.includes("read-only") || lower.includes("operation not permitted") ? "workspace-write" : "danger-full-access";
+
+    const approval: ApprovalQueueItem = {
+      id: `approval_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      runId,
+      createdAt: Date.now(),
+      reason: text.slice(0, 600),
+      suggestedSandbox,
+      suggestedApprovalPolicy: "on-request",
+      command,
       status: "pending",
-      lastError: message,
-      nextAttemptAt,
-      updatedAt: Date.now(),
-      completedAt: null,
-    }));
-    auditLogger.log("queue.retry", {
-      queueItemId: item.id,
-      threadId: item.threadId,
-      attempts,
-      message,
-      nextAttemptAt,
-    });
-    scheduleQueueProcessing(QUEUE_RETRY_DELAY_MS);
+    };
+
+    this.approvals.set(approval.id, approval);
+    this.persistState();
+    this.emitSse({ kind: "run.approvalQueued", runId, at: Date.now(), payload: approval as unknown as Record<string, unknown> });
+  }
+
+  private refreshDiff(runId: string): void {
+    const run = this.runs.get(runId);
+    if (!run) return;
+
+    const isGitRepo = isGitRepository(run.config.workspace);
+    if (isGitRepo) {
+      const result = spawnSync("git", ["-C", run.config.workspace, "diff", "--no-color"], {
+        encoding: "utf8",
+      });
+      const snapshot: DiffSnapshot = {
+        runId,
+        at: Date.now(),
+        isGitRepo: true,
+        diffText: result.stdout || "",
+        changedFiles: run.changedFiles,
+        fallbackMessage: null,
+      };
+      this.diffs.set(runId, snapshot);
+      this.emitSse({ kind: "run.diffUpdated", runId, at: Date.now(), payload: snapshot as unknown as Record<string, unknown> });
+      return;
+    }
+
+    const snapshot: DiffSnapshot = {
+      runId,
+      at: Date.now(),
+      isGitRepo: false,
+      diffText: "",
+      changedFiles: run.changedFiles,
+      fallbackMessage: "No git repository detected. Showing changed file paths only.",
+    };
+    this.diffs.set(runId, snapshot);
+    this.emitSse({ kind: "run.diffUpdated", runId, at: Date.now(), payload: snapshot as unknown as Record<string, unknown> });
+  }
+
+  private appendEvent(runId: string, partial: Pick<RunEventEntry, "source" | "text">): void {
+    const run = this.runs.get(runId);
+    if (!run) return;
+
+    const events = [...run.events, { id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, at: Date.now(), ...partial }];
+    const capped = events.length > 1500 ? events.slice(events.length - 1500) : events;
+    this.updateRun(runId, { events: capped });
+  }
+
+  private updateRun(runId: string, patch: Partial<RunRecord>): void {
+    const run = this.runs.get(runId);
+    if (!run) return;
+    const next = { ...run, ...patch, updatedAt: Date.now() };
+    this.runs.set(runId, next);
+    this.persistState();
+  }
+
+  private emitSse(evt: SseEvent): void {
+    this.emit("sse", evt);
+  }
+
+  private getSessionRuns(sessionId: string): RunRecord[] {
+    return [...this.runs.values()].filter((run) => runSessionId(run) === sessionId);
+  }
+
+  private hasActiveRunInSession(sessionId: string): boolean {
+    return this.getSessionRuns(sessionId).some((run) => this.activeRuns.has(run.id));
+  }
+
+  private removeApprovalsForRunIds(runIds: Set<string>): number {
+    let removed = 0;
+    for (const [approvalId, approval] of this.approvals.entries()) {
+      if (!runIds.has(approval.runId)) continue;
+      this.approvals.delete(approvalId);
+      removed += 1;
+    }
+    return removed;
+  }
+
+  private persistState(): void {
+    persistRuns(this.getRuns(true), this.getApprovals());
   }
 }
 
-async function processQueue(): Promise<void> {
-  if (!bridgeState.running || !bridgeState.initialized) {
-    scheduleQueueProcessing(1_000);
-    return;
+class TerminalManager extends EventEmitter {
+  private terminals = new Map<string, ActiveTerminal>();
+
+  constructor(private readonly getDefaultWorkspace: () => string) {
+    super();
   }
 
-  const now = Date.now();
-  const candidates = queuedMessages
-    .filter((entry) => entry.status === "pending" && (!entry.nextAttemptAt || entry.nextAttemptAt <= now))
-    .sort((a, b) => a.createdAt - b.createdAt);
+  getSession(sessionId: string): TerminalSessionSnapshot | null {
+    const active = this.terminals.get(sessionId);
+    if (!active) return null;
+    return { ...active.session };
+  }
 
-  for (const candidate of candidates) {
-    if (queueThreadsInFlight.has(candidate.threadId)) continue;
+  startSession(sessionId: string, workspace: string): TerminalSessionSnapshot {
+    const existing = this.terminals.get(sessionId);
+    if (existing?.session.status === "running") {
+      return { ...existing.session };
+    }
 
-    const transitioned = updateQueuedMessage(candidate.id, (existing) => ({
-      ...existing,
-      status: "processing",
-      attempts: existing.attempts + 1,
-      nextAttemptAt: null,
+    const resolvedWorkspace = path.resolve(workspace || this.getDefaultWorkspace());
+    const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/zsh");
+    const shellName = path.basename(shell).toLowerCase();
+    const useShellRc = process.env.TERMINAL_USE_SHELL_RC === "1";
+    let shellArgs: string[] = [];
+    if (process.platform !== "win32") {
+      if (useShellRc) {
+        shellArgs = ["-i"];
+      } else if (shellName.includes("zsh")) {
+        shellArgs = ["-f", "-i"];
+      } else if (shellName.includes("bash")) {
+        shellArgs = ["--noprofile", "--norc", "-i"];
+      }
+    }
+
+    const child = spawn(shell, shellArgs, {
+      cwd: resolvedWorkspace,
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        TERM: process.env.TERM || "xterm-256color",
+        COLORTERM: process.env.COLORTERM || "truecolor",
+        PS1: process.env.TERMINAL_PS1 || "$ ",
+        PROMPT: process.env.TERMINAL_PS1 || "$ ",
+        PROMPT_EOL_MARK: "",
+      },
+    });
+
+    if (!child.stdin || !child.stdout || !child.stderr) {
+      throw new Error("Failed to initialize terminal streams");
+    }
+
+    const now = Date.now();
+    const snapshot: TerminalSessionSnapshot = {
+      sessionId,
+      status: "running",
+      workspace: resolvedWorkspace,
+      shell,
+      pid: child.pid ?? null,
+      createdAt: now,
+      updatedAt: now,
+      output: "",
+    };
+
+    const active: ActiveTerminal = {
+      process: child,
+      session: snapshot,
+    };
+    this.terminals.set(sessionId, active);
+    this.emitSse({
+      kind: "terminal.started",
+      at: now,
+      sessionId,
+      payload: { terminal: snapshot },
+    });
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      this.handleOutputChunk(sessionId, "stdout", chunk.toString("utf8"));
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      this.handleOutputChunk(sessionId, "stderr", chunk.toString("utf8"));
+    });
+
+    child.on("exit", (code, signal) => {
+      const current = this.terminals.get(sessionId);
+      if (!current) return;
+      const stoppedSession: TerminalSessionSnapshot = {
+        ...current.session,
+        status: "stopped",
+        pid: null,
+        updatedAt: Date.now(),
+      };
+      this.terminals.set(sessionId, {
+        ...current,
+        session: stoppedSession,
+      });
+
+      this.emitSse({
+        kind: "terminal.stopped",
+        at: Date.now(),
+        sessionId,
+        payload: {
+          terminal: stoppedSession,
+          code: code ?? null,
+          signal: signal ?? null,
+        },
+      });
+    });
+
+    return { ...snapshot };
+  }
+
+  writeInput(sessionId: string, input: string): boolean {
+    const active = this.terminals.get(sessionId);
+    if (!active || active.session.status !== "running") return false;
+    if (!active.process.stdin) return false;
+    active.process.stdin.write(input);
+    active.session = { ...active.session, updatedAt: Date.now() };
+    this.terminals.set(sessionId, active);
+    return true;
+  }
+
+  interruptSession(sessionId: string): TerminalSessionSnapshot | null {
+    const active = this.terminals.get(sessionId);
+    if (!active) return null;
+    if (active.session.status !== "running") return { ...active.session };
+    this.sendSignal(active, "SIGINT");
+    return { ...active.session };
+  }
+
+  stopSession(sessionId: string): TerminalSessionSnapshot | null {
+    const active = this.terminals.get(sessionId);
+    if (!active) return null;
+
+    if (active.session.status !== "running") {
+      return { ...active.session };
+    }
+
+    const targetPid = active.process.pid;
+    this.sendSignal(active, "SIGTERM");
+
+    setTimeout(() => {
+      const current = this.terminals.get(sessionId);
+      if (!current || current.session.status !== "running" || current.process.pid !== targetPid) return;
+      this.sendSignal(current, "SIGKILL");
+    }, 1500);
+
+    return { ...active.session };
+  }
+
+  removeSession(sessionId: string): void {
+    const active = this.terminals.get(sessionId);
+    if (!active) return;
+    if (active.session.status === "running") {
+      this.sendSignal(active, "SIGKILL");
+    }
+    this.terminals.delete(sessionId);
+  }
+
+  private handleOutputChunk(sessionId: string, stream: "stdout" | "stderr", text: string): void {
+    if (!text) return;
+    const cleaned = sanitizeTerminalChunk(text);
+    if (!cleaned) return;
+    const active = this.terminals.get(sessionId);
+    if (!active) return;
+
+    const merged = `${active.session.output}${cleaned}`;
+    const output = merged.length > TERMINAL_HISTORY_MAX_CHARS
+      ? merged.slice(merged.length - TERMINAL_HISTORY_MAX_CHARS)
+      : merged;
+
+    const nextSession: TerminalSessionSnapshot = {
+      ...active.session,
+      output,
       updatedAt: Date.now(),
-      completedAt: null,
-    }));
-    if (!transitioned) continue;
+    };
+    this.terminals.set(sessionId, { ...active, session: nextSession });
 
-    queueThreadsInFlight.add(transitioned.threadId);
-    broadcastQueueNotification("queue/item/processing", {
-      queueItemId: transitioned.id,
-      threadId: transitioned.threadId,
-      attempts: transitioned.attempts,
-    });
-    void processQueuedMessage(transitioned.id).finally(() => {
-      queueThreadsInFlight.delete(transitioned.threadId);
-      scheduleQueueProcessing(0);
+    this.emitSse({
+      kind: "terminal.output",
+      at: Date.now(),
+      sessionId,
+      payload: {
+        sessionId,
+        stream,
+        text: cleaned,
+      },
     });
   }
-}
 
-persistQueuedMessages();
-
-function applyRpcDefaults(method: AllowedRpcMethod, params: Record<string, unknown>): Record<string, unknown> {
-  const next = { ...params };
-  const workspaceRoot = getWorkspaceRoot();
-
-  if (method === "thread/start") {
-    if (!next.model) next.model = config.defaultModel;
-    if (!next.cwd) next.cwd = workspaceRoot;
-    if (!next.approvalPolicy) next.approvalPolicy = config.defaultApprovalPolicy;
-    else next.approvalPolicy = normalizeApprovalPolicy(next.approvalPolicy);
-    if (!next.sandbox) next.sandbox = normalizeThreadSandbox(config.defaultSandboxType);
-    else next.sandbox = normalizeThreadSandbox(next.sandbox);
+  private emitSse(evt: SseEvent): void {
+    this.emit("sse", evt);
   }
 
-  if (method === "turn/start") {
-    if (!next.cwd) next.cwd = workspaceRoot;
-    if (!next.approvalPolicy) next.approvalPolicy = config.defaultApprovalPolicy;
-    else next.approvalPolicy = normalizeApprovalPolicy(next.approvalPolicy);
-    if (!next.sandboxPolicy) {
-      next.sandboxPolicy = {
-        type: normalizeTurnSandboxType(config.defaultSandboxType),
-        writableRoots: [workspaceRoot],
-        networkAccess: config.defaultNetworkAccess,
-      };
-    } else if (isObject(next.sandboxPolicy)) {
-      next.sandboxPolicy = {
-        ...next.sandboxPolicy,
-        type: normalizeTurnSandboxType((next.sandboxPolicy as Record<string, unknown>).type),
-      };
+  private sendSignal(active: ActiveTerminal, signal: NodeJS.Signals): void {
+    const pid = active.process.pid;
+    if (!pid) return;
+    try {
+      if (process.platform !== "win32") {
+        process.kill(-pid, signal);
+        return;
+      }
+      active.process.kill(signal);
+    } catch {
+      // ignore signal errors
     }
   }
+}
 
-  if (method === "command/exec") {
-    if (!next.cwd) next.cwd = workspaceRoot;
+const PLAN_MODE_PREAMBLE = `Plan Mode is enabled. You must:
+1) Explore first with non-mutating actions.
+2) Clarify assumptions before implementation.
+3) Produce explicit implementation steps before execution.
+4) Do not skip risk/edge-case analysis.`;
+
+function looksLikeApprovalIssue(lower: string): boolean {
+  return (
+    lower.includes("operation not permitted") ||
+    lower.includes("read-only") ||
+    lower.includes("rejected by user approval settings") ||
+    lower.includes("network access is restricted") ||
+    lower.includes("sandbox") ||
+    lower.includes("outside of the project") ||
+    lower.includes("not permitted")
+  );
+}
+
+function stripAnsi(input: string): string {
+  return input.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function sanitizeTerminalChunk(input: string): string {
+  if (!input) return "";
+
+  let text = input;
+  // Remove OSC sequences (title updates, etc.).
+  text = text.replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g, "");
+  // Remove CSI/control escape sequences.
+  text = text.replace(/\u001B\[[0-9;?]*[ -/]*[@-~]/g, "");
+  // Remove carriage-return redraw artifacts.
+  text = text.replace(/\r/g, "");
+
+  while (/[^\n]\u0008/.test(text)) {
+    text = text.replace(/[^\n]\u0008/g, "");
   }
+  text = text.replace(/\u0008/g, "");
+  return text;
+}
 
-  if (method === "account/login/start") {
-    next.type = "chatgpt";
+function isBenignCodexStderr(text: string): boolean {
+  const lower = stripAnsi(text).toLowerCase();
+  return lower.includes("failed to record rollout items: thread")
+    && lower.includes(" not found");
+}
+
+function toOptionalNumber(input: unknown): number | undefined {
+  return typeof input === "number" ? input : undefined;
+}
+
+function isGitRepository(workspace: string): boolean {
+  const res = spawnSync("git", ["-C", workspace, "rev-parse", "--is-inside-work-tree"], {
+    encoding: "utf8",
+  });
+  return res.status === 0 && res.stdout.trim() === "true";
+}
+
+function safeJsonParse<T>(text: string, fallback: T): T {
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return fallback;
   }
-
-  return next;
 }
 
-function normalizePathLike(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  if (!path.isAbsolute(value)) return null;
-  return path.resolve(value);
+function ensureDataDir(): void {
+  fs.mkdirSync(path.dirname(APP_STATE_PATH), { recursive: true });
 }
 
-function isPathWithinWorkspace(candidate: string): boolean {
-  const workspace = getWorkspaceRoot();
-  const target = path.resolve(candidate);
-  return target === workspace || target.startsWith(`${workspace}${path.sep}`);
-}
-
-function collectWorkspacePaths(params: Record<string, unknown>): string[] {
-  const candidates: string[] = [];
-  for (const key of ["path", "source", "sourcePath", "from", "destination", "to", "targetPath", "cwd"]) {
-    const normalized = normalizePathLike(params[key]);
-    if (normalized) candidates.push(normalized);
+function loadPersistedUiState(defaultWorkspace: string): PersistedUiState {
+  ensureDataDir();
+  if (!fs.existsSync(APP_STATE_PATH)) {
+    return { activeWorkspace: defaultWorkspace, manualWorkspaces: [] };
   }
-  return Array.from(new Set(candidates));
-}
-
-function getCapabilities(): BootstrapCapabilities {
+  const parsed = safeJsonParse<PersistedUiState>(fs.readFileSync(APP_STATE_PATH, "utf8"), {
+    activeWorkspace: defaultWorkspace,
+    manualWorkspaces: [],
+  });
   return {
-    methods: getCapabilityDescriptors(config.groupEnabled),
-    groups: config.groupEnabled,
+    activeWorkspace: parsed.activeWorkspace || defaultWorkspace,
+    manualWorkspaces: Array.isArray(parsed.manualWorkspaces) ? parsed.manualWorkspaces : [],
   };
 }
 
-function guardRequirement(policy: MethodPolicy, reason: string, expiresInMs?: number): GuardRequirement {
-  return {
-    required: true,
-    tier: policy.riskTier,
-    group: policy.group,
-    reason,
-    allowAcceptForSession: true,
-    requiresReauthPassword: policy.riskTier >= 3,
-    ...(typeof expiresInMs === "number" ? { expiresInMs } : {}),
-  };
+function persistUiState(state: PersistedUiState): void {
+  ensureDataDir();
+  fs.writeFileSync(APP_STATE_PATH, JSON.stringify(state, null, 2));
 }
 
-function enforceGuards(input: {
-  policy: MethodPolicy;
-  method: AllowedRpcMethod;
-  params: Record<string, unknown>;
-  sessionToken: string;
-  guard?: {
-    acceptRisk?: boolean;
-    acceptForSession?: boolean;
-    reauthPassword?: string;
-  };
-}): { ok: true; expiresAt: number | null } | { ok: false; guard: GuardRequirement; status: number } {
-  const { policy, params, sessionToken, guard } = input;
+function loadPersistedRuns(): { runs: RunRecord[]; approvals: ApprovalQueueItem[] } {
+  ensureDataDir();
+  if (!fs.existsSync(RUNS_PATH)) return { runs: [], approvals: [] };
+  return safeJsonParse<{ runs: RunRecord[]; approvals: ApprovalQueueItem[] }>(fs.readFileSync(RUNS_PATH, "utf8"), {
+    runs: [],
+    approvals: [],
+  });
+}
 
-  if (!config.groupEnabled[policy.group]) {
+function persistRuns(runs: RunRecord[], approvals: ApprovalQueueItem[]): void {
+  ensureDataDir();
+  fs.writeFileSync(RUNS_PATH, JSON.stringify({ runs, approvals }, null, 2));
+}
+
+function findUpFile(startDir: string, fileName: string): string | null {
+  let dir = path.resolve(startDir);
+  while (true) {
+    const candidate = path.join(dir, fileName);
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+function resolveConfigWorkspaces(): { defaultWorkspace: string; options: WorkspaceOption[] } {
+  const configPath = findUpFile(rootDir, "config.yaml") || path.resolve(rootDir, "config.yaml");
+  if (!fs.existsSync(configPath)) {
+    const cwd = process.cwd();
     return {
-      ok: false,
-      status: 403,
-      guard: guardRequirement(policy, `Method group disabled: ${policy.group}`),
+      defaultWorkspace: cwd,
+      options: [
+        {
+          id: "cwd",
+          name: "Current Workspace",
+          path: cwd,
+          source: "manual",
+        },
+      ],
     };
   }
 
-  if (policy.group === "filesystem") {
-    const touchedPaths = collectWorkspacePaths(params);
-    const outside = touchedPaths.find((entry) => !isPathWithinWorkspace(entry));
-    if (outside) {
+  const text = fs.readFileSync(configPath, "utf8");
+  const lines = text.split(/\r?\n/);
+
+  let defaultWorkspace = process.cwd();
+  const options: WorkspaceOption[] = [];
+  let inRepos = false;
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (line.trim().startsWith("default_workspace:")) {
+      const value = line.split(":").slice(1).join(":").trim().replace(/^['"]|['"]$/g, "");
+      if (value) {
+        defaultWorkspace = expandHome(value);
+        options.push({
+          id: "default_workspace",
+          name: "Default Workspace",
+          path: defaultWorkspace,
+          source: "config-default",
+        });
+      }
+      continue;
+    }
+
+    if (line.trim() === "repos:") {
+      inRepos = true;
+      continue;
+    }
+
+    if (!inRepos) continue;
+    const match = line.match(/^\s{2}([^:]+):\s*(.+)$/);
+    if (!match) continue;
+    const name = match[1].trim();
+    const repoPath = expandHome(match[2].trim().replace(/^['"]|['"]$/g, ""));
+
+    options.push({
+      id: `repo_${name}`,
+      name,
+      path: repoPath,
+      source: "config-repo",
+    });
+  }
+
+  const dedup = new Map<string, WorkspaceOption>();
+  for (const option of options) dedup.set(option.path, option);
+
+  return {
+    defaultWorkspace,
+    options: [...dedup.values()],
+  };
+}
+
+function expandHome(value: string): string {
+  if (!value.startsWith("~")) return value;
+  return path.join(os.homedir(), value.slice(1));
+}
+
+function listTree(root: string, relativePath: string, depth: number): FileTreeNode[] {
+  const resolved = path.resolve(root, relativePath || ".");
+  if (!resolved.startsWith(path.resolve(root))) return [];
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return [];
+
+  const ignored = new Set([".git", "node_modules", "dist", ".next", "coverage", ".turbo"]);
+  const entries = fs.readdirSync(resolved, { withFileTypes: true })
+    .filter((entry) => !ignored.has(entry.name))
+    .sort((a, b) => {
+      if (a.isDirectory() && !b.isDirectory()) return -1;
+      if (!a.isDirectory() && b.isDirectory()) return 1;
+      return a.name.localeCompare(b.name);
+    });
+
+  return entries.map((entry) => {
+    const childPath = path.join(resolved, entry.name);
+    const rel = path.relative(root, childPath) || ".";
+    if (entry.isDirectory()) {
       return {
-        ok: false,
-        status: 403,
-        guard: guardRequirement(policy, `Path is outside selected workspace root: ${outside}`),
+        name: entry.name,
+        path: rel,
+        type: "directory" as const,
+        children: depth > 0 ? listTree(root, rel, depth - 1) : [],
       };
+    }
+    return {
+      name: entry.name,
+      path: rel,
+      type: "file" as const,
+    };
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function looksLikeEnvelopeMessage(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  return normalized.startsWith("<user_instructions>")
+    || normalized.startsWith("<environment_context>")
+    || normalized.startsWith("<ide_context>");
+}
+
+function normalizeSessionTitle(raw: string, fallback: string): string {
+  const collapsed = raw.replace(/\s+/g, " ").trim();
+  if (!collapsed) return fallback;
+
+  const dashIndex = collapsed.indexOf("---");
+  const trimmed = dashIndex >= 0 ? collapsed.slice(0, dashIndex).trim() : collapsed;
+  const title = trimmed || fallback;
+
+  return title.length > 160 ? `${title.slice(0, 157)}...` : title;
+}
+
+function extractFirstUserMessage(lines: string[]): string {
+  let fallback = "";
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const row = safeJsonParse<Record<string, unknown>>(line, {});
+    if (row.type !== "message" || row.role !== "user") continue;
+
+    const content = Array.isArray(row.content) ? row.content : [];
+    const textParts: string[] = [];
+    for (const part of content) {
+      if (!isRecord(part) || part.type !== "input_text") continue;
+      if (typeof part.text === "string" && part.text.trim()) {
+        textParts.push(part.text);
+      }
+    }
+
+    const candidate = textParts.join("\n").trim();
+    if (!candidate) continue;
+    if (!fallback) fallback = candidate;
+    if (!looksLikeEnvelopeMessage(candidate)) return candidate;
+  }
+
+  return fallback;
+}
+
+function loadCodexSessionHistory(limit = 0): SessionHistoryEntry[] {
+  const root = path.join(os.homedir(), ".codex", "sessions");
+  if (!fs.existsSync(root)) return [];
+
+  const files: string[] = [];
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop() as string;
+    for (const name of fs.readdirSync(dir)) {
+      const full = path.join(dir, name);
+      const stat = fs.statSync(full);
+      if (stat.isDirectory()) {
+        stack.push(full);
+      } else if (name.endsWith(".jsonl")) {
+        files.push(full);
+      }
     }
   }
 
-  if (policy.riskTier <= 1) {
-    return { ok: true, expiresAt: null };
+  files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  const selected = limit > 0 ? files.slice(0, limit) : files;
+
+  const out: SessionHistoryEntry[] = [];
+  for (const file of selected) {
+    if (file.toLowerCase().includes(`${path.sep}archived${path.sep}`)) continue;
+    const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+    let payload: Record<string, unknown> | null = null;
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const row = safeJsonParse<Record<string, unknown>>(line, {});
+      if (row.type !== "session_meta" || !isRecord(row.payload)) continue;
+      payload = row.payload;
+      break;
+    }
+
+    if (!payload) continue;
+
+    const id = typeof payload.id === "string" ? payload.id : path.basename(file);
+    const timestamp = typeof payload.timestamp === "string" ? payload.timestamp : new Date(fs.statSync(file).mtimeMs).toISOString();
+    const cwd = typeof payload.cwd === "string" ? payload.cwd : "";
+    const source = typeof payload.source === "string" ? payload.source : "unknown";
+    const firstMessage = extractFirstUserMessage(lines);
+    const summary = normalizeSessionTitle(firstMessage, `Session in ${cwd || "unknown cwd"}`);
+
+    out.push({
+      id,
+      timestamp,
+      cwd,
+      source,
+      model: typeof payload.model === "string" ? payload.model : undefined,
+      cliVersion: typeof payload.cli_version === "string" ? payload.cli_version : undefined,
+      summary,
+    });
   }
 
-  if (sessionStore.hasActiveRiskAcceptance(sessionToken, policy.group)) {
-    const expiresAt = sessionStore.getRiskAcceptanceExpiry(sessionToken, policy.group);
-    return { ok: true, expiresAt };
-  }
+  return out;
+}
 
-  if (!guard?.acceptRisk) {
+const { defaultWorkspace, options: configWorkspaceOptions } = resolveConfigWorkspaces();
+let uiState = loadPersistedUiState(defaultWorkspace);
+
+const app = express();
+app.use(express.json({ limit: "2mb" }));
+app.use(
+  cors({
+    origin: [
+      `http://localhost:${WEB_PORT}`,
+      `http://127.0.0.1:${WEB_PORT}`,
+      `http://0.0.0.0:${WEB_PORT}`,
+    ],
+    credentials: false,
+  }),
+);
+
+const runManager = new RunManager(CODEX_PATH);
+const persisted = loadPersistedRuns();
+runManager.loadPersisted(persisted.runs, persisted.approvals);
+const terminalManager = new TerminalManager(() => uiState.activeWorkspace);
+
+const sseClients = new Set<express.Response>();
+runManager.on("sse", (event: SseEvent) => {
+  const data = `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const client of sseClients) client.write(data);
+});
+terminalManager.on("sse", (event: SseEvent) => {
+  const data = `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const client of sseClients) client.write(data);
+});
+
+setInterval(() => {
+  const evt: SseEvent = { kind: "heartbeat", at: Date.now() };
+  const data = `event: heartbeat\ndata: ${JSON.stringify(evt)}\n\n`;
+  for (const client of sseClients) client.write(data);
+}, 10000);
+
+function apiOk<T>(data: T): ApiResponse<T> {
+  return { ok: true, data };
+}
+
+function apiErr(message: string): ApiResponse<never> {
+  return { ok: false, error: { message } };
+}
+
+function runCodexCommandStatus(args: string[]): CodexCommandStatus {
+  const command = [CODEX_PATH, ...args].join(" ");
+  const result = spawnSync(CODEX_PATH, args, {
+    cwd: uiState.activeWorkspace,
+    encoding: "utf8",
+    timeout: 15000,
+  });
+
+  const statusCode = typeof result.status === "number" ? result.status : 1;
+  const errorText = result.error ? (result.error instanceof Error ? result.error.message : String(result.error)) : "";
+  const stdout = (result.stdout || "").trim();
+  const stderr = [result.stderr || "", errorText].filter(Boolean).join("\n").trim();
+
+  return {
+    command,
+    ok: statusCode === 0,
+    exitCode: statusCode,
+    stdout,
+    stderr,
+  };
+}
+
+function extractRemainingTokens(raw: string): number | null {
+  const patterns = [
+    /remaining\s+tokens?\s*[:=]\s*([0-9][0-9,]*)/i,
+    /tokens?\s+remaining\s*[:=]\s*([0-9][0-9,]*)/i,
+    /remaining\s*[:=]\s*([0-9][0-9,]*)\s*tokens?/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    if (!match?.[1]) continue;
+    const value = Number(match[1].replace(/,/g, ""));
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function resolveTokenStatus(accountStatus: CodexCommandStatus): CodexTokenStatus {
+  if (!accountStatus.ok) {
     return {
-      ok: false,
-      status: 409,
-      guard: guardRequirement(policy, `Risk acknowledgement required for ${policy.group} operations`, config.riskAcceptTtlMs),
+      source: "codex-login-status",
+      remainingTokens: null,
+      note: "Unable to read account status from Codex CLI.",
     };
   }
 
-  if (policy.riskTier >= 3) {
-    const password = guard.reauthPassword || "";
-    if (!sessionStore.verifyPassword(password)) {
-      return {
-        ok: false,
-        status: 401,
-        guard: guardRequirement(policy, "Password re-authentication required", config.riskAcceptTtlMs),
-      };
-    }
+  const combined = `${accountStatus.stdout}\n${accountStatus.stderr}`.trim();
+  const remainingTokens = extractRemainingTokens(combined);
+  if (remainingTokens !== null) {
+    return {
+      source: "codex-login-status",
+      remainingTokens,
+      note: null,
+    };
   }
 
-  if (guard.acceptForSession) {
-    const expiresAt = sessionStore.grantRiskAcceptance(sessionToken, policy.group, config.riskAcceptTtlMs);
-    return { ok: true, expiresAt };
-  }
-
-  return { ok: true, expiresAt: null };
+  return {
+    source: "codex-login-status",
+    remainingTokens: null,
+    note: "Codex CLI does not expose remaining tokens for this account.",
+  };
 }
 
-async function bootstrapData(): Promise<Record<string, unknown>> {
-  const requests = {
-    account: bridge.request("account/read", { refreshToken: false }),
-    rateLimits: bridge.request("account/rateLimits/read", {}),
-    threads: bridge.request("thread/list", {
-      cursor: null,
-      limit: 50,
-      sortKey: "updated_at",
-      archived: false,
-    }),
-    archivedThreads: bridge.request("thread/list", {
-      cursor: null,
-      limit: 50,
-      sortKey: "updated_at",
-      archived: true,
-    }),
-    loadedThreads: bridge.request("thread/loaded/list", {}),
-    models: bridge.request("model/list", {
-      limit: 20,
-      includeHidden: false,
-    }),
-    mcpServers: bridge.request("mcpServerStatus/list", {
-      cursor: null,
-      limit: 100,
-      detail: "toolsAndAuthOnly",
-    }),
-    featureFlags: bridge.request("experimentalFeature/list", {
-      limit: 100,
-    }),
-    collaborationModes: bridge.request("collaborationMode/list", {}),
-  };
+function getWorkspaces(): WorkspaceOption[] {
+  const merged = new Map<string, WorkspaceOption>();
+  for (const option of configWorkspaceOptions) merged.set(option.path, option);
 
-  const settled = await Promise.allSettled(Object.values(requests));
-  const keys = Object.keys(requests);
-  const result: Record<string, unknown> = {
-    uiState: uiStateStore.read(),
-    capabilities: getCapabilities(),
-    queue: queueSnapshot(),
-  };
-
-  settled.forEach((entry, index) => {
-    const key = keys[index];
-    if (entry.status === "fulfilled") {
-      result[key] = entry.value;
-    } else {
-      result[key] = {
-        error: sanitizeError(entry.reason),
-      };
-    }
-  });
-
-  return result;
-}
-
-bridge.on("notification", (message: BridgeNotificationEvent) => {
-  if (
-    message.method.startsWith("turn/") ||
-    message.method.startsWith("item/") ||
-    message.method === "serverRequest/resolved"
-  ) {
-    debugLog("bridge.notification", {
-      method: message.method,
-      threadId: message.params.threadId ?? null,
-      turnId: message.params.turnId ?? null,
-      itemId: message.params.itemId ?? null,
+  for (const manual of uiState.manualWorkspaces) {
+    merged.set(manual, {
+      id: `manual_${manual}`,
+      name: path.basename(manual) || manual,
+      path: manual,
+      source: "manual",
     });
   }
-  broadcast({ kind: "notification", ...message, at: Date.now() });
-});
 
-bridge.on("serverRequest", (request: BridgeServerRequestEvent) => {
-  debugLog("bridge.serverRequest", {
-    id: request.id,
-    method: request.method,
-    threadId: request.params.threadId ?? null,
-    turnId: request.params.turnId ?? null,
-    itemId: request.params.itemId ?? null,
-  });
-  broadcast({ kind: "serverRequest", ...request, at: Date.now() });
-});
-
-bridge.on("status", (status: BridgeStatusEvent) => {
-  bridgeState.lastStatus = status;
-
-  if (status.type === "started") bridgeState.running = true;
-  if (status.type === "initialized") bridgeState.initialized = true;
-  if (status.type === "exit") {
-    bridgeState.running = false;
-    bridgeState.initialized = false;
-  }
-  if (status.type === "initialized" || status.type === "restart_completed") {
-    scheduleQueueProcessing(0);
+  if (!merged.has(uiState.activeWorkspace)) {
+    merged.set(uiState.activeWorkspace, {
+      id: `active_${uiState.activeWorkspace}`,
+      name: path.basename(uiState.activeWorkspace) || uiState.activeWorkspace,
+      path: uiState.activeWorkspace,
+      source: "manual",
+    });
   }
 
-  auditLogger.log("bridge.status", status);
-  broadcast({ kind: "bridgeStatus", ...status, at: Date.now() });
-});
+  return [...merged.values()];
+}
 
-app.get("/api/health", (_req, res) => {
-  res.json({
-    ok: true,
-    bridgeState,
-  });
-});
-
-app.get("/api/session", (req, res) => {
-  const token = extractSessionToken(req);
-  const authenticated = sessionStore.isValidSession(token);
-  res.json({
-    ok: true,
-    result: {
-      authenticated,
+app.get("/api/bootstrap", (_req, res) => {
+  const payload: AppBootstrap = {
+    defaults: {
+      model: DEFAULT_MODEL,
+      sandbox: DEFAULT_SANDBOX as "read-only" | "workspace-write" | "danger-full-access",
     },
-  });
+    activeWorkspace: uiState.activeWorkspace,
+    workspaces: getWorkspaces(),
+    runs: runManager.getRuns(false),
+    approvals: runManager.getApprovals(),
+  };
+  res.json(apiOk(payload));
 });
 
-app.post("/api/login", (req, res) => {
-  const parsed = loginRequestSchema.safeParse(req.body || {});
+app.get("/api/workspaces", (_req, res) => {
+  res.json(apiOk({ activeWorkspace: uiState.activeWorkspace, workspaces: getWorkspaces() }));
+});
+
+app.get("/api/system/mcp-status", (_req, res) => {
+  const payload: CodexMcpStatusResponse = {
+    at: Date.now(),
+    mcp: runCodexCommandStatus(["mcp", "list"]),
+  };
+  res.json(apiOk(payload));
+});
+
+app.get("/api/system/account-status", (_req, res) => {
+  const account = runCodexCommandStatus(["login", "status"]);
+  const payload: CodexAccountStatusResponse = {
+    at: Date.now(),
+    account,
+    tokenStatus: resolveTokenStatus(account),
+  };
+  res.json(apiOk(payload));
+});
+
+app.get("/api/system/status", (_req, res) => {
+  const account = runCodexCommandStatus(["login", "status"]);
+  const payload: CodexSystemStatusResponse = {
+    at: Date.now(),
+    account,
+    mcp: runCodexCommandStatus(["mcp", "list"]),
+    tokenStatus: resolveTokenStatus(account),
+  };
+  res.json(apiOk(payload));
+});
+
+app.post("/api/workspaces/active", (req, res) => {
+  const parsed = setWorkspaceSchema.safeParse(req.body || {});
   if (!parsed.success) {
-    res.status(400).json({
-      ok: false,
-      error: { message: "Invalid login payload" },
-    });
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid workspace payload"));
     return;
   }
 
-  const ip = clientIp(req);
-  if (!sessionStore.canAttemptLogin(ip)) {
-    auditLogger.log("auth.login.rate_limited", { ip });
-    res.status(429).json({
-      ok: false,
-      error: { message: "Too many login attempts. Please wait and retry." },
-    });
+  const workspace = path.resolve(parsed.data.workspace);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist or is not a directory"));
     return;
   }
 
-  sessionStore.trackLoginAttempt(ip);
+  uiState = {
+    ...uiState,
+    activeWorkspace: workspace,
+    manualWorkspaces: parsed.data.persist
+      ? Array.from(new Set([...uiState.manualWorkspaces, workspace]))
+      : uiState.manualWorkspaces,
+  };
+  persistUiState(uiState);
 
-  if (!sessionStore.verifyPassword(parsed.data.password)) {
-    auditLogger.log("auth.login.failed", { ip });
-    res.status(401).json({
-      ok: false,
-      error: { message: "Invalid password" },
-    });
-    return;
-  }
-
-  const token = sessionStore.createSession(ip);
-
-  res.cookie("session_token", token, {
-    httpOnly: true,
-    secure: config.cookieSecure,
-    sameSite: "lax",
-    maxAge: 24 * 60 * 60 * 1000,
-  });
-
-  auditLogger.log("auth.login.success", { ip });
-  res.json({ ok: true, sessionToken: token });
+  res.json(apiOk({ activeWorkspace: workspace, workspaces: getWorkspaces() }));
 });
 
-app.post("/api/logout", requireAuth, (req, res) => {
-  sessionStore.deleteSession(req.sessionToken || null);
-  res.clearCookie("session_token");
-  auditLogger.log("auth.logout", { ip: clientIp(req) });
-  res.json({ ok: true });
+app.get("/api/runs", (_req, res) => {
+  res.json(apiOk({ runs: runManager.getRuns(false), approvals: runManager.getApprovals() }));
 });
 
-app.get("/api/events", requireAuth, (req, res) => {
+app.post("/api/runs/start", (req, res) => {
+  const parsed = startRunSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid run payload"));
+    return;
+  }
+
+  const workspace = path.resolve(parsed.data.workspace || uiState.activeWorkspace);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+
+  try {
+    const run = runManager.startRun({
+      workspace,
+      prompt: parsed.data.prompt,
+      model: parsed.data.model,
+      sandbox: parsed.data.sandbox,
+      approvalPolicy: parsed.data.approvalPolicy,
+      planMode: parsed.data.planMode,
+      sessionId: parsed.data.sessionId,
+    });
+
+    res.json(apiOk({ run }));
+  } catch (error) {
+    res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to start run"));
+  }
+});
+
+app.post("/api/runs/:runId/stop", (req, res) => {
+  const { runId } = req.params;
+  const ok = runManager.stopRun(runId);
+  if (!ok) {
+    res.status(404).json(apiErr("Run is not active"));
+    return;
+  }
+  res.json(apiOk({ stopped: true }));
+});
+
+app.post("/api/runs/:runId/rerun", (req, res) => {
+  const { runId } = req.params;
+  const baseRun = runManager.getRun(runId);
+  if (!baseRun) {
+    res.status(404).json(apiErr("Run not found"));
+    return;
+  }
+
+  const parsed = rerunSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid rerun payload"));
+    return;
+  }
+
+  try {
+    const run = runManager.startRun({
+      ...baseRun.config,
+      sandbox: parsed.data.sandbox || baseRun.config.sandbox,
+      approvalPolicy: parsed.data.approvalPolicy || baseRun.config.approvalPolicy,
+      sessionId: baseRun.sessionId || undefined,
+    });
+
+    const approvalId = typeof req.body?.approvalId === "string" ? req.body.approvalId : null;
+    if (approvalId) runManager.acceptApproval(approvalId);
+
+    res.json(apiOk({ run }));
+  } catch (error) {
+    res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to rerun"));
+  }
+});
+
+app.post("/api/runs/:runId/approval/:approvalId/accept", (req, res) => {
+  const parsedPolicy = approvalPolicySchema.safeParse(req.body?.approvalPolicy ?? "on-request");
+  if (!parsedPolicy.success) {
+    res.status(400).json(apiErr("Invalid approval policy"));
+    return;
+  }
+
+  const approval = runManager.acceptApproval(req.params.approvalId);
+  if (!approval) {
+    res.status(404).json(apiErr("Approval item not found"));
+    return;
+  }
+
+  const baseRun = runManager.getRun(req.params.runId);
+  if (!baseRun) {
+    res.status(404).json(apiErr("Run not found"));
+    return;
+  }
+
+  try {
+    const run = runManager.startRun({
+      ...baseRun.config,
+      sandbox: approval.suggestedSandbox,
+      approvalPolicy: parsedPolicy.data,
+      sessionId: baseRun.sessionId || undefined,
+    });
+    res.json(apiOk({ run, approval }));
+  } catch (error) {
+    res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to run escalation"));
+  }
+});
+
+app.get("/api/runs/:runId", (req, res) => {
+  const run = runManager.getRun(req.params.runId);
+  if (!run) {
+    res.status(404).json(apiErr("Run not found"));
+    return;
+  }
+
+  const approvals = runManager.getApprovals().filter((item) => item.runId === run.id);
+  res.json(apiOk({ run, approvals }));
+});
+
+app.get("/api/runs/:runId/diff", (req, res) => {
+  const diff = runManager.getDiff(req.params.runId);
+  if (!diff) {
+    res.status(404).json(apiErr("Diff not available yet for this run"));
+    return;
+  }
+  res.json(apiOk(diff));
+});
+
+app.post("/api/sessions/:sessionId/archive", (req, res) => {
+  try {
+    const result = runManager.archiveSession(req.params.sessionId);
+    if (!result) {
+      res.status(404).json(apiErr("Session not found"));
+      return;
+    }
+    terminalManager.removeSession(req.params.sessionId);
+    res.json(apiOk({ sessionId: req.params.sessionId, archivedRuns: result.archivedRuns }));
+  } catch (error) {
+    res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to archive session"));
+  }
+});
+
+app.delete("/api/sessions/:sessionId", (req, res) => {
+  try {
+    const result = runManager.deleteSession(req.params.sessionId);
+    if (!result) {
+      res.status(404).json(apiErr("Session not found"));
+      return;
+    }
+    terminalManager.removeSession(req.params.sessionId);
+    res.json(apiOk({ sessionId: req.params.sessionId, ...result }));
+  } catch (error) {
+    res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to delete session"));
+  }
+});
+
+app.get("/api/terminals/:sessionId", (req, res) => {
+  const terminal = terminalManager.getSession(req.params.sessionId);
+  res.json(apiOk({ terminal }));
+});
+
+app.post("/api/terminals/:sessionId/start", (req, res) => {
+  const workspaceRaw = typeof req.body?.workspace === "string" && req.body.workspace.trim()
+    ? req.body.workspace
+    : uiState.activeWorkspace;
+  const workspace = path.resolve(workspaceRaw);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+
+  try {
+    const terminal = terminalManager.startSession(req.params.sessionId, workspace);
+    res.json(apiOk({ terminal }));
+  } catch (error) {
+    res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to start terminal"));
+  }
+});
+
+app.post("/api/terminals/:sessionId/stop", (req, res) => {
+  const terminal = terminalManager.stopSession(req.params.sessionId);
+  if (!terminal) {
+    res.status(404).json(apiErr("Terminal session not found"));
+    return;
+  }
+  res.json(apiOk({ terminal }));
+});
+
+app.post("/api/terminals/:sessionId/interrupt", (req, res) => {
+  const terminal = terminalManager.interruptSession(req.params.sessionId);
+  if (!terminal) {
+    res.status(404).json(apiErr("Terminal session not found"));
+    return;
+  }
+  res.json(apiOk({ terminal }));
+});
+
+app.post("/api/terminals/:sessionId/input", (req, res) => {
+  const input = typeof req.body?.input === "string" ? req.body.input : "";
+  if (!input) {
+    res.status(400).json(apiErr("Input is required"));
+    return;
+  }
+
+  const accepted = terminalManager.writeInput(req.params.sessionId, input);
+  if (!accepted) {
+    res.status(404).json(apiErr("Terminal is not running for this session"));
+    return;
+  }
+
+  res.json(apiOk({ accepted: true }));
+});
+
+app.get("/api/files/tree", (req, res) => {
+  const relativePath = typeof req.query.path === "string" ? req.query.path : ".";
+  const depth = Number(req.query.depth ?? 2);
+
+  const workspace = uiState.activeWorkspace;
+  const nodes = listTree(workspace, relativePath, Number.isFinite(depth) ? Math.min(Math.max(depth, 0), 5) : 2);
+  res.json(apiOk({ root: relativePath, nodes }));
+});
+
+app.get("/api/sessions/history", (_req, res) => {
+  const codex = loadCodexSessionHistory(0);
+  const localBySession = new Map<string, { latest: RunRecord; firstPrompt: string; firstCreatedAt: number }>();
+  for (const run of runManager.getRuns(false)) {
+    const key = run.sessionId || run.threadId || run.id;
+    const existing = localBySession.get(key);
+    if (!existing) {
+      localBySession.set(key, {
+        latest: run,
+        firstPrompt: run.config.prompt || "",
+        firstCreatedAt: run.createdAt,
+      });
+      continue;
+    }
+    if (run.createdAt < existing.firstCreatedAt && run.config.prompt.trim()) {
+      existing.firstPrompt = run.config.prompt;
+      existing.firstCreatedAt = run.createdAt;
+    }
+    if (run.updatedAt > existing.latest.updatedAt) {
+      existing.latest = run;
+    }
+  }
+
+  const local: SessionHistoryEntry[] = [...localBySession.entries()].map(([id, row]) => ({
+    id,
+    timestamp: new Date(row.latest.updatedAt || row.latest.createdAt).toISOString(),
+    cwd: row.latest.config.workspace,
+    source: "agentic-cli",
+    model: row.latest.config.model,
+    cliVersion: undefined,
+    summary: normalizeSessionTitle(row.firstPrompt || row.latest.summary || "", `Session in ${row.latest.config.workspace || "unknown cwd"}`),
+  }));
+
+  const mergedById = new Map<string, SessionHistoryEntry>();
+  for (const entry of [...codex, ...local]) {
+    const existing = mergedById.get(entry.id);
+    if (!existing) {
+      mergedById.set(entry.id, entry);
+      continue;
+    }
+
+    const currentTime = Date.parse(existing.timestamp) || 0;
+    const nextTime = Date.parse(entry.timestamp) || 0;
+    const existingScore = existing.summary.startsWith("Session in ") ? 0 : 1;
+    const nextScore = entry.summary.startsWith("Session in ") ? 0 : 1;
+
+    if (nextTime > currentTime || (nextTime === currentTime && nextScore > existingScore)) {
+      mergedById.set(entry.id, entry);
+    }
+  }
+
+  const merged = [...mergedById.values()]
+    .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+
+  res.json(apiOk({ entries: merged }));
+});
+
+app.get("/api/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
 
-  const client = {
-    id: Math.random().toString(16).slice(2),
-    res,
-  };
-
-  sseClients.add(client);
-  debugLog("sse.connected", {
-    clientId: client.id,
-    totalClients: sseClients.size,
-    ip: clientIp(req),
-  });
-  sendSse(client, {
-    kind: "connected",
-    bridgeState,
-    at: Date.now(),
-  });
-
-  const keepAlive = setInterval(() => {
-    if (!sseClients.has(client)) return;
-    sendSse(client, {
-      kind: "heartbeat",
-      at: Date.now(),
-    });
-  }, 15_000);
+  sseClients.add(res);
+  res.write(`event: heartbeat\ndata: ${JSON.stringify({ kind: "heartbeat", at: Date.now() })}\n\n`);
 
   req.on("close", () => {
-    clearInterval(keepAlive);
-    sseClients.delete(client);
-    debugLog("sse.disconnected", {
-      clientId: client.id,
-      totalClients: sseClients.size,
-      ip: clientIp(req),
-    });
+    sseClients.delete(res);
   });
 });
 
-app.use("/api", requireAuth);
-
-app.get("/api/capabilities", (_req, res) => {
-  res.json({
-    ok: true,
-    result: getCapabilities(),
-  });
-});
-
-app.get("/api/ui-state", (_req, res) => {
-  res.json({
-    ok: true,
-    result: uiStateStore.read(),
-  });
-});
-
-app.post("/api/ui-state", (req, res) => {
-  const parsed = uiStatePatchSchema.safeParse(req.body || {});
-  if (!parsed.success) {
-    res.status(400).json({
-      ok: false,
-      error: { message: "Invalid ui-state payload" },
-    });
-    return;
-  }
-
-  const next = uiStateStore.patch(parsed.data as Partial<PersistedUiState>);
-  res.json({
-    ok: true,
-    result: next,
-  });
-});
-
-app.get("/api/workspace", (_req, res) => {
-  res.json({
-    ok: true,
-    result: {
-      root: getWorkspaceRoot(),
-    },
-  });
-});
-
-app.post("/api/workspace", (req, res) => {
-  const parsed = workspaceSelectSchema.safeParse(req.body || {});
-  if (!parsed.success) {
-    res.status(400).json({
-      ok: false,
-      error: { message: "Invalid workspace payload" },
-    });
-    return;
-  }
-
-  const root = path.resolve(parsed.data.root.trim());
-  if (!path.isAbsolute(root)) {
-    res.status(400).json({
-      ok: false,
-      error: { message: "Workspace root must be an absolute path" },
-    });
-    return;
-  }
-
-  if (!fs.existsSync(root)) {
-    res.status(400).json({
-      ok: false,
-      error: { message: `Workspace path does not exist: ${root}` },
-    });
-    return;
-  }
-
-  try {
-    const stat = fs.statSync(root);
-    if (!stat.isDirectory()) {
-      res.status(400).json({
-        ok: false,
-        error: { message: `Workspace path is not a directory: ${root}` },
-      });
-      return;
-    }
-  } catch {
-    res.status(400).json({
-      ok: false,
-      error: { message: `Workspace path is not accessible: ${root}` },
-    });
-    return;
-  }
-
-  selectedWorkspaceRoot = root;
-  auditLogger.log("workspace.updated", {
-    root,
-    ip: clientIp(req),
-  });
-
-  res.json({
-    ok: true,
-    result: {
-      root,
-    },
-  });
-});
-
-app.get("/api/message/queue", (_req, res) => {
-  const snapshot = queueSnapshot();
-  const recent = [...queuedMessages]
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .slice(0, 200)
-    .map((item) => ({
-      id: item.id,
-      threadId: item.threadId,
-      status: item.status,
-      attempts: item.attempts,
-      lastError: item.lastError,
-      createdAt: item.createdAt,
-      updatedAt: item.updatedAt,
-      completedAt: item.completedAt,
-    }));
-
-  res.json({
-    ok: true,
-    result: {
-      ...snapshot,
-      items: recent,
-    },
-  });
-});
-
-app.post("/api/message/enqueue", (req, res) => {
-  const parsed = messageEnqueueSchema.safeParse(req.body || {});
-  if (!parsed.success) {
-    res.status(400).json({
-      ok: false,
-      error: { message: "Invalid message enqueue payload" },
-    });
-    return;
-  }
-
-  const text = parsed.data.text.trim();
-  if (!text) {
-    res.status(400).json({
-      ok: false,
-      error: { message: "Message text must not be empty" },
-    });
-    return;
-  }
-
-  const now = Date.now();
-  const queueItem: PersistedQueuedMessage = {
-    id: crypto.randomUUID(),
-    threadId: parsed.data.threadId,
-    text,
-    collaborationMode: parsed.data.collaborationMode || null,
-    status: "pending",
-    attempts: 0,
-    lastError: null,
-    nextAttemptAt: null,
-    createdAt: now,
-    updatedAt: now,
-    completedAt: null,
-  };
-  queuedMessages.push(queueItem);
-  persistQueuedMessages();
-  scheduleQueueProcessing(0);
-
-  auditLogger.log("queue.enqueued", {
-    queueItemId: queueItem.id,
-    threadId: queueItem.threadId,
-    textLength: queueItem.text.length,
-    hasCollaborationMode: Boolean(queueItem.collaborationMode),
-  });
-  broadcastQueueNotification("queue/item/enqueued", {
-    queueItemId: queueItem.id,
-    threadId: queueItem.threadId,
-    createdAt: queueItem.createdAt,
-  });
-
-  res.json({
-    ok: true,
-    result: {
-      queueItemId: queueItem.id,
-      threadId: queueItem.threadId,
-      status: queueItem.status,
-      createdAt: queueItem.createdAt,
-      queue: queueSnapshot(),
-    },
-  });
-});
-
-app.get("/api/bootstrap", async (_req, res) => {
-  try {
-    const data = await bootstrapData();
-    const workspaceRoot = getWorkspaceRoot();
-    res.json({
-      ok: true,
-      bridgeState,
-      defaults: {
-        cwd: workspaceRoot,
-        model: config.defaultModel,
-        approvalPolicy: config.defaultApprovalPolicy,
-        sandboxType: config.defaultSandboxType,
-      },
-      data,
-    });
-  } catch (error) {
-    auditLogger.log("bootstrap.error", { error: sanitizeError(error) });
-    res.status(500).json({
-      ok: false,
-      error: sanitizeError(error),
-    });
-  }
-});
-
-app.post("/api/rpc", async (req, res) => {
-  const parsed = rpcRequestSchema.safeParse(req.body || {});
-  if (!parsed.success) {
-    res.status(400).json({
-      ok: false,
-      error: { message: "Invalid rpc payload" },
-    });
-    return;
-  }
-
-  const method = parsed.data.method;
-  if (!allowedMethods.has(method)) {
-    res.status(403).json({
-      ok: false,
-      error: { message: `Method is not allowed: ${method}` },
-    });
-    return;
-  }
-
-  if (method === "account/login/start" && parsed.data.params.type && parsed.data.params.type !== "chatgpt") {
-    res.status(400).json({
-      ok: false,
-      error: { message: "Only ChatGPT login mode is enabled in this build" },
-    });
-    return;
-  }
-
-  const sessionToken = req.sessionToken;
-  if (!sessionToken) {
-    res.status(401).json({
-      ok: false,
-      error: { message: "Unauthorized" },
-    });
-    return;
-  }
-
-  const policy = getMethodPolicy(method);
-  const guardResult = enforceGuards({
-    policy,
-    method,
-    params: parsed.data.params,
-    sessionToken,
-    guard: parsed.data.guard,
-  });
-
-  if (!guardResult.ok) {
-    auditLogger.log("rpc.guard_required", {
-      method,
-      group: policy.group,
-      tier: policy.riskTier,
-      reason: guardResult.guard.reason,
-      ip: clientIp(req),
-    });
-    res.status(guardResult.status).json({
-      ok: false,
-      error: { message: guardResult.guard.reason, code: guardResult.status },
-      guard: guardResult.guard,
-    });
-    return;
-  }
-
-  try {
-    const params = applyRpcDefaults(method, parsed.data.params);
-    debugLog("rpc.request", {
-      method,
-      hasGuard: Boolean(parsed.data.guard),
-      threadId: typeof params.threadId === "string" ? params.threadId : null,
-    });
-
-    if (method === "turn/start") {
-      debugLog("rpc.turn.start.request", {
-        threadId: params.threadId ?? null,
-        inputCount: Array.isArray(params.input) ? params.input.length : 0,
-      });
-    }
-
-    if (policy.riskTier >= 2) {
-      auditLogger.log("rpc.risky", {
-        method,
-        group: policy.group,
-        tier: policy.riskTier,
-        sessionAcceptedUntil: guardResult.expiresAt,
-      });
-    }
-
-    let result: unknown;
-
-    if (method === "turn/start" && typeof params.threadId === "string") {
-      try {
-        result = await bridge.request(method, params);
-      } catch (error) {
-        if (!isThreadNotFoundError(error)) {
-          throw error;
-        }
-
-        await bridge.request("thread/resume", { threadId: params.threadId });
-        result = await bridge.request(method, params);
-      }
-    } else {
-      result = await bridge.request(method, params);
-    }
-
-    if (method === "turn/start") {
-      const response = result as Record<string, unknown>;
-      const turn = isObject(response.turn) ? response.turn : null;
-      debugLog("rpc.turn.start.response", {
-        threadId: params.threadId ?? null,
-        turnId: turn ? turn.id ?? null : null,
-        status: turn ? turn.status ?? null : null,
-      });
-    }
-
-    res.json({ ok: true, result });
-  } catch (error) {
-    auditLogger.log("rpc.error", {
-      method,
-      group: policy.group,
-      tier: policy.riskTier,
-      error: sanitizeError(error),
-    });
-
-    res.status(500).json({
-      ok: false,
-      error: sanitizeError(error),
-    });
-  }
-});
-
-app.post("/api/server-request/respond", (req, res) => {
-  const parsed = serverRequestRespondSchema.safeParse(req.body || {});
-  if (!parsed.success) {
-    res.status(400).json({
-      ok: false,
-      error: { message: "Invalid server request response payload" },
-    });
-    return;
-  }
-
-  try {
-    bridge.respondToServerRequest({
-      requestId: parsed.data.requestId,
-      result: parsed.data.result,
-      error: parsed.data.error,
-    });
-
-    auditLogger.log("server_request.responded", {
-      requestId: parsed.data.requestId,
-      hasError: Boolean(parsed.data.error),
-    });
-
-    res.json({ ok: true });
-  } catch (error) {
-    res.status(400).json({
-      ok: false,
-      error: sanitizeError(error),
-    });
-  }
-});
-
-const webDistDir = path.resolve(rootDir, "apps/web/dist");
-
-if (fs.existsSync(webDistDir)) {
-  app.use(express.static(webDistDir));
-  app.get("*", (req, res, next) => {
-    if (req.path.startsWith("/api")) {
-      next();
-      return;
-    }
-    res.sendFile(path.join(webDistDir, "index.html"));
-  });
-}
-
-async function start(): Promise<void> {
-  if (!sessionStore.isConfigured()) {
-    throw new Error("APP_PASSWORD must be set in .env before starting the server");
-  }
-
-  await bridge.start();
-  await bridge.initialize({
-    name: "personal_codex_assistant",
-    title: "Personal Codex Assistant",
-    version: "0.3.0",
-  });
-  scheduleQueueProcessing(0);
-
-  app.listen(config.port, config.host, () => {
-    // eslint-disable-next-line no-console
-    console.log(`assistant-server listening on http://${config.host}:${config.port}`);
-    // eslint-disable-next-line no-console
-    console.log(`web origins for dev CORS: ${config.webOrigins.join(", ")}`);
-    // eslint-disable-next-line no-console
-    console.log("Warning: this service is intended for trusted LAN use only.");
-  });
-}
-
-process.on("SIGINT", () => {
-  bridge.stop();
-  process.exit(0);
-});
-
-process.on("SIGTERM", () => {
-  bridge.stop();
-  process.exit(0);
-});
-
-start().catch((error) => {
+app.listen(API_PORT, HOST, () => {
   // eslint-disable-next-line no-console
-  console.error("Failed to start assistant-server:", error);
-  process.exit(1);
+  console.log(`[agentic-cli/server] listening on http://${HOST}:${API_PORT}`);
 });

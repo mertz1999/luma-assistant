@@ -4,6 +4,13 @@
 
 :root {
   color-scheme: light;
+  --bg: #e9eef2;
+  --text: #0d2230;
+  --text-soft: #3b4b58;
+  --panel: #ffffffcc;
+  --panel-border: #0d223024;
+  --brand: #12867d;
+  --warn: #ea5c38;
 }
 
 * {
@@ -25,6 +32,33 @@ body {
     radial-gradient(circle at 12% 8%, #d5f4ed 0%, rgba(213, 244, 237, 0) 35%),
     radial-gradient(circle at 88% 85%, #ffe8c7 0%, rgba(255, 232, 199, 0) 38%),
     linear-gradient(145deg, #edf1f4 0%, #e9eef2 100%);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0f1822;
+  --text: #dce8f2;
+  --text-soft: #9ab0c5;
+  --panel: #1b2735d9;
+  --panel-border: #a2bfd633;
+  --brand: #39b3a8;
+  --warn: #ff8b6a;
+}
+
+html[data-theme="dark"] body {
+  background-image:
+    radial-gradient(circle at 12% 8%, rgba(43, 89, 82, 0.45) 0%, rgba(43, 89, 82, 0) 35%),
+    radial-gradient(circle at 88% 85%, rgba(99, 82, 55, 0.4) 0%, rgba(99, 82, 55, 0) 38%),
+    linear-gradient(145deg, #111b26 0%, #0f1822 100%);
+}
+
+.glass {
+  @apply rounded-3xl border border-card-border bg-card shadow-soft backdrop-blur-xl;
+}
+
+.focus-ring:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
 }
 
 .scrollbar-thin {

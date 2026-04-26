@@ -1,38 +1,46 @@
 SHELL := /bin/bash
 
-PORT ?= $(shell awk -F= '/^PORT=/{print $$2}' .env 2>/dev/null | tail -n 1)
-PORT := $(if $(PORT),$(PORT),8787)
+API_PORT ?= $(shell awk -F= '/^API_PORT=/{print $$2}' .env 2>/dev/null | tail -n 1)
+API_PORT := $(if $(API_PORT),$(API_PORT),9001)
 
-WEB_PORT ?= $(shell awk -F= '/^WEB_ORIGIN=/{print $$2}' .env 2>/dev/null | head -n 1 | awk -F: '{print $$NF}' | tr -cd '0-9')
-WEB_PORT := $(if $(WEB_PORT),$(WEB_PORT),5173)
+WEB_PORT ?= $(shell awk -F= '/^WEB_PORT=/{print $$2}' .env 2>/dev/null | tail -n 1)
+WEB_PORT := $(if $(WEB_PORT),$(WEB_PORT),5175)
 
-PROJECT_PORTS := $(PORT) $(WEB_PORT)
+PROJECT_PORTS := $(API_PORT) $(WEB_PORT)
+PM2_BIN := npx pm2
+PM2_ECOSYSTEM := scripts/pm2/ecosystem.config.cjs
 
-.PHONY: help install install-if-needed kill-ports sync-config sync-agents run
-
-help:
-	@echo "Available targets:"
-	@echo "  make install           - install dependencies"
-	@echo "  make install-if-needed - install dependencies only when node_modules is missing"
-	@echo "  make kill-ports        - kill processes listening on project ports ($(PROJECT_PORTS))"
-	@echo "  make sync-config       - copy config.yaml to ~/config/agentic-assistant/config.yaml"
-	@echo "  make sync-agents       - copy AGENTS.md to default_workspace from config.yaml"
-	@echo "  make run               - install-if-needed, kill ports, then start dev mode"
+.PHONY: install install-if-needed install-pm2 kill-ports run deploy-start deploy-stop deploy-status deploy-logs
 
 install:
-	npm install --no-audit --no-fund
+	npm install --include=optional --no-audit --no-fund
 
 install-if-needed:
 	@if [ ! -d node_modules ]; then \
-		echo "node_modules not found. Installing dependencies..."; \
-		npm install --no-audit --no-fund; \
+		echo "node_modules missing; installing dependencies..."; \
+		npm install --include=optional --no-audit --no-fund; \
+	elif ! node -e "const m={'darwin-arm64':'@esbuild/darwin-arm64','darwin-x64':'@esbuild/darwin-x64','linux-arm':'@esbuild/linux-arm','linux-arm64':'@esbuild/linux-arm64','linux-ia32':'@esbuild/linux-ia32','linux-loong64':'@esbuild/linux-loong64','linux-mips64el':'@esbuild/linux-mips64el','linux-ppc64':'@esbuild/linux-ppc64','linux-riscv64':'@esbuild/linux-riscv64','linux-s390x':'@esbuild/linux-s390x','linux-x64':'@esbuild/linux-x64','freebsd-arm64':'@esbuild/freebsd-arm64','freebsd-x64':'@esbuild/freebsd-x64','netbsd-arm64':'@esbuild/netbsd-arm64','netbsd-x64':'@esbuild/netbsd-x64','openbsd-arm64':'@esbuild/openbsd-arm64','openbsd-x64':'@esbuild/openbsd-x64','sunos-x64':'@esbuild/sunos-x64','win32-arm64':'@esbuild/win32-arm64','win32-ia32':'@esbuild/win32-ia32','win32-x64':'@esbuild/win32-x64','android-arm':'@esbuild/android-arm','android-arm64':'@esbuild/android-arm64','android-x64':'@esbuild/android-x64','aix-ppc64':'@esbuild/aix-ppc64'}; const key=process.platform+'-'+process.arch; const pkg=m[key]; if(!pkg) process.exit(0); try{require.resolve(pkg+'/package.json'); process.exit(0);} catch{process.exit(1);}"; then \
+		echo "esbuild optional binary missing; reinstalling dependencies..."; \
+		npm install --include=optional --no-audit --no-fund; \
+		PKG=$$(node -e "const m={'darwin-arm64':'@esbuild/darwin-arm64','darwin-x64':'@esbuild/darwin-x64','linux-arm':'@esbuild/linux-arm','linux-arm64':'@esbuild/linux-arm64','linux-ia32':'@esbuild/linux-ia32','linux-loong64':'@esbuild/linux-loong64','linux-mips64el':'@esbuild/linux-mips64el','linux-ppc64':'@esbuild/linux-ppc64','linux-riscv64':'@esbuild/linux-riscv64','linux-s390x':'@esbuild/linux-s390x','linux-x64':'@esbuild/linux-x64','freebsd-arm64':'@esbuild/freebsd-arm64','freebsd-x64':'@esbuild/freebsd-x64','netbsd-arm64':'@esbuild/netbsd-arm64','netbsd-x64':'@esbuild/netbsd-x64','openbsd-arm64':'@esbuild/openbsd-arm64','openbsd-x64':'@esbuild/openbsd-x64','sunos-x64':'@esbuild/sunos-x64','win32-arm64':'@esbuild/win32-arm64','win32-ia32':'@esbuild/win32-ia32','win32-x64':'@esbuild/win32-x64','android-arm':'@esbuild/android-arm','android-arm64':'@esbuild/android-arm64','android-x64':'@esbuild/android-x64','aix-ppc64':'@esbuild/aix-ppc64'}; const key=process.platform+'-'+process.arch; const pkg=m[key]; if(pkg) process.stdout.write(pkg);"); \
+		VER=$$(node -e "try{process.stdout.write(require('esbuild/package.json').version)}catch{process.stdout.write('')}"); \
+		if [ -n "$$PKG" ] && [ -n "$$VER" ]; then \
+			npm install --no-save --include=optional --no-audit --no-fund $$PKG@$$VER; \
+		fi; \
 	else \
-		echo "Dependencies already installed. Skipping npm install."; \
+		echo "Dependencies already installed."; \
+	fi
+
+install-pm2:
+	@if [ ! -x node_modules/.bin/pm2 ]; then \
+		echo "Installing pm2 locally (project-scoped)..."; \
+		npm install --no-save --no-package-lock --no-audit --no-fund pm2; \
+	else \
+		echo "pm2 already available in node_modules/.bin"; \
 	fi
 
 kill-ports:
 	@for p in $(PROJECT_PORTS); do \
-		if [ -z "$$p" ]; then continue; fi; \
 		PIDS=$$(lsof -ti tcp:$$p -sTCP:LISTEN 2>/dev/null || true); \
 		if [ -n "$$PIDS" ]; then \
 			echo "Killing process(es) on port $$p: $$PIDS"; \
@@ -48,11 +56,24 @@ kill-ports:
 		fi; \
 	done
 
-sync-config:
-	npm run sync:config
-
-sync-agents:
-	npm run sync:agents
-
-run: install-if-needed kill-ports sync-agents
+run: install-if-needed kill-ports
 	npm run dev
+
+deploy-start: install-if-needed install-pm2 kill-ports
+	@mkdir -p data/logs
+	npm run build
+	API_PORT=$(API_PORT) WEB_PORT=$(WEB_PORT) HOST=$(HOST) NODE_ENV=production $(PM2_BIN) startOrReload $(PM2_ECOSYSTEM) --update-env
+	$(PM2_BIN) save
+	$(PM2_BIN) status
+
+deploy-stop: install-pm2
+	-$(PM2_BIN) delete agentic-cli-server
+	-$(PM2_BIN) delete agentic-cli-web
+	-$(PM2_BIN) save
+	$(PM2_BIN) status
+
+deploy-status: install-pm2
+	$(PM2_BIN) status
+
+deploy-logs: install-pm2
+	$(PM2_BIN) logs --lines 150
