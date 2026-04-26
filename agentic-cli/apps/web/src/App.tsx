@@ -11,6 +11,7 @@ import {
   Layers,
   LoaderCircle,
   MessageSquare,
+  Mic,
   MicOff,
   Moon,
   PanelLeft,
@@ -109,7 +110,7 @@ const toolOutputModalLimit = 2500;
 const draftSessionKey = "__draft__";
 const queueStorageKey = "agentic_cli_queue_v1";
 
-type SlashCommandKey = "/mcp" | "/account" | "/status" | "/help";
+type SlashCommandKey = "/mcp" | "/account" | "/status" | "/help" | "/speech";
 
 type SlashCommandSuggestion = {
   key: SlashCommandKey;
@@ -171,6 +172,7 @@ const slashCommandSuggestions: SlashCommandSuggestion[] = [
   { key: "/status", title: "System status", description: "Show both account and MCP status." },
   { key: "/account", title: "Account status", description: "Show Codex account/login status." },
   { key: "/mcp", title: "MCP status", description: "Show configured MCP servers and auth status." },
+  { key: "/speech", title: "Speech support", description: "Check Web Speech API availability in this browser." },
   { key: "/help", title: "Slash help", description: "List available slash commands." },
 ];
 
@@ -179,6 +181,7 @@ function normalizeSlashCommand(raw: string): SlashCommandKey | null {
   if (lower === "/status") return "/status";
   if (lower === "/account" || lower === "/account-status") return "/account";
   if (lower === "/mcp" || lower === "/mcp-status") return "/mcp";
+  if (lower === "/speech" || lower === "/voice" || lower === "/mic" || lower === "/speech-status") return "/speech";
   if (lower === "/help" || lower === "/?") return "/help";
   return null;
 }
@@ -264,6 +267,37 @@ function buildSlashHelpText(): string {
   return [
     "Available slash commands:",
     ...slashCommandSuggestions.map((item) => `- \`${item.key}\` - ${item.description}`),
+  ].join("\n");
+}
+
+function buildSpeechSupportText(): string {
+  if (typeof window === "undefined") {
+    return [
+      "### Speech Recognition Check",
+      "Expression: `window.SpeechRecognition || window.webkitSpeechRecognition`",
+      "Supported: **no**",
+      "Detected API: `none`",
+      "Note: Browser runtime is not available here.",
+    ].join("\n");
+  }
+
+  const hasSpeechRecognition = Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+  const detectedApi = window.SpeechRecognition
+    ? "window.SpeechRecognition"
+    : window.webkitSpeechRecognition
+      ? "window.webkitSpeechRecognition"
+      : "none";
+
+  return [
+    "### Speech Recognition Check",
+    "Expression: `window.SpeechRecognition || window.webkitSpeechRecognition`",
+    `Supported: **${hasSpeechRecognition ? "yes" : "no"}**`,
+    `Detected API: \`${detectedApi}\``,
+    `Secure context: **${window.isSecureContext ? "yes" : "no"}**`,
+    `URL: \`${window.location.origin}\``,
+    hasSpeechRecognition
+      ? "Result: Voice recording should be available."
+      : "Result: This browser/context does not expose Web Speech API.",
   ].join("\n");
 }
 
@@ -428,6 +462,13 @@ function truncatePreview(input: string, max = 120): string {
   const normalized = input.replace(/\s+/g, " ").trim();
   if (normalized.length <= max) return normalized;
   return `${normalized.slice(0, max - 3)}...`;
+}
+
+function formatRecordingDuration(totalSeconds: number): string {
+  const safe = Math.max(0, Math.floor(totalSeconds));
+  const minutes = Math.floor(safe / 60);
+  const seconds = safe % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 function appendTranscriptToPrompt(currentPrompt: string, transcript: string): string {
@@ -1060,15 +1101,13 @@ export function App(): JSX.Element {
   const [voiceSupported, setVoiceSupported] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [voiceRecordingStartedAt, setVoiceRecordingStartedAt] = useState<number | null>(null);
+  const [voiceRecordingSeconds, setVoiceRecordingSeconds] = useState(0);
 
   const ansi = useMemo(() => new Convert({ newline: true, escapeXML: true }), []);
   const timelineBottomRef = useRef<HTMLDivElement | null>(null);
   const terminalOutputRef = useRef<HTMLDivElement | null>(null);
   const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const voiceHoldTimerRef = useRef<number | null>(null);
-  const voiceHoldSuppressResetTimerRef = useRef<number | null>(null);
-  const voiceHoldTriggeredRef = useRef(false);
-  const suppressNextSendClickRef = useRef(false);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -1094,15 +1133,22 @@ export function App(): JSX.Element {
     recognition.onstart = () => {
       setVoiceListening(true);
       setVoiceError(null);
+      const now = Date.now();
+      setVoiceRecordingStartedAt(now);
+      setVoiceRecordingSeconds(0);
     };
 
     recognition.onend = () => {
       setVoiceListening(false);
+      setVoiceRecordingStartedAt(null);
+      setVoiceRecordingSeconds(0);
     };
 
     recognition.onerror = (event) => {
       setVoiceError(toSpeechErrorMessage(event.error));
       setVoiceListening(false);
+      setVoiceRecordingStartedAt(null);
+      setVoiceRecordingSeconds(0);
     };
 
     recognition.onresult = (event) => {
@@ -1132,14 +1178,6 @@ export function App(): JSX.Element {
       recognition.onend = null;
       recognition.onerror = null;
       recognition.onresult = null;
-      if (voiceHoldTimerRef.current !== null) {
-        window.clearTimeout(voiceHoldTimerRef.current);
-        voiceHoldTimerRef.current = null;
-      }
-      if (voiceHoldSuppressResetTimerRef.current !== null) {
-        window.clearTimeout(voiceHoldSuppressResetTimerRef.current);
-        voiceHoldSuppressResetTimerRef.current = null;
-      }
       try {
         recognition.stop();
       } catch {
@@ -1150,6 +1188,20 @@ export function App(): JSX.Element {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!voiceListening || voiceRecordingStartedAt === null) {
+      setVoiceRecordingSeconds(0);
+      return;
+    }
+
+    const tick = () => {
+      setVoiceRecordingSeconds(Math.floor((Date.now() - voiceRecordingStartedAt) / 1000));
+    };
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [voiceListening, voiceRecordingStartedAt]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1600,6 +1652,20 @@ export function App(): JSX.Element {
       return;
     }
 
+    if (command === "/speech") {
+      pushSlashEntries(sessionKey, [
+        {
+          key: `slash_${messageId}_speech`,
+          role: "assistant",
+          title: "System",
+          text: buildSpeechSupportText(),
+          pending: false,
+          at: Date.now(),
+        },
+      ]);
+      return;
+    }
+
     if (command === "/mcp") {
       const payload = await getMcpStatus();
       pushSlashEntries(sessionKey, [
@@ -1790,53 +1856,15 @@ export function App(): JSX.Element {
     }
   }
 
-  function onSendButtonPressStart(): void {
-    if (typeof window === "undefined") return;
-    if (submitting || !voiceSupported || !speechRecognitionRef.current) return;
-
-    if (voiceHoldTimerRef.current !== null) {
-      window.clearTimeout(voiceHoldTimerRef.current);
-      voiceHoldTimerRef.current = null;
+  function onToggleVoiceRecording(): void {
+    if (voiceListening) {
+      stopVoiceInput();
+      return;
     }
-    if (voiceHoldSuppressResetTimerRef.current !== null) {
-      window.clearTimeout(voiceHoldSuppressResetTimerRef.current);
-      voiceHoldSuppressResetTimerRef.current = null;
-    }
-
-    voiceHoldTriggeredRef.current = false;
-    voiceHoldTimerRef.current = window.setTimeout(() => {
-      voiceHoldTriggeredRef.current = true;
-      suppressNextSendClickRef.current = true;
-      startVoiceInput();
-    }, 2000);
-  }
-
-  function onSendButtonPressEnd(): void {
-    if (typeof window === "undefined") return;
-
-    if (voiceHoldTimerRef.current !== null) {
-      window.clearTimeout(voiceHoldTimerRef.current);
-      voiceHoldTimerRef.current = null;
-    }
-
-    if (!voiceHoldTriggeredRef.current) return;
-    voiceHoldTriggeredRef.current = false;
-    stopVoiceInput();
-    voiceHoldSuppressResetTimerRef.current = window.setTimeout(() => {
-      suppressNextSendClickRef.current = false;
-      voiceHoldSuppressResetTimerRef.current = null;
-    }, 300);
+    startVoiceInput();
   }
 
   function onSendButtonClick(): void {
-    if (typeof window !== "undefined" && voiceHoldSuppressResetTimerRef.current !== null) {
-      window.clearTimeout(voiceHoldSuppressResetTimerRef.current);
-      voiceHoldSuppressResetTimerRef.current = null;
-    }
-    if (suppressNextSendClickRef.current) {
-      suppressNextSendClickRef.current = false;
-      return;
-    }
     void onStartRun();
   }
 
@@ -1996,8 +2024,8 @@ export function App(): JSX.Element {
             voiceSupported={voiceSupported}
             voiceListening={voiceListening}
             voiceError={voiceError}
-            onSendButtonPressStart={onSendButtonPressStart}
-            onSendButtonPressEnd={onSendButtonPressEnd}
+            voiceRecordingSeconds={voiceRecordingSeconds}
+            onToggleVoiceRecording={onToggleVoiceRecording}
             onSendButtonClick={onSendButtonClick}
           />
         </Card>
@@ -2225,8 +2253,8 @@ type CenterPanelProps = {
   voiceSupported: boolean;
   voiceListening: boolean;
   voiceError: string | null;
-  onSendButtonPressStart: () => void;
-  onSendButtonPressEnd: () => void;
+  voiceRecordingSeconds: number;
+  onToggleVoiceRecording: () => void;
   onSendButtonClick: () => void;
 };
 
@@ -2348,17 +2376,13 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 
             <Button
               type="button"
-              className="h-[44px] w-[44px] shrink-0 rounded-full p-0"
-              disabled={props.submitting || (!props.prompt.trim() && !props.voiceSupported)}
-              aria-label={props.voiceListening ? "Recording (release to stop)" : "Send message (hold 2s for voice input)"}
-              title={props.voiceListening ? "Recording (release to stop)" : props.voiceError || "Send message (hold 2s for voice input)"}
-              onPointerDown={props.onSendButtonPressStart}
-              onPointerUp={props.onSendButtonPressEnd}
-              onPointerCancel={props.onSendButtonPressEnd}
-              onPointerLeave={props.onSendButtonPressEnd}
+              disabled={props.submitting}
+              aria-label="Send message"
+              title="Send message"
               onClick={props.onSendButtonClick}
+              className="h-[44px] w-[44px] shrink-0 rounded-full p-0"
             >
-              {props.submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : props.voiceListening ? <MicOff className="h-4 w-4" /> : <Send className="h-4 w-4" />}
+              {props.submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
             </Button>
           </div>
 
@@ -2376,7 +2400,18 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               {props.stopping ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : <CircleStop className="mr-1.5 h-4 w-4" />}
               Stop
             </Button>
-            {selectedRun ? <span className="text-xs text-foreground/70">Run: {selectedRun.id.slice(0, 12)}</span> : null}
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={props.onToggleVoiceRecording}
+              disabled={!props.voiceSupported}
+              aria-label={props.voiceListening ? "Stop recording" : "Start recording"}
+              title={props.voiceListening ? "Stop recording" : props.voiceError || "Start recording"}
+            >
+              {props.voiceListening ? <MicOff className="mr-1.5 h-4 w-4" /> : <Mic className="mr-1.5 h-4 w-4" />}
+              {props.voiceListening ? `Stop ${formatRecordingDuration(props.voiceRecordingSeconds)}` : "Record"}
+            </Button>
           </div>
 
           {props.queueItems.length > 0 ? (
