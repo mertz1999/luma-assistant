@@ -9,6 +9,7 @@ import type {
   RunRecord,
   SseEvent,
   StartRunInput,
+  TerminalSessionSnapshot,
 } from "@agentic/shared";
 
 type ApiResponse<T> =
@@ -99,6 +100,38 @@ export function deleteSession(sessionId: string): Promise<{ sessionId: string; r
   });
 }
 
+export function getTerminal(sessionId: string): Promise<{ terminal: TerminalSessionSnapshot | null }> {
+  return request(`/api/terminals/${encodeURIComponent(sessionId)}`);
+}
+
+export function startTerminal(sessionId: string, workspace: string): Promise<{ terminal: TerminalSessionSnapshot }> {
+  return request(`/api/terminals/${encodeURIComponent(sessionId)}/start`, {
+    method: "POST",
+    body: JSON.stringify({ workspace }),
+  });
+}
+
+export function stopTerminal(sessionId: string): Promise<{ terminal: TerminalSessionSnapshot }> {
+  return request(`/api/terminals/${encodeURIComponent(sessionId)}/stop`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export function interruptTerminal(sessionId: string): Promise<{ terminal: TerminalSessionSnapshot }> {
+  return request(`/api/terminals/${encodeURIComponent(sessionId)}/interrupt`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export function sendTerminalInput(sessionId: string, input: string): Promise<{ accepted: boolean }> {
+  return request(`/api/terminals/${encodeURIComponent(sessionId)}/input`, {
+    method: "POST",
+    body: JSON.stringify({ input }),
+  });
+}
+
 export function connectEvents(onEvent: (evt: SseEvent) => void): EventSource {
   const es = new EventSource("/api/events");
   const names = [
@@ -111,6 +144,9 @@ export function connectEvents(onEvent: (evt: SseEvent) => void): EventSource {
     "run.completed",
     "run.failed",
     "run.stopped",
+    "terminal.started",
+    "terminal.output",
+    "terminal.stopped",
     "heartbeat",
   ];
 

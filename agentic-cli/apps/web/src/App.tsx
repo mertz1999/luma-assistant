@@ -30,6 +30,7 @@ import type {
   RunRecord,
   SandboxMode,
   StartRunInput,
+  TerminalSessionSnapshot,
   WorkspaceOption,
 } from "@agentic/shared";
 import {
@@ -43,10 +44,15 @@ import {
   getMcpStatus,
   getRuns,
   getSystemStatus,
+  getTerminal,
+  interruptTerminal,
   rerun,
+  sendTerminalInput,
   setActiveWorkspace,
   startRun,
+  startTerminal,
   stopRun,
+  stopTerminal,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useUiStore } from "@/store/useUiStore";
@@ -393,6 +399,29 @@ function readTextField(value: unknown): string {
     })
     .filter(Boolean)
     .join("\n");
+}
+
+function isTerminalSessionStatus(value: unknown): value is "running" | "stopped" {
+  return value === "running" || value === "stopped";
+}
+
+function isTerminalSnapshot(value: unknown): value is TerminalSessionSnapshot {
+  if (!isRecord(value)) return false;
+  return typeof value.sessionId === "string"
+    && isTerminalSessionStatus(value.status)
+    && typeof value.workspace === "string"
+    && typeof value.shell === "string"
+    && (typeof value.pid === "number" || value.pid === null)
+    && typeof value.createdAt === "number"
+    && typeof value.updatedAt === "number"
+    && typeof value.output === "string";
+}
+
+function readTerminalSnapshot(payload: unknown): TerminalSessionSnapshot | null {
+  if (!isRecord(payload)) return null;
+  const candidate = payload.terminal;
+  if (!isTerminalSnapshot(candidate)) return null;
+  return candidate;
 }
 
 function truncatePreview(input: string, max = 120): string {
@@ -1025,12 +1054,16 @@ export function App(): JSX.Element {
   const [processingQueueItemId, setProcessingQueueItemId] = useState<string | null>(null);
   const [toolDetailModal, setToolDetailModal] = useState<ToolDetailModalState | null>(null);
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
+  const [terminalsBySession, setTerminalsBySession] = useState<Record<string, TerminalSessionSnapshot>>({});
+  const [terminalInput, setTerminalInput] = useState("");
+  const [terminalAction, setTerminalAction] = useState<"starting" | "stopping" | "sending" | null>(null);
   const [voiceSupported, setVoiceSupported] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
 
   const ansi = useMemo(() => new Convert({ newline: true, escapeXML: true }), []);
   const timelineBottomRef = useRef<HTMLDivElement | null>(null);
+  const terminalOutputRef = useRef<HTMLDivElement | null>(null);
   const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceHoldTimerRef = useRef<number | null>(null);
   const voiceHoldSuppressResetTimerRef = useRef<number | null>(null);
@@ -1175,6 +1208,41 @@ export function App(): JSX.Element {
         return;
       }
 
+      if (event.kind === "terminal.started" || event.kind === "terminal.stopped") {
+        const terminal = readTerminalSnapshot(event.payload);
+        if (!terminal) return;
+        setTerminalsBySession((prev) => ({ ...prev, [terminal.sessionId]: terminal }));
+        return;
+      }
+
+      if (event.kind === "terminal.output") {
+        const sessionId = typeof event.sessionId === "string"
+          ? event.sessionId
+          : typeof event.payload?.sessionId === "string"
+            ? event.payload.sessionId
+            : "";
+        if (!sessionId) return;
+        const chunk = typeof event.payload?.text === "string" ? event.payload.text : "";
+        if (!chunk) return;
+
+        setTerminalsBySession((prev) => {
+          const existing = prev[sessionId];
+          if (!existing) return prev;
+          const merged = `${existing.output}${chunk}`;
+          const output = merged.length > 220000 ? merged.slice(merged.length - 220000) : merged;
+          return {
+            ...prev,
+            [sessionId]: {
+              ...existing,
+              output,
+              status: "running",
+              updatedAt: event.at || Date.now(),
+            },
+          };
+        });
+        return;
+      }
+
       void refreshRuns();
       if (event.kind === "run.diffUpdated" && event.runId === selectedRunId) {
         setDiff(event.payload as unknown as DiffSnapshot);
@@ -1206,6 +1274,10 @@ export function App(): JSX.Element {
   const selectedSession = useMemo(
     () => allSessions.find((session) => session.id === selectedSessionId) || null,
     [allSessions, selectedSessionId],
+  );
+  const selectedTerminal = useMemo(
+    () => (selectedSessionId ? terminalsBySession[selectedSessionId] || null : null),
+    [selectedSessionId, terminalsBySession],
   );
 
   const selectedRun = selectedSession?.latestRun || null;
@@ -1276,6 +1348,21 @@ export function App(): JSX.Element {
 
     setSelectedRunId(null);
   }, [allSessions, isDraftSession, selectedSessionId, setSelectedRunId]);
+
+  useEffect(() => {
+    if (!selectedSessionId) {
+      setTerminalInput("");
+      return;
+    }
+    setTerminalInput("");
+    void loadTerminal(selectedSessionId);
+  }, [selectedSessionId]);
+
+  useEffect(() => {
+    const node = terminalOutputRef.current;
+    if (!node || !selectedSessionId || !selectedTerminal) return;
+    node.scrollTop = node.scrollHeight;
+  }, [selectedSessionId, selectedTerminal?.output]);
 
   useEffect(() => {
     if (submitting || processingQueueItemId) return;
@@ -1350,6 +1437,23 @@ export function App(): JSX.Element {
   async function loadFileTree(): Promise<void> {
     const payload = await getFileTree(".", 2);
     setFileNodes(payload.nodes);
+  }
+
+  async function loadTerminal(sessionId: string): Promise<void> {
+    try {
+      const payload = await getTerminal(sessionId);
+      setTerminalsBySession((prev) => {
+        if (!payload.terminal) {
+          if (!(sessionId in prev)) return prev;
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        }
+        return { ...prev, [sessionId]: payload.terminal };
+      });
+    } catch {
+      // ignore terminal fetch errors in background
+    }
   }
 
   function removeQueuedMessage(sessionKey: string, messageId: string): void {
@@ -1736,6 +1840,66 @@ export function App(): JSX.Element {
     void onStartRun();
   }
 
+  async function onStartTerminal(): Promise<void> {
+    if (!selectedSessionId) return;
+    setTerminalAction("starting");
+    try {
+      const workspace = selectedSession?.latestRun.config.workspace || activeWorkspace;
+      const payload = await startTerminal(selectedSessionId, workspace);
+      setTerminalsBySession((prev) => ({ ...prev, [selectedSessionId]: payload.terminal }));
+      setRightPanelTab("tools");
+      setMobileContextOpen(false);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Failed to start terminal");
+    } finally {
+      setTerminalAction(null);
+    }
+  }
+
+  async function onStopTerminal(): Promise<void> {
+    if (!selectedSessionId) return;
+    setTerminalAction("stopping");
+    try {
+      const payload = await stopTerminal(selectedSessionId);
+      setTerminalsBySession((prev) => ({ ...prev, [selectedSessionId]: payload.terminal }));
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Failed to stop terminal");
+    } finally {
+      setTerminalAction(null);
+    }
+  }
+
+  async function onSubmitTerminalInput(rawInput?: string): Promise<void> {
+    if (!selectedSessionId) return;
+    const base = typeof rawInput === "string" ? rawInput : terminalInput;
+    if (!base) return;
+
+    setTerminalAction("sending");
+    try {
+      await sendTerminalInput(selectedSessionId, base);
+      if (typeof rawInput !== "string") {
+        setTerminalInput("");
+      }
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Failed to send terminal input");
+    } finally {
+      setTerminalAction(null);
+    }
+  }
+
+  async function onInterruptTerminal(): Promise<void> {
+    if (!selectedSessionId) return;
+    setTerminalAction("sending");
+    try {
+      const payload = await interruptTerminal(selectedSessionId);
+      setTerminalsBySession((prev) => ({ ...prev, [selectedSessionId]: payload.terminal }));
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Failed to interrupt terminal");
+    } finally {
+      setTerminalAction(null);
+    }
+  }
+
   async function onArchiveSession(): Promise<void> {
     if (!selectedSessionId || sessionAction || !selectedSession) return;
     const ok = window.confirm("Archive this session? It will be hidden from Chats.");
@@ -1744,6 +1908,12 @@ export function App(): JSX.Element {
     setSessionAction("archive");
     try {
       await archiveSession(selectedSessionId);
+      setTerminalsBySession((prev) => {
+        if (!(selectedSessionId in prev)) return prev;
+        const next = { ...prev };
+        delete next[selectedSessionId];
+        return next;
+      });
       await refreshRuns();
       setMobileContextOpen(false);
     } catch (error) {
@@ -1761,6 +1931,12 @@ export function App(): JSX.Element {
     setSessionAction("delete");
     try {
       await deleteSession(selectedSessionId);
+      setTerminalsBySession((prev) => {
+        if (!(selectedSessionId in prev)) return prev;
+        const next = { ...prev };
+        delete next[selectedSessionId];
+        return next;
+      });
       await refreshRuns();
       setMobileContextOpen(false);
     } catch (error) {
@@ -1850,7 +2026,17 @@ export function App(): JSX.Element {
             onAcceptApproval={onAcceptApproval}
             diff={diff}
             fileNodes={fileNodes}
+            selectedSessionId={selectedSessionId}
             selectedSession={selectedSession}
+            selectedTerminal={selectedTerminal}
+            terminalInput={terminalInput}
+            setTerminalInput={setTerminalInput}
+            terminalAction={terminalAction}
+            terminalOutputRef={terminalOutputRef}
+            onStartTerminal={onStartTerminal}
+            onStopTerminal={onStopTerminal}
+            onInterruptTerminal={onInterruptTerminal}
+            onSubmitTerminalInput={onSubmitTerminalInput}
             sessionAction={sessionAction}
             onArchiveSession={onArchiveSession}
             onDeleteSession={onDeleteSession}
@@ -1907,7 +2093,17 @@ export function App(): JSX.Element {
                 onAcceptApproval={onAcceptApproval}
                 diff={diff}
                 fileNodes={fileNodes}
+                selectedSessionId={selectedSessionId}
                 selectedSession={selectedSession}
+                selectedTerminal={selectedTerminal}
+                terminalInput={terminalInput}
+                setTerminalInput={setTerminalInput}
+                terminalAction={terminalAction}
+                terminalOutputRef={terminalOutputRef}
+                onStartTerminal={onStartTerminal}
+                onStopTerminal={onStopTerminal}
+                onInterruptTerminal={onInterruptTerminal}
+                onSubmitTerminalInput={onSubmitTerminalInput}
                 sessionAction={sessionAction}
                 onArchiveSession={onArchiveSession}
                 onDeleteSession={onDeleteSession}
@@ -2235,7 +2431,17 @@ type RightPanelProps = {
   onAcceptApproval: (item: ApprovalQueueItem) => Promise<void>;
   diff: DiffSnapshot | null;
   fileNodes: FileTreeNode[];
+  selectedSessionId: string | null;
   selectedSession: SessionCard | null;
+  selectedTerminal: TerminalSessionSnapshot | null;
+  terminalInput: string;
+  setTerminalInput: (value: string) => void;
+  terminalAction: "starting" | "stopping" | "sending" | null;
+  terminalOutputRef: React.RefObject<HTMLDivElement>;
+  onStartTerminal: () => Promise<void>;
+  onStopTerminal: () => Promise<void>;
+  onInterruptTerminal: () => Promise<void>;
+  onSubmitTerminalInput: (rawInput?: string) => Promise<void>;
   sessionAction: "archive" | "delete" | null;
   onArchiveSession: () => Promise<void>;
   onDeleteSession: () => Promise<void>;
@@ -2244,6 +2450,8 @@ type RightPanelProps = {
 
 function RightPanel(props: RightPanelProps): JSX.Element {
   const [useCustomModel, setUseCustomModel] = useState(() => !modelOptions.includes(props.model));
+  const terminalRunning = props.selectedTerminal?.status === "running";
+  const terminalBusy = props.terminalAction === "starting" || props.terminalAction === "stopping";
 
   useEffect(() => {
     if (!modelOptions.includes(props.model)) {
@@ -2419,6 +2627,94 @@ function RightPanel(props: RightPanelProps): JSX.Element {
 
       {props.rightPanelTab === "tools" ? (
         <>
+          <section className="rounded-2xl border border-card-border bg-white p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-bold">Session terminal</h3>
+              <Badge>{terminalRunning ? "running" : "stopped"}</Badge>
+            </div>
+
+            {!props.selectedSessionId ? (
+              <p className="text-xs text-foreground/70">Select a chat to open a terminal.</p>
+            ) : (
+              <>
+                <p className="mb-2 truncate font-mono text-[11px] text-foreground/70" title={props.selectedSessionId}>
+                  {props.selectedSessionId}
+                </p>
+
+                <div className="mb-2 flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    onClick={() => void props.onStartTerminal()}
+                    disabled={terminalRunning || terminalBusy}
+                  >
+                    {props.terminalAction === "starting" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                    Open terminal
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void props.onStopTerminal()}
+                    disabled={!terminalRunning || terminalBusy}
+                  >
+                    {props.terminalAction === "stopping" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                    Stop
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void props.onInterruptTerminal()}
+                    disabled={!terminalRunning || props.terminalAction === "sending"}
+                  >
+                    Ctrl+C
+                  </Button>
+                </div>
+
+                {props.selectedTerminal ? (
+                  <p className="mb-2 text-[11px] text-foreground/70">
+                    {props.selectedTerminal.workspace} {props.selectedTerminal.pid ? `| pid ${props.selectedTerminal.pid}` : ""}
+                  </p>
+                ) : (
+                  <p className="mb-2 text-[11px] text-foreground/70">No terminal for this session yet.</p>
+                )}
+
+                <div
+                  ref={props.terminalOutputRef}
+                  className="h-56 overflow-auto rounded-xl border border-card-border bg-slate-950 p-2 font-mono text-[11px] leading-5 text-slate-100"
+                >
+                  <pre className="whitespace-pre-wrap break-words">
+                    {props.selectedTerminal?.output
+                      || (props.selectedTerminal
+                        ? (props.selectedTerminal.status === "running" ? "$ terminal ready" : "$ terminal stopped")
+                        : "$ terminal not started")}
+                  </pre>
+                </div>
+
+                <form
+                  className="mt-2 flex items-center gap-2"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void props.onSubmitTerminalInput(`${props.terminalInput}\n`);
+                  }}
+                >
+                  <input
+                    className="h-10 w-full rounded-xl border border-card-border bg-white px-3 font-mono text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                    value={props.terminalInput}
+                    onChange={(event) => props.setTerminalInput(event.target.value)}
+                    placeholder={terminalRunning ? "Type command and press Enter" : "Start terminal to run commands"}
+                    disabled={!terminalRunning || props.terminalAction === "sending"}
+                  />
+                  <Button
+                    type="submit"
+                    size="sm"
+                    disabled={!terminalRunning || !props.terminalInput.trim() || props.terminalAction === "sending"}
+                  >
+                    {props.terminalAction === "sending" ? <LoaderCircle className="h-4 w-4 animate-spin" /> : "Run"}
+                  </Button>
+                </form>
+              </>
+            )}
+          </section>
+
           <section className="space-y-2">
             {props.approvals.length === 0 ? <p className="text-sm text-foreground/70">Approval queue is empty.</p> : null}
 

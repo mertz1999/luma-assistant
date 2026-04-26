@@ -26,6 +26,7 @@ import {
   type RunRecord,
   type SessionHistoryEntry,
   type SseEvent,
+  type TerminalSessionSnapshot,
   type WorkspaceOption,
 } from "@agentic/shared";
 
@@ -54,6 +55,13 @@ type ActiveRun = {
   stdoutBuffer: string;
   stopRequested: boolean;
 };
+
+type ActiveTerminal = {
+  process: ChildProcess;
+  session: TerminalSessionSnapshot;
+};
+
+const TERMINAL_HISTORY_MAX_CHARS = Number(process.env.TERMINAL_HISTORY_MAX_CHARS || 220000);
 
 function runSessionId(run: RunRecord): string {
   return run.sessionId || run.threadId || run.id;
@@ -474,6 +482,216 @@ class RunManager extends EventEmitter {
   }
 }
 
+class TerminalManager extends EventEmitter {
+  private terminals = new Map<string, ActiveTerminal>();
+
+  constructor(private readonly getDefaultWorkspace: () => string) {
+    super();
+  }
+
+  getSession(sessionId: string): TerminalSessionSnapshot | null {
+    const active = this.terminals.get(sessionId);
+    if (!active) return null;
+    return { ...active.session };
+  }
+
+  startSession(sessionId: string, workspace: string): TerminalSessionSnapshot {
+    const existing = this.terminals.get(sessionId);
+    if (existing?.session.status === "running") {
+      return { ...existing.session };
+    }
+
+    const resolvedWorkspace = path.resolve(workspace || this.getDefaultWorkspace());
+    const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/zsh");
+    const shellName = path.basename(shell).toLowerCase();
+    const useShellRc = process.env.TERMINAL_USE_SHELL_RC === "1";
+    let shellArgs: string[] = [];
+    if (process.platform !== "win32") {
+      if (useShellRc) {
+        shellArgs = ["-i"];
+      } else if (shellName.includes("zsh")) {
+        shellArgs = ["-f", "-i"];
+      } else if (shellName.includes("bash")) {
+        shellArgs = ["--noprofile", "--norc", "-i"];
+      }
+    }
+
+    const child = spawn(shell, shellArgs, {
+      cwd: resolvedWorkspace,
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        TERM: process.env.TERM || "xterm-256color",
+        COLORTERM: process.env.COLORTERM || "truecolor",
+        PS1: process.env.TERMINAL_PS1 || "$ ",
+        PROMPT: process.env.TERMINAL_PS1 || "$ ",
+        PROMPT_EOL_MARK: "",
+      },
+    });
+
+    if (!child.stdin || !child.stdout || !child.stderr) {
+      throw new Error("Failed to initialize terminal streams");
+    }
+
+    const now = Date.now();
+    const snapshot: TerminalSessionSnapshot = {
+      sessionId,
+      status: "running",
+      workspace: resolvedWorkspace,
+      shell,
+      pid: child.pid ?? null,
+      createdAt: now,
+      updatedAt: now,
+      output: "",
+    };
+
+    const active: ActiveTerminal = {
+      process: child,
+      session: snapshot,
+    };
+    this.terminals.set(sessionId, active);
+    this.emitSse({
+      kind: "terminal.started",
+      at: now,
+      sessionId,
+      payload: { terminal: snapshot },
+    });
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      this.handleOutputChunk(sessionId, "stdout", chunk.toString("utf8"));
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      this.handleOutputChunk(sessionId, "stderr", chunk.toString("utf8"));
+    });
+
+    child.on("exit", (code, signal) => {
+      const current = this.terminals.get(sessionId);
+      if (!current) return;
+      const stoppedSession: TerminalSessionSnapshot = {
+        ...current.session,
+        status: "stopped",
+        pid: null,
+        updatedAt: Date.now(),
+      };
+      this.terminals.set(sessionId, {
+        ...current,
+        session: stoppedSession,
+      });
+
+      this.emitSse({
+        kind: "terminal.stopped",
+        at: Date.now(),
+        sessionId,
+        payload: {
+          terminal: stoppedSession,
+          code: code ?? null,
+          signal: signal ?? null,
+        },
+      });
+    });
+
+    return { ...snapshot };
+  }
+
+  writeInput(sessionId: string, input: string): boolean {
+    const active = this.terminals.get(sessionId);
+    if (!active || active.session.status !== "running") return false;
+    if (!active.process.stdin) return false;
+    active.process.stdin.write(input);
+    active.session = { ...active.session, updatedAt: Date.now() };
+    this.terminals.set(sessionId, active);
+    return true;
+  }
+
+  interruptSession(sessionId: string): TerminalSessionSnapshot | null {
+    const active = this.terminals.get(sessionId);
+    if (!active) return null;
+    if (active.session.status !== "running") return { ...active.session };
+    this.sendSignal(active, "SIGINT");
+    return { ...active.session };
+  }
+
+  stopSession(sessionId: string): TerminalSessionSnapshot | null {
+    const active = this.terminals.get(sessionId);
+    if (!active) return null;
+
+    if (active.session.status !== "running") {
+      return { ...active.session };
+    }
+
+    const targetPid = active.process.pid;
+    this.sendSignal(active, "SIGTERM");
+
+    setTimeout(() => {
+      const current = this.terminals.get(sessionId);
+      if (!current || current.session.status !== "running" || current.process.pid !== targetPid) return;
+      this.sendSignal(current, "SIGKILL");
+    }, 1500);
+
+    return { ...active.session };
+  }
+
+  removeSession(sessionId: string): void {
+    const active = this.terminals.get(sessionId);
+    if (!active) return;
+    if (active.session.status === "running") {
+      this.sendSignal(active, "SIGKILL");
+    }
+    this.terminals.delete(sessionId);
+  }
+
+  private handleOutputChunk(sessionId: string, stream: "stdout" | "stderr", text: string): void {
+    if (!text) return;
+    const cleaned = sanitizeTerminalChunk(text);
+    if (!cleaned) return;
+    const active = this.terminals.get(sessionId);
+    if (!active) return;
+
+    const merged = `${active.session.output}${cleaned}`;
+    const output = merged.length > TERMINAL_HISTORY_MAX_CHARS
+      ? merged.slice(merged.length - TERMINAL_HISTORY_MAX_CHARS)
+      : merged;
+
+    const nextSession: TerminalSessionSnapshot = {
+      ...active.session,
+      output,
+      updatedAt: Date.now(),
+    };
+    this.terminals.set(sessionId, { ...active, session: nextSession });
+
+    this.emitSse({
+      kind: "terminal.output",
+      at: Date.now(),
+      sessionId,
+      payload: {
+        sessionId,
+        stream,
+        text: cleaned,
+      },
+    });
+  }
+
+  private emitSse(evt: SseEvent): void {
+    this.emit("sse", evt);
+  }
+
+  private sendSignal(active: ActiveTerminal, signal: NodeJS.Signals): void {
+    const pid = active.process.pid;
+    if (!pid) return;
+    try {
+      if (process.platform !== "win32") {
+        process.kill(-pid, signal);
+        return;
+      }
+      active.process.kill(signal);
+    } catch {
+      // ignore signal errors
+    }
+  }
+}
+
 const PLAN_MODE_PREAMBLE = `Plan Mode is enabled. You must:
 1) Explore first with non-mutating actions.
 2) Clarify assumptions before implementation.
@@ -494,6 +712,24 @@ function looksLikeApprovalIssue(lower: string): boolean {
 
 function stripAnsi(input: string): string {
   return input.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function sanitizeTerminalChunk(input: string): string {
+  if (!input) return "";
+
+  let text = input;
+  // Remove OSC sequences (title updates, etc.).
+  text = text.replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g, "");
+  // Remove CSI/control escape sequences.
+  text = text.replace(/\u001B\[[0-9;?]*[ -/]*[@-~]/g, "");
+  // Remove carriage-return redraw artifacts.
+  text = text.replace(/\r/g, "");
+
+  while (/[^\n]\u0008/.test(text)) {
+    text = text.replace(/[^\n]\u0008/g, "");
+  }
+  text = text.replace(/\u0008/g, "");
+  return text;
 }
 
 function isBenignCodexStderr(text: string): boolean {
@@ -802,9 +1038,14 @@ app.use(
 const runManager = new RunManager(CODEX_PATH);
 const persisted = loadPersistedRuns();
 runManager.loadPersisted(persisted.runs, persisted.approvals);
+const terminalManager = new TerminalManager(() => uiState.activeWorkspace);
 
 const sseClients = new Set<express.Response>();
 runManager.on("sse", (event: SseEvent) => {
+  const data = `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const client of sseClients) client.write(data);
+});
+terminalManager.on("sse", (event: SseEvent) => {
   const data = `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
   for (const client of sseClients) client.write(data);
 });
@@ -1118,6 +1359,7 @@ app.post("/api/sessions/:sessionId/archive", (req, res) => {
       res.status(404).json(apiErr("Session not found"));
       return;
     }
+    terminalManager.removeSession(req.params.sessionId);
     res.json(apiOk({ sessionId: req.params.sessionId, archivedRuns: result.archivedRuns }));
   } catch (error) {
     res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to archive session"));
@@ -1131,10 +1373,68 @@ app.delete("/api/sessions/:sessionId", (req, res) => {
       res.status(404).json(apiErr("Session not found"));
       return;
     }
+    terminalManager.removeSession(req.params.sessionId);
     res.json(apiOk({ sessionId: req.params.sessionId, ...result }));
   } catch (error) {
     res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to delete session"));
   }
+});
+
+app.get("/api/terminals/:sessionId", (req, res) => {
+  const terminal = terminalManager.getSession(req.params.sessionId);
+  res.json(apiOk({ terminal }));
+});
+
+app.post("/api/terminals/:sessionId/start", (req, res) => {
+  const workspaceRaw = typeof req.body?.workspace === "string" && req.body.workspace.trim()
+    ? req.body.workspace
+    : uiState.activeWorkspace;
+  const workspace = path.resolve(workspaceRaw);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+
+  try {
+    const terminal = terminalManager.startSession(req.params.sessionId, workspace);
+    res.json(apiOk({ terminal }));
+  } catch (error) {
+    res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to start terminal"));
+  }
+});
+
+app.post("/api/terminals/:sessionId/stop", (req, res) => {
+  const terminal = terminalManager.stopSession(req.params.sessionId);
+  if (!terminal) {
+    res.status(404).json(apiErr("Terminal session not found"));
+    return;
+  }
+  res.json(apiOk({ terminal }));
+});
+
+app.post("/api/terminals/:sessionId/interrupt", (req, res) => {
+  const terminal = terminalManager.interruptSession(req.params.sessionId);
+  if (!terminal) {
+    res.status(404).json(apiErr("Terminal session not found"));
+    return;
+  }
+  res.json(apiOk({ terminal }));
+});
+
+app.post("/api/terminals/:sessionId/input", (req, res) => {
+  const input = typeof req.body?.input === "string" ? req.body.input : "";
+  if (!input) {
+    res.status(400).json(apiErr("Input is required"));
+    return;
+  }
+
+  const accepted = terminalManager.writeInput(req.params.sessionId, input);
+  if (!accepted) {
+    res.status(404).json(apiErr("Terminal is not running for this session"));
+    return;
+  }
+
+  res.json(apiOk({ accepted: true }));
 });
 
 app.get("/api/files/tree", (req, res) => {

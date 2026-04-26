@@ -115,6 +115,19 @@ export type SessionHistoryEntry = {
   summary: string;
 };
 
+export type TerminalSessionStatus = "running" | "stopped";
+
+export type TerminalSessionSnapshot = {
+  sessionId: string;
+  status: TerminalSessionStatus;
+  workspace: string;
+  shell: string;
+  pid: number | null;
+  createdAt: number;
+  updatedAt: number;
+  output: string;
+};
+
 export type AppBootstrap = {
   defaults: {
     model: string;
@@ -182,6 +195,9 @@ export const sseEventKinds = [
   "run.completed",
   "run.failed",
   "run.stopped",
+  "terminal.started",
+  "terminal.output",
+  "terminal.stopped",
   "heartbeat",
 ] as const;
 
@@ -191,5 +207,6 @@ export type SseEvent = {
   kind: SseEventKind;
   at: number;
   runId?: string;
+  sessionId?: string;
   payload?: Record<string, unknown>;
 };
