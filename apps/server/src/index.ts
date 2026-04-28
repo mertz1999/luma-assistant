@@ -42,7 +42,7 @@ const HOST = process.env.HOST || "0.0.0.0";
 const CODEX_PATH = process.env.CODEX_PATH || "codex";
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "gpt-5.3-codex";
 const DEFAULT_REASONING_EFFORT = process.env.DEFAULT_REASONING_EFFORT || "high";
-const DEFAULT_SANDBOX = process.env.DEFAULT_SANDBOX || "read-only";
+const DEFAULT_SANDBOX = resolveDefaultSandboxMode();
 const MAX_CONCURRENT_RUNS = Number(process.env.MAX_CONCURRENT_RUNS || 8);
 
 type PersistedUiState = {
@@ -65,6 +65,34 @@ const TERMINAL_HISTORY_MAX_CHARS = Number(process.env.TERMINAL_HISTORY_MAX_CHARS
 
 function runSessionId(run: RunRecord): string {
   return run.sessionId || run.threadId || run.id;
+}
+
+function normalizeSandboxMode(input: string | undefined): "read-only" | "workspace-write" | "danger-full-access" {
+  const value = (input || "").trim();
+  if (!value) return "read-only";
+
+  const lower = value.toLowerCase();
+  if (lower === "read-only" || lower === "readonly") return "read-only";
+  if (lower === "workspace-write" || lower === "workspacewrite") return "workspace-write";
+  if (lower === "danger-full-access" || lower === "dangerfullaccess") return "danger-full-access";
+  return "read-only";
+}
+
+function isTruthy(input: string | undefined): boolean {
+  const lower = (input || "").trim().toLowerCase();
+  return lower === "1" || lower === "true" || lower === "yes" || lower === "on";
+}
+
+function resolveDefaultSandboxMode(): "read-only" | "workspace-write" | "danger-full-access" {
+  const explicit = normalizeSandboxMode(process.env.DEFAULT_SANDBOX);
+  const legacy = normalizeSandboxMode(process.env.DEFAULT_SANDBOX_TYPE);
+  const networkEnabled = isTruthy(process.env.DEFAULT_NETWORK_ACCESS);
+
+  const base = process.env.DEFAULT_SANDBOX ? explicit : (process.env.DEFAULT_SANDBOX_TYPE ? legacy : "read-only");
+  if (!networkEnabled) return base;
+
+  // Legacy env compatibility: DEFAULT_NETWORK_ACCESS=true implies unrestricted network runtime.
+  return "danger-full-access";
 }
 
 class RunManager extends EventEmitter {

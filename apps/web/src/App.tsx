@@ -1083,7 +1083,7 @@ export function App(): JSX.Element {
 
   const [prompt, setPrompt] = useState("");
   const [model, setModel] = useState("gpt-5.3-codex");
-  const [sandbox, setSandbox] = useState<SandboxMode>("read-only");
+  const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("on-request");
   const [planMode, setPlanMode] = useState(false);
 
