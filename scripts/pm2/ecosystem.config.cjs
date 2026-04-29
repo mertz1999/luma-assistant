@@ -1,6 +1,9 @@
 const path = require('node:path');
+const dotenv = require('dotenv');
 
 const root = path.resolve(__dirname, '..', '..');
+dotenv.config({ path: path.join(root, '.env') });
+
 const apiPort = String(process.env.API_PORT || '9001');
 const webPort = String(process.env.WEB_PORT || '5175');
 const host = process.env.HOST || '0.0.0.0';
@@ -13,6 +16,7 @@ module.exports = {
       script: 'npm',
       args: 'run start -w @agentic/server',
       env: {
+        ...process.env,
         NODE_ENV: 'production',
         API_PORT: apiPort,
         WEB_PORT: webPort,
@@ -31,6 +35,7 @@ module.exports = {
       script: 'npm',
       args: `run preview -w @agentic/web -- --host 0.0.0.0 --port ${webPort}`,
       env: {
+        ...process.env,
         NODE_ENV: 'production',
       },
       autorestart: true,

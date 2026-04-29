@@ -109,6 +109,8 @@ const modelOptions = ["gpt-5.3-codex", "gpt-5.4", "gpt-5", "gpt-5-mini", "gpt-4.
 const toolOutputModalLimit = 2500;
 const draftSessionKey = "__draft__";
 const queueStorageKey = "agentic_cli_queue_v1";
+const terminalHistoryStorageKey = "agentic_cli_terminal_history_v1";
+const terminalHistoryLimit = 80;
 
 type SlashCommandKey = "/mcp" | "/account" | "/status" | "/help" | "/speech";
 
@@ -307,6 +309,37 @@ function isSandboxMode(value: unknown): value is SandboxMode {
 
 function isApprovalPolicy(value: unknown): value is ApprovalPolicy {
   return value === "untrusted" || value === "on-failure" || value === "on-request" || value === "never";
+}
+
+function normalizeTerminalCommand(input: string): string {
+  return input.replace(/\r\n/g, "\n").replace(/\n+$/g, "").trim();
+}
+
+function loadTerminalCommandHistory(): Record<string, string[]> {
+  if (typeof window === "undefined") return {};
+
+  try {
+    const raw = window.localStorage.getItem(terminalHistoryStorageKey);
+    if (!raw) return {};
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) return {};
+
+    const next: Record<string, string[]> = {};
+    for (const [sessionId, commands] of Object.entries(parsed)) {
+      if (!Array.isArray(commands) || !sessionId) continue;
+
+      const normalized = commands
+        .map((command) => (typeof command === "string" ? normalizeTerminalCommand(command) : ""))
+        .filter((command) => Boolean(command))
+        .slice(0, terminalHistoryLimit);
+
+      if (normalized.length) next[sessionId] = normalized;
+    }
+    return next;
+  } catch {
+    return {};
+  }
 }
 
 function loadQueuedMessages(): Record<string, QueuedMessage[]> {
@@ -1092,6 +1125,7 @@ export function App(): JSX.Element {
   const [isDraftSession, setIsDraftSession] = useState(false);
   const [slashEntriesBySession, setSlashEntriesBySession] = useState<Record<string, TimelineEntry[]>>({});
   const [queuedBySession, setQueuedBySession] = useState<Record<string, QueuedMessage[]>>(() => loadQueuedMessages());
+  const [terminalHistoryBySession, setTerminalHistoryBySession] = useState<Record<string, string[]>>(() => loadTerminalCommandHistory());
   const [processingQueueItemId, setProcessingQueueItemId] = useState<string | null>(null);
   const [toolDetailModal, setToolDetailModal] = useState<ToolDetailModalState | null>(null);
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
@@ -1218,6 +1252,20 @@ export function App(): JSX.Element {
   }, [queuedBySession]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    try {
+      if (Object.keys(terminalHistoryBySession).length === 0) {
+        window.localStorage.removeItem(terminalHistoryStorageKey);
+        return;
+      }
+      window.localStorage.setItem(terminalHistoryStorageKey, JSON.stringify(terminalHistoryBySession));
+    } catch {
+      // ignore localStorage write errors
+    }
+  }, [terminalHistoryBySession]);
+
+  useEffect(() => {
     void loadBootstrap();
   }, []);
 
@@ -1330,6 +1378,10 @@ export function App(): JSX.Element {
   const selectedTerminal = useMemo(
     () => (selectedSessionId ? terminalsBySession[selectedSessionId] || null : null),
     [selectedSessionId, terminalsBySession],
+  );
+  const selectedTerminalHistory = useMemo(
+    () => (selectedSessionId ? terminalHistoryBySession[selectedSessionId] || [] : []),
+    [selectedSessionId, terminalHistoryBySession],
   );
 
   const selectedRun = selectedSession?.latestRun || null;
@@ -1896,6 +1948,18 @@ export function App(): JSX.Element {
     }
   }
 
+  function saveTerminalCommandHistory(sessionId: string, command: string): void {
+    const normalized = normalizeTerminalCommand(command);
+    if (!normalized) return;
+
+    setTerminalHistoryBySession((prev) => {
+      const current = prev[sessionId] || [];
+      const withoutDup = current.filter((item) => item !== normalized);
+      const next = [normalized, ...withoutDup].slice(0, terminalHistoryLimit);
+      return { ...prev, [sessionId]: next };
+    });
+  }
+
   async function onSubmitTerminalInput(rawInput?: string): Promise<void> {
     if (!selectedSessionId) return;
     const base = typeof rawInput === "string" ? rawInput : terminalInput;
@@ -1904,9 +1968,8 @@ export function App(): JSX.Element {
     setTerminalAction("sending");
     try {
       await sendTerminalInput(selectedSessionId, base);
-      if (typeof rawInput !== "string") {
-        setTerminalInput("");
-      }
+      saveTerminalCommandHistory(selectedSessionId, base);
+      setTerminalInput("");
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "Failed to send terminal input");
     } finally {
@@ -2056,6 +2119,7 @@ export function App(): JSX.Element {
             selectedSessionId={selectedSessionId}
             selectedSession={selectedSession}
             selectedTerminal={selectedTerminal}
+            terminalHistory={selectedTerminalHistory}
             terminalInput={terminalInput}
             setTerminalInput={setTerminalInput}
             terminalAction={terminalAction}
@@ -2123,6 +2187,7 @@ export function App(): JSX.Element {
                 selectedSessionId={selectedSessionId}
                 selectedSession={selectedSession}
                 selectedTerminal={selectedTerminal}
+                terminalHistory={selectedTerminalHistory}
                 terminalInput={terminalInput}
                 setTerminalInput={setTerminalInput}
                 terminalAction={terminalAction}
@@ -2468,6 +2533,7 @@ type RightPanelProps = {
   selectedSessionId: string | null;
   selectedSession: SessionCard | null;
   selectedTerminal: TerminalSessionSnapshot | null;
+  terminalHistory: string[];
   terminalInput: string;
   setTerminalInput: (value: string) => void;
   terminalAction: "starting" | "stopping" | "sending" | null;
@@ -2745,6 +2811,41 @@ function RightPanel(props: RightPanelProps): JSX.Element {
                     {props.terminalAction === "sending" ? <LoaderCircle className="h-4 w-4 animate-spin" /> : "Run"}
                   </Button>
                 </form>
+
+                {props.terminalHistory.length ? (
+                  <div className="mt-3 rounded-xl border border-card-border bg-white p-2">
+                    <div className="mb-2 flex items-center justify-between">
+                      <p className="text-[11px] font-semibold text-foreground/80">Recent commands</p>
+                      <Badge>{props.terminalHistory.length}</Badge>
+                    </div>
+                    <div className="max-h-44 space-y-1 overflow-y-auto pr-1">
+                      {props.terminalHistory.map((command, index) => (
+                        <div key={`${command}_${index}`} className="rounded-lg border border-card-border bg-muted px-2 py-1.5">
+                          <p className="truncate font-mono text-[11px]" title={command}>{command}</p>
+                          <div className="mt-1 flex items-center gap-1">
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 px-2 text-[11px]"
+                              onClick={() => props.setTerminalInput(command)}
+                            >
+                              Use
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 px-2 text-[11px]"
+                              disabled={!terminalRunning || props.terminalAction === "sending"}
+                              onClick={() => void props.onSubmitTerminalInput(`${command}\n`)}
+                            >
+                              Run
+                            </Button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
               </>
             )}
           </section>

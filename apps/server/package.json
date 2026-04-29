@@ -16,6 +16,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
+    "node-pty": "^1.0.0",
     "zod": "^3.24.3"
   },
   "devDependencies": {

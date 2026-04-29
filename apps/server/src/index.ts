@@ -3,9 +3,11 @@ import path from "node:path";
 import os from "node:os";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { createRequire } from "node:module";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
+import type { IPty } from "node-pty";
 import {
   approvalPolicySchema,
   rerunSchema,
@@ -32,6 +34,7 @@ import {
 
 const rootDir = path.resolve(process.env.INIT_CWD || process.cwd());
 dotenv.config({ path: path.resolve(rootDir, ".env") });
+const require = createRequire(import.meta.url);
 
 const APP_STATE_PATH = path.resolve(rootDir, "data/ui-state.json");
 const RUNS_PATH = path.resolve(rootDir, "data/runs.json");
@@ -56,10 +59,33 @@ type ActiveRun = {
   stopRequested: boolean;
 };
 
-type ActiveTerminal = {
-  process: ChildProcess;
-  session: TerminalSessionSnapshot;
+type ActiveTerminal =
+  | {
+      mode: "pty";
+      pty: IPty;
+      session: TerminalSessionSnapshot;
+    }
+  | {
+      mode: "process";
+      child: ChildProcess;
+      session: TerminalSessionSnapshot;
+    };
+
+type NodePtyModule = {
+  spawn: (
+    file: string,
+    args: string[],
+    options: {
+      name?: string;
+      cols?: number;
+      rows?: number;
+      cwd?: string;
+      env?: NodeJS.ProcessEnv;
+    },
+  ) => IPty;
 };
+
+const nodePty = loadNodePty();
 
 const TERMINAL_HISTORY_MAX_CHARS = Number(process.env.TERMINAL_HISTORY_MAX_CHARS || 220000);
 
@@ -93,6 +119,51 @@ function resolveDefaultSandboxMode(): "read-only" | "workspace-write" | "danger-
 
   // Legacy env compatibility: DEFAULT_NETWORK_ACCESS=true implies unrestricted network runtime.
   return "danger-full-access";
+}
+
+function loadNodePty(): NodePtyModule | null {
+  try {
+    return require("node-pty") as NodePtyModule;
+  } catch {
+    return null;
+  }
+}
+
+function commandExists(command: string): boolean {
+  const result = spawnSync("which", [command], { encoding: "utf8" });
+  return result.status === 0 && Boolean(result.stdout.trim());
+}
+
+function getChildPids(pid: number): number[] {
+  const result = spawnSync("pgrep", ["-P", String(pid)], { encoding: "utf8" });
+  if (result.status !== 0 || !result.stdout) return [];
+  return result.stdout
+    .split(/\s+/)
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isInteger(value) && value > 0);
+}
+
+function resolveTerminalShell(): string {
+  const configured = process.env.TERMINAL_SHELL?.trim();
+  const candidates = [
+    configured,
+    process.platform === "win32" ? "powershell.exe" : "/bin/bash",
+    process.platform === "win32" ? "cmd.exe" : "/bin/sh",
+    process.platform === "win32" ? "powershell" : "bash",
+    process.platform === "win32" ? "cmd" : "sh",
+  ].filter(Boolean) as string[];
+
+  for (const candidate of candidates) {
+    if (path.isAbsolute(candidate)) {
+      if (fs.existsSync(candidate)) return candidate;
+      continue;
+    }
+    if (commandExists(candidate)) return candidate;
+  }
+
+  throw new Error(
+    "No terminal shell found. Expected /bin/bash or /bin/sh. You can also set TERMINAL_SHELL explicitly in .env.",
+  );
 }
 
 class RunManager extends EventEmitter {
@@ -530,7 +601,7 @@ class TerminalManager extends EventEmitter {
     }
 
     const resolvedWorkspace = path.resolve(workspace || this.getDefaultWorkspace());
-    const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/zsh");
+    const shell = resolveTerminalShell();
     const shellName = path.basename(shell).toLowerCase();
     const useShellRc = process.env.TERMINAL_USE_SHELL_RC === "1";
     let shellArgs: string[] = [];
@@ -544,23 +615,15 @@ class TerminalManager extends EventEmitter {
       }
     }
 
-    const child = spawn(shell, shellArgs, {
-      cwd: resolvedWorkspace,
-      detached: process.platform !== "win32",
-      stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        TERM: process.env.TERM || "xterm-256color",
-        COLORTERM: process.env.COLORTERM || "truecolor",
-        PS1: process.env.TERMINAL_PS1 || "$ ",
-        PROMPT: process.env.TERMINAL_PS1 || "$ ",
-        PROMPT_EOL_MARK: "",
-      },
-    });
-
-    if (!child.stdin || !child.stdout || !child.stderr) {
-      throw new Error("Failed to initialize terminal streams");
-    }
+    const usePty = process.env.TERMINAL_DISABLE_PTY !== "1" && nodePty !== null;
+    const terminalEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      TERM: process.env.TERM || "xterm-256color",
+      COLORTERM: process.env.COLORTERM || "truecolor",
+      PS1: process.env.TERMINAL_PS1 || "$ ",
+      PROMPT: process.env.TERMINAL_PS1 || "$ ",
+      PROMPT_EOL_MARK: "",
+    };
 
     const now = Date.now();
     const snapshot: TerminalSessionSnapshot = {
@@ -568,16 +631,62 @@ class TerminalManager extends EventEmitter {
       status: "running",
       workspace: resolvedWorkspace,
       shell,
-      pid: child.pid ?? null,
+      pid: null,
       createdAt: now,
       updatedAt: now,
       output: "",
     };
 
-    const active: ActiveTerminal = {
-      process: child,
-      session: snapshot,
-    };
+    let active: ActiveTerminal | null = null;
+    let ptyFailureMessage: string | null = null;
+
+    if (usePty && nodePty) {
+      try {
+        const pty = nodePty.spawn(shell, shellArgs, {
+          name: process.env.TERM || "xterm-256color",
+          cols: Number(process.env.TERMINAL_COLS || 160),
+          rows: Number(process.env.TERMINAL_ROWS || 40),
+          cwd: resolvedWorkspace,
+          env: terminalEnv,
+        });
+        snapshot.pid = pty.pid ?? null;
+        active = { mode: "pty", pty, session: snapshot };
+      } catch (error) {
+        ptyFailureMessage = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    if (!active) {
+      try {
+        const child = spawn(shell, shellArgs, {
+          cwd: resolvedWorkspace,
+          detached: process.platform !== "win32",
+          stdio: ["pipe", "pipe", "pipe"],
+          env: terminalEnv,
+        });
+
+        if (!child.stdin || !child.stdout || !child.stderr) {
+          throw new Error("Failed to initialize terminal streams");
+        }
+        snapshot.pid = child.pid ?? null;
+        active = { mode: "process", child, session: snapshot };
+      } catch (error) {
+        const base = error instanceof Error ? error.message : String(error);
+        if (ptyFailureMessage) {
+          throw new Error(`Terminal startup failed (pty: ${ptyFailureMessage}; fallback: ${base})`);
+        }
+        throw new Error(`Terminal startup failed: ${base}`);
+      }
+    }
+
+    if (ptyFailureMessage) {
+      const fallbackNote = `$ PTY unavailable (${ptyFailureMessage}). Using fallback terminal mode.\n`;
+      snapshot.output = fallbackNote;
+      snapshot.shell = `fallback:${shell}`;
+    } else if (active.mode === "pty") {
+      snapshot.shell = `pty:${shell}`;
+    }
+
     this.terminals.set(sessionId, active);
     this.emitSse({
       kind: "terminal.started",
@@ -586,39 +695,28 @@ class TerminalManager extends EventEmitter {
       payload: { terminal: snapshot },
     });
 
-    child.stdout.on("data", (chunk: Buffer) => {
-      this.handleOutputChunk(sessionId, "stdout", chunk.toString("utf8"));
-    });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      this.handleOutputChunk(sessionId, "stderr", chunk.toString("utf8"));
-    });
-
-    child.on("exit", (code, signal) => {
-      const current = this.terminals.get(sessionId);
-      if (!current) return;
-      const stoppedSession: TerminalSessionSnapshot = {
-        ...current.session,
-        status: "stopped",
-        pid: null,
-        updatedAt: Date.now(),
-      };
-      this.terminals.set(sessionId, {
-        ...current,
-        session: stoppedSession,
+    if (active.mode === "pty") {
+      const pty = active.pty;
+      pty.onData((chunk: string) => {
+        this.handleOutputChunk(sessionId, "stdout", chunk);
+      });
+      pty.onExit((event: { exitCode: number; signal?: number }) => {
+        this.onTerminalExit(sessionId, event.exitCode ?? null, event.signal ?? null);
+      });
+    } else {
+      const child = active.child;
+      child.stdout?.on("data", (chunk: Buffer) => {
+        this.handleOutputChunk(sessionId, "stdout", chunk.toString("utf8"));
       });
 
-      this.emitSse({
-        kind: "terminal.stopped",
-        at: Date.now(),
-        sessionId,
-        payload: {
-          terminal: stoppedSession,
-          code: code ?? null,
-          signal: signal ?? null,
-        },
+      child.stderr?.on("data", (chunk: Buffer) => {
+        this.handleOutputChunk(sessionId, "stderr", chunk.toString("utf8"));
       });
-    });
+
+      child.on("exit", (code, signal) => {
+        this.onTerminalExit(sessionId, code ?? null, signal ?? null);
+      });
+    }
 
     return { ...snapshot };
   }
@@ -626,8 +724,12 @@ class TerminalManager extends EventEmitter {
   writeInput(sessionId: string, input: string): boolean {
     const active = this.terminals.get(sessionId);
     if (!active || active.session.status !== "running") return false;
-    if (!active.process.stdin) return false;
-    active.process.stdin.write(input);
+    if (active.mode === "pty") {
+      active.pty.write(input);
+    } else {
+      if (!active.child.stdin) return false;
+      active.child.stdin.write(input);
+    }
     active.session = { ...active.session, updatedAt: Date.now() };
     this.terminals.set(sessionId, active);
     return true;
@@ -637,6 +739,14 @@ class TerminalManager extends EventEmitter {
     const active = this.terminals.get(sessionId);
     if (!active) return null;
     if (active.session.status !== "running") return { ...active.session };
+    if (active.mode === "process") {
+      try {
+        active.child.stdin?.write("\u0003");
+      } catch {
+        // best-effort
+      }
+      this.signalProcessTree(active.child.pid, "SIGINT");
+    }
     this.sendSignal(active, "SIGINT");
     return { ...active.session };
   }
@@ -649,14 +759,26 @@ class TerminalManager extends EventEmitter {
       return { ...active.session };
     }
 
-    const targetPid = active.process.pid;
-    this.sendSignal(active, "SIGTERM");
+    if (active.mode === "pty") {
+      const targetPid = active.pty.pid;
+      this.sendSignal(active, "SIGTERM");
+      setTimeout(() => {
+        const current = this.terminals.get(sessionId);
+        if (!current || current.session.status !== "running" || current.mode !== "pty" || current.pty.pid !== targetPid) return;
+        this.sendSignal(current, "SIGKILL");
+      }, 1500);
+    } else {
+      const targetPid = active.child.pid;
+      this.signalProcessTree(targetPid, "SIGTERM");
+      this.sendSignal(active, "SIGTERM");
 
-    setTimeout(() => {
-      const current = this.terminals.get(sessionId);
-      if (!current || current.session.status !== "running" || current.process.pid !== targetPid) return;
-      this.sendSignal(current, "SIGKILL");
-    }, 1500);
+      setTimeout(() => {
+        const current = this.terminals.get(sessionId);
+        if (!current || current.session.status !== "running" || current.mode !== "process" || current.child.pid !== targetPid) return;
+        this.signalProcessTree(targetPid, "SIGKILL");
+        this.sendSignal(current, "SIGKILL");
+      }, 1500);
+    }
 
     return { ...active.session };
   }
@@ -705,17 +827,92 @@ class TerminalManager extends EventEmitter {
     this.emit("sse", evt);
   }
 
+  private onTerminalExit(sessionId: string, code: number | null, signal: number | string | null): void {
+    const current = this.terminals.get(sessionId);
+    if (!current) return;
+    const stoppedSession: TerminalSessionSnapshot = {
+      ...current.session,
+      status: "stopped",
+      pid: null,
+      updatedAt: Date.now(),
+    };
+    this.terminals.set(sessionId, {
+      ...current,
+      session: stoppedSession,
+    });
+
+    this.emitSse({
+      kind: "terminal.stopped",
+      at: Date.now(),
+      sessionId,
+      payload: {
+        terminal: stoppedSession,
+        code,
+        signal,
+      },
+    });
+  }
+
   private sendSignal(active: ActiveTerminal, signal: NodeJS.Signals): void {
-    const pid = active.process.pid;
+    if (active.mode === "pty") {
+      try {
+        if (signal === "SIGINT") {
+          active.pty.write("\u0003");
+        } else {
+          active.pty.kill(signal);
+        }
+      } catch {
+        // ignore signal errors
+      }
+      return;
+    }
+
+    const pid = active.child.pid;
     if (!pid) return;
     try {
       if (process.platform !== "win32") {
+        // Try the whole process group first (foreground command + shell).
         process.kill(-pid, signal);
         return;
       }
-      active.process.kill(signal);
+      active.child.kill(signal);
+    } catch {
+      // ignore and retry direct pid below
+    }
+
+    try {
+      if (process.platform !== "win32") {
+        // Fallback to direct child pid if process-group signal failed.
+        process.kill(pid, signal);
+        return;
+      }
+      active.child.kill(signal);
     } catch {
       // ignore signal errors
+    }
+  }
+
+  private signalProcessTree(rootPid: number | undefined, signal: NodeJS.Signals): void {
+    if (!rootPid || rootPid <= 0 || process.platform === "win32") return;
+    const visited = new Set<number>();
+    const queue: number[] = [rootPid];
+
+    while (queue.length > 0) {
+      const pid = queue.shift();
+      if (!pid || visited.has(pid)) continue;
+      visited.add(pid);
+      for (const child of getChildPids(pid)) {
+        if (!visited.has(child)) queue.push(child);
+      }
+    }
+
+    const ordered = [...visited].sort((a, b) => b - a);
+    for (const pid of ordered) {
+      try {
+        process.kill(pid, signal);
+      } catch {
+        // ignore missing-process or permission errors
+      }
     }
   }
 }
