@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
+import jwt from "jsonwebtoken";
 import type { IPty } from "node-pty";
 import {
   approvalPolicySchema,
@@ -47,6 +48,10 @@ const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "gpt-5.3-codex";
 const DEFAULT_REASONING_EFFORT = process.env.DEFAULT_REASONING_EFFORT || "high";
 const DEFAULT_SANDBOX = resolveDefaultSandboxMode();
 const MAX_CONCURRENT_RUNS = Number(process.env.MAX_CONCURRENT_RUNS || 8);
+const AUTH_PASSWORD = process.env.PASSWORD || process.env.APP_PASSWORD || "";
+const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
+const AUTH_TOKEN_TTL_SECONDS = Number(process.env.AUTH_TOKEN_TTL_SECONDS || 24 * 60 * 60);
+const JWT_SECRET = process.env.JWT_SECRET || AUTH_PASSWORD || "agentic-cli-default-jwt-secret";
 
 type PersistedUiState = {
   activeWorkspace: string;
@@ -1260,6 +1265,44 @@ app.use(
   }),
 );
 
+app.post("/api/auth/login", (req, res) => {
+  if (!AUTH_ENABLED) {
+    res.status(503).json(apiErr("Password auth is not configured on server."));
+    return;
+  }
+
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  if (!password) {
+    res.status(400).json(apiErr("Password is required."));
+    return;
+  }
+
+  if (password !== AUTH_PASSWORD) {
+    res.status(401).json(apiErr("Invalid password."));
+    return;
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const expiresIn = Math.max(60, AUTH_TOKEN_TTL_SECONDS);
+  const token = jwt.sign(
+    {
+      sub: "agentic-cli-user",
+      iat: nowSeconds,
+    },
+    JWT_SECRET,
+    { expiresIn },
+  );
+  res.json(
+    apiOk({
+      token,
+      expiresAt: (nowSeconds + expiresIn) * 1000,
+      expiresInSeconds: expiresIn,
+    }),
+  );
+});
+
+app.use(requireAuth);
+
 const runManager = new RunManager(CODEX_PATH);
 const persisted = loadPersistedRuns();
 runManager.loadPersisted(persisted.runs, persisted.approvals);
@@ -1287,6 +1330,44 @@ function apiOk<T>(data: T): ApiResponse<T> {
 
 function apiErr(message: string): ApiResponse<never> {
   return { ok: false, error: { message } };
+}
+
+function extractAuthToken(req: express.Request): string | null {
+  const auth = req.header("authorization") || req.header("Authorization");
+  if (auth && auth.startsWith("Bearer ")) {
+    const token = auth.slice("Bearer ".length).trim();
+    if (token) return token;
+  }
+
+  const queryToken = typeof req.query.token === "string" ? req.query.token.trim() : "";
+  if (queryToken) return queryToken;
+
+  return null;
+}
+
+function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  if (!AUTH_ENABLED) {
+    next();
+    return;
+  }
+
+  if (req.path === "/api/auth/login") {
+    next();
+    return;
+  }
+
+  const token = extractAuthToken(req);
+  if (!token) {
+    res.status(401).json(apiErr("Unauthorized"));
+    return;
+  }
+
+  try {
+    jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json(apiErr("Unauthorized"));
+  }
 }
 
 function runCodexCommandStatus(args: string[]): CodexCommandStatus {
@@ -1744,5 +1825,7 @@ app.get("/api/events", (req, res) => {
 
 app.listen(API_PORT, HOST, () => {
   // eslint-disable-next-line no-console
-  console.log(`[agentic-cli/server] listening on http://${HOST}:${API_PORT}`);
+  console.log(
+    `[agentic-cli/server] listening on http://${HOST}:${API_PORT} | auth=${AUTH_ENABLED ? "enabled" : "disabled"}`,
+  );
 });

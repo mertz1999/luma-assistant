@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import Convert from "ansi-to-html";
 import DiffViewer from "react-diff-viewer-continued";
@@ -8,6 +8,7 @@ import {
   CircleStop,
   FileCode2,
   FolderTree,
+  Lock,
   Layers,
   LoaderCircle,
   MessageSquare,
@@ -47,7 +48,9 @@ import {
   getSystemStatus,
   getTerminal,
   interruptTerminal,
+  loginWithPassword,
   rerun,
+  setApiAuthToken,
   sendTerminalInput,
   setActiveWorkspace,
   startRun,
@@ -111,6 +114,13 @@ const draftSessionKey = "__draft__";
 const queueStorageKey = "agentic_cli_queue_v1";
 const terminalHistoryStorageKey = "agentic_cli_terminal_history_v1";
 const terminalHistoryLimit = 80;
+const authSessionStorageKey = "agentic_cli_auth_session_v1";
+const authSessionMaxAgeMs = 24 * 60 * 60 * 1000;
+
+type StoredAuthSession = {
+  token: string;
+  expiresAt: number;
+};
 
 type SlashCommandKey = "/mcp" | "/account" | "/status" | "/help" | "/speech";
 
@@ -339,6 +349,27 @@ function loadTerminalCommandHistory(): Record<string, string[]> {
     return next;
   } catch {
     return {};
+  }
+}
+
+function loadStoredAuthSession(): StoredAuthSession | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(authSessionStorageKey);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) return null;
+
+    const token = typeof parsed.token === "string" ? parsed.token.trim() : "";
+    const expiresAt = typeof parsed.expiresAt === "number" ? parsed.expiresAt : 0;
+    if (!token || !expiresAt) return null;
+
+    if (Date.now() >= expiresAt) return null;
+    if (expiresAt - Date.now() > authSessionMaxAgeMs) return null;
+
+    return { token, expiresAt };
+  } catch {
+    return null;
   }
 }
 
@@ -1137,17 +1168,63 @@ export function App(): JSX.Element {
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceRecordingStartedAt, setVoiceRecordingStartedAt] = useState<number | null>(null);
   const [voiceRecordingSeconds, setVoiceRecordingSeconds] = useState(0);
+  const [authReady, setAuthReady] = useState(false);
+  const [authToken, setAuthTokenState] = useState<string | null>(null);
+  const [authExpiresAt, setAuthExpiresAt] = useState<number>(0);
+  const [authPasswordInput, setAuthPasswordInput] = useState("");
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   const ansi = useMemo(() => new Convert({ newline: true, escapeXML: true }), []);
   const timelineBottomRef = useRef<HTMLDivElement | null>(null);
   const terminalOutputRef = useRef<HTMLDivElement | null>(null);
   const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const isAuthenticated = Boolean(authToken && authExpiresAt > Date.now());
 
   useEffect(() => {
     const root = document.documentElement;
     root.setAttribute("data-theme", theme);
     root.classList.toggle("dark", theme === "dark");
   }, [theme]);
+
+  useEffect(() => {
+    const session = loadStoredAuthSession();
+    if (session) {
+      setAuthTokenState(session.token);
+      setAuthExpiresAt(session.expiresAt);
+      setApiAuthToken(session.token);
+    } else {
+      setApiAuthToken(null);
+    }
+    setAuthReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!authReady || typeof window === "undefined") return;
+    if (isAuthenticated && authToken) {
+      const session: StoredAuthSession = {
+        token: authToken,
+        expiresAt: Math.min(authExpiresAt, Date.now() + authSessionMaxAgeMs),
+      };
+      window.localStorage.setItem(authSessionStorageKey, JSON.stringify(session));
+      return;
+    }
+    window.localStorage.removeItem(authSessionStorageKey);
+  }, [authReady, isAuthenticated, authToken, authExpiresAt]);
+
+  useEffect(() => {
+    if (!authReady || !isAuthenticated) return;
+    const onUnauthorized = () => {
+      setApiAuthToken(null);
+      setAuthTokenState(null);
+      setAuthExpiresAt(0);
+      setAuthError("Session expired. Please enter password again.");
+    };
+    window.addEventListener("agentic:unauthorized", onUnauthorized as EventListener);
+    return () => {
+      window.removeEventListener("agentic:unauthorized", onUnauthorized as EventListener);
+    };
+  }, [authReady, isAuthenticated]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1266,10 +1343,16 @@ export function App(): JSX.Element {
   }, [terminalHistoryBySession]);
 
   useEffect(() => {
+    if (!authReady) return;
+    if (!isAuthenticated) {
+      setLoading(false);
+      return;
+    }
     void loadBootstrap();
-  }, []);
+  }, [authReady, isAuthenticated]);
 
   useEffect(() => {
+    if (!authReady || !isAuthenticated) return;
     const es = connectEvents((event) => {
       if (event.kind === "heartbeat") return;
 
@@ -1350,7 +1433,7 @@ export function App(): JSX.Element {
     });
 
     return () => es.close();
-  }, [selectedRunId]);
+  }, [selectedRunId, authReady, isAuthenticated]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -1481,6 +1564,29 @@ export function App(): JSX.Element {
       return;
     }
   }, [queuedBySession, runningSessionIds, submitting, processingQueueItemId]);
+
+  async function onAuthenticate(event?: FormEvent): Promise<void> {
+    event?.preventDefault();
+    if (!authPasswordInput.trim() || authSubmitting) return;
+
+    setAuthSubmitting(true);
+    setAuthError(null);
+    try {
+      const payload = await loginWithPassword(authPasswordInput);
+      setAuthTokenState(payload.token);
+      setAuthExpiresAt(payload.expiresAt);
+      setApiAuthToken(payload.token);
+      setAuthPasswordInput("");
+      setLoading(true);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Authentication failed.");
+      setApiAuthToken(null);
+      setAuthTokenState(null);
+      setAuthExpiresAt(0);
+    } finally {
+      setAuthSubmitting(false);
+    }
+  }
 
   async function loadBootstrap(): Promise<void> {
     setLoading(true);
@@ -2034,6 +2140,53 @@ export function App(): JSX.Element {
     } finally {
       setSessionAction(null);
     }
+  }
+
+  if (!authReady) {
+    return (
+      <div className="flex h-[100dvh] items-center justify-center bg-[color:var(--bg)] text-[color:var(--text)]">
+        <div className="flex items-center gap-2 rounded-xl border border-card-border bg-white px-4 py-3 shadow-sm">
+          <LoaderCircle className="h-4 w-4 animate-spin" />
+          <span className="text-sm">Preparing secure session...</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <div className="flex h-[100dvh] items-center justify-center bg-[color:var(--bg)] px-4 text-[color:var(--text)]">
+        <Card className="w-full max-w-md">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-lg">
+              <Lock className="h-5 w-5" />
+              Sign in
+            </CardTitle>
+            <p className="text-sm text-foreground/70">
+              Enter password to access this panel. Auth session is saved in browser for 24 hours.
+            </p>
+          </CardHeader>
+          <CardContent>
+            <form className="space-y-3" onSubmit={(event) => void onAuthenticate(event)}>
+              <input
+                className="h-11 w-full rounded-xl border border-card-border bg-white px-3 text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
+                type="password"
+                autoComplete="current-password"
+                value={authPasswordInput}
+                onChange={(event) => setAuthPasswordInput(event.target.value)}
+                placeholder="Password"
+                disabled={authSubmitting}
+              />
+              {authError ? <p className="text-xs text-rose-700">{authError}</p> : null}
+              <Button type="submit" className="w-full" disabled={!authPasswordInput.trim() || authSubmitting}>
+                {authSubmitting ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                Continue
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
+      </div>
+    );
   }
 
   return (

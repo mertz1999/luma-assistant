@@ -16,16 +16,44 @@ type ApiResponse<T> =
   | { ok: true; data: T }
   | { ok: false; error: { message: string } };
 
+let authToken: string | null = null;
+
+export function setApiAuthToken(token: string | null): void {
+  authToken = token && token.trim() ? token.trim() : null;
+}
+
+function emitUnauthorized(): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent("agentic:unauthorized"));
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    headers: { "Content-Type": "application/json" },
-    ...init,
-  });
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (authToken) {
+    headers.set("Authorization", `Bearer ${authToken}`);
+  }
+
+  const response = await fetch(url, { ...init, headers });
+  if (response.status === 401) {
+    emitUnauthorized();
+    throw new Error("Unauthorized");
+  }
+
   const payload = (await response.json()) as ApiResponse<T>;
   if (!payload.ok) {
     throw new Error(payload.error.message || "Request failed");
   }
   return payload.data;
+}
+
+export function loginWithPassword(password: string): Promise<{ token: string; expiresAt: number; expiresInSeconds: number }> {
+  return request("/api/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ password }),
+  });
 }
 
 export function getBootstrap(): Promise<AppBootstrap> {
@@ -133,7 +161,8 @@ export function sendTerminalInput(sessionId: string, input: string): Promise<{ a
 }
 
 export function connectEvents(onEvent: (evt: SseEvent) => void): EventSource {
-  const es = new EventSource("/api/events");
+  const query = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
+  const es = new EventSource(`/api/events${query}`);
   const names = [
     "run.started",
     "run.stdout",
