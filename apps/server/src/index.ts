@@ -52,6 +52,7 @@ const AUTH_PASSWORD = process.env.PASSWORD || process.env.APP_PASSWORD || "";
 const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
 const AUTH_TOKEN_TTL_SECONDS = Number(process.env.AUTH_TOKEN_TTL_SECONDS || 24 * 60 * 60);
 const JWT_SECRET = process.env.JWT_SECRET || AUTH_PASSWORD || "agentic-cli-default-jwt-secret";
+const PLAN_MODE_FILE_PATH = path.resolve(rootDir, "plan.md");
 
 type PersistedUiState = {
   activeWorkspace: string;
@@ -261,18 +262,19 @@ class RunManager extends EventEmitter {
       throw new Error(`Maximum concurrent runs reached (${MAX_CONCURRENT_RUNS})`);
     }
 
+    const effectiveConfig = resolveEffectiveRunConfig(config);
     const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const prompt = config.planMode ? `${PLAN_MODE_PREAMBLE}\n\n${config.prompt}` : config.prompt;
+    const prompt = effectiveConfig.planMode ? buildPlanModePrompt(effectiveConfig.prompt) : effectiveConfig.prompt;
 
     const record: RunRecord = {
       id: runId,
       createdAt: Date.now(),
       updatedAt: Date.now(),
       status: "queued",
-      config,
-      sessionId: config.sessionId || null,
+      config: effectiveConfig,
+      sessionId: effectiveConfig.sessionId || null,
       threadId: null,
-      summary: prompt.slice(0, 140),
+      summary: effectiveConfig.prompt.slice(0, 140),
       events: [],
       lastError: null,
       changedFiles: [],
@@ -282,21 +284,21 @@ class RunManager extends EventEmitter {
 
     this.runs.set(runId, record);
 
-    const args = config.sessionId
+    const args = effectiveConfig.sessionId
       ? [
           "exec",
           "resume",
           "--json",
           "--skip-git-repo-check",
           "-m",
-          config.model,
+          effectiveConfig.model,
           "-c",
           `reasoning_effort=${JSON.stringify(DEFAULT_REASONING_EFFORT)}`,
           "-c",
-          `approval_policy=${JSON.stringify(config.approvalPolicy)}`,
+          `approval_policy=${JSON.stringify(effectiveConfig.approvalPolicy)}`,
           "-c",
-          `sandbox_mode=${JSON.stringify(config.sandbox)}`,
-          config.sessionId,
+          `sandbox_mode=${JSON.stringify(effectiveConfig.sandbox)}`,
+          effectiveConfig.sessionId,
           prompt,
         ]
       : [
@@ -304,20 +306,20 @@ class RunManager extends EventEmitter {
           "--json",
           "--skip-git-repo-check",
           "-C",
-          config.workspace,
+          effectiveConfig.workspace,
           "-m",
-          config.model,
+          effectiveConfig.model,
           "-c",
           `reasoning_effort=${JSON.stringify(DEFAULT_REASONING_EFFORT)}`,
           "-s",
-          config.sandbox,
+          effectiveConfig.sandbox,
           "-c",
-          `approval_policy=${JSON.stringify(config.approvalPolicy)}`,
+          `approval_policy=${JSON.stringify(effectiveConfig.approvalPolicy)}`,
           prompt,
         ];
 
     const child = spawn(this.codexPath, args, {
-      cwd: config.workspace,
+      cwd: effectiveConfig.workspace,
       stdio: ["ignore", "pipe", "pipe"],
     });
     if (!child.stdout || !child.stderr) {
@@ -326,7 +328,7 @@ class RunManager extends EventEmitter {
 
     this.activeRuns.set(runId, { process: child, stdoutBuffer: "", stopRequested: false });
     this.updateRun(runId, { status: "running" });
-    this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config } });
+    this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
 
     child.stdout.on("data", (chunk: Buffer) => {
       const active = this.activeRuns.get(runId);
@@ -922,11 +924,33 @@ class TerminalManager extends EventEmitter {
   }
 }
 
-const PLAN_MODE_PREAMBLE = `Plan Mode is enabled. You must:
-1) Explore first with non-mutating actions.
-2) Clarify assumptions before implementation.
-3) Produce explicit implementation steps before execution.
-4) Do not skip risk/edge-case analysis.`;
+function ensurePlanModeFile(): void {
+  if (!fs.existsSync(PLAN_MODE_FILE_PATH) || !fs.statSync(PLAN_MODE_FILE_PATH).isFile()) {
+    throw new Error(`Plan mode requires ${PLAN_MODE_FILE_PATH}, but the file was not found.`);
+  }
+}
+
+function buildPlanModePrompt(prompt: string): string {
+  ensurePlanModeFile();
+  return [
+    "Plan mode is enabled for this turn.",
+    `Read and follow this file before doing anything else: ${PLAN_MODE_FILE_PATH}`,
+    "Act according to that file for the entire response.",
+    "If the file cannot be accessed from the current workspace, say so explicitly instead of guessing.",
+    "",
+    "User request:",
+    prompt,
+  ].join("\n");
+}
+
+function resolveEffectiveRunConfig(config: RunConfig): RunConfig {
+  if (!config.planMode) return config;
+  return {
+    ...config,
+    sandbox: "read-only",
+    approvalPolicy: "never",
+  };
+}
 
 function looksLikeApprovalIssue(lower: string): boolean {
   return (

@@ -58,6 +58,7 @@ import {
   stopRun,
   stopTerminal,
 } from "@/lib/api";
+import { parsePlanningMessage } from "@/lib/planning";
 import { cn } from "@/lib/utils";
 import { useUiStore } from "@/store/useUiStore";
 import { Button } from "@/components/ui/button";
@@ -106,6 +107,8 @@ type SessionCard = {
   updatedAt: number;
 };
 
+type PlanSessionState = "idle" | "armed" | "active";
+
 const sandboxOptions: SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
 const approvalPolicies: ApprovalPolicy[] = ["untrusted", "on-failure", "on-request", "never"];
 const modelOptions = ["gpt-5.3-codex", "gpt-5.4", "gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o", "o4-mini"];
@@ -116,13 +119,14 @@ const terminalHistoryStorageKey = "agentic_cli_terminal_history_v1";
 const terminalHistoryLimit = 80;
 const authSessionStorageKey = "agentic_cli_auth_session_v1";
 const authSessionMaxAgeMs = 24 * 60 * 60 * 1000;
+const planInstructionPath = "/Users/applestation/Project/archive/agentic-assistant/plan.md";
 
 type StoredAuthSession = {
   token: string;
   expiresAt: number;
 };
 
-type SlashCommandKey = "/mcp" | "/account" | "/status" | "/help" | "/speech";
+type SlashCommandKey = "/mcp" | "/account" | "/status" | "/help" | "/speech" | "/plan";
 
 type SlashCommandSuggestion = {
   key: SlashCommandKey;
@@ -181,6 +185,7 @@ declare global {
 }
 
 const slashCommandSuggestions: SlashCommandSuggestion[] = [
+  { key: "/plan", title: "Planning workflow", description: "Enable the protected planning flow for your next message." },
   { key: "/status", title: "System status", description: "Show both account and MCP status." },
   { key: "/account", title: "Account status", description: "Show Codex account/login status." },
   { key: "/mcp", title: "MCP status", description: "Show configured MCP servers and auth status." },
@@ -190,6 +195,7 @@ const slashCommandSuggestions: SlashCommandSuggestion[] = [
 
 function normalizeSlashCommand(raw: string): SlashCommandKey | null {
   const lower = raw.toLowerCase();
+  if (lower === "/plan") return "/plan";
   if (lower === "/status") return "/status";
   if (lower === "/account" || lower === "/account-status") return "/account";
   if (lower === "/mcp" || lower === "/mcp-status") return "/mcp";
@@ -280,6 +286,29 @@ function buildSlashHelpText(): string {
     "Available slash commands:",
     ...slashCommandSuggestions.map((item) => `- \`${item.key}\` - ${item.description}`),
   ].join("\n");
+}
+
+function buildPlanModeEnabledText(): string {
+  return [
+    "Plan mode is enabled for the next message.",
+    `The next request will ask Codex to read and follow \`${planInstructionPath}\`.`,
+    "Planning turns stay read-only until final approval is granted.",
+  ].join("\n\n");
+}
+
+function buildPlanUsageText(): string {
+  return [
+    "Use `/plan` by itself.",
+    "Then send your actual request in the next message to start the planning workflow.",
+  ].join("\n\n");
+}
+
+function buildPlanAnswerPrompt(questionTitle: string, answer: string): string {
+  return `These are answers:\nQuestion: ${questionTitle}\nAnswer: ${answer}`;
+}
+
+function buildPlanFeedbackPrompt(feedback: string): string {
+  return `Final approval not granted yet. Revise the plan with this feedback:\n${feedback}`;
 }
 
 function buildSpeechSupportText(): string {
@@ -901,6 +930,231 @@ function ThinkingDots({ label = "Thinking" }: { label?: string }): JSX.Element {
   );
 }
 
+type StructuredMessageProps = {
+  entryKey: string;
+  text: string;
+  interactive: boolean;
+  resolved: boolean;
+  onAnswerPlanQuestion: (questionTitle: string, answer: string) => Promise<void>;
+  onApprovePlanImplementation: () => Promise<void>;
+  onSubmitPlanFeedback: (feedback: string) => Promise<void>;
+};
+
+function StructuredMessage(props: StructuredMessageProps): JSX.Element {
+  const segments = useMemo(() => parsePlanningMessage(props.text), [props.text]);
+
+  return (
+    <div className="space-y-3">
+      {segments.map((segment, index) => {
+        const key = `${props.entryKey}_${segment.type}_${index}`;
+
+        if (segment.type === "markdown" || segment.type === "proposed_plan") {
+          return <MarkdownMessage key={key} text={segment.type === "markdown" ? segment.text : segment.text} />;
+        }
+
+        if (segment.type === "question") {
+          if (!props.interactive) {
+            return <MarkdownMessage key={key} text={segment.raw} />;
+          }
+          return (
+            <QuestionCard
+              key={key}
+              title={segment.title}
+              description={segment.description}
+              options={segment.options}
+              disabled={props.resolved}
+              onSubmit={props.onAnswerPlanQuestion}
+            />
+          );
+        }
+
+        if (!props.interactive) {
+          return <MarkdownMessage key={key} text={segment.text || "Do you want to implement this plan now?"} />;
+        }
+
+        return (
+          <FinalApprovalCard
+            key={key}
+            text={segment.text}
+            disabled={props.resolved}
+            onApprove={props.onApprovePlanImplementation}
+            onSubmitFeedback={props.onSubmitPlanFeedback}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function QuestionCard({
+  title,
+  description,
+  options,
+  disabled,
+  onSubmit,
+}: {
+  title: string;
+  description: string;
+  options: string[];
+  disabled: boolean;
+  onSubmit: (questionTitle: string, answer: string) => Promise<void>;
+}): JSX.Element {
+  const [customAnswer, setCustomAnswer] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+  const isDisabled = disabled || submitted;
+
+  async function submitAnswer(answer: string): Promise<void> {
+    if (!answer.trim() || isDisabled || submitting) return;
+    setSubmitting(true);
+    try {
+      await onSubmit(title, answer.trim());
+      setSubmitted(true);
+    } catch {
+      // parent already surfaces submission errors
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <section className="rounded-2xl border border-brand/25 bg-brand-soft/35 p-3">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-foreground/70">Question</p>
+          <h3 className="text-sm font-semibold">{title}</h3>
+        </div>
+        <Badge>{isDisabled ? "Answered" : submitting ? "Sending" : `${options.length + 1} options`}</Badge>
+      </div>
+
+      {description ? (
+        <div className="mb-3 text-sm leading-relaxed">
+          <MarkdownMessage text={description} />
+        </div>
+      ) : null}
+
+      <div className="space-y-2">
+        {options.map((option) => (
+          <button
+            key={option}
+            type="button"
+            className="w-full rounded-xl border border-card-border bg-white px-3 py-2 text-left text-sm transition hover:border-brand/50 hover:bg-brand-soft/30 disabled:cursor-not-allowed disabled:opacity-70"
+            onClick={() => void submitAnswer(option)}
+            disabled={isDisabled || submitting}
+          >
+            {option}
+          </button>
+        ))}
+
+        <div className="flex items-center gap-2 rounded-xl border border-dashed border-card-border bg-white px-3 py-2">
+          <span className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Custom</span>
+          <input
+            className="h-9 w-full rounded-lg border border-card-border bg-white px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+            value={customAnswer}
+            onChange={(event) => setCustomAnswer(event.target.value)}
+            placeholder="Add your own answer"
+            disabled={isDisabled || submitting}
+          />
+          <Button
+            type="button"
+            size="sm"
+            onClick={() => void submitAnswer(customAnswer)}
+            disabled={isDisabled || submitting || !customAnswer.trim()}
+          >
+            {submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : "Send"}
+          </Button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function FinalApprovalCard({
+  text,
+  disabled,
+  onApprove,
+  onSubmitFeedback,
+}: {
+  text: string;
+  disabled: boolean;
+  onApprove: () => Promise<void>;
+  onSubmitFeedback: (feedback: string) => Promise<void>;
+}): JSX.Element {
+  const [feedback, setFeedback] = useState("");
+  const [submitting, setSubmitting] = useState<"approve" | "feedback" | null>(null);
+  const [submitted, setSubmitted] = useState(false);
+  const isDisabled = disabled || submitted;
+
+  async function submitApprove(): Promise<void> {
+    if (isDisabled || submitting) return;
+    setSubmitting("approve");
+    try {
+      await onApprove();
+      setSubmitted(true);
+    } catch {
+      // parent already surfaces submission errors
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function submitFeedback(): Promise<void> {
+    if (isDisabled || submitting || !feedback.trim()) return;
+    setSubmitting("feedback");
+    try {
+      await onSubmitFeedback(feedback.trim());
+      setFeedback("");
+      setSubmitted(true);
+    } catch {
+      // parent already surfaces submission errors
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  return (
+    <section className="rounded-2xl border border-amber-300/70 bg-amber-50/80 p-3">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-foreground/70">Final approval</p>
+          <h3 className="text-sm font-semibold">Do you want to implement this plan?</h3>
+        </div>
+        <Badge>{isDisabled ? "Submitted" : "Required"}</Badge>
+      </div>
+
+      <div className="mb-3 text-sm leading-relaxed">
+        <MarkdownMessage text={text.trim() || "Do you want to implement this plan now?"} />
+      </div>
+
+      <div className="space-y-2">
+        <Button type="button" onClick={() => void submitApprove()} disabled={isDisabled || submitting !== null} className="w-full justify-center">
+          {submitting === "approve" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+          Yes, implement
+        </Button>
+
+        <div className="flex items-center gap-2 rounded-xl border border-dashed border-amber-300/80 bg-white px-3 py-2">
+          <input
+            className="h-9 w-full rounded-lg border border-card-border bg-white px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+            value={feedback}
+            onChange={(event) => setFeedback(event.target.value)}
+            placeholder="Add plan changes before approval"
+            disabled={isDisabled || submitting !== null}
+          />
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => void submitFeedback()}
+            disabled={isDisabled || submitting !== null || !feedback.trim()}
+          >
+            {submitting === "feedback" ? <LoaderCircle className="h-4 w-4 animate-spin" /> : "Send"}
+          </Button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 type ToolDetailModalState = {
   title: string;
   command: string;
@@ -1149,7 +1403,7 @@ export function App(): JSX.Element {
   const [model, setModel] = useState("gpt-5.3-codex");
   const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("on-request");
-  const [planMode, setPlanMode] = useState(false);
+  const [planFlowBySession, setPlanFlowBySession] = useState<Record<string, PlanSessionState>>({});
 
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
@@ -1477,6 +1731,7 @@ export function App(): JSX.Element {
   }, [runs, selectedSessionId]);
 
   const sessionTimelineKey = selectedSessionId || draftSessionKey;
+  const planSessionState = planFlowBySession[sessionTimelineKey] || "idle";
   const timeline = useMemo(() => {
     const base = buildSessionTimeline(selectedSessionRuns);
     const slashEntries = slashEntriesBySession[sessionTimelineKey] || [];
@@ -1666,6 +1921,76 @@ export function App(): JSX.Element {
     }
   }
 
+  function resolvePlanState(sessionKey: string): PlanSessionState {
+    return planFlowBySession[sessionKey] || "idle";
+  }
+
+  function shouldUsePlanMode(sessionKey: string): boolean {
+    const state = resolvePlanState(sessionKey);
+    return state === "armed" || state === "active";
+  }
+
+  function moveDraftTimelineEntries(nextSessionKey: string): void {
+    if (nextSessionKey === draftSessionKey) return;
+    setSlashEntriesBySession((prev) => {
+      const draftEntries = prev[draftSessionKey];
+      if (!draftEntries?.length) return prev;
+      const nextEntries = [...(prev[nextSessionKey] || []), ...draftEntries].slice(-200);
+      const next = { ...prev, [nextSessionKey]: nextEntries };
+      delete next[draftSessionKey];
+      return next;
+    });
+  }
+
+  function setPlanState(sessionKey: string, nextState: PlanSessionState): void {
+    setPlanFlowBySession((prev) => {
+      const next = { ...prev };
+      if (nextState === "idle") {
+        delete next[sessionKey];
+      } else {
+        next[sessionKey] = nextState;
+      }
+      return next;
+    });
+  }
+
+  function buildQueuedMessage(
+    sessionKey: string,
+    promptValue: string,
+    overrides?: {
+      planMode?: boolean;
+      sandbox?: SandboxMode;
+      approvalPolicy?: ApprovalPolicy;
+    },
+  ): QueuedMessage {
+    const planMode = overrides?.planMode ?? shouldUsePlanMode(sessionKey);
+    return {
+      id: `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      sessionKey,
+      prompt: promptValue,
+      createdAt: Date.now(),
+      workspace: activeWorkspace,
+      model,
+      sandbox: overrides?.sandbox ?? (planMode ? "read-only" : sandbox),
+      approvalPolicy: overrides?.approvalPolicy ?? (planMode ? "never" : approvalPolicy),
+      planMode,
+    };
+  }
+
+  function enqueueMessage(request: QueuedMessage): void {
+    const sessionKey = request.sessionKey;
+    const queued: QueuedMessage = {
+      ...request,
+      id: request.id || `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      createdAt: request.createdAt || Date.now(),
+    };
+
+    setQueuedBySession((prev) => ({
+      ...prev,
+      [sessionKey]: [...(prev[sessionKey] || []), queued],
+    }));
+  }
+
   function removeQueuedMessage(sessionKey: string, messageId: string): void {
     setQueuedBySession((prev) => {
       const current = prev[sessionKey] || [];
@@ -1681,27 +2006,7 @@ export function App(): JSX.Element {
     });
   }
 
-  function enqueueMessage(promptValue: string): void {
-    const sessionKey = selectedSessionId || draftSessionKey;
-    const queued: QueuedMessage = {
-      id: `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      sessionKey,
-      prompt: promptValue,
-      createdAt: Date.now(),
-      workspace: activeWorkspace,
-      model,
-      sandbox,
-      approvalPolicy,
-      planMode,
-    };
-
-    setQueuedBySession((prev) => ({
-      ...prev,
-      [sessionKey]: [...(prev[sessionKey] || []), queued],
-    }));
-  }
-
-  async function startCodexRun(request: QueuedMessage, focusSession: boolean): Promise<void> {
+  async function startCodexRun(request: QueuedMessage, focusSession: boolean): Promise<RunRecord> {
     const input: StartRunInput = {
       prompt: request.prompt,
       workspace: request.workspace,
@@ -1715,18 +2020,30 @@ export function App(): JSX.Element {
     const payload = await startRun(input);
     await refreshRuns();
     setIsDraftSession(false);
+    const nextSessionKey = runSessionId(payload.run);
+
+    if (request.sessionKey === draftSessionKey) {
+      moveDraftTimelineEntries(nextSessionKey);
+      setPlanState(draftSessionKey, "idle");
+    }
+
+    if (request.planMode) {
+      setPlanState(nextSessionKey, "active");
+    }
 
     if (focusSession) {
-      setSelectedSessionId(runSessionId(payload.run));
+      setSelectedSessionId(nextSessionKey);
       setSelectedRunId(payload.run.id);
       setRightPanelTab("tools");
       setMobileThreadsOpen(false);
-      return;
+      return payload.run;
     }
 
-    if (selectedSessionId && runSessionId(payload.run) === selectedSessionId) {
+    if (selectedSessionId && nextSessionKey === selectedSessionId) {
       setSelectedRunId(payload.run.id);
     }
+
+    return payload.run;
   }
 
   async function runQueuedMessage(queued: QueuedMessage): Promise<void> {
@@ -1753,6 +2070,49 @@ export function App(): JSX.Element {
     }
   }
 
+  async function submitSessionMessage(
+    promptValue: string,
+    options?: {
+      sessionKey?: string;
+      planMode?: boolean;
+      sandbox?: SandboxMode;
+      approvalPolicy?: ApprovalPolicy;
+      focusSession?: boolean;
+      onBeforeSubmit?: () => void;
+      onError?: (message: string) => void;
+      onSubmitted?: (run: RunRecord | null) => void;
+    },
+  ): Promise<void> {
+    const sessionKey = options?.sessionKey || selectedSessionId || draftSessionKey;
+    const request = buildQueuedMessage(sessionKey, promptValue, {
+      planMode: options?.planMode,
+      sandbox: options?.sandbox,
+      approvalPolicy: options?.approvalPolicy,
+    });
+    const focusSession = options?.focusSession ?? (selectedSessionId === sessionKey || sessionKey === draftSessionKey);
+    const isRealSession = sessionKey !== draftSessionKey;
+    const hasRunningSessionTask = isRealSession && runningSessionIds.has(sessionKey);
+
+    if (isRealSession && (hasRunningSessionTask || submitting || processingQueueItemId !== null)) {
+      enqueueMessage(request);
+      options?.onSubmitted?.(null);
+      return;
+    }
+
+    options?.onBeforeSubmit?.();
+    setSubmitting(true);
+    try {
+      const run = await startCodexRun(request, focusSession);
+      options?.onSubmitted?.(run);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to start run";
+      options?.onError?.(message);
+      throw error;
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   function pushSlashEntries(sessionKey: string, entries: TimelineEntry[]): void {
     setSlashEntriesBySession((prev) => {
       const current = prev[sessionKey] || [];
@@ -1775,6 +2135,50 @@ export function App(): JSX.Element {
         at: now,
       },
     ]);
+
+    if (command === "/plan") {
+      const activeState = resolvePlanState(sessionKey);
+      if (input !== "/plan") {
+        pushSlashEntries(sessionKey, [
+          {
+            key: `slash_${messageId}_plan_usage`,
+            role: "error",
+            title: "System",
+            text: buildPlanUsageText(),
+            pending: false,
+            at: now + 1,
+          },
+        ]);
+        return;
+      }
+
+      if (activeState === "active") {
+        pushSlashEntries(sessionKey, [
+          {
+            key: `slash_${messageId}_plan_active`,
+            role: "assistant",
+            title: "System",
+            text: "This session is already in the planning workflow. Continue with the next planning message or final approval step.",
+            pending: false,
+            at: now + 1,
+          },
+        ]);
+        return;
+      }
+
+      setPlanState(sessionKey, "armed");
+      pushSlashEntries(sessionKey, [
+        {
+          key: `slash_${messageId}_plan_enabled`,
+          role: "assistant",
+          title: "System",
+          text: buildPlanModeEnabledText(),
+          pending: false,
+          at: now + 1,
+        },
+      ]);
+      return;
+    }
 
     if (command === "/help") {
       pushSlashEntries(sessionKey, [
@@ -1908,35 +2312,19 @@ export function App(): JSX.Element {
       return;
     }
 
-    const isRealSession = sessionKey !== draftSessionKey;
-    const hasRunningSessionTask = isRealSession && runningSessionIds.has(sessionKey);
-    if (isRealSession && (hasRunningSessionTask || submitting || processingQueueItemId !== null)) {
-      enqueueMessage(trimmedPrompt);
-      setPrompt("");
-      return;
-    }
-
-    const request: QueuedMessage = {
-      id: `direct_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      sessionKey,
-      prompt: trimmedPrompt,
-      createdAt: Date.now(),
-      workspace: activeWorkspace,
-      model,
-      sandbox,
-      approvalPolicy,
-      planMode,
-    };
-
-    setSubmitting(true);
     try {
-      await startCodexRun(request, true);
+      await submitSessionMessage(trimmedPrompt, {
+        sessionKey,
+        onError: (message) => window.alert(message),
+      });
       setPrompt("");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to start run";
-      window.alert(message);
+    } catch {
+      // handled above
     } finally {
-      setSubmitting(false);
+      if (voiceListening) {
+        setVoiceRecordingStartedAt(null);
+        setVoiceRecordingSeconds(0);
+      }
     }
   }
 
@@ -1985,6 +2373,13 @@ export function App(): JSX.Element {
     setSelectedSessionId(null);
     setSelectedRunId(null);
     setPrompt("");
+    setPlanState(draftSessionKey, "idle");
+    setSlashEntriesBySession((prev) => {
+      if (!(draftSessionKey in prev)) return prev;
+      const next = { ...prev };
+      delete next[draftSessionKey];
+      return next;
+    });
     setMobileThreadsOpen(false);
   }
 
@@ -2024,6 +2419,39 @@ export function App(): JSX.Element {
 
   function onSendButtonClick(): void {
     void onStartRun();
+  }
+
+  async function onAnswerPlanQuestion(questionTitle: string, answer: string): Promise<void> {
+    await submitSessionMessage(buildPlanAnswerPrompt(questionTitle, answer), {
+      sessionKey: sessionTimelineKey,
+      planMode: true,
+      onError: (message) => window.alert(message),
+    });
+  }
+
+  async function onSubmitPlanFeedback(feedback: string): Promise<void> {
+    await submitSessionMessage(buildPlanFeedbackPrompt(feedback), {
+      sessionKey: sessionTimelineKey,
+      planMode: true,
+      onError: (message) => window.alert(message),
+    });
+  }
+
+  async function onApprovePlanImplementation(): Promise<void> {
+    const previousState = resolvePlanState(sessionTimelineKey);
+    setPlanState(sessionTimelineKey, "idle");
+    try {
+      await submitSessionMessage("Final approval granted. Implement the approved plan now.", {
+        sessionKey: sessionTimelineKey,
+        planMode: false,
+        sandbox,
+        approvalPolicy,
+        onError: (message) => window.alert(message),
+      });
+    } catch (error) {
+      setPlanState(sessionTimelineKey, previousState);
+      throw error;
+    }
   }
 
   async function onStartTerminal(): Promise<void> {
@@ -2234,7 +2662,7 @@ export function App(): JSX.Element {
             timelineBottomRef={timelineBottomRef}
             setToolDetailModal={setToolDetailModal}
             slashSuggestions={slashSuggestions}
-            onInsertSlashCommand={(command) => setPrompt(`${command} `)}
+            onInsertSlashCommand={(command) => setPrompt(command === "/plan" ? command : `${command} `)}
             queueItems={queuedMessagesForActiveSession}
             onRemoveQueueItem={(messageId) => removeQueuedMessage(sessionTimelineKey, messageId)}
             voiceSupported={voiceSupported}
@@ -2243,6 +2671,10 @@ export function App(): JSX.Element {
             voiceRecordingSeconds={voiceRecordingSeconds}
             onToggleVoiceRecording={onToggleVoiceRecording}
             onSendButtonClick={onSendButtonClick}
+            planSessionState={planSessionState}
+            onAnswerPlanQuestion={onAnswerPlanQuestion}
+            onApprovePlanImplementation={onApprovePlanImplementation}
+            onSubmitPlanFeedback={onSubmitPlanFeedback}
           />
         </Card>
 
@@ -2261,8 +2693,6 @@ export function App(): JSX.Element {
             setSandbox={setSandbox}
             approvalPolicy={approvalPolicy}
             setApprovalPolicy={setApprovalPolicy}
-            planMode={planMode}
-            setPlanMode={setPlanMode}
             theme={theme}
             toggleTheme={toggleTheme}
             approvals={pendingApprovals}
@@ -2329,8 +2759,6 @@ export function App(): JSX.Element {
                 setSandbox={setSandbox}
                 approvalPolicy={approvalPolicy}
                 setApprovalPolicy={setApprovalPolicy}
-                planMode={planMode}
-                setPlanMode={setPlanMode}
                 theme={theme}
                 toggleTheme={toggleTheme}
                 approvals={pendingApprovals}
@@ -2474,6 +2902,10 @@ type CenterPanelProps = {
   voiceRecordingSeconds: number;
   onToggleVoiceRecording: () => void;
   onSendButtonClick: () => void;
+  planSessionState: PlanSessionState;
+  onAnswerPlanQuestion: (questionTitle: string, answer: string) => Promise<void>;
+  onApprovePlanImplementation: () => Promise<void>;
+  onSubmitPlanFeedback: (feedback: string) => Promise<void>;
 };
 
 function CenterPanel(props: CenterPanelProps): JSX.Element {
@@ -2512,44 +2944,56 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             </div>
           ) : null}
 
-          {props.timeline.map((entry) => (
-            <article
-              key={entry.key}
-              className={cn(
-                "animate-fade-up rounded-2xl border px-3 py-2 shadow-card",
-                entry.role === "user" && "ml-auto max-w-[90%] border-transparent bg-gradient-to-br from-brand to-brand-dark text-white",
-                entry.role === "assistant" && "mr-auto max-w-[90%] border-card-border bg-white",
-                entry.role === "plan" && "mr-auto max-w-full border-brand/35 bg-brand-soft/45",
-                entry.role === "tool" && "max-w-full border-dashed border-card-border bg-muted font-mono text-xs",
-                entry.role === "system" && "mx-auto max-w-fit rounded-full border-card-border bg-white/90 px-3 py-1 text-xs text-foreground/75",
-                entry.role === "error" && "mr-auto max-w-[90%] border-rose-300 bg-rose-50 text-rose-900",
-              )}
-            >
-              {entry.role !== "system" && entry.title ? (
-                <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-foreground/70">{entry.title}</div>
-              ) : null}
+          {props.timeline.map((entry) => {
+            const hasLaterUserMessage = props.timeline.some((item) => item.role === "user" && item.at > entry.at);
 
-              {entry.role === "tool" ? (
-                <ToolEntry entry={entry} ansi={props.ansi} onOpenOutput={props.setToolDetailModal} />
-              ) : entry.role === "assistant" || entry.role === "plan" ? (
-                <div className="break-words text-sm leading-relaxed">
-                  <MarkdownMessage text={entry.text} />
-                  {entry.pending ? (
-                    <div className="mt-1">
-                      <ThinkingDots label={entry.title || "Thinking"} />
-                    </div>
-                  ) : null}
-                </div>
-              ) : entry.role === "error" ? (
-                <div
-                  className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs"
-                  dangerouslySetInnerHTML={{ __html: props.ansi.toHtml(entry.text) }}
-                />
-              ) : (
-                <div className="break-words text-sm leading-relaxed">{entry.text}</div>
-              )}
-            </article>
-          ))}
+            return (
+              <article
+                key={entry.key}
+                className={cn(
+                  "animate-fade-up rounded-2xl border px-3 py-2 shadow-card",
+                  entry.role === "user" && "ml-auto max-w-[90%] border-transparent bg-gradient-to-br from-brand to-brand-dark text-white",
+                  entry.role === "assistant" && "mr-auto max-w-[90%] border-card-border bg-white",
+                  entry.role === "plan" && "mr-auto max-w-full border-brand/35 bg-brand-soft/45",
+                  entry.role === "tool" && "max-w-full border-dashed border-card-border bg-muted font-mono text-xs",
+                  entry.role === "system" && "mx-auto max-w-fit rounded-full border-card-border bg-white/90 px-3 py-1 text-xs text-foreground/75",
+                  entry.role === "error" && "mr-auto max-w-[90%] border-rose-300 bg-rose-50 text-rose-900",
+                )}
+              >
+                {entry.role !== "system" && entry.title ? (
+                  <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-foreground/70">{entry.title}</div>
+                ) : null}
+
+                {entry.role === "tool" ? (
+                  <ToolEntry entry={entry} ansi={props.ansi} onOpenOutput={props.setToolDetailModal} />
+                ) : entry.role === "assistant" || entry.role === "plan" ? (
+                  <div className="break-words text-sm leading-relaxed">
+                    <StructuredMessage
+                      entryKey={entry.key}
+                      text={entry.text}
+                      interactive={entry.role === "assistant" && !entry.pending}
+                      resolved={hasLaterUserMessage}
+                      onAnswerPlanQuestion={props.onAnswerPlanQuestion}
+                      onApprovePlanImplementation={props.onApprovePlanImplementation}
+                      onSubmitPlanFeedback={props.onSubmitPlanFeedback}
+                    />
+                    {entry.pending ? (
+                      <div className="mt-1">
+                        <ThinkingDots label={entry.title || "Thinking"} />
+                      </div>
+                    ) : null}
+                  </div>
+                ) : entry.role === "error" ? (
+                  <div
+                    className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs"
+                    dangerouslySetInnerHTML={{ __html: props.ansi.toHtml(entry.text) }}
+                  />
+                ) : (
+                  <div className="break-words text-sm leading-relaxed">{entry.text}</div>
+                )}
+              </article>
+            );
+          })}
 
           {props.hasPendingIndicator ? (
             <article className="mr-auto max-w-full animate-fade-up rounded-2xl border border-brand/35 bg-brand-soft/45 px-3 py-2 shadow-card">
@@ -2568,6 +3012,14 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             props.onSendButtonClick();
           }}
         >
+          {props.planSessionState !== "idle" ? (
+            <div className="mb-3 rounded-2xl border border-brand/30 bg-brand-soft/40 px-3 py-2 text-sm text-foreground/80">
+              {props.planSessionState === "armed"
+                ? "Plan mode is enabled. Your next message will start the planning workflow."
+                : "Planning workflow is active. Messages stay read-only until final approval."}
+            </div>
+          ) : null}
+
           <div className="relative flex items-end gap-2">
             {props.slashSuggestions.length > 0 ? (
               <div className="absolute bottom-full left-0 right-12 z-10 mb-2 space-y-1 rounded-2xl border border-card-border bg-white/95 p-2 shadow-lg backdrop-blur">
@@ -2587,7 +3039,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 
             <textarea
               className="min-h-[44px] max-h-40 w-full resize-y rounded-2xl border border-card-border bg-white px-3 py-2 text-base md:text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
-              placeholder="Message Codex... (type / for commands)"
+              placeholder="Message Codex... (type / for commands, including /plan)"
               value={props.prompt}
               onChange={(event) => props.setPrompt(event.target.value)}
             />
@@ -2675,8 +3127,6 @@ type RightPanelProps = {
   setSandbox: (value: SandboxMode) => void;
   approvalPolicy: ApprovalPolicy;
   setApprovalPolicy: (value: ApprovalPolicy) => void;
-  planMode: boolean;
-  setPlanMode: (value: boolean) => void;
   theme: "light" | "dark";
   toggleTheme: () => void;
   approvals: ApprovalQueueItem[];
@@ -2848,16 +3298,6 @@ function RightPanel(props: RightPanelProps): JSX.Element {
                     </option>
                   ))}
                 </select>
-              </div>
-
-              <div className="flex items-center justify-between rounded-xl border border-card-border bg-muted px-3 py-2">
-                <div>
-                  <p className="text-sm font-semibold">Plan mode</p>
-                  <p className="text-xs text-foreground/70">Inject planning preamble before prompt</p>
-                </div>
-                <Button size="sm" variant={props.planMode ? "primary" : "ghost"} onClick={() => props.setPlanMode(!props.planMode)}>
-                  {props.planMode ? "On" : "Off"}
-                </Button>
               </div>
             </div>
           </section>
