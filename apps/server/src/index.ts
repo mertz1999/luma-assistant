@@ -28,6 +28,8 @@ import {
   type RunEventEntry,
   type RunRecord,
   type SessionHistoryEntry,
+  type SessionTranscriptEntry,
+  type SessionTranscriptResponse,
   type SseEvent,
   type TerminalSessionSnapshot,
   type WorkspaceOption,
@@ -1174,7 +1176,30 @@ function looksLikeEnvelopeMessage(text: string): boolean {
   const normalized = text.trim().toLowerCase();
   return normalized.startsWith("<user_instructions>")
     || normalized.startsWith("<environment_context>")
-    || normalized.startsWith("<ide_context>");
+    || normalized.startsWith("<ide_context>")
+    || normalized.startsWith("<turn_aborted>")
+    || normalized.startsWith("# agents.md instructions for")
+    || normalized.startsWith("plan mode is enabled in the codex exec fallback path.");
+}
+
+function unwrapWrappedUserRequest(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+
+  if (trimmed.startsWith("Plan mode is enabled for this turn.")) {
+    const marker = "\n\nUser request:\n";
+    const markerIndex = trimmed.indexOf(marker);
+    if (markerIndex >= 0) {
+      return trimmed.slice(markerIndex + marker.length).trim();
+    }
+  }
+
+  const codexRequestMatch = trimmed.match(/(?:^|\n)## My request for Codex:\s*\n([\s\S]*)$/);
+  if (codexRequestMatch?.[1]) {
+    return codexRequestMatch[1].trim();
+  }
+
+  return trimmed;
 }
 
 function normalizeSessionTitle(raw: string, fallback: string): string {
@@ -1188,34 +1213,64 @@ function normalizeSessionTitle(raw: string, fallback: string): string {
   return title.length > 160 ? `${title.slice(0, 157)}...` : title;
 }
 
-function extractFirstUserMessage(lines: string[]): string {
-  let fallback = "";
+function isArchiveWorkspacePath(cwd: string): boolean {
+  return /[\\/]archive[\\/]/i.test(cwd);
+}
 
+function extractMessageText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+
+  const parts = content
+    .map((item) => {
+      if (!isRecord(item)) return "";
+      const type = typeof item.type === "string" ? item.type : "";
+      if ((type === "input_text" || type === "output_text" || type === "text") && typeof item.text === "string") {
+        return item.text;
+      }
+      return "";
+    })
+    .filter(Boolean);
+
+  return parts.join("\n").trim();
+}
+
+function readSessionMessageRow(row: Record<string, unknown>): { role: "user" | "assistant"; text: string; at: number | null } | null {
+  if (row.type === "message" && (row.role === "user" || row.role === "assistant")) {
+    const text = extractMessageText(row.content);
+    const at = typeof row.timestamp === "string" ? Date.parse(row.timestamp) || null : null;
+    return text ? { role: row.role, text, at } : null;
+  }
+
+  if (row.type === "response_item" && isRecord(row.payload) && row.payload.type === "message" && (row.payload.role === "user" || row.payload.role === "assistant")) {
+    const text = extractMessageText(row.payload.content);
+    const at = typeof row.timestamp === "string" ? Date.parse(row.timestamp) || null : null;
+    return text ? { role: row.payload.role, text, at } : null;
+  }
+
+  return null;
+}
+
+function extractFirstUserMessage(lines: string[]): string {
   for (const line of lines) {
     if (!line.trim()) continue;
     const row = safeJsonParse<Record<string, unknown>>(line, {});
-    if (row.type !== "message" || row.role !== "user") continue;
+    const message = readSessionMessageRow(row);
+    if (!message || message.role !== "user") continue;
 
-    const content = Array.isArray(row.content) ? row.content : [];
-    const textParts: string[] = [];
-    for (const part of content) {
-      if (!isRecord(part) || part.type !== "input_text") continue;
-      if (typeof part.text === "string" && part.text.trim()) {
-        textParts.push(part.text);
-      }
-    }
-
-    const candidate = textParts.join("\n").trim();
+    const candidate = unwrapWrappedUserRequest(message.text);
     if (!candidate) continue;
-    if (!fallback) fallback = candidate;
     if (!looksLikeEnvelopeMessage(candidate)) return candidate;
   }
 
-  return fallback;
+  return "";
 }
 
-function loadCodexSessionHistory(limit = 0): SessionHistoryEntry[] {
-  const root = path.join(os.homedir(), ".codex", "sessions");
+function getCodexSessionsRoot(): string {
+  return path.join(os.homedir(), ".codex", "sessions");
+}
+
+function listCodexSessionFiles(): string[] {
+  const root = getCodexSessionsRoot();
   if (!fs.existsSync(root)) return [];
 
   const files: string[] = [];
@@ -1234,32 +1289,34 @@ function loadCodexSessionHistory(limit = 0): SessionHistoryEntry[] {
   }
 
   files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-  const selected = limit > 0 ? files.slice(0, limit) : files;
+  return files;
+}
 
-  const out: SessionHistoryEntry[] = [];
-  for (const file of selected) {
-    if (file.toLowerCase().includes(`${path.sep}archived${path.sep}`)) continue;
-    const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
-    let payload: Record<string, unknown> | null = null;
+function readCodexSessionFile(file: string): { entry: SessionHistoryEntry; lines: string[] } | null {
+  if (file.toLowerCase().includes(`${path.sep}archived${path.sep}`)) return null;
 
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const row = safeJsonParse<Record<string, unknown>>(line, {});
-      if (row.type !== "session_meta" || !isRecord(row.payload)) continue;
-      payload = row.payload;
-      break;
-    }
+  const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+  let payload: Record<string, unknown> | null = null;
 
-    if (!payload) continue;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const row = safeJsonParse<Record<string, unknown>>(line, {});
+    if (row.type !== "session_meta" || !isRecord(row.payload)) continue;
+    payload = row.payload;
+    break;
+  }
 
-    const id = typeof payload.id === "string" ? payload.id : path.basename(file);
-    const timestamp = typeof payload.timestamp === "string" ? payload.timestamp : new Date(fs.statSync(file).mtimeMs).toISOString();
-    const cwd = typeof payload.cwd === "string" ? payload.cwd : "";
-    const source = typeof payload.source === "string" ? payload.source : "unknown";
-    const firstMessage = extractFirstUserMessage(lines);
-    const summary = normalizeSessionTitle(firstMessage, `Session in ${cwd || "unknown cwd"}`);
+  if (!payload) return null;
 
-    out.push({
+  const id = typeof payload.id === "string" ? payload.id : path.basename(file);
+  const timestamp = typeof payload.timestamp === "string" ? payload.timestamp : new Date(fs.statSync(file).mtimeMs).toISOString();
+  const cwd = typeof payload.cwd === "string" ? payload.cwd : "";
+  const source = typeof payload.source === "string" ? payload.source : "unknown";
+  const firstMessage = extractFirstUserMessage(lines);
+  const summary = normalizeSessionTitle(firstMessage, `Session in ${cwd || "unknown cwd"}`);
+
+  return {
+    entry: {
       id,
       timestamp,
       cwd,
@@ -1267,10 +1324,62 @@ function loadCodexSessionHistory(limit = 0): SessionHistoryEntry[] {
       model: typeof payload.model === "string" ? payload.model : undefined,
       cliVersion: typeof payload.cli_version === "string" ? payload.cli_version : undefined,
       summary,
-    });
+    },
+    lines,
+  };
+}
+
+function loadCodexSessionHistory(limit = 0): SessionHistoryEntry[] {
+  const files = listCodexSessionFiles();
+  const selected = limit > 0 ? files.slice(0, limit) : files;
+
+  const out: SessionHistoryEntry[] = [];
+  for (const file of selected) {
+    const parsed = readCodexSessionFile(file);
+    if (!parsed) continue;
+    if (parsed.entry.source === "exec") continue;
+    if (parsed.entry.source !== "agentic-cli" && isArchiveWorkspacePath(parsed.entry.cwd)) continue;
+    out.push(parsed.entry);
   }
 
   return out;
+}
+
+function loadCodexSessionTranscript(sessionId: string): SessionTranscriptResponse | null {
+  for (const file of listCodexSessionFiles()) {
+    const parsed = readCodexSessionFile(file);
+    if (!parsed || parsed.entry.id !== sessionId) continue;
+
+    const baseAt = Date.parse(parsed.entry.timestamp) || fs.statSync(file).mtimeMs || Date.now();
+    const entries: SessionTranscriptEntry[] = [];
+    let index = 0;
+
+    for (const line of parsed.lines) {
+      if (!line.trim()) continue;
+      const row = safeJsonParse<Record<string, unknown>>(line, {});
+      const message = readSessionMessageRow(row);
+      if (!message) continue;
+
+      const text = message.role === "user" ? unwrapWrappedUserRequest(message.text) : message.text.trim();
+      if (!text) continue;
+      if (message.role === "user" && looksLikeEnvelopeMessage(text)) continue;
+
+      entries.push({
+        key: `${sessionId}_${index}`,
+        role: message.role,
+        text,
+        at: message.at ?? (baseAt + index),
+      });
+      index += 1;
+    }
+
+    return {
+      session: parsed.entry,
+      entries,
+    };
+  }
+
+  return null;
 }
 
 const { defaultWorkspace, options: configWorkspaceOptions } = resolveConfigWorkspaces();
@@ -1831,6 +1940,15 @@ app.get("/api/sessions/history", (_req, res) => {
     .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
 
   res.json(apiOk({ entries: merged }));
+});
+
+app.get("/api/sessions/:sessionId/history", (req, res) => {
+  const transcript = loadCodexSessionTranscript(req.params.sessionId);
+  if (!transcript) {
+    res.status(404).json(apiErr("Session history not found"));
+    return;
+  }
+  res.json(apiOk(transcript));
 });
 
 app.get("/api/events", (req, res) => {

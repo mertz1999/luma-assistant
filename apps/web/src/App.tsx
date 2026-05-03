@@ -31,6 +31,7 @@ import type {
   FileTreeNode,
   RunRecord,
   SandboxMode,
+  SessionHistoryEntry,
   StartRunInput,
   TerminalSessionSnapshot,
   WorkspaceOption,
@@ -45,6 +46,8 @@ import {
   getFileTree,
   getMcpStatus,
   getRuns,
+  getSessionHistory,
+  getSessionTranscript,
   getSystemStatus,
   getTerminal,
   interruptTerminal,
@@ -100,11 +103,14 @@ type TimelineEntry = {
 
 type SessionCard = {
   id: string;
-  latestRun: RunRecord;
+  latestRun: RunRecord | null;
   runCount: number;
   summary: string;
   status: RunRecord["status"];
   updatedAt: number;
+  source: string;
+  workspace: string;
+  historyOnly: boolean;
 };
 
 type PlanSessionState = "idle" | "armed" | "active";
@@ -469,6 +475,53 @@ function runSessionId(run: RunRecord): string {
   return run.sessionId || run.threadId || run.id;
 }
 
+function describeSessionMeta(session: SessionCard): string {
+  if (!session.historyOnly) {
+    return `${session.runCount} message${session.runCount > 1 ? "s" : ""}`;
+  }
+
+  const workspaceName = session.workspace.split(/[\\/]/).filter(Boolean).pop() || session.workspace;
+  return workspaceName || "External session";
+}
+
+function getSessionSourceBadge(session: SessionCard): { label: string; className: string } {
+  if (!session.historyOnly) {
+    return {
+      label: "in-app",
+      className: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200",
+    };
+  }
+
+  const source = session.source.trim().toLowerCase();
+  if (source === "vscode") {
+    return {
+      label: "vscode",
+      className: "bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-200",
+    };
+  }
+  if (source === "cli" || source === "agentic-cli") {
+    return {
+      label: "cli",
+      className: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-200",
+    };
+  }
+  if (source === "exec") {
+    return {
+      label: "exec",
+      className: "bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-100",
+    };
+  }
+
+  return {
+    label: source || "other",
+    className: "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-200",
+  };
+}
+
+function resolveSessionRunId(session: SessionCard | null | undefined): string | null {
+  return session?.latestRun?.id || null;
+}
+
 function statusClass(status: string): string {
   if (status === "running") return "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-200";
   if (status === "completed") return "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200";
@@ -487,7 +540,8 @@ function normalizeSessionTitle(raw: string, fallback: string): string {
   return title.length > 160 ? `${title.slice(0, 157)}...` : title;
 }
 
-function buildSessionCards(runs: RunRecord[]): SessionCard[] {
+function buildSessionCards(runs: RunRecord[], historyEntries: SessionHistoryEntry[]): SessionCard[] {
+  const localBySession = new Map<string, SessionCard>();
   const grouped = new Map<string, RunRecord[]>();
   for (const run of runs) {
     if (run.archivedAt !== null) continue;
@@ -497,22 +551,42 @@ function buildSessionCards(runs: RunRecord[]): SessionCard[] {
     grouped.set(key, list);
   }
 
-  return [...grouped.entries()]
-    .map(([id, list]) => {
+  for (const [id, list] of grouped.entries()) {
       const desc = [...list].sort((a, b) => b.createdAt - a.createdAt);
       const asc = [...list].sort((a, b) => a.createdAt - b.createdAt);
       const latestRun = desc[0];
       const firstPrompt = asc.find((run) => run.config.prompt.trim())?.config.prompt || "";
-      return {
+      localBySession.set(id, {
         id,
         latestRun,
         runCount: list.length,
         summary: normalizeSessionTitle(firstPrompt, latestRun.summary || "Session"),
         status: latestRun.status,
         updatedAt: latestRun.updatedAt || latestRun.createdAt,
-      };
-    })
-    .sort((a, b) => b.updatedAt - a.updatedAt);
+        source: "agentic-cli",
+        workspace: latestRun.config.workspace,
+        historyOnly: false,
+      });
+  }
+
+  const merged = [...localBySession.values()];
+  for (const entry of historyEntries) {
+    if (entry.source.trim().toLowerCase() === "exec") continue;
+    if (localBySession.has(entry.id)) continue;
+    merged.push({
+      id: entry.id,
+      latestRun: null,
+      runCount: 0,
+      summary: normalizeSessionTitle(entry.summary, entry.id),
+      status: "completed",
+      updatedAt: Date.parse(entry.timestamp) || 0,
+      source: entry.source,
+      workspace: entry.cwd,
+      historyOnly: true,
+    });
+  }
+
+  return merged.sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {
@@ -1466,6 +1540,8 @@ export function App(): JSX.Element {
   const [workspaces, setWorkspaces] = useState<WorkspaceOption[]>([]);
   const [activeWorkspace, setWorkspace] = useState("");
   const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [sessionHistoryEntries, setSessionHistoryEntries] = useState<SessionHistoryEntry[]>([]);
+  const [showAllHistory, setShowAllHistory] = useState(false);
   const [approvals, setApprovals] = useState<ApprovalQueueItem[]>([]);
 
   const [fileNodes, setFileNodes] = useState<FileTreeNode[]>([]);
@@ -1487,6 +1563,7 @@ export function App(): JSX.Element {
   const [toolDetailModal, setToolDetailModal] = useState<ToolDetailModalState | null>(null);
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
   const [terminalsBySession, setTerminalsBySession] = useState<Record<string, TerminalSessionSnapshot>>({});
+  const [historyTimelineBySession, setHistoryTimelineBySession] = useState<Record<string, TimelineEntry[]>>({});
   const [terminalInput, setTerminalInput] = useState("");
   const [terminalAction, setTerminalAction] = useState<"starting" | "stopping" | "sending" | null>(null);
   const [voiceSupported, setVoiceSupported] = useState(false);
@@ -1790,7 +1867,7 @@ export function App(): JSX.Element {
     void loadFileTree();
   }, [activeWorkspace]);
 
-  const allSessions = useMemo(() => buildSessionCards(runs), [runs]);
+  const allSessions = useMemo(() => buildSessionCards(runs, sessionHistoryEntries), [runs, sessionHistoryEntries]);
   const filteredSessions = useMemo(() => {
     if (statusFilter === "all") return allSessions;
     return allSessions.filter((session) => session.status === statusFilter);
@@ -1821,10 +1898,11 @@ export function App(): JSX.Element {
   const sessionTimelineKey = selectedSessionId || draftSessionKey;
   const planSessionState = planFlowBySession[sessionTimelineKey] || "idle";
   const timeline = useMemo(() => {
-    const base = buildSessionTimeline(selectedSessionRuns);
+    const historyEntries = showAllHistory ? (historyTimelineBySession[sessionTimelineKey] || []) : [];
+    const base = [...historyEntries, ...buildSessionTimeline(selectedSessionRuns)];
     const slashEntries = slashEntriesBySession[sessionTimelineKey] || [];
     return [...base, ...slashEntries].sort((a, b) => a.at - b.at);
-  }, [selectedSessionRuns, sessionTimelineKey, slashEntriesBySession]);
+  }, [selectedSessionRuns, sessionTimelineKey, showAllHistory, slashEntriesBySession, historyTimelineBySession]);
   const pendingApprovals = useMemo(() => approvals.filter((item) => item.status === "pending"), [approvals]);
   const slashSuggestions = useMemo(() => {
     const trimmed = prompt.trimStart();
@@ -1871,23 +1949,24 @@ export function App(): JSX.Element {
       }
       if (allSessions.length > 0) {
         setSelectedSessionId(allSessions[0].id);
-        setSelectedRunId(allSessions[0].latestRun.id);
+        setSelectedRunId(resolveSessionRunId(allSessions[0]));
       }
       return;
     }
 
     const selected = allSessions.find((session) => session.id === selectedSessionId);
     if (selected) {
-      setSelectedRunId(selected.latestRun.id);
+      setSelectedRunId(resolveSessionRunId(selected));
       return;
     }
 
     if (allSessions.length > 0) {
       setSelectedSessionId(allSessions[0].id);
-      setSelectedRunId(allSessions[0].latestRun.id);
+      setSelectedRunId(resolveSessionRunId(allSessions[0]));
       return;
     }
 
+    setSelectedSessionId(null);
     setSelectedRunId(null);
   }, [allSessions, isDraftSession, selectedSessionId, setSelectedRunId]);
 
@@ -1899,6 +1978,74 @@ export function App(): JSX.Element {
     setTerminalInput("");
     void loadTerminal(selectedSessionId);
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    if (!authReady || !isAuthenticated) return;
+    if (showAllHistory) {
+      let cancelled = false;
+      void (async () => {
+        try {
+          const payload = await getSessionHistory();
+          if (cancelled) return;
+          setSessionHistoryEntries(payload.entries);
+        } catch {
+          if (cancelled) return;
+          setSessionHistoryEntries([]);
+        }
+      })();
+
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setSessionHistoryEntries((prev) => (prev.length ? [] : prev));
+  }, [authReady, isAuthenticated, showAllHistory]);
+
+  useEffect(() => {
+    if (showAllHistory) return;
+    if (!selectedSessionId || !selectedSession?.historyOnly) return;
+
+    const nextLocalSession = buildSessionCards(runs, [])[0] || null;
+    setSelectedSessionId(nextLocalSession?.id || null);
+    setSelectedRunId(resolveSessionRunId(nextLocalSession));
+  }, [runs, selectedSession, selectedSessionId, setSelectedRunId, showAllHistory]);
+
+  useEffect(() => {
+    if (!showAllHistory) return;
+    if (!selectedSessionId) return;
+    if (selectedSessionRuns.length > 0) return;
+    if (historyTimelineBySession[selectedSessionId]) return;
+
+    const historySession = sessionHistoryEntries.find((entry) => entry.id === selectedSessionId);
+    if (!historySession) return;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const payload = await getSessionTranscript(selectedSessionId);
+        if (cancelled) return;
+
+        const entries: TimelineEntry[] = payload.entries.map((entry) => ({
+          key: `history_${entry.key}`,
+          role: entry.role,
+          title: entry.role === "user" ? "You" : "Assistant",
+          text: entry.text,
+          pending: false,
+          at: entry.at,
+        }));
+
+        setHistoryTimelineBySession((prev) => ({ ...prev, [selectedSessionId]: entries }));
+      } catch {
+        if (cancelled) return;
+        setHistoryTimelineBySession((prev) => ({ ...prev, [selectedSessionId]: [] }));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [historyTimelineBySession, selectedSessionId, selectedSessionRuns.length, sessionHistoryEntries, showAllHistory]);
 
   useEffect(() => {
     const node = terminalOutputRef.current;
@@ -1946,18 +2093,22 @@ export function App(): JSX.Element {
   async function loadBootstrap(): Promise<void> {
     setLoading(true);
     try {
-      const payload = await getBootstrap();
+      const [payload, historyPayload] = await Promise.all([
+        getBootstrap(),
+        showAllHistory ? getSessionHistory() : Promise.resolve({ entries: [] }),
+      ]);
       setWorkspaces(payload.workspaces);
       setWorkspace(payload.activeWorkspace);
       setRuns(payload.runs);
+      setSessionHistoryEntries(historyPayload.entries);
       setApprovals(payload.approvals);
       setModel(payload.defaults.model);
       setSandbox(payload.defaults.sandbox);
 
-      const sessions = buildSessionCards(payload.runs);
+      const sessions = buildSessionCards(payload.runs, historyPayload.entries);
       if (!selectedSessionId && !isDraftSession && sessions.length > 0) {
         setSelectedSessionId(sessions[0].id);
-        setSelectedRunId(sessions[0].latestRun.id);
+        setSelectedRunId(resolveSessionRunId(sessions[0]));
       }
     } finally {
       setLoading(false);
@@ -1965,24 +2116,28 @@ export function App(): JSX.Element {
   }
 
   async function refreshRuns(): Promise<void> {
-    const payload = await getRuns();
+    const [payload, historyPayload] = await Promise.all([
+      getRuns(),
+      showAllHistory ? getSessionHistory() : Promise.resolve({ entries: [] }),
+    ]);
     setRuns(payload.runs);
+    setSessionHistoryEntries(historyPayload.entries);
     setApprovals(payload.approvals);
 
-    const sessions = buildSessionCards(payload.runs);
+    const sessions = buildSessionCards(payload.runs, historyPayload.entries);
     if (!selectedSessionId && !isDraftSession && sessions.length > 0) {
       setSelectedSessionId(sessions[0].id);
-      setSelectedRunId(sessions[0].latestRun.id);
+      setSelectedRunId(resolveSessionRunId(sessions[0]));
       return;
     }
 
     if (selectedSessionId) {
       const selected = sessions.find((session) => session.id === selectedSessionId);
       if (selected) {
-        setSelectedRunId(selected.latestRun.id);
+        setSelectedRunId(resolveSessionRunId(selected));
       } else if (sessions.length > 0) {
         setSelectedSessionId(sessions[0].id);
-        setSelectedRunId(sessions[0].latestRun.id);
+        setSelectedRunId(resolveSessionRunId(sessions[0]));
       } else {
         setSelectedSessionId(null);
         setSelectedRunId(null);
@@ -2500,7 +2655,7 @@ export function App(): JSX.Element {
     setIsDraftSession(false);
     setSelectedSessionId(sessionId);
     const target = allSessions.find((item) => item.id === sessionId);
-    if (target) setSelectedRunId(target.latestRun.id);
+    if (target) setSelectedRunId(resolveSessionRunId(target));
     setMobileThreadsOpen(false);
   }
 
@@ -2594,7 +2749,7 @@ export function App(): JSX.Element {
     if (!selectedSessionId) return;
     setTerminalAction("starting");
     try {
-      const workspace = selectedSession?.latestRun.config.workspace || activeWorkspace;
+      const workspace = selectedSession?.workspace || activeWorkspace;
       const payload = await startTerminal(selectedSessionId, workspace);
       setTerminalsBySession((prev) => ({ ...prev, [selectedSessionId]: payload.terminal }));
       setRightPanelTab("tools");
@@ -2661,7 +2816,7 @@ export function App(): JSX.Element {
   }
 
   async function onArchiveSession(): Promise<void> {
-    if (!selectedSessionId || sessionAction || !selectedSession) return;
+    if (!selectedSessionId || sessionAction || !selectedSession || selectedSession.historyOnly) return;
     const ok = window.confirm("Archive this session? It will be hidden from Chats.");
     if (!ok) return;
 
@@ -2684,7 +2839,7 @@ export function App(): JSX.Element {
   }
 
   async function onDeleteSession(): Promise<void> {
-    if (!selectedSessionId || sessionAction || !selectedSession) return;
+    if (!selectedSessionId || sessionAction || !selectedSession || selectedSession.historyOnly) return;
     const ok = window.confirm("Delete this session and all its messages? This cannot be undone.");
     if (!ok) return;
 
@@ -2783,6 +2938,8 @@ export function App(): JSX.Element {
             selectedSessionId={selectedSessionId}
             statusFilter={statusFilter}
             setStatusFilter={setStatusFilter}
+            showAllHistory={showAllHistory}
+            onToggleShowAllHistory={setShowAllHistory}
             onSelectSession={onSelectSession}
             onNewSession={onNewSession}
           />
@@ -2875,6 +3032,8 @@ export function App(): JSX.Element {
                 selectedSessionId={selectedSessionId}
                 statusFilter={statusFilter}
                 setStatusFilter={setStatusFilter}
+                showAllHistory={showAllHistory}
+                onToggleShowAllHistory={setShowAllHistory}
                 onSelectSession={onSelectSession}
                 onNewSession={onNewSession}
               />
@@ -2942,6 +3101,8 @@ type SessionsPanelProps = {
   selectedSessionId: string | null;
   statusFilter: StatusFilter;
   setStatusFilter: (next: StatusFilter) => void;
+  showAllHistory: boolean;
+  onToggleShowAllHistory: (next: boolean) => void;
   onSelectSession: (sessionId: string) => void;
   onNewSession: () => void;
 };
@@ -2951,6 +3112,8 @@ function SessionsPanel({
   selectedSessionId,
   statusFilter,
   setStatusFilter,
+  showAllHistory,
+  onToggleShowAllHistory,
   onSelectSession,
   onNewSession,
 }: SessionsPanelProps): JSX.Element {
@@ -2981,6 +3144,18 @@ function SessionsPanel({
           </select>
         </div>
 
+        <label className="flex items-start gap-2 rounded-xl border border-card-border bg-white px-3 py-2 text-xs text-foreground/80">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 rounded border-card-border text-brand focus:ring-brand/20"
+            checked={showAllHistory}
+            onChange={(event) => onToggleShowAllHistory(event.target.checked)}
+          />
+          <span>
+            Show all Codex history
+          </span>
+        </label>
+
         <div className="scrollbar-thin flex-1 space-y-2 overflow-auto pr-1">
           {sessions.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-card-border bg-muted px-3 py-2 text-xs text-foreground/70">
@@ -2988,34 +3163,40 @@ function SessionsPanel({
             </div>
           ) : null}
 
-          {sessions.map((session) => (
-            <div
-              key={session.id}
-              className={cn(
-                "w-full rounded-2xl border bg-white px-3 py-2 text-left shadow-card transition hover:-translate-y-0.5 hover:border-brand/60",
-                selectedSessionId === session.id ? "border-brand bg-brand-soft/60" : "border-card-border",
-              )}
-            >
-              <button
-                type="button"
-                className="w-full text-left"
-                onClick={() => onSelectSession(session.id)}
+          {sessions.map((session) => {
+            const sourceBadge = getSessionSourceBadge(session);
+            return (
+              <div
+                key={session.id}
+                className={cn(
+                  "w-full rounded-2xl border bg-white px-3 py-2 text-left shadow-card transition hover:-translate-y-0.5 hover:border-brand/60",
+                  selectedSessionId === session.id ? "border-brand bg-brand-soft/60" : "border-card-border",
+                )}
               >
-                <div className="flex items-center justify-between gap-2">
-                  <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide", statusClass(session.status))}>
-                    {session.status}
-                  </span>
-                  <span className="text-[11px] text-foreground/70">{new Date(session.updatedAt).toLocaleTimeString()}</span>
-                </div>
-                <p className="mt-1 line-clamp-2 text-sm font-semibold" title={session.summary}>
-                  {session.summary || "Session"}
-                </p>
-                <p className="mt-1 text-xs text-foreground/70">
-                  {`${session.runCount} message${session.runCount > 1 ? "s" : ""}`}
-                </p>
-              </button>
-            </div>
-          ))}
+                <button
+                  type="button"
+                  className="w-full text-left"
+                  onClick={() => onSelectSession(session.id)}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold tracking-wide", sourceBadge.className)}>
+                        {sourceBadge.label}
+                      </span>
+                      <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide", statusClass(session.status))}>
+                        {session.status}
+                      </span>
+                    </div>
+                    <span className="text-[11px] text-foreground/70">{new Date(session.updatedAt).toLocaleTimeString()}</span>
+                  </div>
+                  <p className="mt-1 line-clamp-2 text-sm font-semibold" title={session.summary}>
+                    {session.summary || "Session"}
+                  </p>
+                  <p className="mt-1 truncate text-xs text-foreground/70">{describeSessionMeta(session)}</p>
+                </button>
+              </div>
+            );
+          })}
         </div>
       </CardContent>
     </>
@@ -3307,6 +3488,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
   const [useCustomModel, setUseCustomModel] = useState(() => !modelOptions.includes(props.model));
   const terminalRunning = props.selectedTerminal?.status === "running";
   const terminalBusy = props.terminalAction === "starting" || props.terminalAction === "stopping";
+  const selectedSessionSourceBadge = props.selectedSession ? getSessionSourceBadge(props.selectedSession) : null;
 
   useEffect(() => {
     if (!modelOptions.includes(props.model)) {
@@ -3348,7 +3530,13 @@ function RightPanel(props: RightPanelProps): JSX.Element {
           <section className="rounded-2xl border border-card-border bg-white p-3">
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-bold">Session</h3>
-              <Badge>{props.selectedSession ? `${props.selectedSession.runCount} msg` : "none"}</Badge>
+              {selectedSessionSourceBadge ? (
+                <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold tracking-wide", selectedSessionSourceBadge.className)}>
+                  {selectedSessionSourceBadge.label}
+                </span>
+              ) : (
+                <Badge>none</Badge>
+              )}
             </div>
 
             {props.selectedSession ? (
@@ -3356,11 +3544,19 @@ function RightPanel(props: RightPanelProps): JSX.Element {
                 <p className="mb-2 truncate text-xs text-foreground/70" title={props.selectedSession.id}>
                   {props.selectedSession.id}
                 </p>
+                <p className="mb-2 text-xs text-foreground/70">
+                  {describeSessionMeta(props.selectedSession)}
+                </p>
+                {props.selectedSession.historyOnly ? (
+                  <p className="mb-2 text-xs text-foreground/70">
+                    External Codex session. Archive and delete only apply to sessions with local app runs.
+                  </p>
+                ) : null}
                 <div className="grid grid-cols-2 gap-2">
                   <Button
                     size="sm"
                     variant="ghost"
-                    disabled={props.sessionAction !== null}
+                    disabled={props.sessionAction !== null || props.selectedSession.historyOnly}
                     onClick={() => void props.onArchiveSession()}
                   >
                     {props.sessionAction === "archive" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
@@ -3370,7 +3566,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
                     size="sm"
                     variant="ghost"
                     className="text-rose-700 hover:bg-rose-50 hover:text-rose-800"
-                    disabled={props.sessionAction !== null}
+                    disabled={props.sessionAction !== null || props.selectedSession.historyOnly}
                     onClick={() => void props.onDeleteSession()}
                   >
                     {props.sessionAction === "delete" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}

@@ -7,6 +7,8 @@ import type {
   DiffSnapshot,
   FileTreeNode,
   RunRecord,
+  SessionHistoryEntry,
+  SessionTranscriptResponse,
   SseEvent,
   StartRunInput,
   TerminalSessionSnapshot,
@@ -62,6 +64,14 @@ export function getBootstrap(): Promise<AppBootstrap> {
 
 export function getRuns(): Promise<{ runs: RunRecord[]; approvals: ApprovalQueueItem[] }> {
   return request("/api/runs");
+}
+
+export function getSessionHistory(): Promise<{ entries: SessionHistoryEntry[] }> {
+  return request("/api/sessions/history");
+}
+
+export function getSessionTranscript(sessionId: string): Promise<SessionTranscriptResponse> {
+  return request(`/api/sessions/${encodeURIComponent(sessionId)}/history`);
 }
 
 export function getMcpStatus(): Promise<CodexMcpStatusResponse> {

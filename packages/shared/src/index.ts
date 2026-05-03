@@ -115,6 +115,18 @@ export type SessionHistoryEntry = {
   summary: string;
 };
 
+export type SessionTranscriptEntry = {
+  key: string;
+  role: "user" | "assistant";
+  text: string;
+  at: number;
+};
+
+export type SessionTranscriptResponse = {
+  session: SessionHistoryEntry;
+  entries: SessionTranscriptEntry[];
+};
+
 export type TerminalSessionStatus = "running" | "stopped";
 
 export type TerminalSessionSnapshot = {
