@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { isValidElement, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import Convert from "ansi-to-html";
 import DiffViewer from "react-diff-viewer-continued";
@@ -126,6 +126,7 @@ const terminalHistoryLimit = 80;
 const authSessionStorageKey = "agentic_cli_auth_session_v1";
 const authSessionMaxAgeMs = 24 * 60 * 60 * 1000;
 const planInstructionPath = "/Users/applestation/Project/archive/agentic-assistant/plan.md";
+const initialTimelinePageSize = 20;
 // Account for the chat stack gap and bottom padding so "visually at bottom"
 // still counts as bottom without making the auto-follow area too large.
 const timelineAutoScrollThresholdPx = 64;
@@ -530,6 +531,10 @@ function statusClass(status: string): string {
   return "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-200";
 }
 
+function isGeneratedSessionSummary(summary: string): boolean {
+  return summary.trim().startsWith("Session in ");
+}
+
 function normalizeSessionTitle(raw: string, fallback: string): string {
   const collapsed = raw.replace(/\s+/g, " ").trim();
   if (!collapsed) return fallback;
@@ -540,8 +545,13 @@ function normalizeSessionTitle(raw: string, fallback: string): string {
   return title.length > 160 ? `${title.slice(0, 157)}...` : title;
 }
 
-function buildSessionCards(runs: RunRecord[], historyEntries: SessionHistoryEntry[]): SessionCard[] {
+function buildSessionCards(
+  runs: RunRecord[],
+  historyEntries: SessionHistoryEntry[],
+  summaryHintsBySession: Record<string, string>,
+): SessionCard[] {
   const localBySession = new Map<string, SessionCard>();
+  const historyBySession = new Map(historyEntries.map((entry) => [entry.id, entry]));
   const grouped = new Map<string, RunRecord[]>();
   for (const run of runs) {
     if (run.archivedAt !== null) continue;
@@ -556,11 +566,17 @@ function buildSessionCards(runs: RunRecord[], historyEntries: SessionHistoryEntr
       const asc = [...list].sort((a, b) => a.createdAt - b.createdAt);
       const latestRun = desc[0];
       const firstPrompt = asc.find((run) => run.config.prompt.trim())?.config.prompt || "";
+      const historyEntry = historyBySession.get(id);
+      const hintedSummary = summaryHintsBySession[id] || historyEntry?.summary || "";
+      const fallback = latestRun.summary || "Session";
+      const summary = !isGeneratedSessionSummary(hintedSummary) && hintedSummary.trim()
+        ? normalizeSessionTitle(hintedSummary, fallback)
+        : normalizeSessionTitle(firstPrompt, fallback);
       localBySession.set(id, {
         id,
         latestRun,
         runCount: list.length,
-        summary: normalizeSessionTitle(firstPrompt, latestRun.summary || "Session"),
+        summary,
         status: latestRun.status,
         updatedAt: latestRun.updatedAt || latestRun.createdAt,
         source: "agentic-cli",
@@ -573,11 +589,12 @@ function buildSessionCards(runs: RunRecord[], historyEntries: SessionHistoryEntr
   for (const entry of historyEntries) {
     if (entry.source.trim().toLowerCase() === "exec") continue;
     if (localBySession.has(entry.id)) continue;
+    const hintedSummary = summaryHintsBySession[entry.id] || entry.summary;
     merged.push({
       id: entry.id,
       latestRun: null,
       runCount: 0,
-      summary: normalizeSessionTitle(entry.summary, entry.id),
+      summary: normalizeSessionTitle(hintedSummary, entry.id),
       status: "completed",
       updatedAt: Date.parse(entry.timestamp) || 0,
       source: entry.source,
@@ -957,6 +974,19 @@ function buildSessionTimeline(runs: RunRecord[]): TimelineEntry[] {
   return entries.sort((a, b) => a.at - b.at);
 }
 
+function flattenMarkdownText(children: ReactNode): string {
+  if (typeof children === "string" || typeof children === "number") {
+    return String(children);
+  }
+  if (Array.isArray(children)) {
+    return children.map((child) => flattenMarkdownText(child)).join("");
+  }
+  if (isValidElement(children)) {
+    return flattenMarkdownText(children.props.children);
+  }
+  return "";
+}
+
 function MarkdownMessage({ text }: { text: string }): JSX.Element {
   return (
     <ReactMarkdown
@@ -984,22 +1014,29 @@ function MarkdownMessage({ text }: { text: string }): JSX.Element {
         ),
         th: ({ children }) => <th className="border-b border-card-border bg-muted px-2 py-1 text-left">{children}</th>,
         td: ({ children }) => <td className="border-b border-card-border px-2 py-1 align-top">{children}</td>,
-        code: ({ inline, className, children }: any) => {
+        code: ({ inline, children }: any) => {
+          const raw = flattenMarkdownText(children).replace(/\n$/, "");
+
           if (inline) {
-            return <code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[12px]">{children}</code>;
+            return <code className="font-[inherit] text-[0.98em] font-medium text-[#0f2433]">{raw}</code>;
           }
+
+          const isSingleLine = !raw.includes("\n");
+          if (isSingleLine) {
+            return (
+              <code className="block overflow-x-auto whitespace-nowrap font-[inherit] text-[1.04em] font-semibold tracking-[-0.015em] text-[#0f2433]">
+                {raw}
+              </code>
+            );
+          }
+
           return (
-            <code
-              className={cn(
-                "block overflow-x-auto rounded-xl border border-card-border bg-[#0f2433] p-3 font-mono text-[12px] text-slate-100",
-                className,
-              )}
-            >
-              {children}
+            <code className="block overflow-x-auto whitespace-pre-wrap break-words font-[inherit] text-[0.98em] leading-relaxed text-[#0f2433]">
+              {raw}
             </code>
           );
         },
-        pre: ({ children }) => <div className="my-2">{children}</div>,
+        pre: ({ children }) => <div className="my-1.5">{children}</div>,
       }}
     >
       {text}
@@ -1541,7 +1578,9 @@ export function App(): JSX.Element {
   const [activeWorkspace, setWorkspace] = useState("");
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [sessionHistoryEntries, setSessionHistoryEntries] = useState<SessionHistoryEntry[]>([]);
+  const [sessionSummaryHintsById, setSessionSummaryHintsById] = useState<Record<string, string>>({});
   const [showAllHistory, setShowAllHistory] = useState(false);
+  const [loadingSessionHistory, setLoadingSessionHistory] = useState(false);
   const [approvals, setApprovals] = useState<ApprovalQueueItem[]>([]);
 
   const [fileNodes, setFileNodes] = useState<FileTreeNode[]>([]);
@@ -1564,6 +1603,7 @@ export function App(): JSX.Element {
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
   const [terminalsBySession, setTerminalsBySession] = useState<Record<string, TerminalSessionSnapshot>>({});
   const [historyTimelineBySession, setHistoryTimelineBySession] = useState<Record<string, TimelineEntry[]>>({});
+  const [visibleTimelineCountBySession, setVisibleTimelineCountBySession] = useState<Record<string, number>>({});
   const [terminalInput, setTerminalInput] = useState("");
   const [terminalAction, setTerminalAction] = useState<"starting" | "stopping" | "sending" | null>(null);
   const [voiceSupported, setVoiceSupported] = useState(false);
@@ -1586,6 +1626,7 @@ export function App(): JSX.Element {
   const timelineShouldAutoScrollRef = useRef(true);
   const suppressTimelineScrollTrackingRef = useRef(false);
   const timelineScrollTrackingTimeoutRef = useRef<number | null>(null);
+  const pendingTimelineExpansionRef = useRef<{ sessionKey: string; scrollHeight: number; scrollTop: number } | null>(null);
   const previousTimelineStateRef = useRef<{ sessionKey: string; length: number }>({
     sessionKey: draftSessionKey,
     length: 0,
@@ -1867,7 +1908,10 @@ export function App(): JSX.Element {
     void loadFileTree();
   }, [activeWorkspace]);
 
-  const allSessions = useMemo(() => buildSessionCards(runs, sessionHistoryEntries), [runs, sessionHistoryEntries]);
+  const allSessions = useMemo(
+    () => buildSessionCards(runs, sessionHistoryEntries, sessionSummaryHintsById),
+    [runs, sessionHistoryEntries, sessionSummaryHintsById],
+  );
   const filteredSessions = useMemo(() => {
     if (statusFilter === "all") return allSessions;
     return allSessions.filter((session) => session.status === statusFilter);
@@ -1903,6 +1947,12 @@ export function App(): JSX.Element {
     const slashEntries = slashEntriesBySession[sessionTimelineKey] || [];
     return [...base, ...slashEntries].sort((a, b) => a.at - b.at);
   }, [selectedSessionRuns, sessionTimelineKey, showAllHistory, slashEntriesBySession, historyTimelineBySession]);
+  const visibleTimelineCount = visibleTimelineCountBySession[sessionTimelineKey] ?? initialTimelinePageSize;
+  const visibleTimeline = useMemo(
+    () => timeline.slice(Math.max(0, timeline.length - visibleTimelineCount)),
+    [timeline, visibleTimelineCount],
+  );
+  const hiddenTimelineCount = Math.max(0, timeline.length - visibleTimeline.length);
   const pendingApprovals = useMemo(() => approvals.filter((item) => item.status === "pending"), [approvals]);
   const slashSuggestions = useMemo(() => {
     const trimmed = prompt.trimStart();
@@ -1940,6 +1990,16 @@ export function App(): JSX.Element {
 
     scrollTimelineToBottom(sessionChanged ? "auto" : "smooth");
   }, [timeline.length, sessionTimelineKey]);
+
+  useEffect(() => {
+    const pending = pendingTimelineExpansionRef.current;
+    if (!pending || pending.sessionKey !== sessionTimelineKey) return;
+    const node = timelineScrollRef.current;
+    if (!node) return;
+
+    node.scrollTop = pending.scrollTop + (node.scrollHeight - pending.scrollHeight);
+    pendingTimelineExpansionRef.current = null;
+  }, [visibleTimeline.length, sessionTimelineKey]);
 
   useEffect(() => {
     if (!selectedSessionId) {
@@ -1984,13 +2044,27 @@ export function App(): JSX.Element {
     if (showAllHistory) {
       let cancelled = false;
       void (async () => {
+        setLoadingSessionHistory(true);
         try {
           const payload = await getSessionHistory();
           if (cancelled) return;
           setSessionHistoryEntries(payload.entries);
+          setSessionSummaryHintsById((prev) => {
+            if (payload.entries.length === 0) return prev;
+            const next = { ...prev };
+            for (const entry of payload.entries) {
+              if (!entry.summary.trim()) continue;
+              next[entry.id] = entry.summary;
+            }
+            return next;
+          });
         } catch {
           if (cancelled) return;
           setSessionHistoryEntries([]);
+        } finally {
+          if (!cancelled) {
+            setLoadingSessionHistory(false);
+          }
         }
       })();
 
@@ -1999,6 +2073,7 @@ export function App(): JSX.Element {
       };
     }
 
+    setLoadingSessionHistory(false);
     setSessionHistoryEntries((prev) => (prev.length ? [] : prev));
   }, [authReady, isAuthenticated, showAllHistory]);
 
@@ -2006,10 +2081,10 @@ export function App(): JSX.Element {
     if (showAllHistory) return;
     if (!selectedSessionId || !selectedSession?.historyOnly) return;
 
-    const nextLocalSession = buildSessionCards(runs, [])[0] || null;
+    const nextLocalSession = buildSessionCards(runs, [], sessionSummaryHintsById)[0] || null;
     setSelectedSessionId(nextLocalSession?.id || null);
     setSelectedRunId(resolveSessionRunId(nextLocalSession));
-  }, [runs, selectedSession, selectedSessionId, setSelectedRunId, showAllHistory]);
+  }, [runs, selectedSession, selectedSessionId, sessionSummaryHintsById, setSelectedRunId, showAllHistory]);
 
   useEffect(() => {
     if (!showAllHistory) return;
@@ -2101,11 +2176,26 @@ export function App(): JSX.Element {
       setWorkspace(payload.activeWorkspace);
       setRuns(payload.runs);
       setSessionHistoryEntries(historyPayload.entries);
+      setSessionSummaryHintsById((prev) => {
+        if (historyPayload.entries.length === 0) return prev;
+        const next = { ...prev };
+        for (const entry of historyPayload.entries) {
+          if (!entry.summary.trim()) continue;
+          next[entry.id] = entry.summary;
+        }
+        return next;
+      });
       setApprovals(payload.approvals);
       setModel(payload.defaults.model);
       setSandbox(payload.defaults.sandbox);
 
-      const sessions = buildSessionCards(payload.runs, historyPayload.entries);
+      const mergedSummaryHints = { ...sessionSummaryHintsById };
+      for (const entry of historyPayload.entries) {
+        if (!entry.summary.trim()) continue;
+        mergedSummaryHints[entry.id] = entry.summary;
+      }
+
+      const sessions = buildSessionCards(payload.runs, historyPayload.entries, mergedSummaryHints);
       if (!selectedSessionId && !isDraftSession && sessions.length > 0) {
         setSelectedSessionId(sessions[0].id);
         setSelectedRunId(resolveSessionRunId(sessions[0]));
@@ -2122,9 +2212,24 @@ export function App(): JSX.Element {
     ]);
     setRuns(payload.runs);
     setSessionHistoryEntries(historyPayload.entries);
+    setSessionSummaryHintsById((prev) => {
+      if (historyPayload.entries.length === 0) return prev;
+      const next = { ...prev };
+      for (const entry of historyPayload.entries) {
+        if (!entry.summary.trim()) continue;
+        next[entry.id] = entry.summary;
+      }
+      return next;
+    });
     setApprovals(payload.approvals);
 
-    const sessions = buildSessionCards(payload.runs, historyPayload.entries);
+    const mergedSummaryHints = { ...sessionSummaryHintsById };
+    for (const entry of historyPayload.entries) {
+      if (!entry.summary.trim()) continue;
+      mergedSummaryHints[entry.id] = entry.summary;
+    }
+
+    const sessions = buildSessionCards(payload.runs, historyPayload.entries, mergedSummaryHints);
     if (!selectedSessionId && !isDraftSession && sessions.length > 0) {
       setSelectedSessionId(sessions[0].id);
       setSelectedRunId(resolveSessionRunId(sessions[0]));
@@ -2868,6 +2973,27 @@ export function App(): JSX.Element {
     timelineShouldAutoScrollRef.current = isScrolledToBottom(node);
   }
 
+  function onLoadOlderTimelineMessages(): void {
+    if (hiddenTimelineCount <= 0) return;
+
+    const node = timelineScrollRef.current;
+    if (node) {
+      pendingTimelineExpansionRef.current = {
+        sessionKey: sessionTimelineKey,
+        scrollHeight: node.scrollHeight,
+        scrollTop: node.scrollTop,
+      };
+    }
+
+    setVisibleTimelineCountBySession((prev) => ({
+      ...prev,
+      [sessionTimelineKey]: Math.min(
+        timeline.length,
+        (prev[sessionTimelineKey] ?? initialTimelinePageSize) + initialTimelinePageSize,
+      ),
+    }));
+  }
+
   if (!authReady) {
     return (
       <div className="flex h-[100dvh] items-center justify-center bg-[color:var(--bg)] text-[color:var(--text)]">
@@ -2939,6 +3065,7 @@ export function App(): JSX.Element {
             statusFilter={statusFilter}
             setStatusFilter={setStatusFilter}
             showAllHistory={showAllHistory}
+            loadingSessionHistory={loadingSessionHistory}
             onToggleShowAllHistory={setShowAllHistory}
             onSelectSession={onSelectSession}
             onNewSession={onNewSession}
@@ -2950,7 +3077,8 @@ export function App(): JSX.Element {
             loading={loading}
             selectedSession={selectedSession}
             selectedRun={selectedRun}
-            timeline={timeline}
+            timeline={visibleTimeline}
+            hiddenTimelineCount={hiddenTimelineCount}
             prompt={prompt}
             setPrompt={setPrompt}
             submitting={submitting}
@@ -2962,6 +3090,7 @@ export function App(): JSX.Element {
             timelineScrollRef={timelineScrollRef}
             timelineBottomRef={timelineBottomRef}
             onTimelineScroll={onTimelineScroll}
+            onLoadOlderTimelineMessages={onLoadOlderTimelineMessages}
             setToolDetailModal={setToolDetailModal}
             slashSuggestions={slashSuggestions}
             onSelectSlashCommand={onSelectSlashCommand}
@@ -3033,6 +3162,7 @@ export function App(): JSX.Element {
                 statusFilter={statusFilter}
                 setStatusFilter={setStatusFilter}
                 showAllHistory={showAllHistory}
+                loadingSessionHistory={loadingSessionHistory}
                 onToggleShowAllHistory={setShowAllHistory}
                 onSelectSession={onSelectSession}
                 onNewSession={onNewSession}
@@ -3102,6 +3232,7 @@ type SessionsPanelProps = {
   statusFilter: StatusFilter;
   setStatusFilter: (next: StatusFilter) => void;
   showAllHistory: boolean;
+  loadingSessionHistory: boolean;
   onToggleShowAllHistory: (next: boolean) => void;
   onSelectSession: (sessionId: string) => void;
   onNewSession: () => void;
@@ -3113,6 +3244,7 @@ function SessionsPanel({
   statusFilter,
   setStatusFilter,
   showAllHistory,
+  loadingSessionHistory,
   onToggleShowAllHistory,
   onSelectSession,
   onNewSession,
@@ -3150,9 +3282,11 @@ function SessionsPanel({
             className="mt-0.5 h-4 w-4 rounded border-card-border text-brand focus:ring-brand/20"
             checked={showAllHistory}
             onChange={(event) => onToggleShowAllHistory(event.target.checked)}
+            disabled={loadingSessionHistory}
           />
-          <span>
+          <span className="flex items-center gap-2">
             Show all Codex history
+            {loadingSessionHistory ? <LoaderCircle className="h-3.5 w-3.5 animate-spin text-brand" /> : null}
           </span>
         </label>
 
@@ -3208,6 +3342,7 @@ type CenterPanelProps = {
   selectedSession: SessionCard | null;
   selectedRun: RunRecord | null;
   timeline: TimelineEntry[];
+  hiddenTimelineCount: number;
   prompt: string;
   setPrompt: (value: string) => void;
   submitting: boolean;
@@ -3219,6 +3354,7 @@ type CenterPanelProps = {
   timelineScrollRef: React.RefObject<HTMLDivElement>;
   timelineBottomRef: React.RefObject<HTMLDivElement>;
   onTimelineScroll: () => void;
+  onLoadOlderTimelineMessages: () => void;
   setToolDetailModal: (state: ToolDetailModalState | null) => void;
   slashSuggestions: SlashCommandSuggestion[];
   onSelectSlashCommand: (command: SlashCommandKey) => Promise<void>;
@@ -3273,6 +3409,14 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           {!props.loading && !selectedRun && !props.selectedSession ? (
             <div className="rounded-2xl border border-dashed border-card-border bg-muted px-4 py-3 text-sm text-foreground/75">
               Start a new session or pick one from chats.
+            </div>
+          ) : null}
+
+          {props.hiddenTimelineCount > 0 ? (
+            <div className="flex justify-center">
+              <Button type="button" variant="ghost" size="sm" onClick={props.onLoadOlderTimelineMessages}>
+                Load older messages ({Math.min(initialTimelinePageSize, props.hiddenTimelineCount)})
+              </Button>
             </div>
           ) : null}
 

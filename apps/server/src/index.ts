@@ -1213,6 +1213,20 @@ function normalizeSessionTitle(raw: string, fallback: string): string {
   return title.length > 160 ? `${title.slice(0, 157)}...` : title;
 }
 
+function isGeneratedSessionSummary(summary: string): boolean {
+  return summary.trim().startsWith("Session in ");
+}
+
+function choosePreferredSessionSummary(entries: SessionHistoryEntry[]): string {
+  const externalWithRealSummary = entries.find((entry) => entry.source !== "agentic-cli" && !isGeneratedSessionSummary(entry.summary));
+  if (externalWithRealSummary) return externalWithRealSummary.summary;
+
+  const realSummary = entries.find((entry) => !isGeneratedSessionSummary(entry.summary));
+  if (realSummary) return realSummary.summary;
+
+  return entries[0]?.summary || "";
+}
+
 function isArchiveWorkspacePath(cwd: string): boolean {
   return /[\\/]archive[\\/]/i.test(cwd);
 }
@@ -1930,10 +1944,15 @@ app.get("/api/sessions/history", (_req, res) => {
     const nextTime = Date.parse(entry.timestamp) || 0;
     const existingScore = existing.summary.startsWith("Session in ") ? 0 : 1;
     const nextScore = entry.summary.startsWith("Session in ") ? 0 : 1;
+    const winner = nextTime > currentTime || (nextTime === currentTime && nextScore > existingScore)
+      ? entry
+      : existing;
+    const summary = choosePreferredSessionSummary([existing, entry]);
 
-    if (nextTime > currentTime || (nextTime === currentTime && nextScore > existingScore)) {
-      mergedById.set(entry.id, entry);
-    }
+    mergedById.set(entry.id, {
+      ...winner,
+      summary,
+    });
   }
 
   const merged = [...mergedById.values()]
