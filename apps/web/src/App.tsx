@@ -80,6 +80,13 @@ type FileChangeDetail = {
   removed: number;
 };
 
+type DebugLogEntry = {
+  key: string;
+  runId: string;
+  at: number;
+  text: string;
+};
+
 type TimelineEntry = {
   key: string;
   role: TimelineRole;
@@ -788,15 +795,6 @@ function buildSessionTimeline(runs: RunRecord[]): TimelineEntry[] {
       if (!raw) continue;
 
       if (event.source === "stderr") {
-        entries.push({
-          key: `${run.id}_${event.id}_stderr`,
-          role: "error",
-          title: "stderr",
-          text: raw,
-          pending: false,
-          at: event.at,
-          meta: { runId: run.id },
-        });
         continue;
       }
 
@@ -972,6 +970,26 @@ function buildSessionTimeline(runs: RunRecord[]): TimelineEntry[] {
   }
 
   return entries.sort((a, b) => a.at - b.at);
+}
+
+function collectSessionDebugLogs(runs: RunRecord[]): DebugLogEntry[] {
+  const entries: DebugLogEntry[] = [];
+
+  for (const run of [...runs].sort((a, b) => a.createdAt - b.createdAt)) {
+    for (const event of [...run.events].sort((a, b) => a.at - b.at)) {
+      const raw = (event.text || "").trim();
+      if (!raw || event.source !== "stderr") continue;
+
+      entries.push({
+        key: `${run.id}_${event.id}_stderr`,
+        runId: run.id,
+        at: event.at,
+        text: raw,
+      });
+    }
+  }
+
+  return entries;
 }
 
 function flattenMarkdownText(children: ReactNode): string {
@@ -1942,11 +1960,12 @@ export function App(): JSX.Element {
   const sessionTimelineKey = selectedSessionId || draftSessionKey;
   const planSessionState = planFlowBySession[sessionTimelineKey] || "idle";
   const timeline = useMemo(() => {
-    const historyEntries = showAllHistory ? (historyTimelineBySession[sessionTimelineKey] || []) : [];
+    const historyEntries = historyTimelineBySession[sessionTimelineKey] || [];
     const base = [...historyEntries, ...buildSessionTimeline(selectedSessionRuns)];
     const slashEntries = slashEntriesBySession[sessionTimelineKey] || [];
     return [...base, ...slashEntries].sort((a, b) => a.at - b.at);
-  }, [selectedSessionRuns, sessionTimelineKey, showAllHistory, slashEntriesBySession, historyTimelineBySession]);
+  }, [selectedSessionRuns, sessionTimelineKey, slashEntriesBySession, historyTimelineBySession]);
+  const debugLogs = useMemo(() => collectSessionDebugLogs(selectedSessionRuns), [selectedSessionRuns]);
   const visibleTimelineCount = visibleTimelineCountBySession[sessionTimelineKey] ?? initialTimelinePageSize;
   const visibleTimeline = useMemo(
     () => timeline.slice(Math.max(0, timeline.length - visibleTimelineCount)),
@@ -2087,13 +2106,8 @@ export function App(): JSX.Element {
   }, [runs, selectedSession, selectedSessionId, sessionSummaryHintsById, setSelectedRunId, showAllHistory]);
 
   useEffect(() => {
-    if (!showAllHistory) return;
     if (!selectedSessionId) return;
-    if (selectedSessionRuns.length > 0) return;
     if (historyTimelineBySession[selectedSessionId]) return;
-
-    const historySession = sessionHistoryEntries.find((entry) => entry.id === selectedSessionId);
-    if (!historySession) return;
 
     let cancelled = false;
     void (async () => {
@@ -2101,7 +2115,20 @@ export function App(): JSX.Element {
         const payload = await getSessionTranscript(selectedSessionId);
         if (cancelled) return;
 
-        const entries: TimelineEntry[] = payload.entries.map((entry) => ({
+        if (payload.session.summary.trim()) {
+          setSessionSummaryHintsById((prev) => ({
+            ...prev,
+            [selectedSessionId]: payload.session.summary,
+          }));
+        }
+
+        const firstLocalRunAt = selectedSessionRuns[0]?.createdAt ?? Number.POSITIVE_INFINITY;
+        const shouldKeepFullTranscript = selectedSessionRuns.length === 0;
+        const filteredEntries = shouldKeepFullTranscript
+          ? payload.entries
+          : payload.entries.filter((entry) => entry.at < firstLocalRunAt);
+
+        const entries: TimelineEntry[] = filteredEntries.map((entry) => ({
           key: `history_${entry.key}`,
           role: entry.role,
           title: entry.role === "user" ? "You" : "Assistant",
@@ -2120,7 +2147,7 @@ export function App(): JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [historyTimelineBySession, selectedSessionId, selectedSessionRuns.length, sessionHistoryEntries, showAllHistory]);
+  }, [historyTimelineBySession, selectedSessionId, selectedSessionRuns]);
 
   useEffect(() => {
     const node = terminalOutputRef.current;
@@ -3128,6 +3155,8 @@ export function App(): JSX.Element {
             toggleTheme={toggleTheme}
             approvals={pendingApprovals}
             onAcceptApproval={onAcceptApproval}
+            ansi={ansi}
+            debugLogs={debugLogs}
             diff={diff}
             fileNodes={fileNodes}
             selectedSessionId={selectedSessionId}
@@ -3197,6 +3226,8 @@ export function App(): JSX.Element {
                 toggleTheme={toggleTheme}
                 approvals={pendingApprovals}
                 onAcceptApproval={onAcceptApproval}
+                ansi={ansi}
+                debugLogs={debugLogs}
                 diff={diff}
                 fileNodes={fileNodes}
                 selectedSessionId={selectedSessionId}
@@ -3608,6 +3639,8 @@ type RightPanelProps = {
   toggleTheme: () => void;
   approvals: ApprovalQueueItem[];
   onAcceptApproval: (item: ApprovalQueueItem) => Promise<void>;
+  ansi: Convert;
+  debugLogs: DebugLogEntry[];
   diff: DiffSnapshot | null;
   fileNodes: FileTreeNode[];
   selectedSessionId: string | null;
@@ -3793,6 +3826,30 @@ function RightPanel(props: RightPanelProps): JSX.Element {
               </div>
             </div>
           </section>
+
+          {props.debugLogs.length > 0 ? (
+            <section className="rounded-2xl border border-card-border bg-white p-3">
+              <details>
+                <summary className="cursor-pointer list-none text-sm font-bold text-foreground">
+                  Debug logs ({props.debugLogs.length})
+                </summary>
+                <div className="mt-2 space-y-2">
+                  {props.debugLogs.map((entry) => (
+                    <div key={entry.key} className="rounded-xl border border-card-border bg-muted/50 px-3 py-2">
+                      <div className="mb-1 flex items-center justify-between gap-2 text-[11px] text-foreground/65">
+                        <span className="font-mono">{entry.runId}</span>
+                        <span>{new Date(entry.at).toLocaleString()}</span>
+                      </div>
+                      <div
+                        className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs text-foreground/80"
+                        dangerouslySetInnerHTML={{ __html: props.ansi.toHtml(entry.text) }}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </details>
+            </section>
+          ) : null}
 
           <section className="rounded-2xl border border-card-border bg-white p-3">
             <div className="mb-2 flex items-center justify-between">
