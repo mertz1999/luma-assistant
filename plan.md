@@ -11,17 +11,20 @@ Plan mode is enabled for this turn. Follow this file exactly.
 - Explore the current repo and environment first.
 - Prefer non-mutating inspection, reading, searching, and validation.
 - Ask only questions that materially affect the plan or lock an important assumption.
-- Keep questions focused and ask them one at a time.
+- Keep questions focused.
+- If several clarifications are needed, you may ask multiple questions in the same response.
 - If information can be discovered from the workspace, do not ask the user for it.
 - When the user answers a question, continue planning from those answers instead of implementing.
 
 ## Question Format
-- When you need user input, emit exactly one `<question>` block.
+- When you need user input, emit one or more `<question>` blocks.
 - Inside the block, use markdown.
 - Start with a heading that states the question.
 - Then provide flat markdown bullet items for the available choices.
 - Do not include nested lists.
-- If you emit a `<question>` block, do not emit a `<final_approval>` block in the same response.
+- If you emit any `<question>` block, do not emit a `<final_approval>` block in the same response.
+- If you emit multiple `<question>` blocks, treat them as a questionnaire. The UI will present them one by one and send all answers together after the last question.
+- If you emit multiple `<question>` blocks, keep them adjacent and do not place unrelated markdown between them.
 - Example:
 
 ```md
@@ -30,6 +33,13 @@ Plan mode is enabled for this turn. Follow this file exactly.
 - Ship behind a feature flag
 - Release directly
 - Split into two phases
+</question>
+
+<question>
+## Which audience should get this first?
+- Internal team only
+- Existing customers
+- All users
 </question>
 ```
 

@@ -58,7 +58,7 @@ import {
   stopRun,
   stopTerminal,
 } from "@/lib/api";
-import { parsePlanningMessage } from "@/lib/planning";
+import { parsePlanningMessage, type PlanningSegment } from "@/lib/planning";
 import { cn } from "@/lib/utils";
 import { useUiStore } from "@/store/useUiStore";
 import { Button } from "@/components/ui/button";
@@ -120,6 +120,9 @@ const terminalHistoryLimit = 80;
 const authSessionStorageKey = "agentic_cli_auth_session_v1";
 const authSessionMaxAgeMs = 24 * 60 * 60 * 1000;
 const planInstructionPath = "/Users/applestation/Project/archive/agentic-assistant/plan.md";
+// Account for the chat stack gap and bottom padding so "visually at bottom"
+// still counts as bottom without making the auto-follow area too large.
+const timelineAutoScrollThresholdPx = 64;
 
 type StoredAuthSession = {
   token: string;
@@ -303,8 +306,18 @@ function buildPlanUsageText(): string {
   ].join("\n\n");
 }
 
-function buildPlanAnswerPrompt(questionTitle: string, answer: string): string {
-  return `These are answers:\nQuestion: ${questionTitle}\nAnswer: ${answer}`;
+type PlanQuestionAnswer = {
+  questionTitle: string;
+  answer: string;
+};
+
+function buildPlanAnswersPrompt(answers: PlanQuestionAnswer[]): string {
+  const lines = ["These are answers:"];
+  answers.forEach((item, index) => {
+    lines.push(`${index + 1}. Question: ${item.questionTitle}`);
+    lines.push(`   Answer: ${item.answer}`);
+  });
+  return lines.join("\n");
 }
 
 function buildPlanFeedbackPrompt(feedback: string): string {
@@ -562,6 +575,10 @@ function formatRecordingDuration(totalSeconds: number): string {
   const minutes = Math.floor(safe / 60);
   const seconds = safe % 60;
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function isScrolledToBottom(node: HTMLDivElement): boolean {
+  return node.scrollHeight - node.scrollTop - node.clientHeight <= timelineAutoScrollThresholdPx;
 }
 
 function appendTranscriptToPrompt(currentPrompt: string, transcript: string): string {
@@ -935,13 +952,20 @@ type StructuredMessageProps = {
   text: string;
   interactive: boolean;
   resolved: boolean;
-  onAnswerPlanQuestion: (questionTitle: string, answer: string) => Promise<void>;
+  onAnswerPlanQuestions: (answers: PlanQuestionAnswer[]) => Promise<void>;
   onApprovePlanImplementation: () => Promise<void>;
   onSubmitPlanFeedback: (feedback: string) => Promise<void>;
 };
 
+type PlanningQuestionSegment = Extract<PlanningSegment, { type: "question" }>;
+
 function StructuredMessage(props: StructuredMessageProps): JSX.Element {
   const segments = useMemo(() => parsePlanningMessage(props.text), [props.text]);
+  const questionSegments = useMemo(
+    () => segments.filter((segment): segment is PlanningQuestionSegment => segment.type === "question"),
+    [segments],
+  );
+  let renderedQuestionnaire = false;
 
   return (
     <div className="space-y-3">
@@ -956,14 +980,14 @@ function StructuredMessage(props: StructuredMessageProps): JSX.Element {
           if (!props.interactive) {
             return <MarkdownMessage key={key} text={segment.raw} />;
           }
+          if (renderedQuestionnaire) return null;
+          renderedQuestionnaire = true;
           return (
-            <QuestionCard
+            <QuestionnaireCard
               key={key}
-              title={segment.title}
-              description={segment.description}
-              options={segment.options}
+              questions={questionSegments}
               disabled={props.resolved}
-              onSubmit={props.onAnswerPlanQuestion}
+              onSubmit={props.onAnswerPlanQuestions}
             />
           );
         }
@@ -986,29 +1010,46 @@ function StructuredMessage(props: StructuredMessageProps): JSX.Element {
   );
 }
 
-function QuestionCard({
-  title,
-  description,
-  options,
+function QuestionnaireCard({
+  questions,
   disabled,
   onSubmit,
 }: {
-  title: string;
-  description: string;
-  options: string[];
+  questions: PlanningQuestionSegment[];
   disabled: boolean;
-  onSubmit: (questionTitle: string, answer: string) => Promise<void>;
+  onSubmit: (answers: PlanQuestionAnswer[]) => Promise<void>;
 }): JSX.Element {
-  const [customAnswer, setCustomAnswer] = useState("");
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [selectedAnswers, setSelectedAnswers] = useState<string[]>(() => questions.map(() => ""));
+  const [customAnswers, setCustomAnswers] = useState<string[]>(() => questions.map(() => ""));
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const isDisabled = disabled || submitted;
+  const currentQuestion = questions[currentIndex];
+  const currentAnswer = selectedAnswers[currentIndex] || "";
+  const currentCustomAnswer = customAnswers[currentIndex] || "";
+  const totalQuestions = questions.length;
+  const isLastQuestion = currentIndex === totalQuestions - 1;
 
-  async function submitAnswer(answer: string): Promise<void> {
-    if (!answer.trim() || isDisabled || submitting) return;
+  function updateAnswerAt(index: number, value: string): void {
+    setSelectedAnswers((prev) => prev.map((item, itemIndex) => (itemIndex === index ? value : item)));
+  }
+
+  function updateCustomAnswerAt(index: number, value: string): void {
+    setCustomAnswers((prev) => prev.map((item, itemIndex) => (itemIndex === index ? value : item)));
+    updateAnswerAt(index, value);
+  }
+
+  async function submitAnswers(): Promise<void> {
+    if (isDisabled || submitting) return;
+    const answers = questions.map((question, index) => ({
+      questionTitle: question.title,
+      answer: selectedAnswers[index]?.trim() || "",
+    }));
+    if (answers.some((item) => !item.answer)) return;
     setSubmitting(true);
     try {
-      await onSubmit(title, answer.trim());
+      await onSubmit(answers);
       setSubmitted(true);
     } catch {
       // parent already surfaces submission errors
@@ -1017,53 +1058,84 @@ function QuestionCard({
     }
   }
 
+  function onSelectOption(answer: string): void {
+    if (isDisabled || submitting) return;
+    updateAnswerAt(currentIndex, answer);
+  }
+
+  function onNextQuestion(): void {
+    if (isDisabled || submitting || !currentAnswer.trim() || isLastQuestion) return;
+    setCurrentIndex((value) => Math.min(value + 1, totalQuestions - 1));
+  }
+
   return (
     <section className="rounded-2xl border border-brand/25 bg-brand-soft/35 p-3">
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-foreground/70">Question</p>
-          <h3 className="text-sm font-semibold">{title}</h3>
+          <p className="text-xs font-semibold uppercase tracking-wide text-foreground/70">
+            {totalQuestions > 1 ? `Question ${currentIndex + 1} of ${totalQuestions}` : "Question"}
+          </p>
+          <h3 className="text-sm font-semibold">{currentQuestion?.title || "Question"}</h3>
         </div>
-        <Badge>{isDisabled ? "Answered" : submitting ? "Sending" : `${options.length + 1} options`}</Badge>
+        <Badge>{isDisabled ? "Answered" : submitting ? "Sending" : `${totalQuestions} total`}</Badge>
       </div>
 
-      {description ? (
+      {currentQuestion?.description ? (
         <div className="mb-3 text-sm leading-relaxed">
-          <MarkdownMessage text={description} />
+          <MarkdownMessage text={currentQuestion.description} />
         </div>
       ) : null}
 
       <div className="space-y-2">
-        {options.map((option) => (
+        {currentQuestion?.options.map((option) => (
           <button
             key={option}
             type="button"
-            className="w-full rounded-xl border border-card-border bg-white px-3 py-2 text-left text-sm transition hover:border-brand/50 hover:bg-brand-soft/30 disabled:cursor-not-allowed disabled:opacity-70"
-            onClick={() => void submitAnswer(option)}
+            className={cn(
+              "w-full rounded-xl border bg-white px-3 py-2 text-left text-sm transition hover:border-brand/50 hover:bg-brand-soft/30 disabled:cursor-not-allowed disabled:opacity-70",
+              currentAnswer === option ? "border-brand bg-brand-soft/30" : "border-card-border",
+            )}
+            onClick={() => onSelectOption(option)}
             disabled={isDisabled || submitting}
           >
             {option}
           </button>
         ))}
 
-        <div className="flex items-center gap-2 rounded-xl border border-dashed border-card-border bg-white px-3 py-2">
+        <div
+          className={cn(
+            "flex items-center gap-2 rounded-xl border border-dashed bg-white px-3 py-2",
+            currentCustomAnswer.trim() && currentAnswer === currentCustomAnswer ? "border-brand bg-brand-soft/25" : "border-card-border",
+          )}
+        >
           <span className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Custom</span>
           <input
             className="h-9 w-full rounded-lg border border-card-border bg-white px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
-            value={customAnswer}
-            onChange={(event) => setCustomAnswer(event.target.value)}
+            value={currentCustomAnswer}
+            onChange={(event) => updateCustomAnswerAt(currentIndex, event.target.value)}
             placeholder="Add your own answer"
             disabled={isDisabled || submitting}
           />
-          <Button
-            type="button"
-            size="sm"
-            onClick={() => void submitAnswer(customAnswer)}
-            disabled={isDisabled || submitting || !customAnswer.trim()}
-          >
-            {submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : "Send"}
-          </Button>
         </div>
+
+        {totalQuestions > 1 ? (
+          <div className="rounded-xl border border-card-border bg-white/70 px-3 py-2 text-xs text-foreground/70">
+            {selectedAnswers.filter((answer) => answer.trim()).length} of {totalQuestions} answered
+          </div>
+        ) : null}
+      </div>
+
+      <div className="mt-3 flex items-center justify-end gap-2">
+        {!isLastQuestion ? (
+          <Button type="button" onClick={onNextQuestion} disabled={isDisabled || submitting || !currentAnswer.trim()}>
+            Next question
+          </Button>
+        ) : (
+          <Button type="button" onClick={() => void submitAnswers()} disabled={isDisabled || submitting || !currentAnswer.trim()}>
+            {submitting ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+            {totalQuestions > 1 ? "Send all answers" : "Send answer"}
+          </Button>
+        )}
       </div>
     </section>
   );
@@ -1430,9 +1502,17 @@ export function App(): JSX.Element {
   const [authError, setAuthError] = useState<string | null>(null);
 
   const ansi = useMemo(() => new Convert({ newline: true, escapeXML: true }), []);
-  const timelineBottomRef = useRef<HTMLDivElement | null>(null);
-  const terminalOutputRef = useRef<HTMLDivElement | null>(null);
+  const timelineScrollRef = useRef<HTMLDivElement>(null);
+  const timelineBottomRef = useRef<HTMLDivElement>(null);
+  const terminalOutputRef = useRef<HTMLDivElement>(null);
   const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const timelineShouldAutoScrollRef = useRef(true);
+  const suppressTimelineScrollTrackingRef = useRef(false);
+  const timelineScrollTrackingTimeoutRef = useRef<number | null>(null);
+  const previousTimelineStateRef = useRef<{ sessionKey: string; length: number }>({
+    sessionKey: draftSessionKey,
+    length: 0,
+  });
   const isAuthenticated = Boolean(authToken && authExpiresAt > Date.now());
 
   useEffect(() => {
@@ -1440,6 +1520,14 @@ export function App(): JSX.Element {
     root.setAttribute("data-theme", theme);
     root.classList.toggle("dark", theme === "dark");
   }, [theme]);
+
+  useEffect(() => {
+    return () => {
+      if (timelineScrollTrackingTimeoutRef.current !== null) {
+        window.clearTimeout(timelineScrollTrackingTimeoutRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const session = loadStoredAuthSession();
@@ -1760,8 +1848,20 @@ export function App(): JSX.Element {
   const hasPendingTimelineEntry = timeline.some((entry) => entry.pending);
 
   useEffect(() => {
-    timelineBottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [timeline.length, selectedSessionId]);
+    const previous = previousTimelineStateRef.current;
+    const sessionChanged = previous.sessionKey !== sessionTimelineKey;
+    const hasNewTimelineItems = timeline.length > previous.length;
+
+    previousTimelineStateRef.current = {
+      sessionKey: sessionTimelineKey,
+      length: timeline.length,
+    };
+
+    if (!sessionChanged && !hasNewTimelineItems) return;
+    if (!sessionChanged && !timelineShouldAutoScrollRef.current) return;
+
+    scrollTimelineToBottom(sessionChanged ? "auto" : "smooth");
+  }, [timeline.length, sessionTimelineKey]);
 
   useEffect(() => {
     if (!selectedSessionId) {
@@ -2083,6 +2183,7 @@ export function App(): JSX.Element {
       onSubmitted?: (run: RunRecord | null) => void;
     },
   ): Promise<void> {
+    scrollTimelineToBottom("auto");
     const sessionKey = options?.sessionKey || selectedSessionId || draftSessionKey;
     const request = buildQueuedMessage(sessionKey, promptValue, {
       planMode: options?.planMode,
@@ -2121,10 +2222,32 @@ export function App(): JSX.Element {
     });
   }
 
-  async function runSlashCommand(command: SlashCommandKey, sessionKey: string): Promise<void> {
+  function suppressTimelineScrollTracking(durationMs = 250): void {
+    suppressTimelineScrollTrackingRef.current = true;
+    if (timelineScrollTrackingTimeoutRef.current !== null) {
+      window.clearTimeout(timelineScrollTrackingTimeoutRef.current);
+    }
+    timelineScrollTrackingTimeoutRef.current = window.setTimeout(() => {
+      suppressTimelineScrollTrackingRef.current = false;
+      timelineScrollTrackingTimeoutRef.current = null;
+      const node = timelineScrollRef.current;
+      if (node) {
+        timelineShouldAutoScrollRef.current = isScrolledToBottom(node);
+      }
+    }, durationMs);
+  }
+
+  function scrollTimelineToBottom(behavior: ScrollBehavior = "smooth"): void {
+    timelineShouldAutoScrollRef.current = true;
+    suppressTimelineScrollTracking(behavior === "smooth" ? 300 : 100);
+    timelineBottomRef.current?.scrollIntoView({ behavior, block: "end" });
+  }
+
+  async function runSlashCommand(command: SlashCommandKey, sessionKey: string, rawInput?: string): Promise<void> {
+    scrollTimelineToBottom("auto");
     const now = Date.now();
     const messageId = `${now}_${Math.random().toString(36).slice(2, 7)}`;
-    const input = prompt.trim();
+    const input = (rawInput ?? prompt).trim();
     pushSlashEntries(sessionKey, [
       {
         key: `slash_${messageId}_user`,
@@ -2260,6 +2383,19 @@ export function App(): JSX.Element {
         at: Date.now(),
       },
     ]);
+  }
+
+  async function onSelectSlashCommand(command: SlashCommandKey): Promise<void> {
+    const sessionKey = selectedSessionId || draftSessionKey;
+    if (submitting) return;
+
+    setSubmitting(true);
+    try {
+      await runSlashCommand(command, sessionKey, command);
+      setPrompt("");
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   async function onStartRun(): Promise<void> {
@@ -2421,8 +2557,8 @@ export function App(): JSX.Element {
     void onStartRun();
   }
 
-  async function onAnswerPlanQuestion(questionTitle: string, answer: string): Promise<void> {
-    await submitSessionMessage(buildPlanAnswerPrompt(questionTitle, answer), {
+  async function onAnswerPlanQuestions(answers: PlanQuestionAnswer[]): Promise<void> {
+    await submitSessionMessage(buildPlanAnswersPrompt(answers), {
       sessionKey: sessionTimelineKey,
       planMode: true,
       onError: (message) => window.alert(message),
@@ -2570,6 +2706,13 @@ export function App(): JSX.Element {
     }
   }
 
+  function onTimelineScroll(): void {
+    const node = timelineScrollRef.current;
+    if (!node) return;
+    if (suppressTimelineScrollTrackingRef.current) return;
+    timelineShouldAutoScrollRef.current = isScrolledToBottom(node);
+  }
+
   if (!authReady) {
     return (
       <div className="flex h-[100dvh] items-center justify-center bg-[color:var(--bg)] text-[color:var(--text)]">
@@ -2659,10 +2802,12 @@ export function App(): JSX.Element {
             onNewSession={onNewSession}
             hasPendingIndicator={Boolean(selectedRun && selectedRun.status === "running" && !hasPendingTimelineEntry)}
             ansi={ansi}
+            timelineScrollRef={timelineScrollRef}
             timelineBottomRef={timelineBottomRef}
+            onTimelineScroll={onTimelineScroll}
             setToolDetailModal={setToolDetailModal}
             slashSuggestions={slashSuggestions}
-            onInsertSlashCommand={(command) => setPrompt(command === "/plan" ? command : `${command} `)}
+            onSelectSlashCommand={onSelectSlashCommand}
             queueItems={queuedMessagesForActiveSession}
             onRemoveQueueItem={(messageId) => removeQueuedMessage(sessionTimelineKey, messageId)}
             voiceSupported={voiceSupported}
@@ -2672,7 +2817,7 @@ export function App(): JSX.Element {
             onToggleVoiceRecording={onToggleVoiceRecording}
             onSendButtonClick={onSendButtonClick}
             planSessionState={planSessionState}
-            onAnswerPlanQuestion={onAnswerPlanQuestion}
+            onAnswerPlanQuestions={onAnswerPlanQuestions}
             onApprovePlanImplementation={onApprovePlanImplementation}
             onSubmitPlanFeedback={onSubmitPlanFeedback}
           />
@@ -2890,10 +3035,12 @@ type CenterPanelProps = {
   onNewSession: () => void;
   hasPendingIndicator: boolean;
   ansi: Convert;
+  timelineScrollRef: React.RefObject<HTMLDivElement>;
   timelineBottomRef: React.RefObject<HTMLDivElement>;
+  onTimelineScroll: () => void;
   setToolDetailModal: (state: ToolDetailModalState | null) => void;
   slashSuggestions: SlashCommandSuggestion[];
-  onInsertSlashCommand: (command: SlashCommandKey) => void;
+  onSelectSlashCommand: (command: SlashCommandKey) => Promise<void>;
   queueItems: QueuedMessage[];
   onRemoveQueueItem: (messageId: string) => void;
   voiceSupported: boolean;
@@ -2903,7 +3050,7 @@ type CenterPanelProps = {
   onToggleVoiceRecording: () => void;
   onSendButtonClick: () => void;
   planSessionState: PlanSessionState;
-  onAnswerPlanQuestion: (questionTitle: string, answer: string) => Promise<void>;
+  onAnswerPlanQuestions: (answers: PlanQuestionAnswer[]) => Promise<void>;
   onApprovePlanImplementation: () => Promise<void>;
   onSubmitPlanFeedback: (feedback: string) => Promise<void>;
 };
@@ -2935,7 +3082,11 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
       </CardHeader>
 
       <CardContent className="flex min-h-0 flex-1 flex-col gap-3 p-0">
-        <div className="scrollbar-thin min-h-0 flex-1 space-y-3 overflow-auto px-3 pb-2 pt-3">
+        <div
+          ref={props.timelineScrollRef}
+          onScroll={props.onTimelineScroll}
+          className="scrollbar-thin min-h-0 flex-1 space-y-3 overflow-auto px-3 pb-2 pt-3"
+        >
           {props.loading ? <p className="text-sm text-foreground/70">Loading...</p> : null}
 
           {!props.loading && !selectedRun && !props.selectedSession ? (
@@ -2973,7 +3124,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                       text={entry.text}
                       interactive={entry.role === "assistant" && !entry.pending}
                       resolved={hasLaterUserMessage}
-                      onAnswerPlanQuestion={props.onAnswerPlanQuestion}
+                      onAnswerPlanQuestions={props.onAnswerPlanQuestions}
                       onApprovePlanImplementation={props.onApprovePlanImplementation}
                       onSubmitPlanFeedback={props.onSubmitPlanFeedback}
                     />
@@ -3028,7 +3179,8 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                     key={item.key}
                     type="button"
                     className="w-full rounded-xl border border-transparent px-2 py-2 text-left transition hover:border-card-border hover:bg-muted"
-                    onClick={() => props.onInsertSlashCommand(item.key)}
+                    onClick={() => void props.onSelectSlashCommand(item.key)}
+                    disabled={props.submitting}
                   >
                     <div className="text-xs font-semibold">{item.key}</div>
                     <div className="text-[11px] text-foreground/70">{item.title} - {item.description}</div>
