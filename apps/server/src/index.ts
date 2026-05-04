@@ -18,6 +18,7 @@ import {
   type ApiResponse,
   type ApprovalQueueItem,
   type AppBootstrap,
+  type AppBootstrapLite,
   type AttachmentRef,
   type CodexAccountStatusResponse,
   type CodexCommandStatus,
@@ -27,8 +28,12 @@ import {
   type DiffSnapshot,
   type FileTreeNode,
   type RunConfig,
+  type RunListItem,
+  type RunMessageEntry,
+  type RunMessageFileChange,
   type RunEventEntry,
   type RunRecord,
+  type RunSourceTag,
   type SessionHistoryEntry,
   type SessionTranscriptEntry,
   type SessionTranscriptResponse,
@@ -60,6 +65,10 @@ const PLAN_MODE_FILE_PATH = path.resolve(rootDir, "plan.md");
 const ATTACHMENT_STAGING_DIR = path.join(".agentic", "attachments");
 const ATTACHMENT_MAX_BYTES = Number(process.env.ATTACHMENT_MAX_BYTES || 15 * 1024 * 1024);
 const ATTACHMENT_MAX_FILES = 10;
+const RUN_LIST_PAGE_DEFAULT = Number(process.env.RUN_LIST_PAGE_DEFAULT || 60);
+const RUN_LIST_PAGE_MAX = Number(process.env.RUN_LIST_PAGE_MAX || 200);
+const RUN_MESSAGE_PAGE_SIZE = 30;
+const STORED_EVENT_TEXT_MAX_CHARS = Number(process.env.STORED_EVENT_TEXT_MAX_CHARS || 24000);
 
 const IMAGE_ATTACHMENT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 const IMAGE_ATTACHMENT_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -166,6 +175,89 @@ const TERMINAL_HISTORY_MAX_CHARS = Number(process.env.TERMINAL_HISTORY_MAX_CHARS
 
 function runSessionId(run: RunRecord): string {
   return run.sessionId || run.threadId || run.id;
+}
+
+function normalizeRunSourceTag(sourceRaw: string, historyOnly: boolean): RunSourceTag {
+  if (!historyOnly) return "in-app";
+
+  const normalized = sourceRaw.trim().toLowerCase();
+  if (normalized === "vscode") return "vscode";
+  if (normalized === "cli" || normalized === "agentic-cli") return "cli";
+  if (normalized === "exec") return "exec";
+  return "other";
+}
+
+function normalizeRunListName(raw: string, fallback: string): string {
+  const collapsed = raw.replace(/\s+/g, " ").trim();
+  if (!collapsed) return fallback;
+
+  const dashIndex = collapsed.indexOf("---");
+  const trimmed = dashIndex >= 0 ? collapsed.slice(0, dashIndex).trim() : collapsed;
+  const title = trimmed || fallback;
+  return title.length > 160 ? `${title.slice(0, 157)}...` : title;
+}
+
+function encodeCursor(value: number): string {
+  return Buffer.from(String(Math.max(0, Math.floor(value))), "utf8").toString("base64url");
+}
+
+function decodeCursor(input: unknown): number | null {
+  if (typeof input !== "string" || !input.trim()) return null;
+  try {
+    const decoded = Buffer.from(input, "base64url").toString("utf8");
+    const value = Number(decoded);
+    return Number.isInteger(value) && value >= 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function clampListLimit(input: unknown): number {
+  const raw = typeof input === "string" ? Number(input) : Number(input ?? RUN_LIST_PAGE_DEFAULT);
+  if (!Number.isFinite(raw)) return RUN_LIST_PAGE_DEFAULT;
+  return Math.min(Math.max(Math.floor(raw), 1), RUN_LIST_PAGE_MAX);
+}
+
+function truncateText(input: string, maxChars: number): string {
+  if (input.length <= maxChars) return input;
+  const hidden = input.length - maxChars;
+  return `${input.slice(0, maxChars)}\n...[truncated ${hidden} chars]`;
+}
+
+function compactJsonForStorage(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") {
+    return value.length > STORED_EVENT_TEXT_MAX_CHARS
+      ? truncateText(value, STORED_EVENT_TEXT_MAX_CHARS)
+      : value;
+  }
+  if (depth >= 5) return "[truncated depth]";
+  if (Array.isArray(value)) {
+    const capped = value.slice(0, 100).map((item) => compactJsonForStorage(item, depth + 1));
+    if (value.length > capped.length) capped.push(`[truncated ${value.length - capped.length} items]`);
+    return capped;
+  }
+  if (!isRecord(value)) return value;
+
+  const next: Record<string, unknown> = {};
+  let count = 0;
+  for (const [key, item] of Object.entries(value)) {
+    next[key] = compactJsonForStorage(item, depth + 1);
+    count += 1;
+    if (count >= 100) {
+      next.__truncated__ = `additional fields omitted (${Object.keys(value).length - count})`;
+      break;
+    }
+  }
+  return next;
+}
+
+function sanitizeStoredStdoutLine(line: string): string {
+  if (line.length <= STORED_EVENT_TEXT_MAX_CHARS) return line;
+  try {
+    return JSON.stringify(compactJsonForStorage(JSON.parse(line) as unknown));
+  } catch {
+    return truncateText(line, STORED_EVENT_TEXT_MAX_CHARS);
+  }
 }
 
 function normalizeAttachmentRefs(input: unknown): AttachmentRef[] {
@@ -527,7 +619,7 @@ class RunManager extends EventEmitter {
       for (const line of text.split(/\r?\n/)) {
         if (!line.trim()) continue;
         if (isBenignCodexStderr(line)) continue;
-        const rendered = `${line}\n`;
+        const rendered = truncateText(`${line}\n`, STORED_EVENT_TEXT_MAX_CHARS);
         this.appendEvent(runId, { source: "stderr", text: rendered });
         this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: rendered } });
         this.checkApprovalSignal(runId, line, null);
@@ -592,8 +684,9 @@ class RunManager extends EventEmitter {
   }
 
   private handleStdoutLine(runId: string, line: string): void {
-    this.appendEvent(runId, { source: "stdout", text: line });
-    this.emitSse({ kind: "run.stdout", runId, at: Date.now(), payload: { text: line } });
+    const storedLine = sanitizeStoredStdoutLine(line);
+    this.appendEvent(runId, { source: "stdout", text: storedLine });
+    this.emitSse({ kind: "run.stdout", runId, at: Date.now(), payload: { text: storedLine } });
 
     let parsed: Record<string, unknown> | null = null;
     try {
@@ -1527,7 +1620,7 @@ function readCodexSessionFile(file: string): { entry: SessionHistoryEntry; lines
   };
 }
 
-function loadCodexSessionHistory(limit = 0): SessionHistoryEntry[] {
+function loadCodexSessionHistory(limit = 0, options?: { includeExec?: boolean }): SessionHistoryEntry[] {
   const files = listCodexSessionFiles();
   const selected = limit > 0 ? files.slice(0, limit) : files;
 
@@ -1535,7 +1628,7 @@ function loadCodexSessionHistory(limit = 0): SessionHistoryEntry[] {
   for (const file of selected) {
     const parsed = readCodexSessionFile(file);
     if (!parsed) continue;
-    if (parsed.entry.source === "exec") continue;
+    if (!options?.includeExec && parsed.entry.source === "exec") continue;
     if (parsed.entry.source !== "agentic-cli" && isArchiveWorkspacePath(parsed.entry.cwd)) continue;
     out.push(parsed.entry);
   }
@@ -1578,6 +1671,364 @@ function loadCodexSessionTranscript(sessionId: string): SessionTranscriptRespons
   }
 
   return null;
+}
+
+function readRunListItems(includeHistory: boolean): RunListItem[] {
+  const localRuns = runManager.getRuns(false)
+    .filter((run) => run.archivedAt === null)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+
+  const localItems = localRuns.map((run) => {
+    const fallback = run.summary.trim() || "Run";
+    const prompt = run.config.prompt.trim();
+    return {
+      id: run.id,
+      name: normalizeRunListName(prompt || fallback, fallback),
+      status: run.status,
+      updatedAt: run.updatedAt || run.createdAt,
+      sourceTag: "in-app" as const,
+      sourceRaw: "in-app",
+      sessionId: runSessionId(run),
+      workspace: run.config.workspace,
+      historyOnly: false,
+    };
+  });
+
+  if (!includeHistory) return localItems;
+
+  const localConversationIds = new Set(localItems.map((item) => item.sessionId));
+  const historyItems = loadCodexSessionHistory(0, { includeExec: true })
+    .filter((entry) => !localConversationIds.has(entry.id))
+    .map((entry) => ({
+      id: entry.id,
+      name: normalizeRunListName(entry.summary, entry.id),
+      status: "completed" as const,
+      updatedAt: Date.parse(entry.timestamp) || 0,
+      sourceTag: normalizeRunSourceTag(entry.source, true),
+      sourceRaw: entry.source,
+      sessionId: entry.id,
+      workspace: entry.cwd,
+      historyOnly: true,
+    }));
+
+  return [...localItems, ...historyItems].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+function sliceRunListItems(items: RunListItem[], limit: number, cursor: string | null): { items: RunListItem[]; nextCursor: string | null } {
+  const offset = decodeCursor(cursor) ?? 0;
+  const safeOffset = Math.min(Math.max(offset, 0), items.length);
+  const nextItems = items.slice(safeOffset, safeOffset + limit);
+  const nextOffset = safeOffset + nextItems.length;
+  return {
+    items: nextItems,
+    nextCursor: nextOffset < items.length ? encodeCursor(nextOffset) : null,
+  };
+}
+
+function readTextField(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+  return value
+    .map((item) => {
+      if (!isRecord(item)) return "";
+      if (item.type === "text" && typeof item.text === "string") return item.text;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function parseRunFileChanges(item: Record<string, unknown>): RunMessageFileChange[] {
+  const raw = Array.isArray(item.changes) ? item.changes : [];
+  const result: RunMessageFileChange[] = [];
+  for (const change of raw) {
+    if (!isRecord(change)) continue;
+    const filePath = typeof change.path === "string" ? change.path : "";
+    if (!filePath) continue;
+    result.push({
+      kind: typeof change.kind === "string" ? change.kind : "modify",
+      path: filePath,
+      diff: typeof change.diff === "string" ? change.diff : undefined,
+      added: typeof change.added === "number" ? change.added : 0,
+      removed: typeof change.removed === "number" ? change.removed : 0,
+    });
+  }
+  return result;
+}
+
+function isPlanLike(itemType: string): boolean {
+  const normalized = itemType.toLowerCase();
+  return normalized === "plan" || normalized === "reasoning" || normalized.includes("todo");
+}
+
+function resolvePlanText(item: Record<string, unknown>): string {
+  if (typeof item.text === "string" && item.text.trim()) return item.text;
+  if (typeof item.explanation === "string" && item.explanation.trim()) return item.explanation;
+
+  if (Array.isArray(item.plan)) {
+    const steps = item.plan
+      .map((step) => {
+        if (!isRecord(step)) return "";
+        const text = typeof step.step === "string" ? step.step : "";
+        const status = typeof step.status === "string" ? step.status : "pending";
+        return text ? `- [${status}] ${text}` : "";
+      })
+      .filter(Boolean);
+    if (steps.length) return `Plan steps:\n${steps.join("\n")}`;
+  }
+
+  return readTextField(item.content);
+}
+
+function truncatePreview(input: string, max = 120): string {
+  const normalized = input.replace(/\s+/g, " ").trim();
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, max - 3)}...`;
+}
+
+function buildRunMessageEntries(run: RunRecord): RunMessageEntry[] {
+  const entries: RunMessageEntry[] = [];
+
+  if (run.config.prompt.trim()) {
+    entries.push({
+      key: `${run.id}_user`,
+      role: "user",
+      title: "You",
+      text: run.config.prompt.trim(),
+      pending: false,
+      at: run.createdAt,
+      attachments: normalizeAttachmentRefs(run.config.attachments),
+      meta: { runId: run.id },
+    });
+  }
+
+  const commandByItemId = new Map<
+    string,
+    {
+      itemId: string;
+      at: number;
+      command: string;
+      output: string;
+      status: string;
+      exitCode: number | null;
+      pending: boolean;
+    }
+  >();
+
+  const fileChangeByItemId = new Map<
+    string,
+      {
+        itemId: string;
+        at: number;
+        status: string;
+        pending: boolean;
+        changes: RunMessageFileChange[];
+        errorMessage?: string;
+        path?: string;
+        durationMs?: number;
+      }
+    >();
+
+  const dedupe = new Set<string>();
+  const orderedEvents = [...run.events].sort((a, b) => a.at - b.at);
+
+  for (const event of orderedEvents) {
+    const raw = (event.text || "").trim();
+    if (!raw) continue;
+    if (event.source === "stderr") continue;
+
+    const parsed = safeJsonParse<Record<string, unknown>>(raw, {});
+    if (!parsed || typeof parsed.type !== "string") continue;
+
+    const parsedType = parsed.type;
+    const item = isRecord(parsed.item) ? parsed.item : null;
+    const itemId = item && typeof item.id === "string" ? item.id : `item_${event.id}`;
+    const itemType = item && typeof item.type === "string" ? item.type : "";
+
+    if (item) {
+      const dedupeKey = `${run.id}:${itemId}:${parsedType}`;
+      if (dedupe.has(dedupeKey)) continue;
+      dedupe.add(dedupeKey);
+    }
+
+    if (itemType === "agent_message" && parsedType === "item.completed") {
+      const text = typeof item?.text === "string" ? item.text : readTextField(item?.content);
+      if (!text.trim()) continue;
+      entries.push({
+        key: `${run.id}_${itemId}_assistant`,
+        role: "assistant",
+        title: "Assistant",
+        text,
+        pending: false,
+        at: event.at,
+        meta: { runId: run.id },
+      });
+      continue;
+    }
+
+    if (isPlanLike(itemType) && (parsedType === "item.started" || parsedType === "item.updated" || parsedType === "item.completed")) {
+      const pending = parsedType === "item.started";
+      const text = resolvePlanText(item || {});
+      entries.push({
+        key: `${run.id}_${itemId}_plan_${parsedType}`,
+        role: "plan",
+        title: itemType === "reasoning" ? "Reasoning" : "Plan",
+        text: text || (pending ? "Planning" : "Plan updated"),
+        pending,
+        at: event.at,
+        meta: { runId: run.id },
+      });
+      continue;
+    }
+
+    if (itemType === "command_execution" && (parsedType === "item.started" || parsedType === "item.completed")) {
+      const existing = commandByItemId.get(itemId) || {
+        itemId,
+        at: event.at,
+        command: "command",
+        output: "",
+        status: parsedType === "item.started" ? "in_progress" : "completed",
+        exitCode: null,
+        pending: parsedType === "item.started",
+      };
+
+      if (event.at < existing.at) existing.at = event.at;
+      if (typeof item?.command === "string" && item.command.trim()) existing.command = item.command;
+      if (typeof item?.aggregated_output === "string") existing.output = item.aggregated_output;
+      if (typeof item?.status === "string" && item.status.trim()) existing.status = item.status;
+      if (typeof item?.exit_code === "number") existing.exitCode = item.exit_code;
+      existing.pending = parsedType === "item.started" || existing.status === "in_progress";
+
+      commandByItemId.set(itemId, existing);
+      continue;
+    }
+
+    if (itemType === "file_change" && (parsedType === "item.started" || parsedType === "item.completed")) {
+      const existing = fileChangeByItemId.get(itemId) || {
+        itemId,
+        at: event.at,
+        status: parsedType === "item.started" ? "in_progress" : "completed",
+        pending: parsedType === "item.started",
+        changes: [] as RunMessageFileChange[],
+        errorMessage: undefined,
+        path: undefined,
+        durationMs: undefined,
+      };
+
+      if (event.at < existing.at) existing.at = event.at;
+      if (typeof item?.status === "string" && item.status.trim()) existing.status = item.status;
+      if (typeof item?.error_message === "string") existing.errorMessage = item.error_message;
+      if (typeof item?.path === "string") existing.path = item.path;
+      if (typeof item?.duration_ms === "number") existing.durationMs = item.duration_ms;
+      const changes = parseRunFileChanges(item || {});
+      if (changes.length) existing.changes = changes;
+      existing.pending = parsedType === "item.started" || existing.status === "in_progress";
+
+      fileChangeByItemId.set(itemId, existing);
+      continue;
+    }
+
+    if (itemType === "error") {
+      const message = typeof item?.message === "string" ? item.message : raw;
+      entries.push({
+        key: `${run.id}_${itemId}_error`,
+        role: "error",
+        title: "Error",
+        text: message,
+        pending: false,
+        at: event.at,
+        meta: { runId: run.id },
+      });
+    }
+  }
+
+  const commandEntries = [...commandByItemId.values()].map((command) => ({
+    key: `${run.id}_${command.itemId}_command`,
+    role: "tool" as const,
+    title: "Tool",
+    text: `$ ${truncatePreview(command.command)}`,
+    pending: command.pending,
+    at: command.at,
+    meta: {
+      type: "commandexecution" as const,
+      runId: run.id,
+      status: command.status || (command.pending ? "in_progress" : "completed"),
+      command: command.command,
+      output: command.output,
+      exitCode: command.exitCode,
+    },
+  }));
+
+  const fileEntries = [...fileChangeByItemId.values()].map((change) => {
+    const primaryPath = change.changes[0]?.path || change.path || "file change";
+    const label = change.changes.length > 1 ? `${primaryPath} +${change.changes.length - 1} more` : primaryPath;
+    const status = change.status || (change.pending ? "in_progress" : "completed");
+    const summary = `${status}: ${label}`;
+    return {
+      key: `${run.id}_${change.itemId}_file_change`,
+      role: "tool" as const,
+      title: "Tool",
+      text: summary,
+      pending: change.pending,
+      at: change.at,
+      meta: {
+        type: "filechange" as const,
+        runId: run.id,
+        status,
+        fileChanges: change.changes,
+        errorMessage: change.errorMessage,
+        path: change.path,
+        durationMs: change.durationMs,
+      },
+    };
+  });
+
+  entries.push(...commandEntries, ...fileEntries);
+
+  if (run.usage) {
+    entries.push({
+      key: `${run.id}_usage`,
+      role: "system",
+      title: "Usage",
+      text: `Tokens: in ${run.usage.inputTokens ?? 0}, out ${run.usage.outputTokens ?? 0}, cached ${run.usage.cachedInputTokens ?? 0}`,
+      pending: false,
+      at: run.updatedAt,
+      meta: { runId: run.id },
+    });
+  }
+
+  return entries.sort((a, b) => a.at - b.at);
+}
+
+function buildTranscriptMessageEntries(transcript: SessionTranscriptResponse): RunMessageEntry[] {
+  return transcript.entries.map((entry) => ({
+    key: `history_${entry.key}`,
+    role: entry.role,
+    title: entry.role === "user" ? "You" : "Assistant",
+    text: entry.text,
+    pending: false,
+    at: entry.at,
+  }));
+}
+
+function loadPaginatedRunMessages(runId: string, beforeCursor: string | null): { entries: RunMessageEntry[]; nextCursor: string | null } | null {
+  const localRun = runManager.getRun(runId);
+  const entries = localRun
+    ? buildRunMessageEntries(localRun)
+    : (() => {
+        const transcript = loadCodexSessionTranscript(runId);
+        return transcript ? buildTranscriptMessageEntries(transcript) : null;
+      })();
+
+  if (!entries) return null;
+
+  const end = decodeCursor(beforeCursor) ?? entries.length;
+  const safeEnd = Math.min(Math.max(end, 0), entries.length);
+  const start = Math.max(0, safeEnd - RUN_MESSAGE_PAGE_SIZE);
+  return {
+    entries: entries.slice(start, safeEnd),
+    nextCursor: start > 0 ? encodeCursor(start) : null,
+  };
 }
 
 const { defaultWorkspace, options: configWorkspaceOptions } = resolveConfigWorkspaces();
@@ -1804,6 +2255,19 @@ app.get("/api/bootstrap", (_req, res) => {
   res.json(apiOk(payload));
 });
 
+app.get("/api/bootstrap-lite", (_req, res) => {
+  const payload: AppBootstrapLite = {
+    defaults: {
+      model: DEFAULT_MODEL,
+      sandbox: DEFAULT_SANDBOX as "read-only" | "workspace-write" | "danger-full-access",
+    },
+    activeWorkspace: uiState.activeWorkspace,
+    workspaces: getWorkspaces(),
+    approvals: runManager.getApprovals(),
+  };
+  res.json(apiOk(payload));
+});
+
 app.get("/api/workspaces", (_req, res) => {
   res.json(apiOk({ activeWorkspace: uiState.activeWorkspace, workspaces: getWorkspaces() }));
 });
@@ -1864,6 +2328,14 @@ app.post("/api/workspaces/active", (req, res) => {
 
 app.get("/api/runs", (_req, res) => {
   res.json(apiOk({ runs: runManager.getRuns(false), approvals: runManager.getApprovals() }));
+});
+
+app.get("/api/runs/list", (req, res) => {
+  const limit = clampListLimit(req.query.limit);
+  const cursor = typeof req.query.cursor === "string" ? req.query.cursor : null;
+  const includeHistory = req.query.includeHistory === "1" || req.query.includeHistory === "true";
+  const payload = sliceRunListItems(readRunListItems(includeHistory), limit, cursor);
+  res.json(apiOk({ ...payload, approvals: runManager.getApprovals() }));
 });
 
 app.post("/api/attachments", express.raw({ limit: ATTACHMENT_MAX_BYTES, type: () => true }), (req, res) => {
@@ -2030,6 +2502,16 @@ app.get("/api/runs/:runId", (req, res) => {
 
   const approvals = runManager.getApprovals().filter((item) => item.runId === run.id);
   res.json(apiOk({ run, approvals }));
+});
+
+app.get("/api/runs/:runId/messages", (req, res) => {
+  const before = typeof req.query.before === "string" ? req.query.before : null;
+  const payload = loadPaginatedRunMessages(req.params.runId, before);
+  if (!payload) {
+    res.status(404).json(apiErr("Run messages not found"));
+    return;
+  }
+  res.json(apiOk({ runId: req.params.runId, ...payload }));
 });
 
 app.get("/api/runs/:runId/diff", (req, res) => {

@@ -9,6 +9,9 @@ export type SandboxMode = z.infer<typeof sandboxSchema>;
 export const approvalPolicySchema = z.enum(["untrusted", "on-failure", "on-request", "never"]);
 export type ApprovalPolicy = z.infer<typeof approvalPolicySchema>;
 
+export const runSourceTagSchema = z.enum(["in-app", "vscode", "cli", "exec", "other"]);
+export type RunSourceTag = z.infer<typeof runSourceTagSchema>;
+
 export const attachmentKindSchema = z.enum(["image", "text"]);
 export type AttachmentKind = z.infer<typeof attachmentKindSchema>;
 
@@ -143,6 +146,60 @@ export type SessionTranscriptResponse = {
   entries: SessionTranscriptEntry[];
 };
 
+export type RunListItem = {
+  id: string;
+  name: string;
+  status: RunStatus;
+  updatedAt: number;
+  sourceTag: RunSourceTag;
+  sourceRaw: string;
+  sessionId: string;
+  workspace: string;
+  historyOnly: boolean;
+};
+
+export type RunMessageFileChange = {
+  kind: string;
+  path: string;
+  diff?: string;
+  added: number;
+  removed: number;
+};
+
+export type RunMessageEntry = {
+  key: string;
+  role: "user" | "assistant" | "tool" | "plan" | "system" | "error";
+  title?: string;
+  text: string;
+  pending: boolean;
+  at: number;
+  attachments?: AttachmentRef[];
+  meta?: {
+    type?: "commandexecution" | "filechange";
+    runId?: string;
+    status?: string;
+    command?: string;
+    output?: string;
+    exitCode?: number | null;
+    fileChanges?: RunMessageFileChange[];
+    errorMessage?: string;
+    path?: string;
+    durationMs?: number;
+  };
+};
+
+export type RunListResponse = {
+  items: RunListItem[];
+  nextCursor: string | null;
+  approvals: ApprovalQueueItem[];
+};
+
+export type RunMessagesResponse = {
+  runId: string;
+  entries: RunMessageEntry[];
+  nextCursor: string | null;
+};
+
 export type TerminalSessionStatus = "running" | "stopped";
 
 export type TerminalSessionSnapshot = {
@@ -164,6 +221,16 @@ export type AppBootstrap = {
   activeWorkspace: string;
   workspaces: WorkspaceOption[];
   runs: RunRecord[];
+  approvals: ApprovalQueueItem[];
+};
+
+export type AppBootstrapLite = {
+  defaults: {
+    model: string;
+    sandbox: SandboxMode;
+  };
+  activeWorkspace: string;
+  workspaces: WorkspaceOption[];
   approvals: ApprovalQueueItem[];
 };
 

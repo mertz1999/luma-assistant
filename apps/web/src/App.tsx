@@ -32,8 +32,10 @@ import type {
   DiffSnapshot,
   FileTreeNode,
   RunRecord,
+  RunListItem,
+  RunMessageEntry,
+  RunSourceTag,
   SandboxMode,
-  SessionHistoryEntry,
   StartRunInput,
   TerminalSessionSnapshot,
   WorkspaceOption,
@@ -43,17 +45,17 @@ import {
   connectEvents,
   deleteSession,
   getAccountStatus,
-  getBootstrap,
+  getBootstrapLite,
   getDiff,
   getFileTree,
   getMcpStatus,
-  getRuns,
-  getSessionHistory,
-  getSessionTranscript,
+  getRunList,
+  getRunMessages,
   getSystemStatus,
   getTerminal,
   interruptTerminal,
   loginWithPassword,
+  getRun,
   rerun,
   setApiAuthToken,
   sendTerminalInput,
@@ -73,16 +75,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
 type StatusFilter = "all" | "running" | "completed" | "failed" | "stopped";
 
-type TimelineRole = "user" | "assistant" | "tool" | "plan" | "system" | "error";
-
-type FileChangeDetail = {
-  kind: string;
-  path: string;
-  diff?: string;
-  added: number;
-  removed: number;
-};
-
 type DebugLogEntry = {
   key: string;
   runId: string;
@@ -90,36 +82,16 @@ type DebugLogEntry = {
   text: string;
 };
 
-type TimelineEntry = {
-  key: string;
-  role: TimelineRole;
-  title?: string;
-  text: string;
-  pending: boolean;
-  at: number;
-  attachments?: AttachmentRef[];
-  meta?: {
-    type?: "commandexecution" | "filechange";
-    runId?: string;
-    status?: string;
-    command?: string;
-    output?: string;
-    exitCode?: number | null;
-    fileChanges?: FileChangeDetail[];
-    errorMessage?: string;
-    path?: string;
-    durationMs?: number;
-  };
-};
+type TimelineEntry = RunMessageEntry;
 
 type SessionCard = {
   id: string;
-  latestRun: RunRecord | null;
-  runCount: number;
+  sessionId: string;
   summary: string;
-  status: RunRecord["status"];
+  status: RunListItem["status"];
   updatedAt: number;
-  source: string;
+  sourceTag: RunSourceTag;
+  sourceRaw: string;
   workspace: string;
   historyOnly: boolean;
 };
@@ -131,13 +103,14 @@ const approvalPolicies: ApprovalPolicy[] = ["untrusted", "on-failure", "on-reque
 const modelOptions = ["gpt-5.3-codex", "gpt-5.4", "gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o", "o4-mini"];
 const toolOutputModalLimit = 2500;
 const draftSessionKey = "__draft__";
+const runListPageSize = 60;
+const messagePageSize = 30;
 const queueStorageKey = "agentic_cli_queue_v1";
 const terminalHistoryStorageKey = "agentic_cli_terminal_history_v1";
 const terminalHistoryLimit = 80;
 const authSessionStorageKey = "agentic_cli_auth_session_v1";
 const authSessionMaxAgeMs = 24 * 60 * 60 * 1000;
 const planInstructionPath = "/Users/applestation/Project/archive/agentic-assistant/plan.md";
-const initialTimelinePageSize = 20;
 const attachmentMaxFiles = 10;
 // Account for the chat stack gap and bottom padding so "visually at bottom"
 // still counts as bottom without making the auto-follow area too large.
@@ -492,36 +465,31 @@ function runSessionId(run: RunRecord): string {
 }
 
 function describeSessionMeta(session: SessionCard): string {
-  if (!session.historyOnly) {
-    return `${session.runCount} message${session.runCount > 1 ? "s" : ""}`;
-  }
-
   const workspaceName = session.workspace.split(/[\\/]/).filter(Boolean).pop() || session.workspace;
-  return workspaceName || "External session";
+  if (workspaceName) return workspaceName;
+  return session.historyOnly ? "External session" : "In-app run";
 }
 
 function getSessionSourceBadge(session: SessionCard): { label: string; className: string } {
-  if (!session.historyOnly) {
+  if (session.sourceTag === "in-app") {
     return {
       label: "in-app",
       className: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200",
     };
   }
-
-  const source = session.source.trim().toLowerCase();
-  if (source === "vscode") {
+  if (session.sourceTag === "vscode") {
     return {
       label: "vscode",
       className: "bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-200",
     };
   }
-  if (source === "cli" || source === "agentic-cli") {
+  if (session.sourceTag === "cli") {
     return {
       label: "cli",
       className: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-200",
     };
   }
-  if (source === "exec") {
+  if (session.sourceTag === "exec") {
     return {
       label: "exec",
       className: "bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-100",
@@ -529,13 +497,9 @@ function getSessionSourceBadge(session: SessionCard): { label: string; className
   }
 
   return {
-    label: source || "other",
+    label: "other",
     className: "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-200",
   };
-}
-
-function resolveSessionRunId(session: SessionCard | null | undefined): string | null {
-  return session?.latestRun?.id || null;
 }
 
 function statusClass(status: string): string {
@@ -546,79 +510,31 @@ function statusClass(status: string): string {
   return "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-200";
 }
 
-function isGeneratedSessionSummary(summary: string): boolean {
-  return summary.trim().startsWith("Session in ");
+function buildSessionCards(items: RunListItem[]): SessionCard[] {
+  return items.map((item) => ({
+    id: item.id,
+    sessionId: item.sessionId,
+    summary: item.name,
+    status: item.status,
+    updatedAt: item.updatedAt,
+    sourceTag: item.sourceTag,
+    sourceRaw: item.sourceRaw,
+    workspace: item.workspace,
+    historyOnly: item.historyOnly,
+  }));
 }
 
-function normalizeSessionTitle(raw: string, fallback: string): string {
-  const collapsed = raw.replace(/\s+/g, " ").trim();
-  if (!collapsed) return fallback;
+function mergeTimelineEntries(older: TimelineEntry[], newer: TimelineEntry[]): TimelineEntry[] {
+  const merged: TimelineEntry[] = [];
+  const seen = new Set<string>();
 
-  const dashIndex = collapsed.indexOf("---");
-  const trimmed = dashIndex >= 0 ? collapsed.slice(0, dashIndex).trim() : collapsed;
-  const title = trimmed || fallback;
-  return title.length > 160 ? `${title.slice(0, 157)}...` : title;
-}
-
-function buildSessionCards(
-  runs: RunRecord[],
-  historyEntries: SessionHistoryEntry[],
-  summaryHintsBySession: Record<string, string>,
-): SessionCard[] {
-  const localBySession = new Map<string, SessionCard>();
-  const historyBySession = new Map(historyEntries.map((entry) => [entry.id, entry]));
-  const grouped = new Map<string, RunRecord[]>();
-  for (const run of runs) {
-    if (run.archivedAt !== null) continue;
-    const key = runSessionId(run);
-    const list = grouped.get(key) || [];
-    list.push(run);
-    grouped.set(key, list);
+  for (const entry of [...older, ...newer]) {
+    if (seen.has(entry.key)) continue;
+    seen.add(entry.key);
+    merged.push(entry);
   }
 
-  for (const [id, list] of grouped.entries()) {
-      const desc = [...list].sort((a, b) => b.createdAt - a.createdAt);
-      const asc = [...list].sort((a, b) => a.createdAt - b.createdAt);
-      const latestRun = desc[0];
-      const firstPrompt = asc.find((run) => run.config.prompt.trim())?.config.prompt || "";
-      const historyEntry = historyBySession.get(id);
-      const hintedSummary = summaryHintsBySession[id] || historyEntry?.summary || "";
-      const fallback = latestRun.summary || "Session";
-      const summary = !isGeneratedSessionSummary(hintedSummary) && hintedSummary.trim()
-        ? normalizeSessionTitle(hintedSummary, fallback)
-        : normalizeSessionTitle(firstPrompt, fallback);
-      localBySession.set(id, {
-        id,
-        latestRun,
-        runCount: list.length,
-        summary,
-        status: latestRun.status,
-        updatedAt: latestRun.updatedAt || latestRun.createdAt,
-        source: "agentic-cli",
-        workspace: latestRun.config.workspace,
-        historyOnly: false,
-      });
-  }
-
-  const merged = [...localBySession.values()];
-  for (const entry of historyEntries) {
-    if (entry.source.trim().toLowerCase() === "exec") continue;
-    if (localBySession.has(entry.id)) continue;
-    const hintedSummary = summaryHintsBySession[entry.id] || entry.summary;
-    merged.push({
-      id: entry.id,
-      latestRun: null,
-      runCount: 0,
-      summary: normalizeSessionTitle(hintedSummary, entry.id),
-      status: "completed",
-      updatedAt: Date.parse(entry.timestamp) || 0,
-      source: entry.source,
-      workspace: entry.cwd,
-      historyOnly: true,
-    });
-  }
-
-  return merged.sort((a, b) => b.updatedAt - a.updatedAt);
+  return merged;
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {
@@ -759,22 +675,6 @@ function toSpeechErrorMessage(error?: string): string {
   return error ? `Voice input error: ${error}` : "Voice input failed.";
 }
 
-function parseFileChanges(item: Record<string, unknown>): FileChangeDetail[] {
-  const raw = Array.isArray(item.changes) ? item.changes : [];
-  const result: FileChangeDetail[] = [];
-  for (const change of raw) {
-    if (!isRecord(change)) continue;
-    const path = typeof change.path === "string" ? change.path : "";
-    if (!path) continue;
-    const kind = typeof change.kind === "string" ? change.kind : "modify";
-    const diff = typeof change.diff === "string" ? change.diff : undefined;
-    const added = typeof change.added === "number" ? change.added : 0;
-    const removed = typeof change.removed === "number" ? change.removed : 0;
-    result.push({ kind, path, diff, added, removed });
-  }
-  return result;
-}
-
 function isPlanLike(itemType: string): boolean {
   const normalized = itemType.toLowerCase();
   return normalized === "plan" || normalized === "reasoning" || normalized.includes("todo");
@@ -797,237 +697,6 @@ function resolvePlanText(item: Record<string, unknown>): string {
   }
 
   return readTextField(item.content);
-}
-
-function buildSessionTimeline(runs: RunRecord[]): TimelineEntry[] {
-  const entries: TimelineEntry[] = [];
-  const orderedRuns = [...runs].sort((a, b) => a.createdAt - b.createdAt);
-
-  for (const run of orderedRuns) {
-    if (run.config.prompt.trim()) {
-      const attachments = readAttachmentRefs(run.config.attachments);
-      entries.push({
-        key: `${run.id}_user`,
-        role: "user",
-        title: "You",
-        text: run.config.prompt.trim(),
-        pending: false,
-        at: run.createdAt,
-        attachments,
-        meta: { runId: run.id },
-      });
-    }
-
-    const commandByItemId = new Map<
-      string,
-      {
-        itemId: string;
-        at: number;
-        command: string;
-        output: string;
-        status: string;
-        exitCode: number | null;
-        pending: boolean;
-      }
-    >();
-
-    const fileChangeByItemId = new Map<
-      string,
-      {
-        itemId: string;
-        at: number;
-        status: string;
-        pending: boolean;
-        changes: FileChangeDetail[];
-        errorMessage?: string;
-        path?: string;
-        durationMs?: number;
-      }
-    >();
-
-    const dedupe = new Set<string>();
-    const orderedEvents = [...run.events].sort((a, b) => a.at - b.at);
-
-    for (const event of orderedEvents) {
-      const raw = (event.text || "").trim();
-      if (!raw) continue;
-
-      if (event.source === "stderr") {
-        continue;
-      }
-
-      const parsed = toJson(raw);
-      if (!parsed || typeof parsed.type !== "string") continue;
-
-      const parsedType = parsed.type;
-      const item = isRecord(parsed.item) ? parsed.item : null;
-      const itemId = item && typeof item.id === "string" ? item.id : `item_${event.id}`;
-      const itemType = item && typeof item.type === "string" ? item.type : "";
-
-      if (item) {
-        const dedupeKey = `${run.id}:${itemId}:${parsedType}`;
-        if (dedupe.has(dedupeKey)) continue;
-        dedupe.add(dedupeKey);
-      }
-
-      if (itemType === "agent_message" && parsedType === "item.completed") {
-        const text = typeof item?.text === "string" ? item.text : readTextField(item?.content);
-        if (!text.trim()) continue;
-        entries.push({
-          key: `${run.id}_${itemId}_assistant`,
-          role: "assistant",
-          title: "Assistant",
-          text,
-          pending: false,
-          at: event.at,
-          meta: { runId: run.id },
-        });
-        continue;
-      }
-
-      if (isPlanLike(itemType) && (parsedType === "item.started" || parsedType === "item.updated" || parsedType === "item.completed")) {
-        const pending = parsedType === "item.started";
-        const text = resolvePlanText(item || {});
-        entries.push({
-          key: `${run.id}_${itemId}_plan_${parsedType}`,
-          role: "plan",
-          title: itemType === "reasoning" ? "Reasoning" : "Plan",
-          text: text || (pending ? "Planning" : "Plan updated"),
-          pending,
-          at: event.at,
-          meta: { runId: run.id },
-        });
-        continue;
-      }
-
-      if (itemType === "command_execution" && (parsedType === "item.started" || parsedType === "item.completed")) {
-        const existing = commandByItemId.get(itemId) || {
-          itemId,
-          at: event.at,
-          command: "command",
-          output: "",
-          status: parsedType === "item.started" ? "in_progress" : "completed",
-          exitCode: null,
-          pending: parsedType === "item.started",
-        };
-
-        if (event.at < existing.at) existing.at = event.at;
-        if (typeof item?.command === "string" && item.command.trim()) existing.command = item.command;
-        if (typeof item?.aggregated_output === "string") existing.output = item.aggregated_output;
-        if (typeof item?.status === "string" && item.status.trim()) existing.status = item.status;
-        if (typeof item?.exit_code === "number") existing.exitCode = item.exit_code;
-        existing.pending = parsedType === "item.started" || existing.status === "in_progress";
-
-        commandByItemId.set(itemId, existing);
-        continue;
-      }
-
-      if (itemType === "file_change" && (parsedType === "item.started" || parsedType === "item.completed")) {
-        const existing = fileChangeByItemId.get(itemId) || {
-          itemId,
-          at: event.at,
-          status: parsedType === "item.started" ? "in_progress" : "completed",
-          pending: parsedType === "item.started",
-          changes: [] as FileChangeDetail[],
-          errorMessage: undefined,
-          path: undefined,
-          durationMs: undefined,
-        };
-
-        if (event.at < existing.at) existing.at = event.at;
-        if (typeof item?.status === "string" && item.status.trim()) existing.status = item.status;
-        if (typeof item?.error_message === "string") existing.errorMessage = item.error_message;
-        if (typeof item?.path === "string") existing.path = item.path;
-        if (typeof item?.duration_ms === "number") existing.durationMs = item.duration_ms;
-        const changes = parseFileChanges(item || {});
-        if (changes.length) existing.changes = changes;
-        existing.pending = parsedType === "item.started" || existing.status === "in_progress";
-
-        fileChangeByItemId.set(itemId, existing);
-        continue;
-      }
-
-      if (itemType === "error") {
-        const message = typeof item?.message === "string" ? item.message : raw;
-        entries.push({
-          key: `${run.id}_${itemId}_error`,
-          role: "error",
-          title: "Error",
-          text: message,
-          pending: false,
-          at: event.at,
-          meta: { runId: run.id },
-        });
-      }
-    }
-
-    const commandEntries = [...commandByItemId.values()].map((command) => {
-      const status = command.status || (command.pending ? "in_progress" : "completed");
-      const preview = `$ ${truncatePreview(command.command)}`;
-      return {
-        key: `${run.id}_${command.itemId}_command`,
-        role: "tool" as const,
-        title: "Tool",
-        text: preview,
-        pending: command.pending,
-        at: command.at,
-        meta: {
-          type: "commandexecution" as const,
-          runId: run.id,
-          status,
-          command: command.command,
-          output: command.output,
-          exitCode: command.exitCode,
-        },
-      };
-    });
-
-    const fileEntries = [...fileChangeByItemId.values()].map((change) => {
-      const count = change.changes.length;
-      const summary =
-        count > 0
-          ? `${change.pending ? "Applying" : "Applied"} file changes (${count} file${count > 1 ? "s" : ""})`
-          : change.path
-            ? `${change.pending ? "Updating" : "Updated"}: ${change.path}`
-            : change.pending
-              ? "Applying file changes"
-              : "File changes";
-
-      return {
-        key: `${run.id}_${change.itemId}_file`,
-        role: "tool" as const,
-        title: "Tool",
-        text: summary,
-        pending: change.pending,
-        at: change.at,
-        meta: {
-          type: "filechange" as const,
-          runId: run.id,
-          status: change.status,
-          fileChanges: change.changes,
-          errorMessage: change.errorMessage,
-          path: change.path,
-          durationMs: change.durationMs,
-        },
-      };
-    });
-
-    entries.push(...commandEntries, ...fileEntries);
-
-    if (run.usage) {
-      entries.push({
-        key: `${run.id}_usage`,
-        role: "system",
-        title: "Usage",
-        text: `Tokens: in ${run.usage.inputTokens ?? 0}, out ${run.usage.outputTokens ?? 0}, cached ${run.usage.cachedInputTokens ?? 0}`,
-        pending: false,
-        at: run.updatedAt,
-        meta: { runId: run.id },
-      });
-    }
-  }
-
-  return entries.sort((a, b) => a.at - b.at);
 }
 
 function collectSessionDebugLogs(runs: RunRecord[]): DebugLogEntry[] {
@@ -1652,11 +1321,15 @@ export function App(): JSX.Element {
 
   const [workspaces, setWorkspaces] = useState<WorkspaceOption[]>([]);
   const [activeWorkspace, setWorkspace] = useState("");
-  const [runs, setRuns] = useState<RunRecord[]>([]);
-  const [sessionHistoryEntries, setSessionHistoryEntries] = useState<SessionHistoryEntry[]>([]);
-  const [sessionSummaryHintsById, setSessionSummaryHintsById] = useState<Record<string, string>>({});
+  const [runItems, setRunItems] = useState<RunListItem[]>([]);
+  const [runListNextCursor, setRunListNextCursor] = useState<string | null>(null);
+  const [loadingMoreRunItems, setLoadingMoreRunItems] = useState(false);
+  const [messagesByRunId, setMessagesByRunId] = useState<Record<string, TimelineEntry[]>>({});
+  const [messageNextCursorByRunId, setMessageNextCursorByRunId] = useState<Record<string, string | null>>({});
+  const [loadingMessagesByRunId, setLoadingMessagesByRunId] = useState<Record<string, boolean>>({});
+  const [selectedRunRecord, setSelectedRunRecord] = useState<RunRecord | null>(null);
   const [showAllHistory, setShowAllHistory] = useState(false);
-  const [loadingSessionHistory, setLoadingSessionHistory] = useState(false);
+  const [loadingRunList, setLoadingRunList] = useState(false);
   const [approvals, setApprovals] = useState<ApprovalQueueItem[]>([]);
 
   const [fileNodes, setFileNodes] = useState<FileTreeNode[]>([]);
@@ -1682,8 +1355,6 @@ export function App(): JSX.Element {
   const [toolDetailModal, setToolDetailModal] = useState<ToolDetailModalState | null>(null);
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
   const [terminalsBySession, setTerminalsBySession] = useState<Record<string, TerminalSessionSnapshot>>({});
-  const [historyTimelineBySession, setHistoryTimelineBySession] = useState<Record<string, TimelineEntry[]>>({});
-  const [visibleTimelineCountBySession, setVisibleTimelineCountBySession] = useState<Record<string, number>>({});
   const [terminalInput, setTerminalInput] = useState("");
   const [terminalAction, setTerminalAction] = useState<"starting" | "stopping" | "sending" | null>(null);
   const [voiceSupported, setVoiceSupported] = useState(false);
@@ -1707,7 +1378,8 @@ export function App(): JSX.Element {
   const timelineShouldAutoScrollRef = useRef(true);
   const suppressTimelineScrollTrackingRef = useRef(false);
   const timelineScrollTrackingTimeoutRef = useRef<number | null>(null);
-  const pendingTimelineExpansionRef = useRef<{ sessionKey: string; scrollHeight: number; scrollTop: number } | null>(null);
+  const pendingTimelineExpansionRef = useRef<{ runId: string; scrollHeight: number; scrollTop: number } | null>(null);
+  const selectedRunRefreshTimeoutRef = useRef<number | null>(null);
   const previousTimelineStateRef = useRef<{ sessionKey: string; length: number }>({
     sessionKey: draftSessionKey,
     length: 0,
@@ -1725,6 +1397,9 @@ export function App(): JSX.Element {
     return () => {
       if (timelineScrollTrackingTimeoutRef.current !== null) {
         window.clearTimeout(timelineScrollTrackingTimeoutRef.current);
+      }
+      if (selectedRunRefreshTimeoutRef.current !== null) {
+        window.clearTimeout(selectedRunRefreshTimeoutRef.current);
       }
     };
   }, []);
@@ -1902,48 +1577,14 @@ export function App(): JSX.Element {
       setLoading(false);
       return;
     }
-    void loadBootstrap();
-  }, [authReady, isAuthenticated]);
+    void loadBootstrapLite();
+  }, [authReady, isAuthenticated, showAllHistory]);
 
   useEffect(() => {
     if (!authReady || !isAuthenticated) return;
+    const selectedIsHistory = runItems.some((item) => item.id === selectedRunId && item.historyOnly);
     const es = connectEvents((event) => {
       if (event.kind === "heartbeat") return;
-
-      if (event.kind === "run.stdout" || event.kind === "run.stderr" || event.kind === "run.item") {
-        const runId = event.runId;
-        if (!runId) return;
-
-        setRuns((prev) => {
-          const idx = prev.findIndex((entry) => entry.id === runId);
-          if (idx < 0) return prev;
-          const current = prev[idx];
-          const line =
-            event.kind === "run.item"
-              ? JSON.stringify(event.payload || {})
-              : String(event.payload?.text || "");
-          const source = event.kind === "run.stderr" ? ("stderr" as const) : ("stdout" as const);
-          const nextEvents = [
-            ...current.events,
-            {
-              id: `live_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-              at: Date.now(),
-              source,
-              text: line,
-            },
-          ];
-
-          const next = [...prev];
-          next[idx] = {
-            ...current,
-            events: nextEvents.slice(-1800),
-            updatedAt: Date.now(),
-          };
-          return next;
-        });
-
-        return;
-      }
 
       if (event.kind === "terminal.started" || event.kind === "terminal.stopped") {
         const terminal = readTerminalSnapshot(event.payload);
@@ -1980,40 +1621,49 @@ export function App(): JSX.Element {
         return;
       }
 
-      void refreshRuns();
+      if (event.kind === "run.stdout" || event.kind === "run.stderr" || event.kind === "run.item") {
+        if (event.runId && event.runId === selectedRunId && !selectedIsHistory) {
+          scheduleSelectedRunRefresh(event.runId);
+        }
+        return;
+      }
+
       if (event.kind === "run.diffUpdated" && event.runId === selectedRunId) {
         setDiff(event.payload as unknown as DiffSnapshot);
+      }
+
+      void refreshRunList(selectedRunId);
+      if (selectedRunId && !selectedIsHistory) {
+        scheduleSelectedRunRefresh(selectedRunId);
       }
     });
 
     return () => es.close();
-  }, [selectedRunId, authReady, isAuthenticated]);
+  }, [selectedRunId, runItems, authReady, isAuthenticated]);
 
   useEffect(() => {
-    if (!selectedRunId) {
+    const selectedIsHistory = runItems.some((item) => item.id === selectedRunId && item.historyOnly);
+    if (!selectedRunId || isDraftSession || selectedIsHistory) {
       setDiff(null);
       return;
     }
     void loadDiff(selectedRunId);
-  }, [selectedRunId]);
+  }, [selectedRunId, isDraftSession, runItems]);
 
   useEffect(() => {
     if (!activeWorkspace) return;
     void loadFileTree();
   }, [activeWorkspace]);
 
-  const allSessions = useMemo(
-    () => buildSessionCards(runs, sessionHistoryEntries, sessionSummaryHintsById),
-    [runs, sessionHistoryEntries, sessionSummaryHintsById],
-  );
+  const allSessions = useMemo(() => buildSessionCards(runItems), [runItems]);
   const filteredSessions = useMemo(() => {
     if (statusFilter === "all") return allSessions;
     return allSessions.filter((session) => session.status === statusFilter);
   }, [allSessions, statusFilter]);
 
   const selectedSession = useMemo(
-    () => allSessions.find((session) => session.id === selectedSessionId) || null,
-    [allSessions, selectedSessionId],
+    () => allSessions.find((session) => session.id === selectedRunId) || null,
+    [allSessions, selectedRunId],
   );
   const selectedTerminal = useMemo(
     () => (selectedSessionId ? terminalsBySession[selectedSessionId] || null : null),
@@ -2024,30 +1674,19 @@ export function App(): JSX.Element {
     [selectedSessionId, terminalHistoryBySession],
   );
 
-  const selectedRun = selectedSession?.latestRun || null;
-
-  const selectedSessionRuns = useMemo(() => {
-    if (!selectedSessionId) return [];
-    return runs
-      .filter((run) => runSessionId(run) === selectedSessionId)
-      .sort((a, b) => a.createdAt - b.createdAt);
-  }, [runs, selectedSessionId]);
-
   const sessionTimelineKey = selectedSessionId || draftSessionKey;
   const planSessionState = planFlowBySession[sessionTimelineKey] || "idle";
   const timeline = useMemo(() => {
-    const historyEntries = historyTimelineBySession[sessionTimelineKey] || [];
-    const base = [...historyEntries, ...buildSessionTimeline(selectedSessionRuns)];
+    const base = selectedRunId && !isDraftSession ? (messagesByRunId[selectedRunId] || []) : [];
     const slashEntries = slashEntriesBySession[sessionTimelineKey] || [];
     return [...base, ...slashEntries].sort((a, b) => a.at - b.at);
-  }, [selectedSessionRuns, sessionTimelineKey, slashEntriesBySession, historyTimelineBySession]);
-  const debugLogs = useMemo(() => collectSessionDebugLogs(selectedSessionRuns), [selectedSessionRuns]);
-  const visibleTimelineCount = visibleTimelineCountBySession[sessionTimelineKey] ?? initialTimelinePageSize;
-  const visibleTimeline = useMemo(
-    () => timeline.slice(Math.max(0, timeline.length - visibleTimelineCount)),
-    [timeline, visibleTimelineCount],
+  }, [selectedRunId, isDraftSession, messagesByRunId, sessionTimelineKey, slashEntriesBySession]);
+  const debugLogs = useMemo(
+    () => collectSessionDebugLogs(selectedRunRecord ? [selectedRunRecord] : []),
+    [selectedRunRecord],
   );
-  const hiddenTimelineCount = Math.max(0, timeline.length - visibleTimeline.length);
+  const visibleTimeline = timeline;
+  const hiddenTimelineCount = selectedRunId && messageNextCursorByRunId[selectedRunId] ? messagePageSize : 0;
   const pendingApprovals = useMemo(() => approvals.filter((item) => item.status === "pending"), [approvals]);
   const slashSuggestions = useMemo(() => {
     const trimmed = prompt.trimStart();
@@ -2057,11 +1696,11 @@ export function App(): JSX.Element {
   }, [prompt]);
   const runningSessionIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const run of runs) {
-      if (run.status === "running") ids.add(runSessionId(run));
+    for (const item of allSessions) {
+      if (!item.historyOnly && item.status === "running") ids.add(item.sessionId);
     }
     return ids;
-  }, [runs]);
+  }, [allSessions]);
   const queuedMessagesForActiveSession = queuedBySession[sessionTimelineKey] || [];
 
   const mobileHeaderTitle = selectedSession
@@ -2088,42 +1727,44 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     const pending = pendingTimelineExpansionRef.current;
-    if (!pending || pending.sessionKey !== sessionTimelineKey) return;
+    if (!pending || pending.runId !== (selectedRunId || draftSessionKey)) return;
     const node = timelineScrollRef.current;
     if (!node) return;
 
     node.scrollTop = pending.scrollTop + (node.scrollHeight - pending.scrollHeight);
     pendingTimelineExpansionRef.current = null;
-  }, [visibleTimeline.length, sessionTimelineKey]);
+  }, [visibleTimeline.length, selectedRunId]);
 
   useEffect(() => {
-    if (!selectedSessionId) {
+    if (!selectedRunId) {
       if (isDraftSession) {
-        setSelectedRunId(null);
+        setSelectedSessionId(null);
         return;
       }
       if (allSessions.length > 0) {
-        setSelectedSessionId(allSessions[0].id);
-        setSelectedRunId(resolveSessionRunId(allSessions[0]));
+        setSelectedRunId(allSessions[0].id);
+        setSelectedSessionId(allSessions[0].sessionId);
       }
       return;
     }
 
-    const selected = allSessions.find((session) => session.id === selectedSessionId);
+    const selected = allSessions.find((session) => session.id === selectedRunId);
     if (selected) {
-      setSelectedRunId(resolveSessionRunId(selected));
+      if (selectedSessionId !== selected.sessionId) {
+        setSelectedSessionId(selected.sessionId);
+      }
       return;
     }
 
     if (allSessions.length > 0) {
-      setSelectedSessionId(allSessions[0].id);
-      setSelectedRunId(resolveSessionRunId(allSessions[0]));
+      setSelectedRunId(allSessions[0].id);
+      setSelectedSessionId(allSessions[0].sessionId);
       return;
     }
 
-    setSelectedSessionId(null);
     setSelectedRunId(null);
-  }, [allSessions, isDraftSession, selectedSessionId, setSelectedRunId]);
+    setSelectedSessionId(null);
+  }, [allSessions, isDraftSession, selectedRunId, selectedSessionId, setSelectedRunId]);
 
   useEffect(() => {
     if (!selectedSessionId) {
@@ -2135,95 +1776,17 @@ export function App(): JSX.Element {
   }, [selectedSessionId]);
 
   useEffect(() => {
-    if (!authReady || !isAuthenticated) return;
-    if (showAllHistory) {
-      let cancelled = false;
-      void (async () => {
-        setLoadingSessionHistory(true);
-        try {
-          const payload = await getSessionHistory();
-          if (cancelled) return;
-          setSessionHistoryEntries(payload.entries);
-          setSessionSummaryHintsById((prev) => {
-            if (payload.entries.length === 0) return prev;
-            const next = { ...prev };
-            for (const entry of payload.entries) {
-              if (!entry.summary.trim()) continue;
-              next[entry.id] = entry.summary;
-            }
-            return next;
-          });
-        } catch {
-          if (cancelled) return;
-          setSessionHistoryEntries([]);
-        } finally {
-          if (!cancelled) {
-            setLoadingSessionHistory(false);
-          }
-        }
-      })();
-
-      return () => {
-        cancelled = true;
-      };
+    if (isDraftSession || !selectedRunId || !selectedSession) {
+      setSelectedRunRecord(null);
+      return;
     }
-
-    setLoadingSessionHistory(false);
-    setSessionHistoryEntries((prev) => (prev.length ? [] : prev));
-  }, [authReady, isAuthenticated, showAllHistory]);
-
-  useEffect(() => {
-    if (showAllHistory) return;
-    if (!selectedSessionId || !selectedSession?.historyOnly) return;
-
-    const nextLocalSession = buildSessionCards(runs, [], sessionSummaryHintsById)[0] || null;
-    setSelectedSessionId(nextLocalSession?.id || null);
-    setSelectedRunId(resolveSessionRunId(nextLocalSession));
-  }, [runs, selectedSession, selectedSessionId, sessionSummaryHintsById, setSelectedRunId, showAllHistory]);
-
-  useEffect(() => {
-    if (!selectedSessionId) return;
-    if (historyTimelineBySession[selectedSessionId]) return;
-
-    let cancelled = false;
-    void (async () => {
-      try {
-        const payload = await getSessionTranscript(selectedSessionId);
-        if (cancelled) return;
-
-        if (payload.session.summary.trim()) {
-          setSessionSummaryHintsById((prev) => ({
-            ...prev,
-            [selectedSessionId]: payload.session.summary,
-          }));
-        }
-
-        const firstLocalRunAt = selectedSessionRuns[0]?.createdAt ?? Number.POSITIVE_INFINITY;
-        const shouldKeepFullTranscript = selectedSessionRuns.length === 0;
-        const filteredEntries = shouldKeepFullTranscript
-          ? payload.entries
-          : payload.entries.filter((entry) => entry.at < firstLocalRunAt);
-
-        const entries: TimelineEntry[] = filteredEntries.map((entry) => ({
-          key: `history_${entry.key}`,
-          role: entry.role,
-          title: entry.role === "user" ? "You" : "Assistant",
-          text: entry.text,
-          pending: false,
-          at: entry.at,
-        }));
-
-        setHistoryTimelineBySession((prev) => ({ ...prev, [selectedSessionId]: entries }));
-      } catch {
-        if (cancelled) return;
-        setHistoryTimelineBySession((prev) => ({ ...prev, [selectedSessionId]: [] }));
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [historyTimelineBySession, selectedSessionId, selectedSessionRuns]);
+    void loadRunMessagesPage(selectedRunId, { reset: true });
+    if (!selectedSession.historyOnly) {
+      void loadSelectedRunRecord(selectedRunId);
+    } else {
+      setSelectedRunRecord(null);
+    }
+  }, [isDraftSession, selectedRunId, selectedSession]);
 
   useEffect(() => {
     const node = terminalOutputRef.current;
@@ -2268,89 +1831,127 @@ export function App(): JSX.Element {
     }
   }
 
-  async function loadBootstrap(): Promise<void> {
+  async function loadBootstrapLite(): Promise<void> {
     setLoading(true);
+    setLoadingRunList(true);
     try {
-      const [payload, historyPayload] = await Promise.all([
-        getBootstrap(),
-        showAllHistory ? getSessionHistory() : Promise.resolve({ entries: [] }),
+      const [payload, listPayload] = await Promise.all([
+        getBootstrapLite(),
+        getRunList(runListPageSize, null, showAllHistory),
       ]);
       setWorkspaces(payload.workspaces);
       setWorkspace(payload.activeWorkspace);
-      setRuns(payload.runs);
-      setSessionHistoryEntries(historyPayload.entries);
-      setSessionSummaryHintsById((prev) => {
-        if (historyPayload.entries.length === 0) return prev;
-        const next = { ...prev };
-        for (const entry of historyPayload.entries) {
-          if (!entry.summary.trim()) continue;
-          next[entry.id] = entry.summary;
-        }
-        return next;
-      });
-      setApprovals(payload.approvals);
+      setRunItems(listPayload.items);
+      setRunListNextCursor(listPayload.nextCursor);
+      setApprovals(listPayload.approvals.length ? listPayload.approvals : payload.approvals);
       setModel(payload.defaults.model);
       setSandbox(payload.defaults.sandbox);
-
-      const mergedSummaryHints = { ...sessionSummaryHintsById };
-      for (const entry of historyPayload.entries) {
-        if (!entry.summary.trim()) continue;
-        mergedSummaryHints[entry.id] = entry.summary;
+      const sessions = buildSessionCards(listPayload.items);
+      if (isDraftSession) return;
+      if (selectedRunId) {
+        const current = sessions.find((session) => session.id === selectedRunId);
+        if (current) {
+          setSelectedSessionId(current.sessionId);
+          return;
+        }
       }
-
-      const sessions = buildSessionCards(payload.runs, historyPayload.entries, mergedSummaryHints);
-      if (!selectedSessionId && !isDraftSession && sessions.length > 0) {
-        setSelectedSessionId(sessions[0].id);
-        setSelectedRunId(resolveSessionRunId(sessions[0]));
+      if (sessions.length > 0) {
+        setSelectedRunId(sessions[0].id);
+        setSelectedSessionId(sessions[0].sessionId);
       }
     } finally {
+      setLoadingRunList(false);
       setLoading(false);
     }
   }
 
-  async function refreshRuns(): Promise<void> {
-    const [payload, historyPayload] = await Promise.all([
-      getRuns(),
-      showAllHistory ? getSessionHistory() : Promise.resolve({ entries: [] }),
-    ]);
-    setRuns(payload.runs);
-    setSessionHistoryEntries(historyPayload.entries);
-    setSessionSummaryHintsById((prev) => {
-      if (historyPayload.entries.length === 0) return prev;
-      const next = { ...prev };
-      for (const entry of historyPayload.entries) {
-        if (!entry.summary.trim()) continue;
-        next[entry.id] = entry.summary;
-      }
-      return next;
-    });
+  async function refreshRunList(preferredRunId?: string | null): Promise<void> {
+    const payload = await getRunList(runListPageSize, null, showAllHistory);
+    setRunItems(payload.items);
+    setRunListNextCursor(payload.nextCursor);
     setApprovals(payload.approvals);
 
-    const mergedSummaryHints = { ...sessionSummaryHintsById };
-    for (const entry of historyPayload.entries) {
-      if (!entry.summary.trim()) continue;
-      mergedSummaryHints[entry.id] = entry.summary;
-    }
+    if (isDraftSession) return;
 
-    const sessions = buildSessionCards(payload.runs, historyPayload.entries, mergedSummaryHints);
-    if (!selectedSessionId && !isDraftSession && sessions.length > 0) {
-      setSelectedSessionId(sessions[0].id);
-      setSelectedRunId(resolveSessionRunId(sessions[0]));
+    const sessions = buildSessionCards(payload.items);
+    const preferred = preferredRunId ? sessions.find((session) => session.id === preferredRunId) : null;
+    if (preferred) {
+      setSelectedRunId(preferred.id);
+      setSelectedSessionId(preferred.sessionId);
       return;
     }
 
-    if (selectedSessionId) {
-      const selected = sessions.find((session) => session.id === selectedSessionId);
-      if (selected) {
-        setSelectedRunId(resolveSessionRunId(selected));
-      } else if (sessions.length > 0) {
-        setSelectedSessionId(sessions[0].id);
-        setSelectedRunId(resolveSessionRunId(sessions[0]));
-      } else {
-        setSelectedSessionId(null);
-        setSelectedRunId(null);
+    if (selectedRunId) {
+      const current = sessions.find((session) => session.id === selectedRunId);
+      if (current) {
+        setSelectedSessionId(current.sessionId);
+        return;
       }
     }
+
+    if (sessions.length > 0) {
+      setSelectedRunId(sessions[0].id);
+      setSelectedSessionId(sessions[0].sessionId);
+      return;
+    }
+
+    setSelectedRunId(null);
+    setSelectedSessionId(null);
+  }
+
+  async function loadMoreRunItemsPage(): Promise<void> {
+    if (!runListNextCursor || loadingMoreRunItems) return;
+    setLoadingMoreRunItems(true);
+    try {
+      const payload = await getRunList(runListPageSize, runListNextCursor, showAllHistory);
+      setRunItems((prev) => {
+        const next = new Map(prev.map((item) => [item.id, item]));
+        for (const item of payload.items) next.set(item.id, item);
+        return [...next.values()];
+      });
+      setRunListNextCursor(payload.nextCursor);
+      setApprovals(payload.approvals);
+    } finally {
+      setLoadingMoreRunItems(false);
+    }
+  }
+
+  async function loadRunMessagesPage(runId: string, options?: { reset?: boolean; before?: string | null }): Promise<void> {
+    const before = options?.reset ? null : (options?.before ?? messageNextCursorByRunId[runId] ?? null);
+    if (!options?.reset && !before) return;
+
+    setLoadingMessagesByRunId((prev) => ({ ...prev, [runId]: true }));
+    try {
+      const payload = await getRunMessages(runId, before);
+      setMessagesByRunId((prev) => ({
+        ...prev,
+        [runId]: options?.reset ? payload.entries : mergeTimelineEntries(payload.entries, prev[runId] || []),
+      }));
+      setMessageNextCursorByRunId((prev) => ({ ...prev, [runId]: payload.nextCursor }));
+    } finally {
+      setLoadingMessagesByRunId((prev) => ({ ...prev, [runId]: false }));
+    }
+  }
+
+  async function loadSelectedRunRecord(runId: string): Promise<void> {
+    try {
+      const payload = await getRun(runId);
+      setSelectedRunRecord(payload.run);
+    } catch {
+      setSelectedRunRecord(null);
+    }
+  }
+
+  function scheduleSelectedRunRefresh(runId: string): void {
+    if (selectedRunRefreshTimeoutRef.current !== null) {
+      window.clearTimeout(selectedRunRefreshTimeoutRef.current);
+    }
+
+    selectedRunRefreshTimeoutRef.current = window.setTimeout(() => {
+      selectedRunRefreshTimeoutRef.current = null;
+      void loadRunMessagesPage(runId, { reset: true });
+      void loadSelectedRunRecord(runId);
+    }, 150);
   }
 
   async function loadDiff(runId: string): Promise<void> {
@@ -2485,7 +2086,7 @@ export function App(): JSX.Element {
     };
 
     const payload = await startRun(input);
-    await refreshRuns();
+    await refreshRunList(payload.run.id);
     setIsDraftSession(false);
     const nextSessionKey = runSessionId(payload.run);
 
@@ -2501,6 +2102,8 @@ export function App(): JSX.Element {
     if (focusSession) {
       setSelectedSessionId(nextSessionKey);
       setSelectedRunId(payload.run.id);
+      void loadRunMessagesPage(payload.run.id, { reset: true });
+      void loadSelectedRunRecord(payload.run.id);
       setRightPanelTab("tools");
       setMobileThreadsOpen(false);
       return payload.run;
@@ -2930,7 +2533,8 @@ export function App(): JSX.Element {
     setStopping(true);
     try {
       await stopRun(selectedRunId);
-      await refreshRuns();
+      await refreshRunList(selectedRunId);
+      void loadSelectedRunRecord(selectedRunId);
     } finally {
       setStopping(false);
     }
@@ -2943,10 +2547,12 @@ export function App(): JSX.Element {
       approvalId: item.id,
     });
 
-    await refreshRuns();
+    await refreshRunList(payload.run.id);
     setIsDraftSession(false);
     setSelectedSessionId(runSessionId(payload.run));
     setSelectedRunId(payload.run.id);
+    void loadRunMessagesPage(payload.run.id, { reset: true });
+    void loadSelectedRunRecord(payload.run.id);
     setRightPanelTab("tools");
     setMobileContextOpen(false);
   }
@@ -2959,9 +2565,11 @@ export function App(): JSX.Element {
 
   function onSelectSession(sessionId: string): void {
     setIsDraftSession(false);
-    setSelectedSessionId(sessionId);
     const target = allSessions.find((item) => item.id === sessionId);
-    if (target) setSelectedRunId(resolveSessionRunId(target));
+    if (target) {
+      setSelectedRunId(target.id);
+      setSelectedSessionId(target.sessionId);
+    }
     setMobileThreadsOpen(false);
   }
 
@@ -2969,6 +2577,8 @@ export function App(): JSX.Element {
     setIsDraftSession(true);
     setSelectedSessionId(null);
     setSelectedRunId(null);
+    setSelectedRunRecord(null);
+    setDiff(null);
     setPrompt("");
     clearComposerAttachments();
     setPlanState(draftSessionKey, "idle");
@@ -3136,7 +2746,7 @@ export function App(): JSX.Element {
         delete next[selectedSessionId];
         return next;
       });
-      await refreshRuns();
+      await refreshRunList();
       setMobileContextOpen(false);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "Failed to archive session");
@@ -3159,7 +2769,7 @@ export function App(): JSX.Element {
         delete next[selectedSessionId];
         return next;
       });
-      await refreshRuns();
+      await refreshRunList();
       setMobileContextOpen(false);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "Failed to delete session");
@@ -3176,24 +2786,21 @@ export function App(): JSX.Element {
   }
 
   function onLoadOlderTimelineMessages(): void {
-    if (hiddenTimelineCount <= 0) return;
+    if (!selectedRunId) return;
+    if (loadingMessagesByRunId[selectedRunId]) return;
+    const nextCursor = messageNextCursorByRunId[selectedRunId];
+    if (!nextCursor) return;
 
     const node = timelineScrollRef.current;
     if (node) {
       pendingTimelineExpansionRef.current = {
-        sessionKey: sessionTimelineKey,
+        runId: selectedRunId,
         scrollHeight: node.scrollHeight,
         scrollTop: node.scrollTop,
       };
     }
 
-    setVisibleTimelineCountBySession((prev) => ({
-      ...prev,
-      [sessionTimelineKey]: Math.min(
-        timeline.length,
-        (prev[sessionTimelineKey] ?? initialTimelinePageSize) + initialTimelinePageSize,
-      ),
-    }));
+    void loadRunMessagesPage(selectedRunId, { before: nextCursor });
   }
 
   if (!authReady) {
@@ -3263,22 +2870,25 @@ export function App(): JSX.Element {
         <Card className="hidden min-h-0 flex-col overflow-hidden lg:flex">
           <SessionsPanel
             sessions={filteredSessions}
-            selectedSessionId={selectedSessionId}
+            selectedRunId={selectedRunId}
             statusFilter={statusFilter}
             setStatusFilter={setStatusFilter}
             showAllHistory={showAllHistory}
-            loadingSessionHistory={loadingSessionHistory}
+            loadingRunList={loadingRunList}
+            hasMoreRuns={Boolean(runListNextCursor)}
+            loadingMoreRuns={loadingMoreRunItems}
             onToggleShowAllHistory={setShowAllHistory}
             onSelectSession={onSelectSession}
+            onLoadMoreRuns={loadMoreRunItemsPage}
             onNewSession={onNewSession}
           />
         </Card>
 
         <Card className="flex min-h-0 flex-col overflow-hidden">
           <CenterPanel
-            loading={loading}
+            loading={loading || Boolean(selectedRunId && loadingMessagesByRunId[selectedRunId] && timeline.length === 0)}
+            loadingOlderMessages={Boolean(selectedRunId && loadingMessagesByRunId[selectedRunId] && timeline.length > 0)}
             selectedSession={selectedSession}
-            selectedRun={selectedRun}
             timeline={visibleTimeline}
             hiddenTimelineCount={hiddenTimelineCount}
             prompt={prompt}
@@ -3292,7 +2902,7 @@ export function App(): JSX.Element {
             stopping={stopping}
             onStopRun={onStopRun}
             onNewSession={onNewSession}
-            hasPendingIndicator={Boolean(selectedRun && selectedRun.status === "running" && !hasPendingTimelineEntry)}
+            hasPendingIndicator={Boolean(selectedSession && selectedSession.status === "running" && !hasPendingTimelineEntry)}
             ansi={ansi}
             timelineScrollRef={timelineScrollRef}
             timelineBottomRef={timelineBottomRef}
@@ -3369,13 +2979,16 @@ export function App(): JSX.Element {
             <Card className="flex h-full min-h-0 flex-col overflow-hidden animate-slide-in">
               <SessionsPanel
                 sessions={filteredSessions}
-                selectedSessionId={selectedSessionId}
+                selectedRunId={selectedRunId}
                 statusFilter={statusFilter}
                 setStatusFilter={setStatusFilter}
                 showAllHistory={showAllHistory}
-                loadingSessionHistory={loadingSessionHistory}
+                loadingRunList={loadingRunList}
+                hasMoreRuns={Boolean(runListNextCursor)}
+                loadingMoreRuns={loadingMoreRunItems}
                 onToggleShowAllHistory={setShowAllHistory}
                 onSelectSession={onSelectSession}
+                onLoadMoreRuns={loadMoreRunItemsPage}
                 onNewSession={onNewSession}
               />
             </Card>
@@ -3441,25 +3054,31 @@ export function App(): JSX.Element {
 
 type SessionsPanelProps = {
   sessions: SessionCard[];
-  selectedSessionId: string | null;
+  selectedRunId: string | null;
   statusFilter: StatusFilter;
   setStatusFilter: (next: StatusFilter) => void;
   showAllHistory: boolean;
-  loadingSessionHistory: boolean;
+  loadingRunList: boolean;
+  hasMoreRuns: boolean;
+  loadingMoreRuns: boolean;
   onToggleShowAllHistory: (next: boolean) => void;
   onSelectSession: (sessionId: string) => void;
+  onLoadMoreRuns: () => Promise<void>;
   onNewSession: () => void;
 };
 
 function SessionsPanel({
   sessions,
-  selectedSessionId,
+  selectedRunId,
   statusFilter,
   setStatusFilter,
   showAllHistory,
-  loadingSessionHistory,
+  loadingRunList,
+  hasMoreRuns,
+  loadingMoreRuns,
   onToggleShowAllHistory,
   onSelectSession,
+  onLoadMoreRuns,
   onNewSession,
 }: SessionsPanelProps): JSX.Element {
   return (
@@ -3495,11 +3114,11 @@ function SessionsPanel({
             className="mt-0.5 h-4 w-4 rounded border-card-border text-brand focus:ring-brand/20"
             checked={showAllHistory}
             onChange={(event) => onToggleShowAllHistory(event.target.checked)}
-            disabled={loadingSessionHistory}
+            disabled={loadingRunList}
           />
           <span className="flex items-center gap-2">
             Show all Codex history
-            {loadingSessionHistory ? <LoaderCircle className="h-3.5 w-3.5 animate-spin text-brand" /> : null}
+            {loadingRunList ? <LoaderCircle className="h-3.5 w-3.5 animate-spin text-brand" /> : null}
           </span>
         </label>
 
@@ -3517,7 +3136,7 @@ function SessionsPanel({
                 key={session.id}
                 className={cn(
                   "w-full rounded-2xl border bg-white px-3 py-2 text-left shadow-card transition hover:-translate-y-0.5 hover:border-brand/60",
-                  selectedSessionId === session.id ? "border-brand bg-brand-soft/60" : "border-card-border",
+                  selectedRunId === session.id ? "border-brand bg-brand-soft/60" : "border-card-border",
                 )}
               >
                 <button
@@ -3544,6 +3163,20 @@ function SessionsPanel({
               </div>
             );
           })}
+
+          {hasMoreRuns ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => void onLoadMoreRuns()}
+              disabled={loadingMoreRuns}
+              className="w-full"
+            >
+              {loadingMoreRuns ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+              Load more
+            </Button>
+          ) : null}
         </div>
       </CardContent>
     </>
@@ -3578,8 +3211,8 @@ function AttachmentChip({ attachment, className, onRemove }: AttachmentChipProps
 
 type CenterPanelProps = {
   loading: boolean;
+  loadingOlderMessages: boolean;
   selectedSession: SessionCard | null;
-  selectedRun: RunRecord | null;
   timeline: TimelineEntry[];
   hiddenTimelineCount: number;
   prompt: string;
@@ -3619,7 +3252,7 @@ type CenterPanelProps = {
 };
 
 function CenterPanel(props: CenterPanelProps): JSX.Element {
-  const { selectedRun } = props;
+  const sourceBadge = props.selectedSession ? getSessionSourceBadge(props.selectedSession) : null;
 
   return (
     <>
@@ -3629,12 +3262,12 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             {props.selectedSession ? props.selectedSession.summary : "No active chat"}
           </CardTitle>
           <p className="mt-1 font-mono text-[11px] text-foreground/70">
-            {props.selectedSession ? `Session: ${props.selectedSession.id}` : "Create or select a chat to start"}
+            {props.selectedSession ? `Run: ${props.selectedSession.id}` : "Create or select a chat to start"}
           </p>
-          {selectedRun ? (
+          {props.selectedSession ? (
             <div className="mt-1 flex items-center gap-2">
-              <Badge className={statusClass(selectedRun.status)}>{selectedRun.status}</Badge>
-              <Badge>{props.selectedSession?.runCount || 0} messages</Badge>
+              <Badge className={statusClass(props.selectedSession.status)}>{props.selectedSession.status}</Badge>
+              {sourceBadge ? <Badge className={sourceBadge.className}>{sourceBadge.label}</Badge> : null}
             </div>
           ) : null}
         </div>
@@ -3652,7 +3285,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
         >
           {props.loading ? <p className="text-sm text-foreground/70">Loading...</p> : null}
 
-          {!props.loading && !selectedRun && !props.selectedSession ? (
+          {!props.loading && !props.selectedSession ? (
             <div className="rounded-2xl border border-dashed border-card-border bg-muted px-4 py-3 text-sm text-foreground/75">
               Start a new session or pick one from chats.
             </div>
@@ -3660,8 +3293,15 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 
           {props.hiddenTimelineCount > 0 ? (
             <div className="flex justify-center">
-              <Button type="button" variant="ghost" size="sm" onClick={props.onLoadOlderTimelineMessages}>
-                Load older messages ({Math.min(initialTimelinePageSize, props.hiddenTimelineCount)})
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={props.onLoadOlderTimelineMessages}
+                disabled={props.loadingOlderMessages}
+              >
+                {props.loadingOlderMessages ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                Load older messages
               </Button>
             </div>
           ) : null}
@@ -3860,7 +3500,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               variant="ghost"
               size="sm"
               onClick={() => void props.onStopRun()}
-              disabled={!selectedRun || selectedRun.status !== "running" || props.stopping}
+              disabled={!props.selectedSession || props.selectedSession.status !== "running" || props.stopping}
             >
               {props.stopping ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : <CircleStop className="mr-1.5 h-4 w-4" />}
               Stop
@@ -4010,11 +3650,14 @@ function RightPanel(props: RightPanelProps): JSX.Element {
 
             {props.selectedSession ? (
               <>
-                <p className="mb-2 truncate text-xs text-foreground/70" title={props.selectedSession.id}>
-                  {props.selectedSession.id}
+                <p className="mb-2 truncate text-xs text-foreground/70" title={props.selectedSession.sessionId}>
+                  {props.selectedSession.sessionId}
                 </p>
                 <p className="mb-2 text-xs text-foreground/70">
                   {describeSessionMeta(props.selectedSession)}
+                </p>
+                <p className="mb-2 text-xs text-foreground/60">
+                  source: {props.selectedSession.sourceRaw || props.selectedSession.sourceTag}
                 </p>
                 {props.selectedSession.historyOnly ? (
                   <p className="mb-2 text-xs text-foreground/70">

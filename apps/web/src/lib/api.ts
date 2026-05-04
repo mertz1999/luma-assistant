@@ -1,6 +1,7 @@
 import type {
   ApprovalQueueItem,
   AppBootstrap,
+  AppBootstrapLite,
   AttachmentRef,
   CodexAccountStatusResponse,
   CodexMcpStatusResponse,
@@ -8,6 +9,8 @@ import type {
   DiffSnapshot,
   FileTreeNode,
   RunRecord,
+  RunListResponse,
+  RunMessagesResponse,
   SessionHistoryEntry,
   SessionTranscriptResponse,
   SseEvent,
@@ -63,8 +66,26 @@ export function getBootstrap(): Promise<AppBootstrap> {
   return request<AppBootstrap>("/api/bootstrap");
 }
 
+export function getBootstrapLite(): Promise<AppBootstrapLite> {
+  return request<AppBootstrapLite>("/api/bootstrap-lite");
+}
+
 export function getRuns(): Promise<{ runs: RunRecord[]; approvals: ApprovalQueueItem[] }> {
   return request("/api/runs");
+}
+
+export function getRunList(limit = 60, cursor?: string | null, includeHistory = false): Promise<RunListResponse> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+  if (includeHistory) params.set("includeHistory", "1");
+  return request(`/api/runs/list?${params.toString()}`);
+}
+
+export function getRunMessages(runId: string, before?: string | null): Promise<RunMessagesResponse> {
+  const params = new URLSearchParams();
+  if (before) params.set("before", before);
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return request(`/api/runs/${encodeURIComponent(runId)}/messages${suffix}`);
 }
 
 export function getSessionHistory(): Promise<{ entries: SessionHistoryEntry[] }> {
