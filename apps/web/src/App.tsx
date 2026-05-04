@@ -17,6 +17,7 @@ import {
   Moon,
   PanelLeft,
   PanelRight,
+  Paperclip,
   Play,
   Rocket,
   Send,
@@ -27,6 +28,7 @@ import {
 import type {
   ApprovalPolicy,
   ApprovalQueueItem,
+  AttachmentRef,
   DiffSnapshot,
   FileTreeNode,
   RunRecord,
@@ -60,6 +62,7 @@ import {
   startTerminal,
   stopRun,
   stopTerminal,
+  uploadAttachment,
 } from "@/lib/api";
 import { parsePlanningMessage, type PlanningSegment } from "@/lib/planning";
 import { cn } from "@/lib/utils";
@@ -94,6 +97,7 @@ type TimelineEntry = {
   text: string;
   pending: boolean;
   at: number;
+  attachments?: AttachmentRef[];
   meta?: {
     type?: "commandexecution" | "filechange";
     runId?: string;
@@ -134,6 +138,7 @@ const authSessionStorageKey = "agentic_cli_auth_session_v1";
 const authSessionMaxAgeMs = 24 * 60 * 60 * 1000;
 const planInstructionPath = "/Users/applestation/Project/archive/agentic-assistant/plan.md";
 const initialTimelinePageSize = 20;
+const attachmentMaxFiles = 10;
 // Account for the chat stack gap and bottom padding so "visually at bottom"
 // still counts as bottom without making the auto-follow area too large.
 const timelineAutoScrollThresholdPx = 64;
@@ -155,6 +160,7 @@ type QueuedMessage = {
   id: string;
   sessionKey: string;
   prompt: string;
+  attachments: AttachmentRef[];
   createdAt: number;
   workspace: string;
   model: string;
@@ -452,6 +458,7 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
         const model = typeof item.model === "string" ? item.model : "";
         const createdAt = typeof item.createdAt === "number" ? item.createdAt : Date.now();
         const planMode = typeof item.planMode === "boolean" ? item.planMode : false;
+        const attachments = readAttachmentRefs(item.attachments);
 
         if (!id || !prompt || !workspace || !model || !isSandboxMode(item.sandbox) || !isApprovalPolicy(item.approvalPolicy)) {
           continue;
@@ -461,6 +468,7 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
           id,
           sessionKey,
           prompt,
+          attachments,
           createdAt,
           workspace,
           model,
@@ -617,6 +625,35 @@ function isRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === "object" && input !== null;
 }
 
+function readAttachmentRef(input: unknown): AttachmentRef | null {
+  if (!isRecord(input)) return null;
+  return typeof input.id === "string"
+    && typeof input.name === "string"
+    && typeof input.mimeType === "string"
+    && typeof input.size === "number"
+    && (input.kind === "image" || input.kind === "text")
+    && typeof input.relativePath === "string"
+    && typeof input.uploadedAt === "number"
+    ? {
+        id: input.id,
+        name: input.name,
+        mimeType: input.mimeType,
+        size: input.size,
+        kind: input.kind,
+        relativePath: input.relativePath,
+        uploadedAt: input.uploadedAt,
+      }
+    : null;
+}
+
+function readAttachmentRefs(input: unknown): AttachmentRef[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((value) => readAttachmentRef(value))
+    .filter((value): value is AttachmentRef => value !== null)
+    .slice(0, attachmentMaxFiles);
+}
+
 function toJson(input: string): Record<string, unknown> | null {
   try {
     const parsed = JSON.parse(input) as unknown;
@@ -666,6 +703,25 @@ function truncatePreview(input: string, max = 120): string {
   const normalized = input.replace(/\s+/g, " ").trim();
   if (normalized.length <= max) return normalized;
   return `${normalized.slice(0, max - 3)}...`;
+}
+
+function formatAttachmentSize(size: number): string {
+  if (!Number.isFinite(size) || size <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = size;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const precision = value >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(precision)} ${units[unitIndex]}`;
+}
+
+function formatAttachmentSummary(attachments: AttachmentRef[]): string {
+  if (attachments.length === 0) return "";
+  if (attachments.length === 1) return attachments[0]?.name || "1 attachment";
+  return `${attachments.length} attachments`;
 }
 
 function formatRecordingDuration(totalSeconds: number): string {
@@ -749,6 +805,7 @@ function buildSessionTimeline(runs: RunRecord[]): TimelineEntry[] {
 
   for (const run of orderedRuns) {
     if (run.config.prompt.trim()) {
+      const attachments = readAttachmentRefs(run.config.attachments);
       entries.push({
         key: `${run.id}_user`,
         role: "user",
@@ -756,6 +813,7 @@ function buildSessionTimeline(runs: RunRecord[]): TimelineEntry[] {
         text: run.config.prompt.trim(),
         pending: false,
         at: run.createdAt,
+        attachments,
         meta: { runId: run.id },
       });
     }
@@ -1605,6 +1663,10 @@ export function App(): JSX.Element {
   const [diff, setDiff] = useState<DiffSnapshot | null>(null);
 
   const [prompt, setPrompt] = useState("");
+  const [pendingAttachments, setPendingAttachments] = useState<AttachmentRef[]>([]);
+  const [pendingAttachmentWorkspace, setPendingAttachmentWorkspace] = useState<string | null>(null);
+  const [uploadingAttachmentNames, setUploadingAttachmentNames] = useState<string[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [model, setModel] = useState("gpt-5.3-codex");
   const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("on-request");
@@ -1637,6 +1699,7 @@ export function App(): JSX.Element {
   const [authError, setAuthError] = useState<string | null>(null);
 
   const ansi = useMemo(() => new Convert({ newline: true, escapeXML: true }), []);
+  const composerFileInputRef = useRef<HTMLInputElement>(null);
   const timelineScrollRef = useRef<HTMLDivElement>(null);
   const timelineBottomRef = useRef<HTMLDivElement>(null);
   const terminalOutputRef = useRef<HTMLDivElement>(null);
@@ -1650,6 +1713,7 @@ export function App(): JSX.Element {
     length: 0,
   });
   const isAuthenticated = Boolean(authToken && authExpiresAt > Date.now());
+  const isUploadingAttachments = uploadingAttachmentNames.length > 0;
 
   useEffect(() => {
     const root = document.documentElement;
@@ -1703,6 +1767,18 @@ export function App(): JSX.Element {
       window.removeEventListener("agentic:unauthorized", onUnauthorized as EventListener);
     };
   }, [authReady, isAuthenticated]);
+
+  useEffect(() => {
+    if (!activeWorkspace || pendingAttachments.length === 0) return;
+    if (pendingAttachmentWorkspace === null || pendingAttachmentWorkspace === activeWorkspace) return;
+
+    setPendingAttachments([]);
+    setPendingAttachmentWorkspace(activeWorkspace);
+    setAttachmentError("Attachments were cleared after changing workspace.");
+    if (composerFileInputRef.current) {
+      composerFileInputRef.current.value = "";
+    }
+  }, [activeWorkspace, pendingAttachmentWorkspace, pendingAttachments.length]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -2345,6 +2421,7 @@ export function App(): JSX.Element {
     sessionKey: string,
     promptValue: string,
     overrides?: {
+      attachments?: AttachmentRef[];
       planMode?: boolean;
       sandbox?: SandboxMode;
       approvalPolicy?: ApprovalPolicy;
@@ -2355,6 +2432,7 @@ export function App(): JSX.Element {
       id: `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       sessionKey,
       prompt: promptValue,
+      attachments: readAttachmentRefs(overrides?.attachments),
       createdAt: Date.now(),
       workspace: activeWorkspace,
       model,
@@ -2368,6 +2446,7 @@ export function App(): JSX.Element {
     const sessionKey = request.sessionKey;
     const queued: QueuedMessage = {
       ...request,
+      attachments: readAttachmentRefs(request.attachments),
       id: request.id || `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       createdAt: request.createdAt || Date.now(),
     };
@@ -2396,6 +2475,7 @@ export function App(): JSX.Element {
   async function startCodexRun(request: QueuedMessage, focusSession: boolean): Promise<RunRecord> {
     const input: StartRunInput = {
       prompt: request.prompt,
+      attachments: request.attachments,
       workspace: request.workspace,
       model: request.model,
       sandbox: request.sandbox,
@@ -2461,6 +2541,7 @@ export function App(): JSX.Element {
     promptValue: string,
     options?: {
       sessionKey?: string;
+      attachments?: AttachmentRef[];
       planMode?: boolean;
       sandbox?: SandboxMode;
       approvalPolicy?: ApprovalPolicy;
@@ -2473,6 +2554,7 @@ export function App(): JSX.Element {
     scrollTimelineToBottom("auto");
     const sessionKey = options?.sessionKey || selectedSessionId || draftSessionKey;
     const request = buildQueuedMessage(sessionKey, promptValue, {
+      attachments: options?.attachments,
       planMode: options?.planMode,
       sandbox: options?.sandbox,
       approvalPolicy: options?.approvalPolicy,
@@ -2498,6 +2580,88 @@ export function App(): JSX.Element {
       throw error;
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  function clearComposerAttachments(): void {
+    setPendingAttachments([]);
+    setPendingAttachmentWorkspace(null);
+    setAttachmentError(null);
+    setUploadingAttachmentNames([]);
+    if (composerFileInputRef.current) {
+      composerFileInputRef.current.value = "";
+    }
+  }
+
+  function removePendingAttachment(attachmentId: string): void {
+    if (pendingAttachments.length === 1 && pendingAttachments[0]?.id === attachmentId) {
+      setPendingAttachmentWorkspace(null);
+    }
+    setPendingAttachments((current) => current.filter((attachment) => attachment.id !== attachmentId));
+    setAttachmentError(null);
+    if (composerFileInputRef.current) {
+      composerFileInputRef.current.value = "";
+    }
+  }
+
+  async function uploadPendingFiles(files: FileList | null): Promise<void> {
+    const selectedFiles = Array.from(files || []);
+    if (selectedFiles.length === 0) return;
+
+    if (!activeWorkspace) {
+      setAttachmentError("Select a workspace before adding attachments.");
+      return;
+    }
+
+    const remainingCapacity = Math.max(0, attachmentMaxFiles - pendingAttachments.length);
+    if (remainingCapacity === 0) {
+      setAttachmentError(`You can attach up to ${attachmentMaxFiles} files per message.`);
+      if (composerFileInputRef.current) {
+        composerFileInputRef.current.value = "";
+      }
+      return;
+    }
+
+    const acceptedFiles = selectedFiles.slice(0, remainingCapacity);
+    const skippedCount = selectedFiles.length - acceptedFiles.length;
+    setUploadingAttachmentNames((current) => [...current, ...acceptedFiles.map((file) => file.name)]);
+
+    const uploaded: AttachmentRef[] = [];
+    const failures: string[] = [];
+    for (const file of acceptedFiles) {
+      try {
+        const payload = await uploadAttachment(file, activeWorkspace);
+        uploaded.push(payload.attachment);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Upload failed";
+        failures.push(`${file.name}: ${message}`);
+      }
+    }
+
+    if (uploaded.length > 0) {
+      setPendingAttachments((current) => [...current, ...uploaded].slice(0, attachmentMaxFiles));
+      setPendingAttachmentWorkspace(activeWorkspace);
+    }
+
+    if (failures.length > 0) {
+      setAttachmentError(failures[0] || "One or more attachments failed to upload.");
+    } else if (skippedCount > 0) {
+      setAttachmentError(`Only ${attachmentMaxFiles} attachments are allowed per message.`);
+    } else {
+      setAttachmentError(null);
+    }
+
+    setUploadingAttachmentNames((current) => {
+      const next = [...current];
+      for (const file of acceptedFiles) {
+        const index = next.indexOf(file.name);
+        if (index >= 0) next.splice(index, 1);
+      }
+      return next;
+    });
+
+    if (composerFileInputRef.current) {
+      composerFileInputRef.current.value = "";
     }
   }
 
@@ -2687,6 +2851,14 @@ export function App(): JSX.Element {
 
   async function onStartRun(): Promise<void> {
     if (!prompt.trim()) return;
+    if (isUploadingAttachments) {
+      setAttachmentError("Wait for attachments to finish uploading before sending.");
+      return;
+    }
+    if (pendingAttachments.length > 0 && pendingAttachmentWorkspace && pendingAttachmentWorkspace !== activeWorkspace) {
+      setAttachmentError("Attachments belong to a different workspace. Reattach them after switching workspaces.");
+      return;
+    }
     if (voiceListening) {
       try {
         speechRecognitionRef.current?.stop();
@@ -2738,9 +2910,11 @@ export function App(): JSX.Element {
     try {
       await submitSessionMessage(trimmedPrompt, {
         sessionKey,
+        attachments: pendingAttachments,
         onError: (message) => window.alert(message),
       });
       setPrompt("");
+      clearComposerAttachments();
     } catch {
       // handled above
     } finally {
@@ -2796,6 +2970,7 @@ export function App(): JSX.Element {
     setSelectedSessionId(null);
     setSelectedRunId(null);
     setPrompt("");
+    clearComposerAttachments();
     setPlanState(draftSessionKey, "idle");
     setSlashEntriesBySession((prev) => {
       if (!(draftSessionKey in prev)) return prev;
@@ -3108,6 +3283,11 @@ export function App(): JSX.Element {
             hiddenTimelineCount={hiddenTimelineCount}
             prompt={prompt}
             setPrompt={setPrompt}
+            pendingAttachments={pendingAttachments}
+            attachmentError={attachmentError}
+            uploadingAttachmentNames={uploadingAttachmentNames}
+            isUploadingAttachments={isUploadingAttachments}
+            composerFileInputRef={composerFileInputRef}
             submitting={submitting}
             stopping={stopping}
             onStopRun={onStopRun}
@@ -3123,6 +3303,8 @@ export function App(): JSX.Element {
             onSelectSlashCommand={onSelectSlashCommand}
             queueItems={queuedMessagesForActiveSession}
             onRemoveQueueItem={(messageId) => removeQueuedMessage(sessionTimelineKey, messageId)}
+            onSelectAttachments={uploadPendingFiles}
+            onRemovePendingAttachment={removePendingAttachment}
             voiceSupported={voiceSupported}
             voiceListening={voiceListening}
             voiceError={voiceError}
@@ -3368,6 +3550,32 @@ function SessionsPanel({
   );
 }
 
+type AttachmentChipProps = {
+  attachment: AttachmentRef;
+  className?: string;
+  onRemove?: () => void;
+};
+
+function AttachmentChip({ attachment, className, onRemove }: AttachmentChipProps): JSX.Element {
+  return (
+    <div className={cn("inline-flex items-center gap-2 rounded-full border px-2 py-1 text-[11px]", className)}>
+      <span className="font-medium">{attachment.name}</span>
+      <span className="opacity-70">{attachment.kind === "image" ? "image" : "file"} · {formatAttachmentSize(attachment.size)}</span>
+      {onRemove ? (
+        <button
+          type="button"
+          className="rounded-full p-0.5 transition hover:bg-black/5"
+          onClick={onRemove}
+          aria-label={`Remove ${attachment.name}`}
+          title="Remove attachment"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 type CenterPanelProps = {
   loading: boolean;
   selectedSession: SessionCard | null;
@@ -3376,6 +3584,11 @@ type CenterPanelProps = {
   hiddenTimelineCount: number;
   prompt: string;
   setPrompt: (value: string) => void;
+  pendingAttachments: AttachmentRef[];
+  attachmentError: string | null;
+  uploadingAttachmentNames: string[];
+  isUploadingAttachments: boolean;
+  composerFileInputRef: React.RefObject<HTMLInputElement>;
   submitting: boolean;
   stopping: boolean;
   onStopRun: () => Promise<void>;
@@ -3391,6 +3604,8 @@ type CenterPanelProps = {
   onSelectSlashCommand: (command: SlashCommandKey) => Promise<void>;
   queueItems: QueuedMessage[];
   onRemoveQueueItem: (messageId: string) => void;
+  onSelectAttachments: (files: FileList | null) => Promise<void>;
+  onRemovePendingAttachment: (attachmentId: string) => void;
   voiceSupported: boolean;
   voiceListening: boolean;
   voiceError: string | null;
@@ -3471,6 +3686,20 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                   <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-foreground/70">{entry.title}</div>
                 ) : null}
 
+                {entry.attachments && entry.attachments.length > 0 ? (
+                  <div className="mb-2 flex flex-wrap gap-1.5">
+                    {entry.attachments.map((attachment) => (
+                      <AttachmentChip
+                        key={`${entry.key}_${attachment.id}`}
+                        attachment={attachment}
+                        className={entry.role === "user"
+                          ? "border-white/20 bg-white/10 text-white"
+                          : "border-card-border bg-white/80 text-foreground"}
+                      />
+                    ))}
+                  </div>
+                ) : null}
+
                 {entry.role === "tool" ? (
                   <ToolEntry entry={entry} ansi={props.ansi} onOpenOutput={props.setToolDetailModal} />
                 ) : entry.role === "assistant" || entry.role === "plan" ? (
@@ -3519,11 +3748,60 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             props.onSendButtonClick();
           }}
         >
+          <input
+            ref={props.composerFileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(event) => void props.onSelectAttachments(event.target.files)}
+          />
+
           {props.planSessionState !== "idle" ? (
             <div className="mb-3 rounded-2xl border border-brand/30 bg-brand-soft/40 px-3 py-2 text-sm text-foreground/80">
               {props.planSessionState === "armed"
                 ? "Plan mode is enabled. Your next message will start the planning workflow."
                 : "Planning workflow is active. Messages stay read-only until final approval."}
+            </div>
+          ) : null}
+
+          {props.pendingAttachments.length > 0 || props.isUploadingAttachments || props.attachmentError ? (
+            <div className="mb-3 rounded-2xl border border-card-border bg-white/90 px-3 py-2">
+              <div className="flex items-center justify-between gap-2 text-xs font-semibold text-foreground/80">
+                <span>Attachments</span>
+                <span>
+                  {props.pendingAttachments.length}/{attachmentMaxFiles}
+                  {props.isUploadingAttachments ? ` · Uploading ${props.uploadingAttachmentNames.length}` : ""}
+                </span>
+              </div>
+
+              {props.pendingAttachments.length > 0 ? (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {props.pendingAttachments.map((attachment) => (
+                    <AttachmentChip
+                      key={attachment.id}
+                      attachment={attachment}
+                      className="border-card-border bg-muted/60 text-foreground"
+                      onRemove={() => props.onRemovePendingAttachment(attachment.id)}
+                    />
+                  ))}
+                </div>
+              ) : null}
+
+              {props.isUploadingAttachments ? (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {props.uploadingAttachmentNames.map((name, index) => (
+                    <div
+                      key={`${name}_${index}`}
+                      className="inline-flex items-center gap-2 rounded-full border border-dashed border-card-border px-2 py-1 text-[11px] text-foreground/70"
+                    >
+                      <LoaderCircle className="h-3 w-3 animate-spin" />
+                      <span>{name}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              {props.attachmentError ? <p className="mt-2 text-xs text-rose-700">{props.attachmentError}</p> : null}
             </div>
           ) : null}
 
@@ -3554,7 +3832,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 
             <Button
               type="button"
-              disabled={props.submitting}
+              disabled={props.submitting || props.isUploadingAttachments}
               aria-label="Send message"
               title="Send message"
               onClick={props.onSendButtonClick}
@@ -3565,8 +3843,17 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           </div>
 
           <div className="mt-2 flex flex-wrap items-center gap-2">
-            <Button type="button" variant="ghost" size="sm" onClick={props.onNewSession}>
-              New session
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={props.submitting || props.isUploadingAttachments}
+              aria-label="Add attachment"
+              title="Add attachment"
+              onClick={() => props.composerFileInputRef.current?.click()}
+            >
+              <Paperclip className="mr-1.5 h-4 w-4" />
+              Attachment
             </Button>
             <Button
               type="button"
@@ -3598,9 +3885,14 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               <div className="space-y-1">
                 {props.queueItems.slice(0, 5).map((item) => (
                   <div key={item.id} className="flex items-center gap-2 rounded-lg bg-muted/60 px-2 py-1">
-                    <span className="min-w-0 flex-1 truncate text-xs text-foreground/80" title={item.prompt}>
-                      {truncatePreview(item.prompt, 140)}
-                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-xs text-foreground/80" title={item.prompt}>
+                        {truncatePreview(item.prompt, 140)}
+                      </div>
+                      {item.attachments.length > 0 ? (
+                        <div className="text-[11px] text-foreground/60">{formatAttachmentSummary(item.attachments)}</div>
+                      ) : null}
+                    </div>
                     <button
                       type="button"
                       className="rounded p-1 text-foreground/70 transition hover:bg-black/5 hover:text-foreground"

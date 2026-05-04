@@ -11,12 +11,14 @@ import jwt from "jsonwebtoken";
 import type { IPty } from "node-pty";
 import {
   approvalPolicySchema,
+  attachmentRefSchema,
   rerunSchema,
   setWorkspaceSchema,
   startRunSchema,
   type ApiResponse,
   type ApprovalQueueItem,
   type AppBootstrap,
+  type AttachmentRef,
   type CodexAccountStatusResponse,
   type CodexCommandStatus,
   type CodexMcpStatusResponse,
@@ -55,6 +57,71 @@ const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
 const AUTH_TOKEN_TTL_SECONDS = Number(process.env.AUTH_TOKEN_TTL_SECONDS || 24 * 60 * 60);
 const JWT_SECRET = process.env.JWT_SECRET || AUTH_PASSWORD || "agentic-cli-default-jwt-secret";
 const PLAN_MODE_FILE_PATH = path.resolve(rootDir, "plan.md");
+const ATTACHMENT_STAGING_DIR = path.join(".agentic", "attachments");
+const ATTACHMENT_MAX_BYTES = Number(process.env.ATTACHMENT_MAX_BYTES || 15 * 1024 * 1024);
+const ATTACHMENT_MAX_FILES = 10;
+
+const IMAGE_ATTACHMENT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
+const IMAGE_ATTACHMENT_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const TEXT_ATTACHMENT_EXTENSIONS = new Set([
+  ".txt",
+  ".md",
+  ".markdown",
+  ".json",
+  ".jsonl",
+  ".yaml",
+  ".yml",
+  ".xml",
+  ".csv",
+  ".tsv",
+  ".log",
+  ".svg",
+  ".js",
+  ".jsx",
+  ".ts",
+  ".tsx",
+  ".mjs",
+  ".cjs",
+  ".py",
+  ".rb",
+  ".go",
+  ".rs",
+  ".java",
+  ".c",
+  ".h",
+  ".cc",
+  ".cpp",
+  ".cxx",
+  ".hpp",
+  ".cs",
+  ".php",
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".sql",
+  ".html",
+  ".css",
+  ".scss",
+]);
+const TEXT_ATTACHMENT_MIME_TYPES = new Set([
+  "application/json",
+  "application/ld+json",
+  "application/xml",
+  "application/javascript",
+  "application/x-javascript",
+  "application/typescript",
+  "application/x-typescript",
+  "application/yaml",
+  "application/x-yaml",
+  "application/csv",
+  "application/x-sh",
+  "image/svg+xml",
+]);
+
+type ResolvedAttachment = {
+  ref: AttachmentRef;
+  absolutePath: string;
+};
 
 type PersistedUiState = {
   activeWorkspace: string;
@@ -99,6 +166,105 @@ const TERMINAL_HISTORY_MAX_CHARS = Number(process.env.TERMINAL_HISTORY_MAX_CHARS
 
 function runSessionId(run: RunRecord): string {
   return run.sessionId || run.threadId || run.id;
+}
+
+function normalizeAttachmentRefs(input: unknown): AttachmentRef[] {
+  if (!Array.isArray(input)) return [];
+
+  const next: AttachmentRef[] = [];
+  for (const value of input) {
+    const parsed = attachmentRefSchema.safeParse(value);
+    if (parsed.success) next.push(parsed.data);
+    if (next.length >= ATTACHMENT_MAX_FILES) break;
+  }
+  return next;
+}
+
+function normalizeMimeType(input: string | undefined): string {
+  const raw = (input || "").split(";")[0]?.trim().toLowerCase();
+  return raw || "application/octet-stream";
+}
+
+function classifyAttachment(name: string, mimeType: string): "image" | "text" | null {
+  const normalizedMimeType = normalizeMimeType(mimeType);
+  const extension = path.extname(name).toLowerCase();
+
+  if (IMAGE_ATTACHMENT_MIME_TYPES.has(normalizedMimeType) || IMAGE_ATTACHMENT_EXTENSIONS.has(extension)) {
+    return "image";
+  }
+
+  if (
+    normalizedMimeType.startsWith("text/") ||
+    TEXT_ATTACHMENT_MIME_TYPES.has(normalizedMimeType) ||
+    TEXT_ATTACHMENT_EXTENSIONS.has(extension)
+  ) {
+    return "text";
+  }
+
+  return null;
+}
+
+function sanitizeAttachmentName(input: string): string {
+  const base = path.basename(input || "").trim();
+  const safe = base
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 160);
+  return safe || "attachment";
+}
+
+function ensurePathInsideWorkspace(workspace: string, targetPath: string): boolean {
+  const relative = path.relative(workspace, targetPath);
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+function createStoredAttachmentRelativePath(workspace: string, attachmentId: string, name: string): string {
+  const date = new Date();
+  const dayStamp = [
+    date.getUTCFullYear(),
+    String(date.getUTCMonth() + 1).padStart(2, "0"),
+    String(date.getUTCDate()).padStart(2, "0"),
+  ].join("-");
+  const safeName = sanitizeAttachmentName(name);
+  const absolutePath = path.join(workspace, ATTACHMENT_STAGING_DIR, dayStamp, `${attachmentId}_${safeName}`);
+  const relative = path.relative(workspace, absolutePath);
+  return relative.split(path.sep).join(path.posix.sep);
+}
+
+function resolveStoredAttachmentPath(workspace: string, relativePath: string): string {
+  const absolutePath = path.resolve(workspace, relativePath);
+  if (!ensurePathInsideWorkspace(workspace, absolutePath)) {
+    throw new Error(`Attachment path is outside the workspace: ${relativePath}`);
+  }
+  return absolutePath;
+}
+
+function buildPromptWithAttachments(prompt: string, attachments: ResolvedAttachment[]): string {
+  if (attachments.length === 0) return prompt;
+
+  const lines = ["The user attached the following files:"];
+  for (const attachment of attachments) {
+    const location = attachment.ref.kind === "image"
+      ? `attached directly and stored at ${attachment.ref.relativePath}`
+      : `stored at ${attachment.ref.relativePath}`;
+    lines.push(`- ${attachment.ref.name} (${attachment.ref.kind}, ${location})`);
+  }
+  lines.push("Use these attachments as part of the request.");
+  lines.push("");
+  lines.push(prompt);
+  return lines.join("\n");
+}
+
+function resolveRunAttachments(config: RunConfig): ResolvedAttachment[] {
+  const attachments = normalizeAttachmentRefs(config.attachments);
+  return attachments.map((ref) => {
+    const absolutePath = resolveStoredAttachmentPath(config.workspace, ref.relativePath);
+    if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+      throw new Error(`Attachment not found: ${ref.name}`);
+    }
+    return { ref, absolutePath };
+  });
 }
 
 function normalizeSandboxMode(input: string | undefined): "read-only" | "workspace-write" | "danger-full-access" {
@@ -191,6 +357,10 @@ class RunManager extends EventEmitter {
     for (const run of runs) {
       this.runs.set(run.id, {
         ...run,
+        config: {
+          ...run.config,
+          attachments: normalizeAttachmentRefs(run.config?.attachments),
+        },
         sessionId: typeof run.sessionId === "string"
           ? run.sessionId
           : typeof run.threadId === "string"
@@ -265,8 +435,13 @@ class RunManager extends EventEmitter {
     }
 
     const effectiveConfig = resolveEffectiveRunConfig(config);
+    const resolvedAttachments = resolveRunAttachments(effectiveConfig);
+    const promptBase = buildPromptWithAttachments(effectiveConfig.prompt, resolvedAttachments);
+    const prompt = effectiveConfig.planMode ? buildPlanModePrompt(promptBase) : promptBase;
+    const imageArgs = resolvedAttachments
+      .filter((attachment) => attachment.ref.kind === "image")
+      .flatMap((attachment) => ["-i", attachment.absolutePath]);
     const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const prompt = effectiveConfig.planMode ? buildPlanModePrompt(effectiveConfig.prompt) : effectiveConfig.prompt;
 
     const record: RunRecord = {
       id: runId,
@@ -300,6 +475,7 @@ class RunManager extends EventEmitter {
           `approval_policy=${JSON.stringify(effectiveConfig.approvalPolicy)}`,
           "-c",
           `sandbox_mode=${JSON.stringify(effectiveConfig.sandbox)}`,
+          ...imageArgs,
           effectiveConfig.sessionId,
           prompt,
         ]
@@ -317,6 +493,7 @@ class RunManager extends EventEmitter {
           effectiveConfig.sandbox,
           "-c",
           `approval_policy=${JSON.stringify(effectiveConfig.approvalPolicy)}`,
+          ...imageArgs,
           prompt,
         ];
 
@@ -946,9 +1123,16 @@ function buildPlanModePrompt(prompt: string): string {
 }
 
 function resolveEffectiveRunConfig(config: RunConfig): RunConfig {
-  if (!config.planMode) return config;
+  const attachments = normalizeAttachmentRefs(config.attachments);
+  if (!config.planMode) {
+    return {
+      ...config,
+      attachments,
+    };
+  }
   return {
     ...config,
+    attachments,
     sandbox: "read-only",
     approvalPolicy: "never",
   };
@@ -1682,6 +1866,57 @@ app.get("/api/runs", (_req, res) => {
   res.json(apiOk({ runs: runManager.getRuns(false), approvals: runManager.getApprovals() }));
 });
 
+app.post("/api/attachments", express.raw({ limit: ATTACHMENT_MAX_BYTES, type: () => true }), (req, res) => {
+  const workspaceRaw = typeof req.query.workspace === "string" && req.query.workspace.trim()
+    ? req.query.workspace
+    : uiState.activeWorkspace;
+  const workspace = path.resolve(workspaceRaw);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+
+  const rawNameHeader = req.header("x-attachment-name") || "";
+  let decodedName = rawNameHeader;
+  try {
+    decodedName = decodeURIComponent(rawNameHeader);
+  } catch {
+    decodedName = rawNameHeader;
+  }
+
+  const displayName = path.basename(decodedName || "").trim() || "attachment";
+  const mimeType = normalizeMimeType(req.header("x-attachment-content-type") || req.header("content-type") || undefined);
+  const kind = classifyAttachment(displayName, mimeType);
+  if (!kind) {
+    res.status(400).json(apiErr("Unsupported attachment type. Use an image or a text/code file."));
+    return;
+  }
+
+  const body = Buffer.isBuffer(req.body) ? req.body : null;
+  if (!body || body.byteLength === 0) {
+    res.status(400).json(apiErr("Attachment body is required"));
+    return;
+  }
+
+  const attachmentId = `attachment_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const relativePath = createStoredAttachmentRelativePath(workspace, attachmentId, displayName);
+  const absolutePath = resolveStoredAttachmentPath(workspace, relativePath);
+  fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+  fs.writeFileSync(absolutePath, body);
+
+  const attachment: AttachmentRef = {
+    id: attachmentId,
+    name: displayName,
+    mimeType,
+    size: body.byteLength,
+    kind,
+    relativePath,
+    uploadedAt: Date.now(),
+  };
+
+  res.json(apiOk({ attachment }));
+});
+
 app.post("/api/runs/start", (req, res) => {
   const parsed = startRunSchema.safeParse(req.body || {});
   if (!parsed.success) {
@@ -1704,6 +1939,7 @@ app.post("/api/runs/start", (req, res) => {
       approvalPolicy: parsed.data.approvalPolicy,
       planMode: parsed.data.planMode,
       sessionId: parsed.data.sessionId,
+      attachments: parsed.data.attachments,
     });
 
     res.json(apiOk({ run }));
@@ -1982,6 +2218,20 @@ app.get("/api/events", (req, res) => {
   req.on("close", () => {
     sseClients.delete(res);
   });
+});
+
+app.use((error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) {
+    next(error);
+    return;
+  }
+
+  if (isRecord(error) && error.type === "entity.too.large") {
+    res.status(413).json(apiErr(`Attachment exceeds the ${Math.round(ATTACHMENT_MAX_BYTES / (1024 * 1024))} MB limit.`));
+    return;
+  }
+
+  next(error);
 });
 
 app.listen(API_PORT, HOST, () => {

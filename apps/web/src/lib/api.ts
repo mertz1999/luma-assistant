@@ -1,6 +1,7 @@
 import type {
   ApprovalQueueItem,
   AppBootstrap,
+  AttachmentRef,
   CodexAccountStatusResponse,
   CodexMcpStatusResponse,
   CodexSystemStatusResponse,
@@ -90,6 +91,18 @@ export function startRun(input: StartRunInput): Promise<{ run: RunRecord }> {
   return request("/api/runs/start", {
     method: "POST",
     body: JSON.stringify(input),
+  });
+}
+
+export function uploadAttachment(file: File, workspace: string): Promise<{ attachment: AttachmentRef }> {
+  return request(`/api/attachments?workspace=${encodeURIComponent(workspace)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "x-attachment-name": encodeURIComponent(file.name),
+      "x-attachment-content-type": file.type || "application/octet-stream",
+    },
+    body: file,
   });
 }
 

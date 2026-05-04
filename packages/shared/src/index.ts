@@ -9,6 +9,20 @@ export type SandboxMode = z.infer<typeof sandboxSchema>;
 export const approvalPolicySchema = z.enum(["untrusted", "on-failure", "on-request", "never"]);
 export type ApprovalPolicy = z.infer<typeof approvalPolicySchema>;
 
+export const attachmentKindSchema = z.enum(["image", "text"]);
+export type AttachmentKind = z.infer<typeof attachmentKindSchema>;
+
+export const attachmentRefSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  mimeType: z.string().min(1),
+  size: z.number().int().nonnegative(),
+  kind: attachmentKindSchema,
+  relativePath: z.string().min(1),
+  uploadedAt: z.number().int().nonnegative(),
+});
+export type AttachmentRef = z.infer<typeof attachmentRefSchema>;
+
 export const runConfigSchema = z.object({
   workspace: z.string().min(1),
   prompt: z.string().min(1),
@@ -17,6 +31,7 @@ export const runConfigSchema = z.object({
   approvalPolicy: approvalPolicySchema,
   planMode: z.boolean().default(false),
   sessionId: z.string().optional(),
+  attachments: z.array(attachmentRefSchema).max(10).default([]),
 });
 export type RunConfig = z.infer<typeof runConfigSchema>;
 
@@ -28,6 +43,7 @@ export const startRunSchema = z.object({
   approvalPolicy: approvalPolicySchema.default("on-request"),
   planMode: z.boolean().default(false),
   sessionId: z.string().optional(),
+  attachments: z.array(attachmentRefSchema).max(10).default([]),
 });
 export type StartRunInput = z.infer<typeof startRunSchema>;
 
