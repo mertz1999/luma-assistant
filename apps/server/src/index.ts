@@ -2240,6 +2240,10 @@ function transcriptEntryToChatMessage(sessionId: string, entry: SessionTranscrip
   };
 }
 
+function transcriptToChatMessages(sessionId: string, transcript: SessionTranscriptResponse): ChatMessage[] {
+  return transcript.entries.map((entry, index) => transcriptEntryToChatMessage(sessionId, entry, index + 1));
+}
+
 function buildHistorySessionListItem(entry: SessionHistoryEntry): SessionListItem {
   return {
     id: entry.id,
@@ -2371,6 +2375,11 @@ class MessageStore {
   }
 
   acceptOutgoingMessage(sessionId: string, input: SendMessageInput): ChatMessage {
+    const transcript = loadCodexSessionTranscript(sessionId);
+    if (transcript) {
+      this.hydrateHistorySession(sessionId, transcript, input.workspace);
+    }
+
     const titleFallback = normalizeRunListName(input.text, "Session");
     const state = this.ensureSession(sessionId, {
       title: titleFallback,
@@ -2726,6 +2735,59 @@ class MessageStore {
     const next = transform(state.messages[index]);
     this.writeMessage(next);
     return next;
+  }
+
+  private hydrateHistorySession(sessionId: string, transcript: SessionTranscriptResponse, workspaceFallback: string): void {
+    const historyItem = buildHistorySessionListItem(transcript.session);
+    const historyMessages = transcriptToChatMessages(sessionId, transcript);
+    const existing = this.sessions.get(sessionId);
+
+    const mergedMessages = existing
+      ? [
+          ...historyMessages,
+          ...existing.messages.filter((message) => !message.id.startsWith("history_")),
+        ]
+      : historyMessages;
+
+    const normalizedMessages = mergedMessages.map((message, index) => ({
+      ...message,
+      sessionId,
+      sequence: index + 1,
+    }));
+
+    const nextItem: SessionListItem = {
+      id: sessionId,
+      title: existing?.item.title?.trim() || historyItem.title,
+      status: existing?.item.status || "completed",
+      updatedAt: Math.max(
+        existing?.item.updatedAt || 0,
+        historyItem.updatedAt,
+        normalizedMessages[normalizedMessages.length - 1]?.createdAt || 0,
+      ),
+      sourceTag: historyItem.sourceTag,
+      sourceRaw: historyItem.sourceRaw,
+      workspace: existing?.item.workspace || historyItem.workspace || workspaceFallback,
+      latestRunId: existing?.item.latestRunId || null,
+      lastMessagePreview: previewText(normalizedMessages[normalizedMessages.length - 1]?.text || historyItem.lastMessagePreview),
+      messageCount: normalizedMessages.length,
+      historyOnly: false,
+    };
+
+    const nextState: SessionState = {
+      item: nextItem,
+      messages: normalizedMessages,
+      messageIds: new Map(normalizedMessages.map((message, index) => [message.id, index])),
+      nextSequence: normalizedMessages.length + 1,
+    };
+
+    this.sessions.set(sessionId, nextState);
+    this.enqueueWrite(async () => {
+      await fs.promises.mkdir(MESSAGE_LOG_DIR, { recursive: true });
+      const fileContent = normalizedMessages.map((message) => JSON.stringify(message)).join("\n");
+      await fs.promises.writeFile(messageLogPath(sessionId), `${fileContent}${fileContent ? "\n" : ""}`);
+    });
+    this.scheduleSnapshot();
+    this.emitSessionUpsert(nextItem);
   }
 
   private emitSessionUpsert(item: SessionListItem, previousSessionId?: string): void {
