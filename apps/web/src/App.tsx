@@ -550,6 +550,55 @@ function buildSessionCards(items: SessionListItem[]): SessionCard[] {
   }));
 }
 
+function isProvisionalSessionId(sessionId: string): boolean {
+  return sessionId.startsWith("local_");
+}
+
+function chooseCanonicalSessionItem(current: SessionListItem, candidate: SessionListItem): SessionListItem {
+  const currentIsProvisional = isProvisionalSessionId(current.id);
+  const candidateIsProvisional = isProvisionalSessionId(candidate.id);
+  if (currentIsProvisional !== candidateIsProvisional) {
+    return currentIsProvisional ? candidate : current;
+  }
+
+  if (current.historyOnly !== candidate.historyOnly) {
+    return current.historyOnly ? candidate : current;
+  }
+
+  if (current.updatedAt !== candidate.updatedAt) {
+    return current.updatedAt >= candidate.updatedAt ? current : candidate;
+  }
+
+  return current.messageCount >= candidate.messageCount ? current : candidate;
+}
+
+function normalizeSessionItems(items: SessionListItem[]): SessionListItem[] {
+  const latestById = new Map<string, SessionListItem>();
+  for (const item of items) {
+    latestById.set(item.id, item);
+  }
+
+  const dedupedByRunId = new Map<string, SessionListItem>();
+  const passthrough: SessionListItem[] = [];
+
+  for (const item of latestById.values()) {
+    if (!item.latestRunId) {
+      passthrough.push(item);
+      continue;
+    }
+
+    const existing = dedupedByRunId.get(item.latestRunId);
+    if (!existing) {
+      dedupedByRunId.set(item.latestRunId, item);
+      continue;
+    }
+
+    dedupedByRunId.set(item.latestRunId, chooseCanonicalSessionItem(existing, item));
+  }
+
+  return [...passthrough, ...dedupedByRunId.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
 function findSessionByRunId(sessions: SessionCard[], runId: string | null): SessionCard | null {
   if (!runId) return null;
   return sessions.find((session) => session.latestRunId === runId || session.id === runId) || null;
@@ -1557,12 +1606,32 @@ export function App(): JSX.Element {
   const timelineScrollTrackingTimeoutRef = useRef<number | null>(null);
   const pendingTimelineExpansionRef = useRef<{ sessionKey: string; scrollHeight: number; scrollTop: number } | null>(null);
   const selectedRunRefreshTimeoutRef = useRef<number | null>(null);
+  const selectedRunIdRef = useRef<string | null>(selectedRunId);
+  const selectedSessionIdRef = useRef<string | null>(selectedSessionId);
+  const showAllHistoryRef = useRef(showAllHistory);
+  const isDraftSessionRef = useRef(isDraftSession);
   const previousTimelineStateRef = useRef<{ sessionKey: string; length: number }>({
     sessionKey: draftSessionKey,
     length: 0,
   });
   const isAuthenticated = Boolean(authToken && authExpiresAt > Date.now());
   const isUploadingAttachments = uploadingAttachmentNames.length > 0;
+
+  useEffect(() => {
+    selectedRunIdRef.current = selectedRunId;
+  }, [selectedRunId]);
+
+  useEffect(() => {
+    selectedSessionIdRef.current = selectedSessionId;
+  }, [selectedSessionId]);
+
+  useEffect(() => {
+    showAllHistoryRef.current = showAllHistory;
+  }, [showAllHistory]);
+
+  useEffect(() => {
+    isDraftSessionRef.current = isDraftSession;
+  }, [isDraftSession]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -1809,13 +1878,13 @@ export function App(): JSX.Element {
         const message = readChatMessage(event.payload?.message);
         if (!message) return;
         applyIncomingMessage(message);
-        if (message.runId && message.runId === selectedRunId) {
+        if (message.runId && message.runId === selectedRunIdRef.current) {
           void loadSelectedRunRecord(message.runId);
         }
         return;
       }
 
-      if (event.kind === "run.diffUpdated" && event.runId === selectedRunId) {
+      if (event.kind === "run.diffUpdated" && event.runId === selectedRunIdRef.current) {
         setDiff(event.payload as unknown as DiffSnapshot);
         return;
       }
@@ -1826,14 +1895,14 @@ export function App(): JSX.Element {
           || event.kind === "run.failed"
           || event.kind === "run.stopped")
         && event.runId
-        && event.runId === selectedRunId
+        && event.runId === selectedRunIdRef.current
       ) {
         void loadSelectedRunRecord(event.runId);
         return;
       }
 
       if (event.kind === "run.approvalQueued") {
-        void refreshRunList(selectedSessionId);
+        void refreshRunList(selectedSessionIdRef.current);
       }
     });
 
@@ -1846,9 +1915,10 @@ export function App(): JSX.Element {
         shouldRefreshSelectedSession = false;
         return;
       }
-      if (!shouldRefreshSelectedSession || !selectedSessionId) return;
+      const currentSelectedSessionId = selectedSessionIdRef.current;
+      if (!shouldRefreshSelectedSession || !currentSelectedSessionId) return;
       shouldRefreshSelectedSession = false;
-      void loadRunMessagesPage(selectedSessionId, { reset: true });
+      void loadRunMessagesPage(currentSelectedSessionId, { reset: true });
     };
 
     es.onerror = () => {
@@ -1857,7 +1927,7 @@ export function App(): JSX.Element {
     };
 
     return () => es.close();
-  }, [selectedRunId, selectedSessionId, authReady, isAuthenticated]);
+  }, [authReady, isAuthenticated]);
 
   useEffect(() => {
     const selectedIsHistory = runItems.some((item) => item.id === selectedSessionId && item.historyOnly);
@@ -2059,26 +2129,27 @@ export function App(): JSX.Element {
     try {
       const [payload, listPayload] = await Promise.all([
         getBootstrapLite(),
-        getSessionList(runListPageSize, null, showAllHistory),
+        getSessionList(runListPageSize, null, showAllHistoryRef.current),
       ]);
       setWorkspaces(payload.workspaces);
       setWorkspace(payload.activeWorkspace);
-      setRunItems(listPayload.items);
+      const normalizedItems = normalizeSessionItems(listPayload.items);
+      setRunItems(normalizedItems);
       setRunListNextCursor(listPayload.nextCursor);
       setApprovals(listPayload.approvals.length ? listPayload.approvals : payload.approvals);
       setModel(payload.defaults.model);
       setSandbox(payload.defaults.sandbox);
-      const sessions = buildSessionCards(listPayload.items);
-      if (isDraftSession) return;
-      if (selectedSessionId) {
-        const current = sessions.find((session) => session.id === selectedSessionId);
+      const sessions = buildSessionCards(normalizedItems);
+      if (isDraftSessionRef.current) return;
+      if (selectedSessionIdRef.current) {
+        const current = sessions.find((session) => session.id === selectedSessionIdRef.current);
         if (current) {
           setSelectedRunId(current.latestRunId);
           return;
         }
       }
-      if (selectedRunId) {
-        const current = findSessionByRunId(sessions, selectedRunId);
+      if (selectedRunIdRef.current) {
+        const current = findSessionByRunId(sessions, selectedRunIdRef.current);
         if (current) {
           setSelectedSessionId(current.id);
           setSelectedRunId(current.latestRunId);
@@ -2096,14 +2167,15 @@ export function App(): JSX.Element {
   }
 
   async function refreshRunList(preferredSessionId?: string | null): Promise<void> {
-    const payload = await getSessionList(runListPageSize, null, showAllHistory);
-    setRunItems(payload.items);
+    const payload = await getSessionList(runListPageSize, null, showAllHistoryRef.current);
+    const normalizedItems = normalizeSessionItems(payload.items);
+    setRunItems(normalizedItems);
     setRunListNextCursor(payload.nextCursor);
     setApprovals(payload.approvals);
 
-    if (isDraftSession) return;
+    if (isDraftSessionRef.current) return;
 
-    const sessions = buildSessionCards(payload.items);
+    const sessions = buildSessionCards(normalizedItems);
     const preferred = preferredSessionId ? sessions.find((session) => session.id === preferredSessionId) : null;
     if (preferred) {
       setSelectedSessionId(preferred.id);
@@ -2111,16 +2183,16 @@ export function App(): JSX.Element {
       return;
     }
 
-    if (selectedSessionId) {
-      const current = sessions.find((session) => session.id === selectedSessionId);
+    if (selectedSessionIdRef.current) {
+      const current = sessions.find((session) => session.id === selectedSessionIdRef.current);
       if (current) {
         setSelectedRunId(current.latestRunId);
         return;
       }
     }
 
-    if (selectedRunId) {
-      const current = findSessionByRunId(sessions, selectedRunId);
+    if (selectedRunIdRef.current) {
+      const current = findSessionByRunId(sessions, selectedRunIdRef.current);
       if (current) {
         setSelectedSessionId(current.id);
         setSelectedRunId(current.latestRunId);
@@ -2142,11 +2214,11 @@ export function App(): JSX.Element {
     if (!runListNextCursor || loadingMoreRunItems) return;
     setLoadingMoreRunItems(true);
     try {
-      const payload = await getSessionList(runListPageSize, runListNextCursor, showAllHistory);
+      const payload = await getSessionList(runListPageSize, runListNextCursor, showAllHistoryRef.current);
       setRunItems((prev) => {
         const next = new Map(prev.map((item) => [item.id, item]));
         for (const item of payload.items) next.set(item.id, item);
-        return [...next.values()];
+        return normalizeSessionItems([...next.values()]);
       });
       setRunListNextCursor(payload.nextCursor);
       setApprovals(payload.approvals);
@@ -2172,7 +2244,7 @@ export function App(): JSX.Element {
           ),
       }));
       setMessageNextCursorByRunId((prev) => ({ ...prev, [sessionId]: payload.nextCursor }));
-      if (selectedSessionId === sessionId && payload.latestRunId !== undefined) {
+      if (selectedSessionIdRef.current === sessionId && payload.latestRunId !== undefined) {
         setSelectedRunId(payload.latestRunId);
       }
     } finally {
@@ -2281,7 +2353,7 @@ export function App(): JSX.Element {
   function applySessionUpsert(session: SessionListItem, previousSessionId: string | null): void {
     if (previousSessionId && previousSessionId !== session.id) {
       moveSessionCollections(previousSessionId, session.id);
-      if (selectedSessionId === previousSessionId) {
+      if (selectedSessionIdRef.current === previousSessionId) {
         setSelectedSessionId(session.id);
       }
     }
@@ -2292,10 +2364,10 @@ export function App(): JSX.Element {
         next.delete(previousSessionId);
       }
       next.set(session.id, session);
-      return [...next.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+      return normalizeSessionItems([...next.values()]);
     });
 
-    if (selectedSessionId === session.id) {
+    if (selectedSessionIdRef.current === session.id) {
       setSelectedRunId(session.latestRunId);
     }
   }
