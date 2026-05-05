@@ -13,6 +13,7 @@ import {
   approvalPolicySchema,
   attachmentRefSchema,
   rerunSchema,
+  sendMessageSchema,
   setWorkspaceSchema,
   startRunSchema,
   type ApiResponse,
@@ -20,6 +21,7 @@ import {
   type AppBootstrap,
   type AppBootstrapLite,
   type AttachmentRef,
+  type ChatMessage,
   type CodexAccountStatusResponse,
   type CodexCommandStatus,
   type CodexMcpStatusResponse,
@@ -34,7 +36,12 @@ import {
   type RunEventEntry,
   type RunRecord,
   type RunSourceTag,
+  type SendMessageAccepted,
+  type SendMessageInput,
+  type SessionListItem,
   type SessionHistoryEntry,
+  type SessionListResponse,
+  type SessionMessagesResponse,
   type SessionTranscriptEntry,
   type SessionTranscriptResponse,
   type SseEvent,
@@ -48,6 +55,10 @@ const require = createRequire(import.meta.url);
 
 const APP_STATE_PATH = path.resolve(rootDir, "data/ui-state.json");
 const RUNS_PATH = path.resolve(rootDir, "data/runs.json");
+const SESSION_INDEX_PATH = path.resolve(rootDir, "data/session-index.json");
+const MESSAGE_STORE_META_PATH = path.resolve(rootDir, "data/message-store-meta.json");
+const MESSAGE_OUTBOX_PATH = path.resolve(rootDir, "data/message-outbox.json");
+const MESSAGE_LOG_DIR = path.resolve(rootDir, "data/messages");
 
 const API_PORT = Number(process.env.API_PORT || 9001);
 const WEB_PORT = Number(process.env.WEB_PORT || 5175);
@@ -68,7 +79,14 @@ const ATTACHMENT_MAX_FILES = 10;
 const RUN_LIST_PAGE_DEFAULT = Number(process.env.RUN_LIST_PAGE_DEFAULT || 60);
 const RUN_LIST_PAGE_MAX = Number(process.env.RUN_LIST_PAGE_MAX || 200);
 const RUN_MESSAGE_PAGE_SIZE = 30;
+const SESSION_LIST_PAGE_DEFAULT = Number(process.env.SESSION_LIST_PAGE_DEFAULT || 60);
+const SESSION_LIST_PAGE_MAX = Number(process.env.SESSION_LIST_PAGE_MAX || 200);
+const SESSION_MESSAGE_PAGE_SIZE = 30;
 const STORED_EVENT_TEXT_MAX_CHARS = Number(process.env.STORED_EVENT_TEXT_MAX_CHARS || 24000);
+const RUNS_PERSIST_DEBOUNCE_MS = Number(process.env.RUNS_PERSIST_DEBOUNCE_MS || 750);
+const SESSION_INDEX_PERSIST_DEBOUNCE_MS = Number(process.env.SESSION_INDEX_PERSIST_DEBOUNCE_MS || 500);
+const MESSAGE_OUTBOX_RETRY_DELAYS_MS = [1000, 3000, 10000];
+const MESSAGE_STORE_SCHEMA_VERSION = 1;
 
 const IMAGE_ATTACHMENT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 const IMAGE_ATTACHMENT_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -143,6 +161,62 @@ type ActiveRun = {
   stopRequested: boolean;
 };
 
+type MessageStoreMeta = {
+  schemaVersion: number;
+  backfilledAt: number;
+};
+
+type SessionState = {
+  item: SessionListItem;
+  messages: ChatMessage[];
+  messageIds: Map<string, number>;
+  nextSequence: number;
+};
+
+type OutboxStatus = "pending" | "processing" | "failed";
+
+type MessageOutboxItem = {
+  id: string;
+  sessionId: string;
+  provisionalSession: boolean;
+  messageId: string;
+  clientMessageId: string;
+  text: string;
+  attachments: AttachmentRef[];
+  workspace: string;
+  model: string;
+  sandbox: RunConfig["sandbox"];
+  approvalPolicy: RunConfig["approvalPolicy"];
+  planMode: boolean;
+  attempts: number;
+  status: OutboxStatus;
+  nextAttemptAt: number | null;
+  lastError: string | null;
+  latestRunId: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type RunLifecycleKind = "started" | "completed" | "failed" | "stopped" | "updated";
+
+type RunLifecycleEvent = {
+  kind: RunLifecycleKind;
+  run: RunRecord;
+  previous: RunRecord | null;
+};
+
+type RunParsedEvent = {
+  runId: string;
+  run: RunRecord;
+  parsed: Record<string, unknown>;
+};
+
+type RunStderrEvent = {
+  runId: string;
+  run: RunRecord;
+  text: string;
+};
+
 type ActiveTerminal =
   | {
       mode: "pty";
@@ -212,16 +286,30 @@ function decodeCursor(input: unknown): number | null {
   }
 }
 
-function clampListLimit(input: unknown): number {
-  const raw = typeof input === "string" ? Number(input) : Number(input ?? RUN_LIST_PAGE_DEFAULT);
-  if (!Number.isFinite(raw)) return RUN_LIST_PAGE_DEFAULT;
-  return Math.min(Math.max(Math.floor(raw), 1), RUN_LIST_PAGE_MAX);
+function clampListLimit(input: unknown, fallback = RUN_LIST_PAGE_DEFAULT, max = RUN_LIST_PAGE_MAX): number {
+  const raw = typeof input === "string" ? Number(input) : Number(input ?? fallback);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.min(Math.max(Math.floor(raw), 1), max);
 }
 
 function truncateText(input: string, maxChars: number): string {
   if (input.length <= maxChars) return input;
   const hidden = input.length - maxChars;
   return `${input.slice(0, maxChars)}\n...[truncated ${hidden} chars]`;
+}
+
+async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
+  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.tmp`;
+  await fs.promises.writeFile(tempPath, JSON.stringify(value, null, 2));
+  await fs.promises.rename(tempPath, filePath);
+}
+
+function writeJsonAtomicSync(filePath: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(value, null, 2));
+  fs.renameSync(tempPath, filePath);
 }
 
 function compactJsonForStorage(value: unknown, depth = 0): unknown {
@@ -441,6 +529,8 @@ class RunManager extends EventEmitter {
 
   private activeRuns = new Map<string, ActiveRun>();
 
+  private persistTimer: NodeJS.Timeout | null = null;
+
   constructor(private codexPath: string) {
     super();
   }
@@ -519,6 +609,10 @@ class RunManager extends EventEmitter {
 
   hasCapacity(): boolean {
     return this.activeRuns.size < MAX_CONCURRENT_RUNS;
+  }
+
+  isSessionActive(sessionId: string): boolean {
+    return this.hasActiveRunInSession(sessionId);
   }
 
   startRun(config: RunConfig): RunRecord {
@@ -600,6 +694,10 @@ class RunManager extends EventEmitter {
     this.activeRuns.set(runId, { process: child, stdoutBuffer: "", stopRequested: false });
     this.updateRun(runId, { status: "running" });
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
+    const startedRun = this.runs.get(runId);
+    if (startedRun) {
+      this.emit("run.lifecycle", { kind: "started", run: startedRun, previous: null } as RunLifecycleEvent);
+    }
 
     child.stdout.on("data", (chunk: Buffer) => {
       const active = this.activeRuns.get(runId);
@@ -622,6 +720,10 @@ class RunManager extends EventEmitter {
         const rendered = truncateText(`${line}\n`, STORED_EVENT_TEXT_MAX_CHARS);
         this.appendEvent(runId, { source: "stderr", text: rendered });
         this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: rendered } });
+        const currentRun = this.runs.get(runId);
+        if (currentRun) {
+          this.emit("run.stderrLine", { runId, run: currentRun, text: rendered } as RunStderrEvent);
+        }
         this.checkApprovalSignal(runId, line, null);
       }
     });
@@ -637,12 +739,24 @@ class RunManager extends EventEmitter {
       if (stopRequested) {
         this.updateRun(runId, { status: "stopped" });
         this.emitSse({ kind: "run.stopped", runId, at: Date.now() });
+        const stoppedRun = this.runs.get(runId);
+        if (stoppedRun) {
+          this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous: run } as RunLifecycleEvent);
+        }
       } else if (code === 0 && run.status !== "failed") {
         this.updateRun(runId, { status: "completed" });
         this.emitSse({ kind: "run.completed", runId, at: Date.now() });
+        const completedRun = this.runs.get(runId);
+        if (completedRun) {
+          this.emit("run.lifecycle", { kind: "completed", run: completedRun, previous: run } as RunLifecycleEvent);
+        }
       } else if (run.status !== "stopped") {
         this.updateRun(runId, { status: "failed" });
         this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code } });
+        const failedRun = this.runs.get(runId);
+        if (failedRun) {
+          this.emit("run.lifecycle", { kind: "failed", run: failedRun, previous: run } as RunLifecycleEvent);
+        }
       }
 
       this.refreshDiff(runId);
@@ -756,6 +870,11 @@ class RunManager extends EventEmitter {
         this.checkApprovalSignal(runId, message, item || null);
       }
     }
+
+    const currentRun = this.runs.get(runId);
+    if (currentRun) {
+      this.emit("run.parsed", { runId, run: currentRun, parsed } as RunParsedEvent);
+    }
   }
 
   private checkApprovalSignal(runId: string, text: string, item: Record<string, unknown> | null): void {
@@ -830,6 +949,7 @@ class RunManager extends EventEmitter {
     if (!run) return;
     const next = { ...run, ...patch, updatedAt: Date.now() };
     this.runs.set(runId, next);
+    this.emit("run.lifecycle", { kind: "updated", run: next, previous: run } as RunLifecycleEvent);
     this.persistState();
   }
 
@@ -856,6 +976,21 @@ class RunManager extends EventEmitter {
   }
 
   private persistState(): void {
+    if (this.persistTimer !== null) {
+      clearTimeout(this.persistTimer);
+    }
+
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      persistRuns(this.getRuns(true), this.getApprovals());
+    }, RUNS_PERSIST_DEBOUNCE_MS);
+  }
+
+  flushPersistedStateSync(): void {
+    if (this.persistTimer !== null) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
     persistRuns(this.getRuns(true), this.getApprovals());
   }
 }
@@ -1678,18 +1813,32 @@ function readRunListItems(includeHistory: boolean): RunListItem[] {
     .filter((run) => run.archivedAt === null)
     .sort((a, b) => b.updatedAt - a.updatedAt);
 
-  const localItems = localRuns.map((run) => {
-    const fallback = run.summary.trim() || "Run";
-    const prompt = run.config.prompt.trim();
+  const groupedLocalRuns = new Map<string, RunRecord[]>();
+  for (const run of localRuns) {
+    const sessionKey = runSessionId(run);
+    const existing = groupedLocalRuns.get(sessionKey) || [];
+    existing.push(run);
+    groupedLocalRuns.set(sessionKey, existing);
+  }
+
+  const localItems = [...groupedLocalRuns.entries()].map(([sessionId, runs]) => {
+    const orderedDesc = [...runs].sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt));
+    const orderedAsc = [...runs].sort((a, b) => a.createdAt - b.createdAt);
+    const latestRun = orderedDesc[0];
+    const fallback = latestRun?.summary.trim() || "Session";
+    const firstPrompt = orderedAsc.find((run) => run.config.prompt.trim())?.config.prompt.trim() || "";
+
     return {
-      id: run.id,
-      name: normalizeRunListName(prompt || fallback, fallback),
-      status: run.status,
-      updatedAt: run.updatedAt || run.createdAt,
+      id: sessionId,
+      name: normalizeRunListName(firstPrompt || fallback, fallback),
+      status: latestRun?.status || "completed",
+      updatedAt: latestRun ? (latestRun.updatedAt || latestRun.createdAt) : 0,
       sourceTag: "in-app" as const,
       sourceRaw: "in-app",
-      sessionId: runSessionId(run),
-      workspace: run.config.workspace,
+      sessionId,
+      latestRunId: latestRun?.id || null,
+      runCount: runs.length,
+      workspace: latestRun?.config.workspace || "",
       historyOnly: false,
     };
   });
@@ -1707,6 +1856,8 @@ function readRunListItems(includeHistory: boolean): RunListItem[] {
       sourceTag: normalizeRunSourceTag(entry.source, true),
       sourceRaw: entry.source,
       sessionId: entry.id,
+      latestRunId: null,
+      runCount: 0,
       workspace: entry.cwd,
       historyOnly: true,
     }));
@@ -1714,7 +1865,7 @@ function readRunListItems(includeHistory: boolean): RunListItem[] {
   return [...localItems, ...historyItems].sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
-function sliceRunListItems(items: RunListItem[], limit: number, cursor: string | null): { items: RunListItem[]; nextCursor: string | null } {
+function sliceRunListItems<T>(items: T[], limit: number, cursor: string | null): { items: T[]; nextCursor: string | null } {
   const offset = decodeCursor(cursor) ?? 0;
   const safeOffset = Math.min(Math.max(offset, 0), items.length);
   const nextItems = items.slice(safeOffset, safeOffset + limit);
@@ -2011,14 +2162,29 @@ function buildTranscriptMessageEntries(transcript: SessionTranscriptResponse): R
   }));
 }
 
+function getLocalSessionRuns(sessionId: string): RunRecord[] {
+  return runManager.getRuns(false)
+    .filter((run) => run.archivedAt === null && runSessionId(run) === sessionId)
+    .sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function buildSessionMessageEntries(runs: RunRecord[]): RunMessageEntry[] {
+  return runs
+    .flatMap((run) => buildRunMessageEntries(run))
+    .sort((a, b) => a.at - b.at);
+}
+
 function loadPaginatedRunMessages(runId: string, beforeCursor: string | null): { entries: RunMessageEntry[]; nextCursor: string | null } | null {
-  const localRun = runManager.getRun(runId);
-  const entries = localRun
-    ? buildRunMessageEntries(localRun)
-    : (() => {
-        const transcript = loadCodexSessionTranscript(runId);
-        return transcript ? buildTranscriptMessageEntries(transcript) : null;
-      })();
+  const localSessionRuns = getLocalSessionRuns(runId);
+  const localRun = localSessionRuns.length === 0 ? runManager.getRun(runId) : null;
+  const entries = localSessionRuns.length > 0
+    ? buildSessionMessageEntries(localSessionRuns)
+    : localRun
+      ? buildRunMessageEntries(localRun)
+      : (() => {
+          const transcript = loadCodexSessionTranscript(runId);
+          return transcript ? buildTranscriptMessageEntries(transcript) : null;
+        })();
 
   if (!entries) return null;
 
@@ -2029,6 +2195,1000 @@ function loadPaginatedRunMessages(runId: string, beforeCursor: string | null): {
     entries: entries.slice(start, safeEnd),
     nextCursor: start > 0 ? encodeCursor(start) : null,
   };
+}
+
+function messageKindForRole(role: ChatMessage["role"]): ChatMessage["kind"] {
+  if (role === "tool") return "tool";
+  if (role === "plan") return "plan";
+  if (role === "system") return "system";
+  if (role === "error") return "error";
+  return "message";
+}
+
+function timelineEntryToChatMessage(sessionId: string, entry: RunMessageEntry, sequence: number): ChatMessage {
+  return {
+    id: entry.key,
+    clientMessageId: null,
+    sessionId,
+    runId: entry.meta?.runId || null,
+    role: entry.role,
+    kind: messageKindForRole(entry.role),
+    title: entry.title,
+    text: entry.text,
+    createdAt: entry.at,
+    sequence,
+    deliveryStatus: entry.pending ? "streaming" : "sent",
+    attachments: normalizeAttachmentRefs(entry.attachments),
+    meta: entry.meta ? { ...entry.meta } : undefined,
+  };
+}
+
+function transcriptEntryToChatMessage(sessionId: string, entry: SessionTranscriptEntry, sequence: number): ChatMessage {
+  return {
+    id: `history_${entry.key}`,
+    clientMessageId: null,
+    sessionId,
+    runId: null,
+    role: entry.role,
+    kind: "message",
+    title: entry.role === "user" ? "You" : "Assistant",
+    text: entry.text,
+    createdAt: entry.at,
+    sequence,
+    deliveryStatus: "sent",
+    attachments: [],
+  };
+}
+
+function buildHistorySessionListItem(entry: SessionHistoryEntry): SessionListItem {
+  return {
+    id: entry.id,
+    title: normalizeRunListName(entry.summary, entry.id),
+    status: "completed",
+    updatedAt: Date.parse(entry.timestamp) || 0,
+    sourceTag: normalizeRunSourceTag(entry.source, true),
+    sourceRaw: entry.source,
+    workspace: entry.cwd,
+    latestRunId: null,
+    lastMessagePreview: entry.summary,
+    messageCount: 0,
+    historyOnly: true,
+  };
+}
+
+function readSessionListItems(includeHistory: boolean): SessionListItem[] {
+  const localItems = messageStore.listLocalSessions();
+  if (!includeHistory) return localItems;
+
+  const localIds = new Set(localItems.map((item) => item.id));
+  const historyItems = loadCodexSessionHistory(0, { includeExec: true })
+    .filter((entry) => !localIds.has(entry.id))
+    .map((entry) => buildHistorySessionListItem(entry));
+
+  return [...localItems, ...historyItems].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+function messageLogPath(sessionId: string): string {
+  return path.join(MESSAGE_LOG_DIR, `${encodeURIComponent(sessionId)}.jsonl`);
+}
+
+function clearMessageErrorMeta(meta: ChatMessage["meta"] | undefined): ChatMessage["meta"] | undefined {
+  if (!meta) return undefined;
+  const { errorMessage, ...rest } = meta;
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}
+
+function readMessageLog(sessionId: string): ChatMessage[] {
+  const filePath = messageLogPath(sessionId);
+  if (!fs.existsSync(filePath)) return [];
+
+  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+  const ordered: ChatMessage[] = [];
+  const indexById = new Map<string, number>();
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const row = safeJsonParse<ChatMessage>(line, null as unknown as ChatMessage);
+    if (!row || typeof row.id !== "string" || typeof row.sessionId !== "string") continue;
+    const normalized: ChatMessage = {
+      ...row,
+      clientMessageId: typeof row.clientMessageId === "string" ? row.clientMessageId : null,
+      runId: typeof row.runId === "string" ? row.runId : null,
+      title: typeof row.title === "string" ? row.title : undefined,
+      attachments: normalizeAttachmentRefs(row.attachments),
+      meta: isRecord(row.meta) ? { ...row.meta } : undefined,
+    };
+
+    const existingIndex = indexById.get(normalized.id);
+    if (existingIndex === undefined) {
+      indexById.set(normalized.id, ordered.length);
+      ordered.push(normalized);
+    } else {
+      ordered[existingIndex] = normalized;
+    }
+  }
+
+  return ordered.sort((a, b) => a.sequence - b.sequence || a.createdAt - b.createdAt);
+}
+
+function previewText(text: string): string {
+  return truncatePreview(text.replace(/\s+/g, " ").trim(), 140);
+}
+
+class MessageStore {
+  private sessions = new Map<string, SessionState>();
+
+  private writeQueue = Promise.resolve();
+
+  private snapshotTimer: NodeJS.Timeout | null = null;
+
+  constructor(private readonly emitEvent: (event: SseEvent) => void) {}
+
+  loadOrBackfill(runs: RunRecord[]): void {
+    fs.mkdirSync(MESSAGE_LOG_DIR, { recursive: true });
+    const meta = this.loadMeta();
+    if (meta?.schemaVersion === MESSAGE_STORE_SCHEMA_VERSION && fs.existsSync(SESSION_INDEX_PATH)) {
+      this.loadFromDisk();
+      return;
+    }
+
+    this.backfillFromRuns(runs.filter((run) => run.archivedAt === null));
+    this.persistMetaSync();
+  }
+
+  listLocalSessions(): SessionListItem[] {
+    return [...this.sessions.values()]
+      .map((session) => ({ ...session.item }))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  hasLocalSession(sessionId: string): boolean {
+    return this.sessions.has(sessionId);
+  }
+
+  getLocalSession(sessionId: string): SessionListItem | null {
+    const state = this.sessions.get(sessionId);
+    return state ? { ...state.item } : null;
+  }
+
+  getMessagesPage(sessionId: string, beforeCursor: string | null, limit = SESSION_MESSAGE_PAGE_SIZE): SessionMessagesResponse | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+
+    const end = decodeCursor(beforeCursor) ?? state.messages.length;
+    const safeEnd = Math.min(Math.max(end, 0), state.messages.length);
+    const start = Math.max(0, safeEnd - limit);
+    return {
+      sessionId,
+      messages: state.messages.slice(start, safeEnd).map((message) => ({
+        ...message,
+        attachments: normalizeAttachmentRefs(message.attachments),
+        meta: message.meta ? { ...message.meta } : undefined,
+      })),
+      nextCursor: start > 0 ? encodeCursor(start) : null,
+      latestRunId: state.item.latestRunId,
+    };
+  }
+
+  acceptOutgoingMessage(sessionId: string, input: SendMessageInput): ChatMessage {
+    const titleFallback = normalizeRunListName(input.text, "Session");
+    const state = this.ensureSession(sessionId, {
+      title: titleFallback,
+      workspace: input.workspace,
+      status: "queued",
+      sourceTag: "in-app",
+      sourceRaw: "in-app",
+    });
+
+    const createdAt = Date.now();
+    const message: ChatMessage = {
+      id: `msg_${createdAt}_${Math.random().toString(36).slice(2, 8)}`,
+      clientMessageId: input.clientMessageId,
+      sessionId,
+      runId: null,
+      role: "user",
+      kind: "message",
+      title: "You",
+      text: input.text,
+      createdAt,
+      sequence: state.nextSequence,
+      deliveryStatus: "pending",
+      attachments: normalizeAttachmentRefs(input.attachments),
+    };
+
+    this.writeMessage(message);
+    return message;
+  }
+
+  bindMessageToRun(sessionId: string, messageId: string, runId: string): void {
+    this.updateStoredMessage(sessionId, messageId, (current) => ({
+      ...current,
+      runId,
+      meta: {
+        ...(clearMessageErrorMeta(current.meta) || {}),
+        runId,
+      },
+    }));
+  }
+
+  markMessagePending(sessionId: string, messageId: string): void {
+    this.updateStoredMessage(sessionId, messageId, (current) => ({
+      ...current,
+      deliveryStatus: "pending",
+      meta: clearMessageErrorMeta(current.meta),
+    }));
+  }
+
+  markMessageSent(sessionId: string, messageId: string): void {
+    this.updateStoredMessage(sessionId, messageId, (current) => ({
+      ...current,
+      deliveryStatus: "sent",
+      meta: clearMessageErrorMeta(current.meta),
+    }));
+  }
+
+  markMessageFailed(sessionId: string, messageId: string, errorMessage: string): void {
+    const next = this.updateStoredMessage(sessionId, messageId, (current) => ({
+      ...current,
+      deliveryStatus: "failed",
+      meta: {
+        ...(current.meta || {}),
+        errorMessage,
+      },
+    }));
+    if (!next) return;
+    this.emitEvent({
+      kind: "message.failed",
+      at: Date.now(),
+      sessionId,
+      runId: next.runId || undefined,
+      payload: { message: next as unknown as Record<string, unknown> },
+    });
+  }
+
+  updateSessionFromRun(run: RunRecord, sessionIdOverride?: string | null): void {
+    const sessionId = sessionIdOverride || runSessionId(run);
+    const titleFallback = normalizeRunListName(run.config.prompt || run.summary || "Session", "Session");
+    const state = this.ensureSession(sessionId, {
+      title: titleFallback,
+      workspace: run.config.workspace,
+      status: run.status,
+      sourceTag: "in-app",
+      sourceRaw: "in-app",
+    });
+
+    state.item.status = run.status;
+    state.item.updatedAt = run.updatedAt || run.createdAt;
+    state.item.workspace = run.config.workspace;
+    state.item.latestRunId = run.id;
+    if (!state.item.title.trim()) {
+      state.item.title = titleFallback;
+    }
+    this.scheduleSnapshot();
+    this.emitSessionUpsert(state.item);
+  }
+
+  upsertGeneratedMessage(sessionId: string, message: Omit<ChatMessage, "sessionId" | "sequence"> & { sequence?: number }): ChatMessage {
+    const state = this.ensureSession(sessionId, {
+      title: "Session",
+      workspace: "",
+      status: "running",
+      sourceTag: "in-app",
+      sourceRaw: "in-app",
+    });
+
+    const next: ChatMessage = {
+      ...message,
+      sessionId,
+      attachments: normalizeAttachmentRefs(message.attachments),
+      sequence: typeof message.sequence === "number" ? message.sequence : state.nextSequence,
+    };
+
+    this.writeMessage(next);
+    return next;
+  }
+
+  renameSession(previousSessionId: string, nextSessionId: string, latestRunId: string | null): void {
+    if (!previousSessionId || previousSessionId === nextSessionId) return;
+    const current = this.sessions.get(previousSessionId);
+    if (!current) return;
+
+    const existingNext = this.sessions.get(nextSessionId);
+    const mergedMessages = existingNext
+      ? [...existingNext.messages, ...current.messages]
+      : [...current.messages];
+    mergedMessages.sort((a, b) => a.sequence - b.sequence || a.createdAt - b.createdAt);
+
+    const deduped: ChatMessage[] = [];
+    const seen = new Map<string, number>();
+    for (const message of mergedMessages) {
+      const normalized = { ...message, sessionId: nextSessionId };
+      const existingIndex = seen.get(normalized.id);
+      if (existingIndex === undefined) {
+        seen.set(normalized.id, deduped.length);
+        deduped.push(normalized);
+      } else {
+        deduped[existingIndex] = normalized;
+      }
+    }
+
+    const nextState: SessionState = {
+      item: {
+        ...(existingNext?.item || current.item),
+        id: nextSessionId,
+        updatedAt: Math.max(existingNext?.item.updatedAt || 0, current.item.updatedAt),
+        latestRunId: latestRunId || existingNext?.item.latestRunId || current.item.latestRunId,
+      },
+      messages: deduped,
+      messageIds: new Map(deduped.map((message, index) => [message.id, index])),
+      nextSequence: deduped.reduce((max, message) => Math.max(max, message.sequence), 0) + 1,
+    };
+
+    nextState.item.messageCount = deduped.length;
+    nextState.item.lastMessagePreview = previewText(deduped[deduped.length - 1]?.text || "");
+
+    this.sessions.delete(previousSessionId);
+    this.sessions.set(nextSessionId, nextState);
+    this.enqueueWrite(async () => {
+      await fs.promises.mkdir(MESSAGE_LOG_DIR, { recursive: true });
+      const fileContent = deduped.map((message) => JSON.stringify(message)).join("\n");
+      await fs.promises.writeFile(messageLogPath(nextSessionId), `${fileContent}${fileContent ? "\n" : ""}`);
+      if (fs.existsSync(messageLogPath(previousSessionId))) {
+        await fs.promises.rm(messageLogPath(previousSessionId), { force: true });
+      }
+    });
+    this.scheduleSnapshot();
+    this.emitSessionUpsert(nextState.item, previousSessionId);
+  }
+
+  removeSession(sessionId: string): void {
+    if (!this.sessions.has(sessionId)) return;
+    this.sessions.delete(sessionId);
+    this.enqueueWrite(async () => {
+      if (fs.existsSync(messageLogPath(sessionId))) {
+        await fs.promises.rm(messageLogPath(sessionId), { force: true });
+      }
+    });
+    this.scheduleSnapshot();
+  }
+
+  flushSync(): void {
+    if (this.snapshotTimer !== null) {
+      clearTimeout(this.snapshotTimer);
+      this.snapshotTimer = null;
+    }
+    writeJsonAtomicSync(SESSION_INDEX_PATH, this.listLocalSessions());
+    this.persistMetaSync();
+  }
+
+  private loadMeta(): MessageStoreMeta | null {
+    if (!fs.existsSync(MESSAGE_STORE_META_PATH)) return null;
+    return safeJsonParse<MessageStoreMeta | null>(fs.readFileSync(MESSAGE_STORE_META_PATH, "utf8"), null);
+  }
+
+  private persistMetaSync(): void {
+    writeJsonAtomicSync(MESSAGE_STORE_META_PATH, {
+      schemaVersion: MESSAGE_STORE_SCHEMA_VERSION,
+      backfilledAt: Date.now(),
+    } satisfies MessageStoreMeta);
+  }
+
+  private loadFromDisk(): void {
+    const rows = safeJsonParse<SessionListItem[]>(fs.readFileSync(SESSION_INDEX_PATH, "utf8"), []);
+    this.sessions.clear();
+    for (const item of rows) {
+      const messages = readMessageLog(item.id);
+      const state: SessionState = {
+        item: {
+          ...item,
+          lastMessagePreview: item.lastMessagePreview || previewText(messages[messages.length - 1]?.text || ""),
+          messageCount: messages.length,
+        },
+        messages,
+        messageIds: new Map(messages.map((message, index) => [message.id, index])),
+        nextSequence: messages.reduce((max, message) => Math.max(max, message.sequence), 0) + 1,
+      };
+      this.sessions.set(item.id, state);
+    }
+  }
+
+  private backfillFromRuns(runs: RunRecord[]): void {
+    this.sessions.clear();
+    fs.mkdirSync(MESSAGE_LOG_DIR, { recursive: true });
+
+    const grouped = new Map<string, RunRecord[]>();
+    for (const run of runs) {
+      const key = runSessionId(run);
+      const existing = grouped.get(key) || [];
+      existing.push(run);
+      grouped.set(key, existing);
+    }
+
+    for (const [sessionId, sessionRuns] of grouped.entries()) {
+      const messages = buildSessionMessageEntries(sessionRuns)
+        .map((entry, index) => timelineEntryToChatMessage(sessionId, entry, index + 1));
+      const orderedDesc = [...sessionRuns].sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt));
+      const orderedAsc = [...sessionRuns].sort((a, b) => a.createdAt - b.createdAt);
+      const latestRun = orderedDesc[0];
+      const firstPrompt = orderedAsc.find((run) => run.config.prompt.trim())?.config.prompt.trim() || "";
+
+      const item: SessionListItem = {
+        id: sessionId,
+        title: normalizeRunListName(firstPrompt || latestRun?.summary || "Session", latestRun?.summary || "Session"),
+        status: latestRun?.status || "completed",
+        updatedAt: latestRun ? (latestRun.updatedAt || latestRun.createdAt) : 0,
+        sourceTag: "in-app",
+        sourceRaw: "in-app",
+        workspace: latestRun?.config.workspace || "",
+        latestRunId: latestRun?.id || null,
+        lastMessagePreview: previewText(messages[messages.length - 1]?.text || firstPrompt || latestRun?.summary || ""),
+        messageCount: messages.length,
+        historyOnly: false,
+      };
+
+      const state: SessionState = {
+        item,
+        messages,
+        messageIds: new Map(messages.map((message, index) => [message.id, index])),
+        nextSequence: messages.reduce((max, message) => Math.max(max, message.sequence), 0) + 1,
+      };
+      this.sessions.set(sessionId, state);
+      const fileContent = messages.map((message) => JSON.stringify(message)).join("\n");
+      fs.writeFileSync(messageLogPath(sessionId), `${fileContent}${fileContent ? "\n" : ""}`);
+    }
+
+    writeJsonAtomicSync(SESSION_INDEX_PATH, this.listLocalSessions());
+  }
+
+  private ensureSession(
+    sessionId: string,
+    seed: Pick<SessionListItem, "title" | "workspace" | "status" | "sourceTag" | "sourceRaw">,
+  ): SessionState {
+    const existing = this.sessions.get(sessionId);
+    if (existing) return existing;
+
+    const state: SessionState = {
+      item: {
+        id: sessionId,
+        title: seed.title,
+        status: seed.status,
+        updatedAt: Date.now(),
+        sourceTag: seed.sourceTag,
+        sourceRaw: seed.sourceRaw,
+        workspace: seed.workspace,
+        latestRunId: null,
+        lastMessagePreview: "",
+        messageCount: 0,
+        historyOnly: false,
+      },
+      messages: [],
+      messageIds: new Map(),
+      nextSequence: 1,
+    };
+    this.sessions.set(sessionId, state);
+    this.scheduleSnapshot();
+    this.emitSessionUpsert(state.item);
+    return state;
+  }
+
+  private writeMessage(message: ChatMessage, options?: { emitMessage?: boolean }): void {
+    const state = this.ensureSession(message.sessionId, {
+      title: "Session",
+      workspace: "",
+      status: "running",
+      sourceTag: "in-app",
+      sourceRaw: "in-app",
+    });
+    const existingIndex = state.messageIds.get(message.id);
+    if (existingIndex === undefined) {
+      state.messageIds.set(message.id, state.messages.length);
+      state.messages.push(message);
+      state.nextSequence = Math.max(state.nextSequence, message.sequence + 1);
+    } else {
+      state.messages[existingIndex] = message;
+      state.nextSequence = Math.max(state.nextSequence, message.sequence + 1);
+    }
+
+    state.messages.sort((a, b) => a.sequence - b.sequence || a.createdAt - b.createdAt);
+    state.messageIds = new Map(state.messages.map((row, index) => [row.id, index]));
+    state.item.updatedAt = Math.max(state.item.updatedAt, message.createdAt);
+    state.item.messageCount = state.messages.length;
+    state.item.lastMessagePreview = previewText(message.text);
+    if (!state.item.title.trim() && message.role === "user") {
+      state.item.title = normalizeRunListName(message.text, "Session");
+    }
+
+    this.enqueueWrite(async () => {
+      await fs.promises.mkdir(MESSAGE_LOG_DIR, { recursive: true });
+      await fs.promises.appendFile(messageLogPath(message.sessionId), `${JSON.stringify(message)}\n`);
+    });
+    this.scheduleSnapshot();
+    if (options?.emitMessage !== false) {
+      this.emitEvent({
+        kind: "message.upsert",
+        at: Date.now(),
+        sessionId: message.sessionId,
+        runId: message.runId || undefined,
+        payload: { message: message as unknown as Record<string, unknown> },
+      });
+    }
+    this.emitSessionUpsert(state.item);
+  }
+
+  private updateStoredMessage(
+    sessionId: string,
+    messageId: string,
+    transform: (current: ChatMessage) => ChatMessage,
+  ): ChatMessage | null {
+    const state = this.sessions.get(sessionId);
+    const index = state?.messageIds.get(messageId);
+    if (state === undefined || index === undefined) return null;
+    const next = transform(state.messages[index]);
+    this.writeMessage(next);
+    return next;
+  }
+
+  private emitSessionUpsert(item: SessionListItem, previousSessionId?: string): void {
+    this.emitEvent({
+      kind: "session.upsert",
+      at: Date.now(),
+      sessionId: item.id,
+      runId: item.latestRunId || undefined,
+      payload: {
+        session: item as unknown as Record<string, unknown>,
+        previousSessionId,
+      },
+    });
+  }
+
+  private scheduleSnapshot(): void {
+    if (this.snapshotTimer !== null) {
+      clearTimeout(this.snapshotTimer);
+    }
+
+    this.snapshotTimer = setTimeout(() => {
+      this.snapshotTimer = null;
+      this.enqueueWrite(async () => {
+        await writeJsonAtomic(SESSION_INDEX_PATH, this.listLocalSessions());
+      });
+    }, SESSION_INDEX_PERSIST_DEBOUNCE_MS);
+  }
+
+  private enqueueWrite(task: () => Promise<void>): void {
+    this.writeQueue = this.writeQueue
+      .then(task)
+      .catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error("[agentic-cli/message-store] write failed", error);
+      });
+  }
+}
+
+class OutboxProcessor {
+  private items: MessageOutboxItem[] = [];
+
+  private persistQueue = Promise.resolve();
+
+  private timer: NodeJS.Timeout | null = null;
+
+  private readonly busySessionIds = new Set<string>();
+
+  private readonly busySessionIdsByRunId = new Map<string, Set<string>>();
+
+  constructor(
+    private readonly runManager: RunManager,
+    private readonly messageStore: MessageStore,
+    private readonly emitEvent: (event: SseEvent) => void,
+    private readonly onRunStarted: (item: MessageOutboxItem, run: RunRecord) => void,
+  ) {
+    this.load();
+  }
+
+  enqueue(item: Omit<MessageOutboxItem, "id" | "attempts" | "status" | "nextAttemptAt" | "lastError" | "latestRunId" | "createdAt" | "updatedAt">): void {
+    const now = Date.now();
+    this.items.push({
+      ...item,
+      id: `outbox_${now}_${Math.random().toString(36).slice(2, 8)}`,
+      attempts: 0,
+      status: "pending",
+      nextAttemptAt: now,
+      lastError: null,
+      latestRunId: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    this.persistSoon();
+    this.emitOutboxUpdated();
+    this.scheduleProcessing(0);
+  }
+
+  remapSession(previousSessionId: string, nextSessionId: string, runId?: string | null): void {
+    if (!previousSessionId || !nextSessionId || previousSessionId === nextSessionId) return;
+    for (const item of this.items) {
+      if (item.sessionId !== previousSessionId) continue;
+      item.sessionId = nextSessionId;
+      item.updatedAt = Date.now();
+    }
+
+    if (this.busySessionIds.has(previousSessionId)) {
+      this.busySessionIds.add(nextSessionId);
+    }
+
+    if (runId) {
+      const aliases = this.busySessionIdsByRunId.get(runId) || new Set<string>();
+      aliases.add(previousSessionId);
+      aliases.add(nextSessionId);
+      this.busySessionIdsByRunId.set(runId, aliases);
+    }
+
+    this.persistSoon();
+  }
+
+  handleRunFinished(runId: string): void {
+    const aliases = this.busySessionIdsByRunId.get(runId);
+    if (aliases) {
+      for (const alias of aliases) this.busySessionIds.delete(alias);
+      this.busySessionIdsByRunId.delete(runId);
+    }
+    this.scheduleProcessing(0);
+  }
+
+  removeSession(sessionId: string): void {
+    const next = this.items.filter((item) => item.sessionId !== sessionId);
+    if (next.length === this.items.length) return;
+    this.items = next;
+    this.busySessionIds.delete(sessionId);
+    this.persistSoon();
+    this.emitOutboxUpdated();
+  }
+
+  retryFailedMessage(messageId: string): MessageOutboxItem | null {
+    const item = this.items.find((row) => row.messageId === messageId && row.status === "failed");
+    if (!item) return null;
+
+    item.attempts = 0;
+    item.status = "pending";
+    item.nextAttemptAt = Date.now();
+    item.lastError = null;
+    item.updatedAt = Date.now();
+    this.messageStore.markMessagePending(item.sessionId, item.messageId);
+    this.persistSoon();
+    this.emitOutboxUpdated();
+    this.scheduleProcessing(0);
+    return { ...item, attachments: normalizeAttachmentRefs(item.attachments) };
+  }
+
+  flushSync(): void {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    writeJsonAtomicSync(MESSAGE_OUTBOX_PATH, { items: this.items });
+  }
+
+  private load(): void {
+    if (!fs.existsSync(MESSAGE_OUTBOX_PATH)) return;
+    const payload = safeJsonParse<{ items: MessageOutboxItem[] }>(fs.readFileSync(MESSAGE_OUTBOX_PATH, "utf8"), { items: [] });
+    this.items = payload.items || [];
+    if (this.items.some((item) => item.status === "pending" || item.status === "processing")) {
+      this.scheduleProcessing(0);
+    }
+  }
+
+  private emitOutboxUpdated(): void {
+    this.emitEvent({
+      kind: "outbox.updated",
+      at: Date.now(),
+      payload: {
+        items: this.items.map((item) => ({
+          id: item.id,
+          sessionId: item.sessionId,
+          status: item.status,
+          attempts: item.attempts,
+          nextAttemptAt: item.nextAttemptAt,
+          latestRunId: item.latestRunId,
+          messageId: item.messageId,
+          lastError: item.lastError,
+        })) as unknown as Record<string, unknown>,
+      },
+    });
+  }
+
+  private persistSoon(): void {
+    this.persistQueue = this.persistQueue
+      .then(() => writeJsonAtomic(MESSAGE_OUTBOX_PATH, { items: this.items }))
+      .catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error("[agentic-cli/outbox] persist failed", error);
+      });
+  }
+
+  private scheduleProcessing(delayMs: number): void {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this.processReadyItems();
+    }, Math.max(0, delayMs));
+  }
+
+  private async processReadyItems(): Promise<void> {
+    const now = Date.now();
+    const ready = this.items
+      .filter((item) => item.status === "pending" && (item.nextAttemptAt ?? 0) <= now)
+      .sort((a, b) => a.createdAt - b.createdAt);
+
+    if (ready.length === 0) {
+      const nextAt = this.items
+        .filter((item) => item.status === "pending" && typeof item.nextAttemptAt === "number")
+        .map((item) => item.nextAttemptAt as number)
+        .sort((a, b) => a - b)[0];
+      if (typeof nextAt === "number") this.scheduleProcessing(Math.max(0, nextAt - now));
+      return;
+    }
+
+    for (const item of ready) {
+      if (this.busySessionIds.has(item.sessionId) || this.runManager.isSessionActive(item.sessionId)) {
+        continue;
+      }
+
+      item.status = "processing";
+      item.updatedAt = Date.now();
+      this.persistSoon();
+      this.emitOutboxUpdated();
+
+      try {
+        const run = this.runManager.startRun({
+          workspace: item.workspace,
+          prompt: item.text,
+          model: item.model,
+          sandbox: item.sandbox,
+          approvalPolicy: item.approvalPolicy,
+          planMode: item.planMode,
+          sessionId: item.provisionalSession ? undefined : item.sessionId,
+          attachments: item.attachments,
+        });
+
+        item.latestRunId = run.id;
+        this.messageStore.updateSessionFromRun(run, item.sessionId);
+        this.messageStore.bindMessageToRun(item.sessionId, item.messageId, run.id);
+        this.messageStore.markMessageSent(item.sessionId, item.messageId);
+        this.busySessionIds.add(item.sessionId);
+        this.busySessionIdsByRunId.set(run.id, new Set([item.sessionId]));
+        this.onRunStarted(item, run);
+        this.items = this.items.filter((row) => row.id !== item.id);
+        this.persistSoon();
+        this.emitOutboxUpdated();
+      } catch (error) {
+        item.attempts += 1;
+        item.lastError = error instanceof Error ? error.message : "Failed to start run";
+        item.updatedAt = Date.now();
+
+        const retryDelay = MESSAGE_OUTBOX_RETRY_DELAYS_MS[item.attempts - 1];
+        if (typeof retryDelay === "number") {
+          item.status = "pending";
+          item.nextAttemptAt = Date.now() + retryDelay;
+        } else {
+          item.status = "failed";
+          item.nextAttemptAt = null;
+          this.messageStore.markMessageFailed(item.sessionId, item.messageId, item.lastError);
+        }
+
+        this.persistSoon();
+        this.emitOutboxUpdated();
+      }
+    }
+
+    const nextPending = this.items
+      .filter((item) => item.status === "pending" && typeof item.nextAttemptAt === "number")
+      .map((item) => item.nextAttemptAt as number)
+      .sort((a, b) => a - b)[0];
+    if (typeof nextPending === "number") {
+      this.scheduleProcessing(Math.max(0, nextPending - Date.now()));
+    }
+  }
+}
+
+class MessageProjector {
+  private sessionIdByRunId = new Map<string, string>();
+
+  constructor(
+    private readonly messageStore: MessageStore,
+    private readonly outboxBridge: {
+      remapSession: (previousSessionId: string, nextSessionId: string, runId?: string | null) => void;
+      handleRunFinished: (runId: string) => void;
+    },
+  ) {}
+
+  registerRun(runId: string, sessionId: string): void {
+    this.sessionIdByRunId.set(runId, sessionId);
+  }
+
+  onLifecycle(event: RunLifecycleEvent): void {
+    if (event.kind === "updated" && event.previous) {
+      const meaningfulChange = event.previous.status !== event.run.status
+        || event.previous.sessionId !== event.run.sessionId
+        || event.previous.threadId !== event.run.threadId
+        || event.previous.summary !== event.run.summary
+        || event.previous.lastError !== event.run.lastError
+        || JSON.stringify(event.previous.usage) !== JSON.stringify(event.run.usage)
+        || event.previous.changedFiles.join("\n") !== event.run.changedFiles.join("\n");
+      if (!meaningfulChange) return;
+    }
+
+    const resolvedSessionId = this.sessionIdByRunId.get(event.run.id) || runSessionId(event.run);
+    this.messageStore.updateSessionFromRun(event.run, resolvedSessionId);
+    if (event.kind === "completed" || event.kind === "failed" || event.kind === "stopped") {
+      this.outboxBridge.handleRunFinished(event.run.id);
+    }
+
+    if (event.kind === "failed" && event.run.lastError) {
+      const messageId = `${event.run.id}_failed`;
+      this.messageStore.upsertGeneratedMessage(resolvedSessionId, {
+        id: messageId,
+        clientMessageId: null,
+        runId: event.run.id,
+        role: "error",
+        kind: "error",
+        title: "Error",
+        text: event.run.lastError,
+        createdAt: event.run.updatedAt,
+        deliveryStatus: "failed",
+        attachments: [],
+        meta: { runId: event.run.id, errorMessage: event.run.lastError },
+      });
+    }
+  }
+
+  onParsed(event: RunParsedEvent): void {
+    const type = typeof event.parsed.type === "string" ? event.parsed.type : "";
+    const currentSessionId = this.sessionIdByRunId.get(event.runId) || runSessionId(event.run);
+
+    if (type === "thread.started" && typeof event.parsed.thread_id === "string") {
+      const actualSessionId = event.parsed.thread_id;
+      if (currentSessionId !== actualSessionId) {
+        this.messageStore.renameSession(currentSessionId, actualSessionId, event.run.id);
+        this.outboxBridge.remapSession(currentSessionId, actualSessionId, event.run.id);
+        this.sessionIdByRunId.set(event.runId, actualSessionId);
+      }
+    }
+
+    const sessionId = this.sessionIdByRunId.get(event.runId) || runSessionId(event.run);
+    const item = isRecord(event.parsed.item) ? event.parsed.item : null;
+    const itemId = item && typeof item.id === "string" ? item.id : null;
+    const itemType = item && typeof item.type === "string" ? item.type : "";
+
+    if (type === "turn.completed" && event.run.usage) {
+      this.messageStore.upsertGeneratedMessage(sessionId, {
+        id: `${event.run.id}_usage`,
+        clientMessageId: null,
+        runId: event.run.id,
+        role: "system",
+        kind: "system",
+        title: "Usage",
+        text: `Tokens: in ${event.run.usage.inputTokens ?? 0}, out ${event.run.usage.outputTokens ?? 0}, cached ${event.run.usage.cachedInputTokens ?? 0}`,
+        createdAt: event.run.updatedAt,
+        deliveryStatus: "sent",
+        attachments: [],
+        meta: { runId: event.run.id },
+      });
+    }
+
+    if (!type.startsWith("item.") || !itemId) return;
+
+    if (itemType === "agent_message" && type === "item.completed") {
+      const text = typeof item?.text === "string" ? item.text : readTextField(item?.content);
+      if (!text.trim()) return;
+      this.messageStore.upsertGeneratedMessage(sessionId, {
+        id: `${event.run.id}_${itemId}_assistant`,
+        clientMessageId: null,
+        runId: event.run.id,
+        role: "assistant",
+        kind: "message",
+        title: "Assistant",
+        text,
+        createdAt: event.run.updatedAt,
+        deliveryStatus: "sent",
+        attachments: [],
+        meta: { runId: event.run.id },
+      });
+      return;
+    }
+
+    if (isPlanLike(itemType) && (type === "item.started" || type === "item.updated" || type === "item.completed")) {
+      const pending = type !== "item.completed";
+      const text = resolvePlanText(item || {});
+      this.messageStore.upsertGeneratedMessage(sessionId, {
+        id: `${event.run.id}_${itemId}_plan`,
+        clientMessageId: null,
+        runId: event.run.id,
+        role: "plan",
+        kind: "plan",
+        title: itemType === "reasoning" ? "Reasoning" : "Plan",
+        text: text || (pending ? "Planning" : "Plan updated"),
+        createdAt: event.run.updatedAt,
+        deliveryStatus: pending ? "streaming" : "sent",
+        attachments: [],
+        meta: { runId: event.run.id },
+      });
+      return;
+    }
+
+    if (itemType === "command_execution" && (type === "item.started" || type === "item.completed")) {
+      const command = typeof item?.command === "string" && item.command.trim() ? item.command : "command";
+      const status = typeof item?.status === "string" ? item.status : (type === "item.started" ? "in_progress" : "completed");
+      const output = typeof item?.aggregated_output === "string" ? item.aggregated_output : "";
+      this.messageStore.upsertGeneratedMessage(sessionId, {
+        id: `${event.run.id}_${itemId}_command`,
+        clientMessageId: null,
+        runId: event.run.id,
+        role: "tool",
+        kind: "tool",
+        title: "Tool",
+        text: `$ ${truncatePreview(command)}`,
+        createdAt: event.run.updatedAt,
+        deliveryStatus: type === "item.started" || status === "in_progress" ? "streaming" : "sent",
+        attachments: [],
+        meta: {
+          type: "commandexecution",
+          runId: event.run.id,
+          status,
+          command,
+          output,
+          exitCode: typeof item?.exit_code === "number" ? item.exit_code : null,
+        },
+      });
+      return;
+    }
+
+    if (itemType === "file_change" && (type === "item.started" || type === "item.completed")) {
+      const changes = parseRunFileChanges(item || {});
+      const primaryPath = changes[0]?.path || (typeof item?.path === "string" ? item.path : "file change");
+      const status = typeof item?.status === "string" ? item.status : (type === "item.started" ? "in_progress" : "completed");
+      const label = changes.length > 1 ? `${primaryPath} +${changes.length - 1} more` : primaryPath;
+      this.messageStore.upsertGeneratedMessage(sessionId, {
+        id: `${event.run.id}_${itemId}_file_change`,
+        clientMessageId: null,
+        runId: event.run.id,
+        role: "tool",
+        kind: "tool",
+        title: "Tool",
+        text: `${status}: ${label}`,
+        createdAt: event.run.updatedAt,
+        deliveryStatus: type === "item.started" || status === "in_progress" ? "streaming" : "sent",
+        attachments: [],
+        meta: {
+          type: "filechange",
+          runId: event.run.id,
+          status,
+          fileChanges: changes,
+          errorMessage: typeof item?.error_message === "string" ? item.error_message : undefined,
+          path: typeof item?.path === "string" ? item.path : undefined,
+          durationMs: typeof item?.duration_ms === "number" ? item.duration_ms : undefined,
+        },
+      });
+      return;
+    }
+
+    if (itemType === "error") {
+      const message = typeof item?.message === "string" ? item.message : "Unknown error";
+      this.messageStore.upsertGeneratedMessage(sessionId, {
+        id: `${event.run.id}_${itemId}_error`,
+        clientMessageId: null,
+        runId: event.run.id,
+        role: "error",
+        kind: "error",
+        title: "Error",
+        text: message,
+        createdAt: event.run.updatedAt,
+        deliveryStatus: "failed",
+        attachments: [],
+        meta: { runId: event.run.id, errorMessage: message },
+      });
+    }
+  }
 }
 
 const { defaultWorkspace, options: configWorkspaceOptions } = resolveConfigWorkspaces();
@@ -2088,22 +3248,52 @@ app.use(requireAuth);
 const runManager = new RunManager(CODEX_PATH);
 const persisted = loadPersistedRuns();
 runManager.loadPersisted(persisted.runs, persisted.approvals);
+const sseClients = new Set<express.Response>();
+function broadcastSse(event: SseEvent): void {
+  const data = `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const client of sseClients) client.write(data);
+}
+
+const messageStore = new MessageStore((event) => broadcastSse(event));
+messageStore.loadOrBackfill(runManager.getRuns(false));
+
+let outboxProcessor: OutboxProcessor | null = null;
+const messageProjector = new MessageProjector(messageStore, {
+  remapSession(previousSessionId: string, nextSessionId: string, runId?: string | null): void {
+    outboxProcessor?.remapSession(previousSessionId, nextSessionId, runId);
+  },
+  handleRunFinished(runId: string): void {
+    outboxProcessor?.handleRunFinished(runId);
+  },
+} as OutboxProcessor);
+
+outboxProcessor = new OutboxProcessor(
+  runManager,
+  messageStore,
+  (event) => broadcastSse(event),
+  (item, run) => {
+    messageProjector.registerRun(run.id, item.sessionId);
+  },
+);
+
 const terminalManager = new TerminalManager(() => uiState.activeWorkspace);
 
-const sseClients = new Set<express.Response>();
 runManager.on("sse", (event: SseEvent) => {
-  const data = `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
-  for (const client of sseClients) client.write(data);
+  broadcastSse(event);
+});
+runManager.on("run.lifecycle", (event: RunLifecycleEvent) => {
+  messageProjector.onLifecycle(event);
+});
+runManager.on("run.parsed", (event: RunParsedEvent) => {
+  messageProjector.onParsed(event);
 });
 terminalManager.on("sse", (event: SseEvent) => {
-  const data = `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
-  for (const client of sseClients) client.write(data);
+  broadcastSse(event);
 });
 
 setInterval(() => {
   const evt: SseEvent = { kind: "heartbeat", at: Date.now() };
-  const data = `event: heartbeat\ndata: ${JSON.stringify(evt)}\n\n`;
-  for (const client of sseClients) client.write(data);
+  broadcastSse(evt);
 }, 10000);
 
 function apiOk<T>(data: T): ApiResponse<T> {
@@ -2330,6 +3520,24 @@ app.get("/api/runs", (_req, res) => {
   res.json(apiOk({ runs: runManager.getRuns(false), approvals: runManager.getApprovals() }));
 });
 
+app.get("/api/sessions/list", (req, res) => {
+  const limit = clampListLimit(req.query.limit, SESSION_LIST_PAGE_DEFAULT, SESSION_LIST_PAGE_MAX);
+  const cursor = typeof req.query.cursor === "string" ? req.query.cursor : null;
+  const includeHistory = req.query.includeHistory === "1" || req.query.includeHistory === "true";
+  const startedAt = Date.now();
+  const payload = sliceRunListItems(readSessionListItems(includeHistory), limit, cursor);
+  const response: SessionListResponse = {
+    items: payload.items,
+    nextCursor: payload.nextCursor,
+    approvals: runManager.getApprovals(),
+  };
+  if (process.env.MESSAGE_PERF_LOG === "1") {
+    // eslint-disable-next-line no-console
+    console.log(`[agentic-cli/message-perf] sessions.list durationMs=${Date.now() - startedAt} payloadBytes=${Buffer.byteLength(JSON.stringify(response))}`);
+  }
+  res.json(apiOk(response));
+});
+
 app.get("/api/runs/list", (req, res) => {
   const limit = clampListLimit(req.query.limit);
   const cursor = typeof req.query.cursor === "string" ? req.query.cursor : null;
@@ -2387,6 +3595,77 @@ app.post("/api/attachments", express.raw({ limit: ATTACHMENT_MAX_BYTES, type: ()
   };
 
   res.json(apiOk({ attachment }));
+});
+
+app.post("/api/messages/send", (req, res) => {
+  const parsed = sendMessageSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid message payload"));
+    return;
+  }
+
+  const workspace = path.resolve(parsed.data.workspace || uiState.activeWorkspace);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+
+  const startedAt = Date.now();
+  const sessionId = parsed.data.sessionId?.trim() || `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const provisionalSession = !parsed.data.sessionId?.trim();
+  const acceptedMessage = messageStore.acceptOutgoingMessage(sessionId, {
+    ...parsed.data,
+    workspace,
+  });
+
+  outboxProcessor?.enqueue({
+    sessionId,
+    provisionalSession,
+    messageId: acceptedMessage.id,
+    clientMessageId: parsed.data.clientMessageId,
+    text: parsed.data.text,
+    attachments: normalizeAttachmentRefs(parsed.data.attachments),
+    workspace,
+    model: parsed.data.model,
+    sandbox: parsed.data.sandbox,
+    approvalPolicy: parsed.data.approvalPolicy,
+    planMode: parsed.data.planMode,
+  });
+
+  const response: SendMessageAccepted = {
+    sessionId,
+    message: acceptedMessage,
+    queueStatus: "accepted",
+    latestRunId: messageStore.getLocalSession(sessionId)?.latestRunId || null,
+  };
+
+  broadcastSse({
+    kind: "message.ack",
+    at: Date.now(),
+    sessionId,
+    payload: {
+      message: acceptedMessage as unknown as Record<string, unknown>,
+      queueStatus: response.queueStatus,
+      latestRunId: response.latestRunId,
+    },
+  });
+
+  if (process.env.MESSAGE_PERF_LOG === "1") {
+    // eslint-disable-next-line no-console
+    console.log(`[agentic-cli/message-perf] messages.send ackMs=${Date.now() - startedAt}`);
+  }
+
+  res.json(apiOk(response));
+});
+
+app.post("/api/messages/:messageId/retry", (req, res) => {
+  const retried = outboxProcessor?.retryFailedMessage(req.params.messageId);
+  if (!retried) {
+    res.status(404).json(apiErr("Failed message not found or is not retryable"));
+    return;
+  }
+
+  res.json(apiOk({ messageId: retried.messageId, sessionId: retried.sessionId, queued: true }));
 });
 
 app.post("/api/runs/start", (req, res) => {
@@ -2514,6 +3793,43 @@ app.get("/api/runs/:runId/messages", (req, res) => {
   res.json(apiOk({ runId: req.params.runId, ...payload }));
 });
 
+app.get("/api/sessions/:sessionId/messages", (req, res) => {
+  const limit = clampListLimit(req.query.limit, SESSION_MESSAGE_PAGE_SIZE, SESSION_MESSAGE_PAGE_SIZE);
+  const before = typeof req.query.before === "string" ? req.query.before : null;
+  const startedAt = Date.now();
+  const payload = messageStore.getMessagesPage(req.params.sessionId, before, limit);
+  if (payload) {
+    if (process.env.MESSAGE_PERF_LOG === "1") {
+      // eslint-disable-next-line no-console
+      console.log(`[agentic-cli/message-perf] sessions.messages durationMs=${Date.now() - startedAt} payloadBytes=${Buffer.byteLength(JSON.stringify(payload))}`);
+    }
+    res.json(apiOk(payload));
+    return;
+  }
+
+  const transcript = loadCodexSessionTranscript(req.params.sessionId);
+  if (!transcript) {
+    res.status(404).json(apiErr("Session messages not found"));
+    return;
+  }
+
+  const historyMessages = transcript.entries.map((entry, index) => transcriptEntryToChatMessage(req.params.sessionId, entry, index + 1));
+  const end = decodeCursor(before) ?? historyMessages.length;
+  const safeEnd = Math.min(Math.max(end, 0), historyMessages.length);
+  const start = Math.max(0, safeEnd - limit);
+  const response: SessionMessagesResponse = {
+    sessionId: req.params.sessionId,
+    messages: historyMessages.slice(start, safeEnd),
+    nextCursor: start > 0 ? encodeCursor(start) : null,
+    latestRunId: null,
+  };
+  if (process.env.MESSAGE_PERF_LOG === "1") {
+    // eslint-disable-next-line no-console
+    console.log(`[agentic-cli/message-perf] sessions.messages durationMs=${Date.now() - startedAt} payloadBytes=${Buffer.byteLength(JSON.stringify(response))}`);
+  }
+  res.json(apiOk(response));
+});
+
 app.get("/api/runs/:runId/diff", (req, res) => {
   const diff = runManager.getDiff(req.params.runId);
   if (!diff) {
@@ -2530,6 +3846,8 @@ app.post("/api/sessions/:sessionId/archive", (req, res) => {
       res.status(404).json(apiErr("Session not found"));
       return;
     }
+    messageStore.removeSession(req.params.sessionId);
+    outboxProcessor?.removeSession(req.params.sessionId);
     terminalManager.removeSession(req.params.sessionId);
     res.json(apiOk({ sessionId: req.params.sessionId, archivedRuns: result.archivedRuns }));
   } catch (error) {
@@ -2544,6 +3862,8 @@ app.delete("/api/sessions/:sessionId", (req, res) => {
       res.status(404).json(apiErr("Session not found"));
       return;
     }
+    messageStore.removeSession(req.params.sessionId);
+    outboxProcessor?.removeSession(req.params.sessionId);
     terminalManager.removeSession(req.params.sessionId);
     res.json(apiOk({ sessionId: req.params.sessionId, ...result }));
   } catch (error) {
@@ -2714,6 +4034,26 @@ app.use((error: unknown, _req: express.Request, res: express.Response, next: exp
   }
 
   next(error);
+});
+
+function flushPersistentStateSync(): void {
+  runManager.flushPersistedStateSync();
+  messageStore.flushSync();
+  outboxProcessor?.flushSync();
+}
+
+process.on("beforeExit", () => {
+  flushPersistentStateSync();
+});
+
+process.on("SIGINT", () => {
+  flushPersistentStateSync();
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  flushPersistentStateSync();
+  process.exit(0);
 });
 
 app.listen(API_PORT, HOST, () => {

@@ -50,6 +50,19 @@ export const startRunSchema = z.object({
 });
 export type StartRunInput = z.infer<typeof startRunSchema>;
 
+export const sendMessageSchema = z.object({
+  clientMessageId: z.string().min(1),
+  sessionId: z.string().optional(),
+  text: z.string().min(1),
+  workspace: z.string().min(1),
+  model: z.string().min(1),
+  sandbox: sandboxSchema.default("read-only"),
+  approvalPolicy: approvalPolicySchema.default("on-request"),
+  planMode: z.boolean().default(false),
+  attachments: z.array(attachmentRefSchema).max(10).default([]),
+});
+export type SendMessageInput = z.infer<typeof sendMessageSchema>;
+
 export const rerunSchema = z.object({
   sandbox: sandboxSchema.optional(),
   approvalPolicy: approvalPolicySchema.optional(),
@@ -154,6 +167,8 @@ export type RunListItem = {
   sourceTag: RunSourceTag;
   sourceRaw: string;
   sessionId: string;
+  latestRunId: string | null;
+  runCount: number;
   workspace: string;
   historyOnly: boolean;
 };
@@ -198,6 +213,67 @@ export type RunMessagesResponse = {
   runId: string;
   entries: RunMessageEntry[];
   nextCursor: string | null;
+};
+
+export type SessionListItem = {
+  id: string;
+  title: string;
+  status: RunStatus;
+  updatedAt: number;
+  sourceTag: RunSourceTag;
+  sourceRaw: string;
+  workspace: string;
+  latestRunId: string | null;
+  lastMessagePreview: string;
+  messageCount: number;
+  historyOnly: boolean;
+};
+
+export type ChatMessage = {
+  id: string;
+  clientMessageId: string | null;
+  sessionId: string;
+  runId: string | null;
+  role: "user" | "assistant" | "tool" | "plan" | "system" | "error";
+  kind: "message" | "tool" | "plan" | "system" | "error";
+  title?: string;
+  text: string;
+  createdAt: number;
+  sequence: number;
+  deliveryStatus: "pending" | "sent" | "failed" | "streaming";
+  attachments: AttachmentRef[];
+  meta?: {
+    type?: "commandexecution" | "filechange";
+    runId?: string;
+    status?: string;
+    command?: string;
+    output?: string;
+    exitCode?: number | null;
+    fileChanges?: RunMessageFileChange[];
+    errorMessage?: string;
+    path?: string;
+    durationMs?: number;
+  };
+};
+
+export type SessionListResponse = {
+  items: SessionListItem[];
+  nextCursor: string | null;
+  approvals: ApprovalQueueItem[];
+};
+
+export type SessionMessagesResponse = {
+  sessionId: string;
+  messages: ChatMessage[];
+  nextCursor: string | null;
+  latestRunId: string | null;
+};
+
+export type SendMessageAccepted = {
+  sessionId: string;
+  message: ChatMessage;
+  queueStatus: "accepted" | "queued" | "retrying" | "failed";
+  latestRunId: string | null;
 };
 
 export type TerminalSessionStatus = "running" | "stopped";
@@ -290,6 +366,11 @@ export const sseEventKinds = [
   "run.completed",
   "run.failed",
   "run.stopped",
+  "session.upsert",
+  "message.upsert",
+  "message.failed",
+  "message.ack",
+  "outbox.updated",
   "terminal.started",
   "terminal.output",
   "terminal.stopped",

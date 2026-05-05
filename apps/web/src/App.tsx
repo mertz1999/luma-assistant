@@ -29,14 +29,14 @@ import type {
   ApprovalPolicy,
   ApprovalQueueItem,
   AttachmentRef,
+  ChatMessage,
   DiffSnapshot,
   FileTreeNode,
   RunRecord,
-  RunListItem,
-  RunMessageEntry,
   RunSourceTag,
   SandboxMode,
-  StartRunInput,
+  SendMessageInput,
+  SessionListItem,
   TerminalSessionSnapshot,
   WorkspaceOption,
 } from "@agentic/shared";
@@ -44,23 +44,24 @@ import {
   archiveSession,
   connectEvents,
   deleteSession,
+  sendMessage,
   getAccountStatus,
   getBootstrapLite,
   getDiff,
   getFileTree,
   getMcpStatus,
-  getRunList,
-  getRunMessages,
+  getSessionList,
+  getSessionMessages,
   getSystemStatus,
   getTerminal,
   interruptTerminal,
   loginWithPassword,
   getRun,
   rerun,
+  retryMessage,
   setApiAuthToken,
   sendTerminalInput,
   setActiveWorkspace,
-  startRun,
   startTerminal,
   stopRun,
   stopTerminal,
@@ -82,13 +83,31 @@ type DebugLogEntry = {
   text: string;
 };
 
-type TimelineEntry = RunMessageEntry;
+type TimelineEntry = {
+  key: string;
+  messageId: string;
+  clientMessageId: string | null;
+  sessionId: string;
+  role: ChatMessage["role"];
+  kind: ChatMessage["kind"];
+  title?: string;
+  text: string;
+  pending: boolean;
+  at: number;
+  sequence: number;
+  deliveryStatus: ChatMessage["deliveryStatus"];
+  attachments?: AttachmentRef[];
+  meta?: ChatMessage["meta"];
+};
 
 type SessionCard = {
   id: string;
   sessionId: string;
+  latestRunId: string | null;
+  messageCount: number;
+  lastMessagePreview: string;
   summary: string;
-  status: RunListItem["status"];
+  status: SessionListItem["status"];
   updatedAt: number;
   sourceTag: RunSourceTag;
   sourceRaw: string;
@@ -465,9 +484,13 @@ function runSessionId(run: RunRecord): string {
 }
 
 function describeSessionMeta(session: SessionCard): string {
+  if (!session.historyOnly) {
+    return session.lastMessagePreview || `${session.messageCount} message${session.messageCount === 1 ? "" : "s"}`;
+  }
+
   const workspaceName = session.workspace.split(/[\\/]/).filter(Boolean).pop() || session.workspace;
   if (workspaceName) return workspaceName;
-  return session.historyOnly ? "External session" : "In-app run";
+  return "External session";
 }
 
 function getSessionSourceBadge(session: SessionCard): { label: string; className: string } {
@@ -510,11 +533,14 @@ function statusClass(status: string): string {
   return "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-200";
 }
 
-function buildSessionCards(items: RunListItem[]): SessionCard[] {
+function buildSessionCards(items: SessionListItem[]): SessionCard[] {
   return items.map((item) => ({
     id: item.id,
-    sessionId: item.sessionId,
-    summary: item.name,
+    sessionId: item.id,
+    latestRunId: item.latestRunId,
+    messageCount: item.messageCount,
+    lastMessagePreview: item.lastMessagePreview,
+    summary: item.title,
     status: item.status,
     updatedAt: item.updatedAt,
     sourceTag: item.sourceTag,
@@ -524,17 +550,119 @@ function buildSessionCards(items: RunListItem[]): SessionCard[] {
   }));
 }
 
+function findSessionByRunId(sessions: SessionCard[], runId: string | null): SessionCard | null {
+  if (!runId) return null;
+  return sessions.find((session) => session.latestRunId === runId || session.id === runId) || null;
+}
+
+function chatMessageToTimelineEntry(message: ChatMessage): TimelineEntry {
+  return {
+    key: message.id,
+    messageId: message.id,
+    clientMessageId: message.clientMessageId,
+    sessionId: message.sessionId,
+    role: message.role,
+    kind: message.kind,
+    title: message.title,
+    text: message.text,
+    pending: message.deliveryStatus === "pending" || message.deliveryStatus === "streaming",
+    at: message.createdAt,
+    sequence: message.sequence,
+    deliveryStatus: message.deliveryStatus,
+    attachments: readAttachmentRefs(message.attachments),
+    meta: message.meta ? { ...message.meta } : undefined,
+  };
+}
+
+function sameTimelineMessage(left: TimelineEntry, right: TimelineEntry): boolean {
+  if (left.messageId && right.messageId && left.messageId === right.messageId) return true;
+  return Boolean(left.clientMessageId && right.clientMessageId && left.clientMessageId === right.clientMessageId);
+}
+
 function mergeTimelineEntries(older: TimelineEntry[], newer: TimelineEntry[]): TimelineEntry[] {
   const merged: TimelineEntry[] = [];
-  const seen = new Set<string>();
+  const seenMessageIds = new Set<string>();
+  const seenClientIds = new Set<string>();
 
   for (const entry of [...older, ...newer]) {
-    if (seen.has(entry.key)) continue;
-    seen.add(entry.key);
+    if (entry.messageId && seenMessageIds.has(entry.messageId)) continue;
+    if (entry.clientMessageId && seenClientIds.has(entry.clientMessageId)) continue;
+    if (entry.messageId) seenMessageIds.add(entry.messageId);
+    if (entry.clientMessageId) seenClientIds.add(entry.clientMessageId);
     merged.push(entry);
   }
 
-  return merged;
+  return merged.sort((a, b) => a.sequence - b.sequence || a.at - b.at);
+}
+
+function upsertTimelineEntry(entries: TimelineEntry[], nextEntry: TimelineEntry): TimelineEntry[] {
+  const next = [...entries];
+  const index = next.findIndex((entry) => sameTimelineMessage(entry, nextEntry));
+  if (index >= 0) {
+    next[index] = nextEntry;
+  } else {
+    next.push(nextEntry);
+  }
+  return next.sort((a, b) => a.sequence - b.sequence || a.at - b.at);
+}
+
+function removeTimelineEntryByClientMessageId(entries: TimelineEntry[], clientMessageId: string): TimelineEntry[] {
+  return entries.filter((entry) => entry.clientMessageId !== clientMessageId);
+}
+
+function buildOptimisticUserEntry(
+  sessionId: string,
+  clientMessageId: string,
+  text: string,
+  attachments: AttachmentRef[],
+): TimelineEntry {
+  const now = Date.now();
+  return {
+    key: `optimistic_${clientMessageId}`,
+    messageId: `optimistic_${clientMessageId}`,
+    clientMessageId,
+    sessionId,
+    role: "user",
+    kind: "message",
+    title: "You",
+    text,
+    pending: true,
+    at: now,
+    sequence: now,
+    deliveryStatus: "pending",
+    attachments: readAttachmentRefs(attachments),
+  };
+}
+
+function buildLocalTimelineEntry(
+  sessionId: string,
+  key: string,
+  role: TimelineEntry["role"],
+  title: string,
+  text: string,
+  at: number,
+): TimelineEntry {
+  let kind: TimelineEntry["kind"] = "message";
+  if (role === "tool") kind = "tool";
+  else if (role === "plan") kind = "plan";
+  else if (role === "system") kind = "system";
+  else if (role === "error") kind = "error";
+
+  return {
+    key,
+    messageId: key,
+    clientMessageId: null,
+    sessionId,
+    role,
+    kind,
+    title,
+    text,
+    pending: false,
+    at,
+    sequence: at,
+    deliveryStatus: "sent",
+    attachments: [],
+  };
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {
@@ -568,6 +696,55 @@ function readAttachmentRefs(input: unknown): AttachmentRef[] {
     .map((value) => readAttachmentRef(value))
     .filter((value): value is AttachmentRef => value !== null)
     .slice(0, attachmentMaxFiles);
+}
+
+function readChatMessage(input: unknown): ChatMessage | null {
+  if (!isRecord(input)) return null;
+  return typeof input.id === "string"
+    && typeof input.sessionId === "string"
+    && typeof input.role === "string"
+    && typeof input.kind === "string"
+    && typeof input.text === "string"
+    && typeof input.createdAt === "number"
+    && typeof input.sequence === "number"
+    && typeof input.deliveryStatus === "string"
+    ? {
+        ...input,
+        clientMessageId: typeof input.clientMessageId === "string" ? input.clientMessageId : null,
+        runId: typeof input.runId === "string" ? input.runId : null,
+        title: typeof input.title === "string" ? input.title : undefined,
+        attachments: readAttachmentRefs(input.attachments),
+        meta: isRecord(input.meta) ? { ...input.meta } : undefined,
+      } as ChatMessage
+    : null;
+}
+
+function readSessionListItem(input: unknown): SessionListItem | null {
+  if (!isRecord(input)) return null;
+  return typeof input.id === "string"
+    && typeof input.title === "string"
+    && typeof input.status === "string"
+    && typeof input.updatedAt === "number"
+    && typeof input.sourceTag === "string"
+    && typeof input.sourceRaw === "string"
+    && typeof input.workspace === "string"
+    && typeof input.lastMessagePreview === "string"
+    && typeof input.messageCount === "number"
+    && typeof input.historyOnly === "boolean"
+    ? {
+        id: input.id,
+        title: input.title,
+        status: input.status as SessionListItem["status"],
+        updatedAt: input.updatedAt,
+        sourceTag: input.sourceTag as RunSourceTag,
+        sourceRaw: input.sourceRaw,
+        workspace: input.workspace,
+        latestRunId: typeof input.latestRunId === "string" ? input.latestRunId : null,
+        lastMessagePreview: input.lastMessagePreview,
+        messageCount: input.messageCount,
+        historyOnly: input.historyOnly,
+      }
+    : null;
 }
 
 function toJson(input: string): Record<string, unknown> | null {
@@ -1321,7 +1498,7 @@ export function App(): JSX.Element {
 
   const [workspaces, setWorkspaces] = useState<WorkspaceOption[]>([]);
   const [activeWorkspace, setWorkspace] = useState("");
-  const [runItems, setRunItems] = useState<RunListItem[]>([]);
+  const [runItems, setRunItems] = useState<SessionListItem[]>([]);
   const [runListNextCursor, setRunListNextCursor] = useState<string | null>(null);
   const [loadingMoreRunItems, setLoadingMoreRunItems] = useState(false);
   const [messagesByRunId, setMessagesByRunId] = useState<Record<string, TimelineEntry[]>>({});
@@ -1378,7 +1555,7 @@ export function App(): JSX.Element {
   const timelineShouldAutoScrollRef = useRef(true);
   const suppressTimelineScrollTrackingRef = useRef(false);
   const timelineScrollTrackingTimeoutRef = useRef<number | null>(null);
-  const pendingTimelineExpansionRef = useRef<{ runId: string; scrollHeight: number; scrollTop: number } | null>(null);
+  const pendingTimelineExpansionRef = useRef<{ sessionKey: string; scrollHeight: number; scrollTop: number } | null>(null);
   const selectedRunRefreshTimeoutRef = useRef<number | null>(null);
   const previousTimelineStateRef = useRef<{ sessionKey: string; length: number }>({
     sessionKey: draftSessionKey,
@@ -1582,7 +1759,6 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     if (!authReady || !isAuthenticated) return;
-    const selectedIsHistory = runItems.some((item) => item.id === selectedRunId && item.historyOnly);
     const es = connectEvents((event) => {
       if (event.kind === "heartbeat") return;
 
@@ -1621,34 +1797,76 @@ export function App(): JSX.Element {
         return;
       }
 
-      if (event.kind === "run.stdout" || event.kind === "run.stderr" || event.kind === "run.item") {
-        if (event.runId && event.runId === selectedRunId && !selectedIsHistory) {
-          scheduleSelectedRunRefresh(event.runId);
+      if (event.kind === "session.upsert") {
+        const session = readSessionListItem(event.payload?.session);
+        if (!session) return;
+        const previousSessionId = typeof event.payload?.previousSessionId === "string" ? event.payload.previousSessionId : null;
+        applySessionUpsert(session, previousSessionId);
+        return;
+      }
+
+      if (event.kind === "message.upsert" || event.kind === "message.ack" || event.kind === "message.failed") {
+        const message = readChatMessage(event.payload?.message);
+        if (!message) return;
+        applyIncomingMessage(message);
+        if (message.runId && message.runId === selectedRunId) {
+          void loadSelectedRunRecord(message.runId);
         }
         return;
       }
 
       if (event.kind === "run.diffUpdated" && event.runId === selectedRunId) {
         setDiff(event.payload as unknown as DiffSnapshot);
+        return;
       }
 
-      void refreshRunList(selectedRunId);
-      if (selectedRunId && !selectedIsHistory) {
-        scheduleSelectedRunRefresh(selectedRunId);
+      if (
+        (event.kind === "run.started"
+          || event.kind === "run.completed"
+          || event.kind === "run.failed"
+          || event.kind === "run.stopped")
+        && event.runId
+        && event.runId === selectedRunId
+      ) {
+        void loadSelectedRunRecord(event.runId);
+        return;
+      }
+
+      if (event.kind === "run.approvalQueued") {
+        void refreshRunList(selectedSessionId);
       }
     });
 
+    let hasOpenedOnce = false;
+    let shouldRefreshSelectedSession = false;
+
+    es.onopen = () => {
+      if (!hasOpenedOnce) {
+        hasOpenedOnce = true;
+        shouldRefreshSelectedSession = false;
+        return;
+      }
+      if (!shouldRefreshSelectedSession || !selectedSessionId) return;
+      shouldRefreshSelectedSession = false;
+      void loadRunMessagesPage(selectedSessionId, { reset: true });
+    };
+
+    es.onerror = () => {
+      if (!hasOpenedOnce) return;
+      shouldRefreshSelectedSession = true;
+    };
+
     return () => es.close();
-  }, [selectedRunId, runItems, authReady, isAuthenticated]);
+  }, [selectedRunId, selectedSessionId, authReady, isAuthenticated]);
 
   useEffect(() => {
-    const selectedIsHistory = runItems.some((item) => item.id === selectedRunId && item.historyOnly);
+    const selectedIsHistory = runItems.some((item) => item.id === selectedSessionId && item.historyOnly);
     if (!selectedRunId || isDraftSession || selectedIsHistory) {
       setDiff(null);
       return;
     }
     void loadDiff(selectedRunId);
-  }, [selectedRunId, isDraftSession, runItems]);
+  }, [selectedRunId, selectedSessionId, isDraftSession, runItems]);
 
   useEffect(() => {
     if (!activeWorkspace) return;
@@ -1662,8 +1880,8 @@ export function App(): JSX.Element {
   }, [allSessions, statusFilter]);
 
   const selectedSession = useMemo(
-    () => allSessions.find((session) => session.id === selectedRunId) || null,
-    [allSessions, selectedRunId],
+    () => allSessions.find((session) => session.id === selectedSessionId) || null,
+    [allSessions, selectedSessionId],
   );
   const selectedTerminal = useMemo(
     () => (selectedSessionId ? terminalsBySession[selectedSessionId] || null : null),
@@ -1677,16 +1895,16 @@ export function App(): JSX.Element {
   const sessionTimelineKey = selectedSessionId || draftSessionKey;
   const planSessionState = planFlowBySession[sessionTimelineKey] || "idle";
   const timeline = useMemo(() => {
-    const base = selectedRunId && !isDraftSession ? (messagesByRunId[selectedRunId] || []) : [];
+    const base = messagesByRunId[sessionTimelineKey] || [];
     const slashEntries = slashEntriesBySession[sessionTimelineKey] || [];
     return [...base, ...slashEntries].sort((a, b) => a.at - b.at);
-  }, [selectedRunId, isDraftSession, messagesByRunId, sessionTimelineKey, slashEntriesBySession]);
+  }, [messagesByRunId, sessionTimelineKey, slashEntriesBySession]);
   const debugLogs = useMemo(
     () => collectSessionDebugLogs(selectedRunRecord ? [selectedRunRecord] : []),
     [selectedRunRecord],
   );
   const visibleTimeline = timeline;
-  const hiddenTimelineCount = selectedRunId && messageNextCursorByRunId[selectedRunId] ? messagePageSize : 0;
+  const hiddenTimelineCount = selectedSessionId && messageNextCursorByRunId[selectedSessionId] ? messagePageSize : 0;
   const pendingApprovals = useMemo(() => approvals.filter((item) => item.status === "pending"), [approvals]);
   const slashSuggestions = useMemo(() => {
     const trimmed = prompt.trimStart();
@@ -1727,44 +1945,48 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     const pending = pendingTimelineExpansionRef.current;
-    if (!pending || pending.runId !== (selectedRunId || draftSessionKey)) return;
+    if (!pending || pending.sessionKey !== sessionTimelineKey) return;
     const node = timelineScrollRef.current;
     if (!node) return;
 
     node.scrollTop = pending.scrollTop + (node.scrollHeight - pending.scrollHeight);
     pendingTimelineExpansionRef.current = null;
-  }, [visibleTimeline.length, selectedRunId]);
+  }, [visibleTimeline.length, sessionTimelineKey]);
 
   useEffect(() => {
-    if (!selectedRunId) {
+    if (!selectedSessionId) {
       if (isDraftSession) {
-        setSelectedSessionId(null);
+        setSelectedRunId(null);
         return;
       }
       if (allSessions.length > 0) {
-        setSelectedRunId(allSessions[0].id);
-        setSelectedSessionId(allSessions[0].sessionId);
+        setSelectedSessionId(allSessions[0].id);
+        setSelectedRunId(allSessions[0].latestRunId);
       }
       return;
     }
 
-    const selected = allSessions.find((session) => session.id === selectedRunId);
+    const selected = allSessions.find((session) => session.id === selectedSessionId);
     if (selected) {
-      if (selectedSessionId !== selected.sessionId) {
-        setSelectedSessionId(selected.sessionId);
+      if (selectedRunId !== selected.latestRunId) {
+        setSelectedRunId(selected.latestRunId);
       }
+      return;
+    }
+
+    if (messagesByRunId[selectedSessionId]?.length) {
       return;
     }
 
     if (allSessions.length > 0) {
-      setSelectedRunId(allSessions[0].id);
-      setSelectedSessionId(allSessions[0].sessionId);
+      setSelectedSessionId(allSessions[0].id);
+      setSelectedRunId(allSessions[0].latestRunId);
       return;
     }
 
-    setSelectedRunId(null);
     setSelectedSessionId(null);
-  }, [allSessions, isDraftSession, selectedRunId, selectedSessionId, setSelectedRunId]);
+    setSelectedRunId(null);
+  }, [allSessions, isDraftSession, messagesByRunId, selectedRunId, selectedSessionId, setSelectedRunId]);
 
   useEffect(() => {
     if (!selectedSessionId) {
@@ -1776,17 +1998,17 @@ export function App(): JSX.Element {
   }, [selectedSessionId]);
 
   useEffect(() => {
-    if (isDraftSession || !selectedRunId || !selectedSession) {
+    if (isDraftSession || !selectedSessionId || !selectedSession) {
       setSelectedRunRecord(null);
       return;
     }
-    void loadRunMessagesPage(selectedRunId, { reset: true });
-    if (!selectedSession.historyOnly) {
-      void loadSelectedRunRecord(selectedRunId);
+    void loadRunMessagesPage(selectedSessionId, { reset: true });
+    if (!selectedSession.historyOnly && selectedSession.latestRunId) {
+      void loadSelectedRunRecord(selectedSession.latestRunId);
     } else {
       setSelectedRunRecord(null);
     }
-  }, [isDraftSession, selectedRunId, selectedSession]);
+  }, [isDraftSession, selectedSessionId, selectedSession]);
 
   useEffect(() => {
     const node = terminalOutputRef.current;
@@ -1837,7 +2059,7 @@ export function App(): JSX.Element {
     try {
       const [payload, listPayload] = await Promise.all([
         getBootstrapLite(),
-        getRunList(runListPageSize, null, showAllHistory),
+        getSessionList(runListPageSize, null, showAllHistory),
       ]);
       setWorkspaces(payload.workspaces);
       setWorkspace(payload.activeWorkspace);
@@ -1848,16 +2070,24 @@ export function App(): JSX.Element {
       setSandbox(payload.defaults.sandbox);
       const sessions = buildSessionCards(listPayload.items);
       if (isDraftSession) return;
-      if (selectedRunId) {
-        const current = sessions.find((session) => session.id === selectedRunId);
+      if (selectedSessionId) {
+        const current = sessions.find((session) => session.id === selectedSessionId);
         if (current) {
-          setSelectedSessionId(current.sessionId);
+          setSelectedRunId(current.latestRunId);
+          return;
+        }
+      }
+      if (selectedRunId) {
+        const current = findSessionByRunId(sessions, selectedRunId);
+        if (current) {
+          setSelectedSessionId(current.id);
+          setSelectedRunId(current.latestRunId);
           return;
         }
       }
       if (sessions.length > 0) {
-        setSelectedRunId(sessions[0].id);
-        setSelectedSessionId(sessions[0].sessionId);
+        setSelectedSessionId(sessions[0].id);
+        setSelectedRunId(sessions[0].latestRunId);
       }
     } finally {
       setLoadingRunList(false);
@@ -1865,8 +2095,8 @@ export function App(): JSX.Element {
     }
   }
 
-  async function refreshRunList(preferredRunId?: string | null): Promise<void> {
-    const payload = await getRunList(runListPageSize, null, showAllHistory);
+  async function refreshRunList(preferredSessionId?: string | null): Promise<void> {
+    const payload = await getSessionList(runListPageSize, null, showAllHistory);
     setRunItems(payload.items);
     setRunListNextCursor(payload.nextCursor);
     setApprovals(payload.approvals);
@@ -1874,36 +2104,45 @@ export function App(): JSX.Element {
     if (isDraftSession) return;
 
     const sessions = buildSessionCards(payload.items);
-    const preferred = preferredRunId ? sessions.find((session) => session.id === preferredRunId) : null;
+    const preferred = preferredSessionId ? sessions.find((session) => session.id === preferredSessionId) : null;
     if (preferred) {
-      setSelectedRunId(preferred.id);
-      setSelectedSessionId(preferred.sessionId);
+      setSelectedSessionId(preferred.id);
+      setSelectedRunId(preferred.latestRunId);
       return;
     }
 
-    if (selectedRunId) {
-      const current = sessions.find((session) => session.id === selectedRunId);
+    if (selectedSessionId) {
+      const current = sessions.find((session) => session.id === selectedSessionId);
       if (current) {
-        setSelectedSessionId(current.sessionId);
+        setSelectedRunId(current.latestRunId);
+        return;
+      }
+    }
+
+    if (selectedRunId) {
+      const current = findSessionByRunId(sessions, selectedRunId);
+      if (current) {
+        setSelectedSessionId(current.id);
+        setSelectedRunId(current.latestRunId);
         return;
       }
     }
 
     if (sessions.length > 0) {
-      setSelectedRunId(sessions[0].id);
-      setSelectedSessionId(sessions[0].sessionId);
+      setSelectedSessionId(sessions[0].id);
+      setSelectedRunId(sessions[0].latestRunId);
       return;
     }
 
-    setSelectedRunId(null);
     setSelectedSessionId(null);
+    setSelectedRunId(null);
   }
 
   async function loadMoreRunItemsPage(): Promise<void> {
     if (!runListNextCursor || loadingMoreRunItems) return;
     setLoadingMoreRunItems(true);
     try {
-      const payload = await getRunList(runListPageSize, runListNextCursor, showAllHistory);
+      const payload = await getSessionList(runListPageSize, runListNextCursor, showAllHistory);
       setRunItems((prev) => {
         const next = new Map(prev.map((item) => [item.id, item]));
         for (const item of payload.items) next.set(item.id, item);
@@ -1916,20 +2155,28 @@ export function App(): JSX.Element {
     }
   }
 
-  async function loadRunMessagesPage(runId: string, options?: { reset?: boolean; before?: string | null }): Promise<void> {
-    const before = options?.reset ? null : (options?.before ?? messageNextCursorByRunId[runId] ?? null);
+  async function loadRunMessagesPage(sessionId: string, options?: { reset?: boolean; before?: string | null }): Promise<void> {
+    const before = options?.reset ? null : (options?.before ?? messageNextCursorByRunId[sessionId] ?? null);
     if (!options?.reset && !before) return;
 
-    setLoadingMessagesByRunId((prev) => ({ ...prev, [runId]: true }));
+    setLoadingMessagesByRunId((prev) => ({ ...prev, [sessionId]: true }));
     try {
-      const payload = await getRunMessages(runId, before);
+      const payload = await getSessionMessages(sessionId, before);
       setMessagesByRunId((prev) => ({
         ...prev,
-        [runId]: options?.reset ? payload.entries : mergeTimelineEntries(payload.entries, prev[runId] || []),
+        [sessionId]: options?.reset
+          ? payload.messages.map((message) => chatMessageToTimelineEntry(message))
+          : mergeTimelineEntries(
+            payload.messages.map((message) => chatMessageToTimelineEntry(message)),
+            prev[sessionId] || [],
+          ),
       }));
-      setMessageNextCursorByRunId((prev) => ({ ...prev, [runId]: payload.nextCursor }));
+      setMessageNextCursorByRunId((prev) => ({ ...prev, [sessionId]: payload.nextCursor }));
+      if (selectedSessionId === sessionId && payload.latestRunId !== undefined) {
+        setSelectedRunId(payload.latestRunId);
+      }
     } finally {
-      setLoadingMessagesByRunId((prev) => ({ ...prev, [runId]: false }));
+      setLoadingMessagesByRunId((prev) => ({ ...prev, [sessionId]: false }));
     }
   }
 
@@ -1942,15 +2189,19 @@ export function App(): JSX.Element {
     }
   }
 
-  function scheduleSelectedRunRefresh(runId: string): void {
+  function scheduleSelectedRunRefresh(sessionKey: string, runId: string | null): void {
     if (selectedRunRefreshTimeoutRef.current !== null) {
       window.clearTimeout(selectedRunRefreshTimeoutRef.current);
     }
 
     selectedRunRefreshTimeoutRef.current = window.setTimeout(() => {
       selectedRunRefreshTimeoutRef.current = null;
-      void loadRunMessagesPage(runId, { reset: true });
-      void loadSelectedRunRecord(runId);
+      void loadRunMessagesPage(sessionKey, { reset: true });
+      if (runId) {
+        void loadSelectedRunRecord(runId);
+      } else {
+        setSelectedRunRecord(null);
+      }
     }, 150);
   }
 
@@ -1983,6 +2234,78 @@ export function App(): JSX.Element {
     } catch {
       // ignore terminal fetch errors in background
     }
+  }
+
+  function moveSessionCollections(previousSessionId: string, nextSessionId: string): void {
+    setMessagesByRunId((prev) => {
+      if (!(previousSessionId in prev) || previousSessionId === nextSessionId) return prev;
+      const next = { ...prev, [nextSessionId]: mergeTimelineEntries(prev[previousSessionId] || [], prev[nextSessionId] || []) };
+      delete next[previousSessionId];
+      return next;
+    });
+    setMessageNextCursorByRunId((prev) => {
+      if (!(previousSessionId in prev) || previousSessionId === nextSessionId) return prev;
+      const next = { ...prev, [nextSessionId]: prev[nextSessionId] ?? prev[previousSessionId] ?? null };
+      delete next[previousSessionId];
+      return next;
+    });
+    setLoadingMessagesByRunId((prev) => {
+      if (!(previousSessionId in prev) || previousSessionId === nextSessionId) return prev;
+      const next = { ...prev, [nextSessionId]: prev[nextSessionId] ?? prev[previousSessionId] ?? false };
+      delete next[previousSessionId];
+      return next;
+    });
+    setSlashEntriesBySession((prev) => {
+      if (!(previousSessionId in prev) || previousSessionId === nextSessionId) return prev;
+      const next = {
+        ...prev,
+        [nextSessionId]: mergeTimelineEntries(prev[previousSessionId] || [], prev[nextSessionId] || []),
+      };
+      delete next[previousSessionId];
+      return next;
+    });
+    setQueuedBySession((prev) => {
+      if (!(previousSessionId in prev) || previousSessionId === nextSessionId) return prev;
+      const next = { ...prev, [nextSessionId]: [...(prev[nextSessionId] || []), ...(prev[previousSessionId] || [])] };
+      delete next[previousSessionId];
+      return next;
+    });
+    setPlanFlowBySession((prev) => {
+      if (!(previousSessionId in prev) || previousSessionId === nextSessionId) return prev;
+      const next = { ...prev, [nextSessionId]: prev[nextSessionId] || prev[previousSessionId] };
+      delete next[previousSessionId];
+      return next;
+    });
+  }
+
+  function applySessionUpsert(session: SessionListItem, previousSessionId: string | null): void {
+    if (previousSessionId && previousSessionId !== session.id) {
+      moveSessionCollections(previousSessionId, session.id);
+      if (selectedSessionId === previousSessionId) {
+        setSelectedSessionId(session.id);
+      }
+    }
+
+    setRunItems((prev) => {
+      const next = new Map(prev.map((item) => [item.id, item]));
+      if (previousSessionId && previousSessionId !== session.id) {
+        next.delete(previousSessionId);
+      }
+      next.set(session.id, session);
+      return [...next.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+    });
+
+    if (selectedSessionId === session.id) {
+      setSelectedRunId(session.latestRunId);
+    }
+  }
+
+  function applyIncomingMessage(message: ChatMessage): void {
+    const nextEntry = chatMessageToTimelineEntry(message);
+    setMessagesByRunId((prev) => ({
+      ...prev,
+      [message.sessionId]: upsertTimelineEntry(prev[message.sessionId] || [], nextEntry),
+    }));
   }
 
   function resolvePlanState(sessionKey: string): PlanSessionState {
@@ -2073,9 +2396,16 @@ export function App(): JSX.Element {
     });
   }
 
-  async function startCodexRun(request: QueuedMessage, focusSession: boolean): Promise<RunRecord> {
-    const input: StartRunInput = {
-      prompt: request.prompt,
+  async function startCodexRun(request: QueuedMessage, focusSession: boolean): Promise<{ sessionId: string; latestRunId: string | null }> {
+    const optimisticEntry = buildOptimisticUserEntry(request.sessionKey, request.id, request.prompt, request.attachments);
+    setMessagesByRunId((prev) => ({
+      ...prev,
+      [request.sessionKey]: upsertTimelineEntry(prev[request.sessionKey] || [], optimisticEntry),
+    }));
+
+    const input: SendMessageInput = {
+      clientMessageId: request.id,
+      text: request.prompt,
       attachments: request.attachments,
       workspace: request.workspace,
       model: request.model,
@@ -2085,35 +2415,47 @@ export function App(): JSX.Element {
       sessionId: request.sessionKey === draftSessionKey ? undefined : request.sessionKey,
     };
 
-    const payload = await startRun(input);
-    await refreshRunList(payload.run.id);
-    setIsDraftSession(false);
-    const nextSessionKey = runSessionId(payload.run);
+    try {
+      const payload = await sendMessage(input);
+      const nextSessionKey = payload.sessionId;
 
-    if (request.sessionKey === draftSessionKey) {
-      moveDraftTimelineEntries(nextSessionKey);
-      setPlanState(draftSessionKey, "idle");
+      if (request.sessionKey === draftSessionKey) {
+        moveDraftTimelineEntries(nextSessionKey);
+        moveSessionCollections(draftSessionKey, nextSessionKey);
+        setPlanState(draftSessionKey, "idle");
+      }
+
+      setIsDraftSession(false);
+
+      if (request.planMode) {
+        setPlanState(nextSessionKey, "active");
+      }
+
+      applyIncomingMessage(payload.message);
+
+      if (focusSession) {
+        setSelectedSessionId(nextSessionKey);
+        setSelectedRunId(payload.latestRunId);
+        setRightPanelTab("tools");
+        setMobileThreadsOpen(false);
+      } else if (selectedSessionId && nextSessionKey === selectedSessionId) {
+        setSelectedRunId(payload.latestRunId);
+      }
+
+      return {
+        sessionId: nextSessionKey,
+        latestRunId: payload.latestRunId,
+      };
+    } catch (error) {
+      setMessagesByRunId((prev) => {
+        const current = prev[request.sessionKey] || [];
+        return {
+          ...prev,
+          [request.sessionKey]: removeTimelineEntryByClientMessageId(current, request.id),
+        };
+      });
+      throw error;
     }
-
-    if (request.planMode) {
-      setPlanState(nextSessionKey, "active");
-    }
-
-    if (focusSession) {
-      setSelectedSessionId(nextSessionKey);
-      setSelectedRunId(payload.run.id);
-      void loadRunMessagesPage(payload.run.id, { reset: true });
-      void loadSelectedRunRecord(payload.run.id);
-      setRightPanelTab("tools");
-      setMobileThreadsOpen(false);
-      return payload.run;
-    }
-
-    if (selectedSessionId && nextSessionKey === selectedSessionId) {
-      setSelectedRunId(payload.run.id);
-    }
-
-    return payload.run;
   }
 
   async function runQueuedMessage(queued: QueuedMessage): Promise<void> {
@@ -2124,14 +2466,14 @@ export function App(): JSX.Element {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to run queued message";
       pushSlashEntries(queued.sessionKey, [
-        {
-          key: `queue_${queued.id}_error`,
-          role: "error",
-          title: "System",
-          text: `Queued message failed: ${message}`,
-          pending: false,
-          at: Date.now(),
-        },
+        buildLocalTimelineEntry(
+          queued.sessionKey,
+          `queue_${queued.id}_error`,
+          "error",
+          "System",
+          `Queued message failed: ${message}`,
+          Date.now(),
+        ),
       ]);
     } finally {
       removeQueuedMessage(queued.sessionKey, queued.id);
@@ -2151,7 +2493,7 @@ export function App(): JSX.Element {
       focusSession?: boolean;
       onBeforeSubmit?: () => void;
       onError?: (message: string) => void;
-      onSubmitted?: (run: RunRecord | null) => void;
+      onSubmitted?: () => void;
     },
   ): Promise<void> {
     scrollTimelineToBottom("auto");
@@ -2163,20 +2505,12 @@ export function App(): JSX.Element {
       approvalPolicy: options?.approvalPolicy,
     });
     const focusSession = options?.focusSession ?? (selectedSessionId === sessionKey || sessionKey === draftSessionKey);
-    const isRealSession = sessionKey !== draftSessionKey;
-    const hasRunningSessionTask = isRealSession && runningSessionIds.has(sessionKey);
-
-    if (isRealSession && (hasRunningSessionTask || submitting || processingQueueItemId !== null)) {
-      enqueueMessage(request);
-      options?.onSubmitted?.(null);
-      return;
-    }
 
     options?.onBeforeSubmit?.();
     setSubmitting(true);
     try {
-      const run = await startCodexRun(request, focusSession);
-      options?.onSubmitted?.(run);
+      await startCodexRun(request, focusSession);
+      options?.onSubmitted?.();
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to start run";
       options?.onError?.(message);
@@ -2303,70 +2637,42 @@ export function App(): JSX.Element {
     const messageId = `${now}_${Math.random().toString(36).slice(2, 7)}`;
     const input = (rawInput ?? prompt).trim();
     pushSlashEntries(sessionKey, [
-      {
-        key: `slash_${messageId}_user`,
-        role: "user",
-        title: "You",
-        text: input,
-        pending: false,
-        at: now,
-      },
+      buildLocalTimelineEntry(sessionKey, `slash_${messageId}_user`, "user", "You", input, now),
     ]);
 
     if (command === "/plan") {
       const activeState = resolvePlanState(sessionKey);
       if (input !== "/plan") {
         pushSlashEntries(sessionKey, [
-          {
-            key: `slash_${messageId}_plan_usage`,
-            role: "error",
-            title: "System",
-            text: buildPlanUsageText(),
-            pending: false,
-            at: now + 1,
-          },
+          buildLocalTimelineEntry(sessionKey, `slash_${messageId}_plan_usage`, "error", "System", buildPlanUsageText(), now + 1),
         ]);
         return;
       }
 
       if (activeState === "active") {
         pushSlashEntries(sessionKey, [
-          {
-            key: `slash_${messageId}_plan_active`,
-            role: "assistant",
-            title: "System",
-            text: "This session is already in the planning workflow. Continue with the next planning message or final approval step.",
-            pending: false,
-            at: now + 1,
-          },
+          buildLocalTimelineEntry(
+            sessionKey,
+            `slash_${messageId}_plan_active`,
+            "assistant",
+            "System",
+            "This session is already in the planning workflow. Continue with the next planning message or final approval step.",
+            now + 1,
+          ),
         ]);
         return;
       }
 
       setPlanState(sessionKey, "armed");
       pushSlashEntries(sessionKey, [
-        {
-          key: `slash_${messageId}_plan_enabled`,
-          role: "assistant",
-          title: "System",
-          text: buildPlanModeEnabledText(),
-          pending: false,
-          at: now + 1,
-        },
+        buildLocalTimelineEntry(sessionKey, `slash_${messageId}_plan_enabled`, "assistant", "System", buildPlanModeEnabledText(), now + 1),
       ]);
       return;
     }
 
     if (command === "/help") {
       pushSlashEntries(sessionKey, [
-        {
-          key: `slash_${messageId}_help`,
-          role: "assistant",
-          title: "System",
-          text: buildSlashHelpText(),
-          pending: false,
-          at: now + 1,
-        },
+        buildLocalTimelineEntry(sessionKey, `slash_${messageId}_help`, "assistant", "System", buildSlashHelpText(), now + 1),
       ]);
       return;
     }
@@ -2374,33 +2680,26 @@ export function App(): JSX.Element {
     if (command === "/account") {
       const payload = await getAccountStatus();
       pushSlashEntries(sessionKey, [
-        {
-          key: `slash_${messageId}_account`,
-          role: "assistant",
-          title: "System",
-          text: [
+        buildLocalTimelineEntry(
+          sessionKey,
+          `slash_${messageId}_account`,
+          "assistant",
+          "System",
+          [
             "### Token quota",
             formatTokenStatus(payload.tokenStatus),
             "",
             formatStatusBlock("Codex Account", payload.account, false),
           ].join("\n"),
-          pending: false,
-          at: Date.now(),
-        },
+          Date.now(),
+        ),
       ]);
       return;
     }
 
     if (command === "/speech") {
       pushSlashEntries(sessionKey, [
-        {
-          key: `slash_${messageId}_speech`,
-          role: "assistant",
-          title: "System",
-          text: buildSpeechSupportText(),
-          pending: false,
-          at: Date.now(),
-        },
+        buildLocalTimelineEntry(sessionKey, `slash_${messageId}_speech`, "assistant", "System", buildSpeechSupportText(), Date.now()),
       ]);
       return;
     }
@@ -2408,34 +2707,34 @@ export function App(): JSX.Element {
     if (command === "/mcp") {
       const payload = await getMcpStatus();
       pushSlashEntries(sessionKey, [
-        {
-          key: `slash_${messageId}_mcp`,
-          role: "assistant",
-          title: "System",
-          text: formatStatusBlock("Codex MCP", payload.mcp, true),
-          pending: false,
-          at: Date.now(),
-        },
+        buildLocalTimelineEntry(
+          sessionKey,
+          `slash_${messageId}_mcp`,
+          "assistant",
+          "System",
+          formatStatusBlock("Codex MCP", payload.mcp, true),
+          Date.now(),
+        ),
       ]);
       return;
     }
 
     const payload = await getSystemStatus();
     pushSlashEntries(sessionKey, [
-      {
-        key: `slash_${messageId}_status`,
-        role: "assistant",
-        title: "System",
-        text: [
+      buildLocalTimelineEntry(
+        sessionKey,
+        `slash_${messageId}_status`,
+        "assistant",
+        "System",
+        [
           "### Token quota",
           formatTokenStatus(payload.tokenStatus),
           "",
           formatStatusBlock("Codex Account", payload.account, false),
           formatStatusBlock("Codex MCP", payload.mcp, true),
         ].join("\n\n"),
-        pending: false,
-        at: Date.now(),
-      },
+        Date.now(),
+      ),
     ]);
   }
 
@@ -2478,22 +2777,15 @@ export function App(): JSX.Element {
       const now = Date.now();
       const messageId = `${now}_${Math.random().toString(36).slice(2, 7)}`;
       pushSlashEntries(sessionKey, [
-        {
-          key: `slash_${messageId}_user`,
-          role: "user",
-          title: "You",
-          text: trimmedPrompt,
-          pending: false,
-          at: now,
-        },
-        {
-          key: `slash_${messageId}_error`,
-          role: "error",
-          title: "System",
-          text: `Unknown slash command. Try \`/help\`.\n\n${buildSlashHelpText()}`,
-          pending: false,
-          at: now + 1,
-        },
+        buildLocalTimelineEntry(sessionKey, `slash_${messageId}_user`, "user", "You", trimmedPrompt, now),
+        buildLocalTimelineEntry(
+          sessionKey,
+          `slash_${messageId}_error`,
+          "error",
+          "System",
+          `Unknown slash command. Try \`/help\`.\n\n${buildSlashHelpText()}`,
+          now + 1,
+        ),
       ]);
       setPrompt("");
       return;
@@ -2533,7 +2825,7 @@ export function App(): JSX.Element {
     setStopping(true);
     try {
       await stopRun(selectedRunId);
-      await refreshRunList(selectedRunId);
+      await refreshRunList(selectedSessionId);
       void loadSelectedRunRecord(selectedRunId);
     } finally {
       setStopping(false);
@@ -2547,11 +2839,12 @@ export function App(): JSX.Element {
       approvalId: item.id,
     });
 
-    await refreshRunList(payload.run.id);
+    const nextSessionKey = runSessionId(payload.run);
+    await refreshRunList(nextSessionKey);
     setIsDraftSession(false);
-    setSelectedSessionId(runSessionId(payload.run));
+    setSelectedSessionId(nextSessionKey);
     setSelectedRunId(payload.run.id);
-    void loadRunMessagesPage(payload.run.id, { reset: true });
+    void loadRunMessagesPage(nextSessionKey, { reset: true });
     void loadSelectedRunRecord(payload.run.id);
     setRightPanelTab("tools");
     setMobileContextOpen(false);
@@ -2567,8 +2860,8 @@ export function App(): JSX.Element {
     setIsDraftSession(false);
     const target = allSessions.find((item) => item.id === sessionId);
     if (target) {
-      setSelectedRunId(target.id);
-      setSelectedSessionId(target.sessionId);
+      setSelectedSessionId(target.id);
+      setSelectedRunId(target.latestRunId);
     }
     setMobileThreadsOpen(false);
   }
@@ -2659,6 +2952,15 @@ export function App(): JSX.Element {
     } catch (error) {
       setPlanState(sessionTimelineKey, previousState);
       throw error;
+    }
+  }
+
+  async function onRetryTimelineMessage(entry: TimelineEntry): Promise<void> {
+    if (entry.role !== "user" || entry.deliveryStatus !== "failed") return;
+    try {
+      await retryMessage(entry.messageId);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Failed to retry message");
     }
   }
 
@@ -2786,21 +3088,21 @@ export function App(): JSX.Element {
   }
 
   function onLoadOlderTimelineMessages(): void {
-    if (!selectedRunId) return;
-    if (loadingMessagesByRunId[selectedRunId]) return;
-    const nextCursor = messageNextCursorByRunId[selectedRunId];
+    if (!selectedSessionId) return;
+    if (loadingMessagesByRunId[selectedSessionId]) return;
+    const nextCursor = messageNextCursorByRunId[selectedSessionId];
     if (!nextCursor) return;
 
     const node = timelineScrollRef.current;
     if (node) {
       pendingTimelineExpansionRef.current = {
-        runId: selectedRunId,
+        sessionKey: selectedSessionId,
         scrollHeight: node.scrollHeight,
         scrollTop: node.scrollTop,
       };
     }
 
-    void loadRunMessagesPage(selectedRunId, { before: nextCursor });
+    void loadRunMessagesPage(selectedSessionId, { before: nextCursor });
   }
 
   if (!authReady) {
@@ -2870,7 +3172,7 @@ export function App(): JSX.Element {
         <Card className="hidden min-h-0 flex-col overflow-hidden lg:flex">
           <SessionsPanel
             sessions={filteredSessions}
-            selectedRunId={selectedRunId}
+            selectedSessionId={selectedSessionId}
             statusFilter={statusFilter}
             setStatusFilter={setStatusFilter}
             showAllHistory={showAllHistory}
@@ -2886,8 +3188,8 @@ export function App(): JSX.Element {
 
         <Card className="flex min-h-0 flex-col overflow-hidden">
           <CenterPanel
-            loading={loading || Boolean(selectedRunId && loadingMessagesByRunId[selectedRunId] && timeline.length === 0)}
-            loadingOlderMessages={Boolean(selectedRunId && loadingMessagesByRunId[selectedRunId] && timeline.length > 0)}
+            loading={loading || Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId] && timeline.length === 0)}
+            loadingOlderMessages={Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId] && timeline.length > 0)}
             selectedSession={selectedSession}
             timeline={visibleTimeline}
             hiddenTimelineCount={hiddenTimelineCount}
@@ -2913,6 +3215,7 @@ export function App(): JSX.Element {
             onSelectSlashCommand={onSelectSlashCommand}
             queueItems={queuedMessagesForActiveSession}
             onRemoveQueueItem={(messageId) => removeQueuedMessage(sessionTimelineKey, messageId)}
+            onRetryMessage={onRetryTimelineMessage}
             onSelectAttachments={uploadPendingFiles}
             onRemovePendingAttachment={removePendingAttachment}
             voiceSupported={voiceSupported}
@@ -2979,7 +3282,7 @@ export function App(): JSX.Element {
             <Card className="flex h-full min-h-0 flex-col overflow-hidden animate-slide-in">
               <SessionsPanel
                 sessions={filteredSessions}
-                selectedRunId={selectedRunId}
+                selectedSessionId={selectedSessionId}
                 statusFilter={statusFilter}
                 setStatusFilter={setStatusFilter}
                 showAllHistory={showAllHistory}
@@ -3054,7 +3357,7 @@ export function App(): JSX.Element {
 
 type SessionsPanelProps = {
   sessions: SessionCard[];
-  selectedRunId: string | null;
+  selectedSessionId: string | null;
   statusFilter: StatusFilter;
   setStatusFilter: (next: StatusFilter) => void;
   showAllHistory: boolean;
@@ -3069,7 +3372,7 @@ type SessionsPanelProps = {
 
 function SessionsPanel({
   sessions,
-  selectedRunId,
+  selectedSessionId,
   statusFilter,
   setStatusFilter,
   showAllHistory,
@@ -3136,7 +3439,7 @@ function SessionsPanel({
                 key={session.id}
                 className={cn(
                   "w-full rounded-2xl border bg-white px-3 py-2 text-left shadow-card transition hover:-translate-y-0.5 hover:border-brand/60",
-                  selectedRunId === session.id ? "border-brand bg-brand-soft/60" : "border-card-border",
+                  selectedSessionId === session.id ? "border-brand bg-brand-soft/60" : "border-card-border",
                 )}
               >
                 <button
@@ -3237,6 +3540,7 @@ type CenterPanelProps = {
   onSelectSlashCommand: (command: SlashCommandKey) => Promise<void>;
   queueItems: QueuedMessage[];
   onRemoveQueueItem: (messageId: string) => void;
+  onRetryMessage: (entry: TimelineEntry) => Promise<void>;
   onSelectAttachments: (files: FileList | null) => Promise<void>;
   onRemovePendingAttachment: (attachmentId: string) => void;
   voiceSupported: boolean;
@@ -3262,7 +3566,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             {props.selectedSession ? props.selectedSession.summary : "No active chat"}
           </CardTitle>
           <p className="mt-1 font-mono text-[11px] text-foreground/70">
-            {props.selectedSession ? `Run: ${props.selectedSession.id}` : "Create or select a chat to start"}
+            {props.selectedSession ? `Session: ${props.selectedSession.id}` : "Create or select a chat to start"}
           </p>
           {props.selectedSession ? (
             <div className="mt-1 flex items-center gap-2">
@@ -3306,18 +3610,22 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             </div>
           ) : null}
 
-          {props.timeline.map((entry) => {
-            const hasLaterUserMessage = props.timeline.some((item) => item.role === "user" && item.at > entry.at);
+	          {props.timeline.map((entry) => {
+	            const hasLaterUserMessage = props.timeline.some((item) => item.role === "user" && item.at > entry.at);
+              const showUserDeliveryState = entry.role === "user"
+                && (entry.deliveryStatus === "pending" || entry.deliveryStatus === "failed");
+              const canRetryUserMessage = entry.role === "user" && entry.deliveryStatus === "failed";
 
-            return (
-              <article
-                key={entry.key}
-                className={cn(
-                  "animate-fade-up rounded-2xl border px-3 py-2 shadow-card",
-                  entry.role === "user" && "ml-auto max-w-[90%] border-transparent bg-gradient-to-br from-brand to-brand-dark text-white",
-                  entry.role === "assistant" && "mr-auto max-w-[90%] border-card-border bg-white",
-                  entry.role === "plan" && "mr-auto max-w-full border-brand/35 bg-brand-soft/45",
-                  entry.role === "tool" && "max-w-full border-dashed border-card-border bg-muted font-mono text-xs",
+	            return (
+	              <article
+	                key={entry.key}
+	                className={cn(
+	                  "animate-fade-up rounded-2xl border px-3 py-2 shadow-card",
+	                  entry.role === "user" && "ml-auto max-w-[90%] border-transparent bg-gradient-to-br from-brand to-brand-dark text-white",
+                    entry.role === "user" && entry.deliveryStatus === "failed" && "border-rose-200/80 from-rose-600 to-rose-700",
+	                  entry.role === "assistant" && "mr-auto max-w-[90%] border-card-border bg-white",
+	                  entry.role === "plan" && "mr-auto max-w-full border-brand/35 bg-brand-soft/45",
+	                  entry.role === "tool" && "max-w-full border-dashed border-card-border bg-muted font-mono text-xs",
                   entry.role === "system" && "mx-auto max-w-fit rounded-full border-card-border bg-white/90 px-3 py-1 text-xs text-foreground/75",
                   entry.role === "error" && "mr-auto max-w-[90%] border-rose-300 bg-rose-50 text-rose-900",
                 )}
@@ -3359,17 +3667,33 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                       </div>
                     ) : null}
                   </div>
-                ) : entry.role === "error" ? (
-                  <div
-                    className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs"
-                    dangerouslySetInnerHTML={{ __html: props.ansi.toHtml(entry.text) }}
-                  />
-                ) : (
-                  <div className="break-words text-sm leading-relaxed">{entry.text}</div>
-                )}
-              </article>
-            );
-          })}
+	                ) : entry.role === "error" ? (
+	                  <div
+	                    className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs"
+	                    dangerouslySetInnerHTML={{ __html: props.ansi.toHtml(entry.text) }}
+	                  />
+	                ) : (
+	                  <div className="break-words text-sm leading-relaxed">{entry.text}</div>
+	                )}
+
+                {showUserDeliveryState ? (
+                  <div className="mt-2 flex items-center justify-end gap-2 text-[11px] text-white/85">
+                    <span>{entry.deliveryStatus === "failed" ? "Failed to send" : "Sending..."}</span>
+                    {canRetryUserMessage ? (
+                      <button
+                        type="button"
+                        className="rounded-full border border-white/30 px-2 py-0.5 font-semibold transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
+                        onClick={() => void props.onRetryMessage(entry)}
+                        disabled={props.submitting}
+                      >
+                        Retry
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+	              </article>
+	            );
+	          })}
 
           {props.hasPendingIndicator ? (
             <article className="mr-auto max-w-full animate-fade-up rounded-2xl border border-brand/35 bg-brand-soft/45 px-3 py-2 shadow-card">

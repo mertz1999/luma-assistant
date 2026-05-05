@@ -3,6 +3,7 @@ import type {
   AppBootstrap,
   AppBootstrapLite,
   AttachmentRef,
+  ChatMessage,
   CodexAccountStatusResponse,
   CodexMcpStatusResponse,
   CodexSystemStatusResponse,
@@ -11,7 +12,11 @@ import type {
   RunRecord,
   RunListResponse,
   RunMessagesResponse,
+  SendMessageAccepted,
+  SendMessageInput,
   SessionHistoryEntry,
+  SessionListResponse,
+  SessionMessagesResponse,
   SessionTranscriptResponse,
   SseEvent,
   StartRunInput,
@@ -81,11 +86,25 @@ export function getRunList(limit = 60, cursor?: string | null, includeHistory = 
   return request(`/api/runs/list?${params.toString()}`);
 }
 
+export function getSessionList(limit = 60, cursor?: string | null, includeHistory = false): Promise<SessionListResponse> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+  if (includeHistory) params.set("includeHistory", "1");
+  return request(`/api/sessions/list?${params.toString()}`);
+}
+
 export function getRunMessages(runId: string, before?: string | null): Promise<RunMessagesResponse> {
   const params = new URLSearchParams();
   if (before) params.set("before", before);
   const suffix = params.size > 0 ? `?${params.toString()}` : "";
   return request(`/api/runs/${encodeURIComponent(runId)}/messages${suffix}`);
+}
+
+export function getSessionMessages(sessionId: string, before?: string | null): Promise<SessionMessagesResponse> {
+  const params = new URLSearchParams();
+  if (before) params.set("before", before);
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return request(`/api/sessions/${encodeURIComponent(sessionId)}/messages${suffix}`);
 }
 
 export function getSessionHistory(): Promise<{ entries: SessionHistoryEntry[] }> {
@@ -112,6 +131,20 @@ export function startRun(input: StartRunInput): Promise<{ run: RunRecord }> {
   return request("/api/runs/start", {
     method: "POST",
     body: JSON.stringify(input),
+  });
+}
+
+export function sendMessage(input: SendMessageInput): Promise<SendMessageAccepted> {
+  return request("/api/messages/send", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function retryMessage(messageId: string): Promise<{ messageId: string; sessionId: string; queued: boolean }> {
+  return request(`/api/messages/${encodeURIComponent(messageId)}/retry`, {
+    method: "POST",
+    body: JSON.stringify({}),
   });
 }
 
@@ -217,6 +250,11 @@ export function connectEvents(onEvent: (evt: SseEvent) => void): EventSource {
     "run.completed",
     "run.failed",
     "run.stopped",
+    "session.upsert",
+    "message.upsert",
+    "message.failed",
+    "message.ack",
+    "outbox.updated",
     "terminal.started",
     "terminal.output",
     "terminal.stopped",
