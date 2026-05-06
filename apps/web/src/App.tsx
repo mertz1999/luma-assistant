@@ -2029,10 +2029,7 @@ export function App(): JSX.Element {
         setSelectedRunId(null);
         return;
       }
-      if (allSessions.length > 0) {
-        setSelectedSessionId(allSessions[0].id);
-        setSelectedRunId(allSessions[0].latestRunId);
-      }
+      setSelectedRunId(null);
       return;
     }
 
@@ -2045,12 +2042,6 @@ export function App(): JSX.Element {
     }
 
     if (messagesByRunId[selectedSessionId]?.length) {
-      return;
-    }
-
-    if (allSessions.length > 0) {
-      setSelectedSessionId(allSessions[0].id);
-      setSelectedRunId(allSessions[0].latestRunId);
       return;
     }
 
@@ -2156,10 +2147,8 @@ export function App(): JSX.Element {
           return;
         }
       }
-      if (sessions.length > 0) {
-        setSelectedSessionId(sessions[0].id);
-        setSelectedRunId(sessions[0].latestRunId);
-      }
+      setSelectedSessionId(null);
+      setSelectedRunId(null);
     } finally {
       setLoadingRunList(false);
       setLoading(false);
@@ -2198,12 +2187,6 @@ export function App(): JSX.Element {
         setSelectedRunId(current.latestRunId);
         return;
       }
-    }
-
-    if (sessions.length > 0) {
-      setSelectedSessionId(sessions[0].id);
-      setSelectedRunId(sessions[0].latestRunId);
-      return;
     }
 
     setSelectedSessionId(null);
