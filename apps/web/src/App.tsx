@@ -605,6 +605,9 @@ function findSessionByRunId(sessions: SessionCard[], runId: string | null): Sess
 }
 
 function chatMessageToTimelineEntry(message: ChatMessage): TimelineEntry {
+  const normalizedText = message.role === "assistant" || message.role === "plan" || message.role === "user"
+    ? normalizeMessageTextForDisplay(message.text)
+    : message.text;
   return {
     key: message.id,
     messageId: message.id,
@@ -613,7 +616,7 @@ function chatMessageToTimelineEntry(message: ChatMessage): TimelineEntry {
     role: message.role,
     kind: message.kind,
     title: message.title,
-    text: message.text,
+    text: normalizedText,
     pending: message.deliveryStatus === "pending" || message.deliveryStatus === "streaming",
     at: message.createdAt,
     sequence: message.sequence,
@@ -815,7 +818,31 @@ function readTextField(value: unknown): string {
       return "";
     })
     .filter(Boolean)
-    .join("\n");
+    .join("");
+}
+
+function normalizeMessageTextForDisplay(input: string): string {
+  if (!input.includes("\n")) return input;
+  if (input.includes("```")) return input;
+
+  const lines = input.split(/\r?\n/);
+  const nonEmpty = lines.map((line) => line.trim()).filter(Boolean);
+  if (nonEmpty.length < 6) return input;
+
+  const looksLikeStructuredMarkdown = nonEmpty.some((line) =>
+    line.startsWith("- ")
+    || line.startsWith("* ")
+    || line.startsWith("> ")
+    || /^\d+\.\s/.test(line),
+  );
+  if (looksLikeStructuredMarkdown) return input;
+
+  const veryShortLineCount = nonEmpty.filter((line) => line.length <= 4).length;
+  const punctuationOnlyCount = nonEmpty.filter((line) => /^[,.;:()[\]{}-]+$/.test(line)).length;
+  const compactRatio = (veryShortLineCount + punctuationOnlyCount) / nonEmpty.length;
+  if (compactRatio < 0.35) return input;
+
+  return nonEmpty.join(" ").replace(/\s+/g, " ").trim();
 }
 
 function isTerminalSessionStatus(value: unknown): value is "running" | "stopped" {

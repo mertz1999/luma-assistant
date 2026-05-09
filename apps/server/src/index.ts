@@ -1657,7 +1657,7 @@ function extractMessageText(content: unknown): string {
     })
     .filter(Boolean);
 
-  return parts.join("\n").trim();
+  return parts.join("").trim();
 }
 
 function readSessionMessageRow(row: Record<string, unknown>): { role: "user" | "assistant"; text: string; at: number | null } | null {
@@ -1886,7 +1886,7 @@ function readTextField(value: unknown): string {
       return "";
     })
     .filter(Boolean)
-    .join("\n");
+    .join("");
 }
 
 function parseRunFileChanges(item: Record<string, unknown>): RunMessageFileChange[] {
