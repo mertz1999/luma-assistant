@@ -1001,7 +1001,12 @@ function MarkdownMessage({ text }: { text: string }): JSX.Element {
           <blockquote className="my-2 border-l-2 border-foreground/30 pl-3 italic text-foreground/80">{children}</blockquote>
         ),
         a: ({ href, children }) => (
-          <a href={href} target="_blank" rel="noreferrer" className="font-medium text-brand underline underline-offset-2 hover:text-brand-dark">
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            className="font-medium text-brand underline underline-offset-2 hover:text-brand-dark dark:text-[#8fc5ff] dark:hover:text-[#bddcff]"
+          >
             {children}
           </a>
         ),
@@ -1016,20 +1021,20 @@ function MarkdownMessage({ text }: { text: string }): JSX.Element {
           const raw = flattenMarkdownText(children).replace(/\n$/, "");
 
           if (inline) {
-            return <code className="font-[inherit] text-[0.98em] font-medium text-[#0f2433]">{raw}</code>;
+            return <code className="font-[inherit] text-[0.98em] font-medium text-[#0f2433] dark:text-[#f1ece6]">{raw}</code>;
           }
 
           const isSingleLine = !raw.includes("\n");
           if (isSingleLine) {
             return (
-              <code className="block overflow-x-auto whitespace-nowrap font-[inherit] text-[1.04em] font-semibold tracking-[-0.015em] text-[#0f2433]">
+              <code className="block overflow-x-auto whitespace-nowrap font-[inherit] text-[1.04em] font-semibold tracking-[-0.015em] text-[#0f2433] dark:text-[#f1ece6]">
                 {raw}
               </code>
             );
           }
 
           return (
-            <code className="block overflow-x-auto whitespace-pre-wrap break-words font-[inherit] text-[0.98em] leading-relaxed text-[#0f2433]">
+            <code className="block overflow-x-auto whitespace-pre-wrap break-words font-[inherit] text-[0.98em] leading-relaxed text-[#0f2433] dark:text-[#f1ece6]">
               {raw}
             </code>
           );
