@@ -4,11 +4,30 @@
 
 :root {
   color-scheme: light;
-  --bg: #e9eef2;
-  --text: #0d2230;
-  --text-soft: #3b4b58;
-  --panel: #ffffffcc;
-  --panel-border: #0d223024;
+  --color-bg: 233 238 242;
+  --color-fg: 13 34 48;
+  --color-text-soft: 59 75 88;
+  --color-card-border: 13 34 48;
+  --color-muted: 245 249 252;
+  --color-surface-1: 255 255 255;
+  --color-surface-2: 245 249 252;
+  --color-control: 255 255 255;
+  --color-control-hover: 229 238 245;
+  --color-danger-bg: 255 241 242;
+  --color-danger-fg: 136 19 55;
+  --color-brand: 18 134 125;
+  --color-brand-dark: 15 106 99;
+  --color-brand-soft: 218 241 237;
+  --color-warn: 234 92 56;
+  --color-ring: 18 134 125;
+  --card: #ffffffcc;
+  --card-border: #0d223024;
+
+  --bg: rgb(var(--color-bg));
+  --text: rgb(var(--color-fg));
+  --text-soft: rgb(var(--color-text-soft));
+  --panel: rgba(255, 255, 255, 0.8);
+  --panel-border: rgba(13, 34, 48, 0.14);
   --brand: #12867d;
   --warn: #ea5c38;
 }
@@ -36,20 +55,55 @@ body {
 
 html[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #0f1822;
-  --text: #dce8f2;
-  --text-soft: #9ab0c5;
-  --panel: #1b2735d9;
-  --panel-border: #a2bfd633;
-  --brand: #39b3a8;
-  --warn: #ff8b6a;
+  --color-bg: 22 22 20;
+  --color-fg: 236 232 226;
+  --color-text-soft: 164 159 150;
+  --color-card-border: 82 79 73;
+  --color-muted: 31 30 28;
+  --color-surface-1: 39 38 36;
+  --color-surface-2: 31 30 28;
+  --color-control: 42 41 39;
+  --color-control-hover: 53 51 48;
+  --color-danger-bg: 74 32 38;
+  --color-danger-fg: 255 218 223;
+  --color-brand: 58 134 126;
+  --color-brand-dark: 44 104 98;
+  --color-brand-soft: 39 54 52;
+  --color-warn: 221 140 108;
+  --color-ring: 111 173 166;
+  --card: rgb(35 34 32 / 0.9);
+  --card-border: rgb(82 79 73 / 0.56);
+
+  --bg: rgb(var(--color-bg));
+  --text: rgb(var(--color-fg));
+  --text-soft: rgb(var(--color-text-soft));
+  --panel: rgba(35, 34, 32, 0.9);
+  --panel-border: rgba(82, 79, 73, 0.56);
+  --brand: #3a867e;
+  --warn: #dd8c6c;
 }
 
 html[data-theme="dark"] body {
   background-image:
-    radial-gradient(circle at 12% 8%, rgba(43, 89, 82, 0.45) 0%, rgba(43, 89, 82, 0) 35%),
-    radial-gradient(circle at 88% 85%, rgba(99, 82, 55, 0.4) 0%, rgba(99, 82, 55, 0) 38%),
-    linear-gradient(145deg, #111b26 0%, #0f1822 100%);
+    radial-gradient(circle at 18% 10%, rgba(67, 90, 86, 0.18) 0%, rgba(67, 90, 86, 0) 30%),
+    radial-gradient(circle at 85% 82%, rgba(82, 77, 67, 0.12) 0%, rgba(82, 77, 67, 0) 34%),
+    linear-gradient(160deg, #1a1a18 0%, #171715 58%, #151513 100%);
+}
+
+html[data-theme="dark"] input,
+html[data-theme="dark"] select,
+html[data-theme="dark"] textarea {
+  color: rgb(var(--color-fg));
+}
+
+html[data-theme="dark"] input::placeholder,
+html[data-theme="dark"] textarea::placeholder {
+  color: rgb(var(--color-text-soft) / 0.9);
+}
+
+html[data-theme="dark"] option {
+  background-color: rgb(var(--color-surface-1));
+  color: rgb(var(--color-fg));
 }
 
 .glass {
@@ -57,7 +111,7 @@ html[data-theme="dark"] body {
 }
 
 .focus-ring:focus-visible {
-  outline: 2px solid var(--brand);
+  outline: 2px solid rgb(var(--color-ring));
   outline-offset: 2px;
 }
 
@@ -78,6 +132,18 @@ html[data-theme="dark"] body {
 
 .scrollbar-thin::-webkit-scrollbar-track {
   background: transparent;
+}
+
+html[data-theme="dark"] .scrollbar-thin {
+  scrollbar-color: rgb(var(--color-card-border) / 0.55) rgb(var(--color-bg) / 0.28);
+}
+
+html[data-theme="dark"] .scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgb(var(--color-card-border) / 0.55);
+}
+
+html[data-theme="dark"] .scrollbar-thin::-webkit-scrollbar-track {
+  background: rgb(var(--color-bg) / 0.28);
 }
 
 .dot-wave {

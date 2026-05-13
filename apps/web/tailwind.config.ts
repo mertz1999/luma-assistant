@@ -6,17 +6,23 @@ export default {
   theme: {
     extend: {
       colors: {
-        background: "#e9eef2",
-        foreground: "#0d2230",
-        card: "#ffffffcc",
-        "card-border": "#0d223024",
+        background: "rgb(var(--color-bg) / <alpha-value>)",
+        foreground: "rgb(var(--color-fg) / <alpha-value>)",
+        card: "var(--card)",
+        "card-border": "var(--card-border)",
+        muted: "rgb(var(--color-muted) / <alpha-value>)",
+        "surface-1": "rgb(var(--color-surface-1) / <alpha-value>)",
+        "surface-2": "rgb(var(--color-surface-2) / <alpha-value>)",
+        control: "rgb(var(--color-control) / <alpha-value>)",
+        "control-hover": "rgb(var(--color-control-hover) / <alpha-value>)",
+        "danger-bg": "rgb(var(--color-danger-bg) / <alpha-value>)",
+        "danger-fg": "rgb(var(--color-danger-fg) / <alpha-value>)",
         brand: {
-          DEFAULT: "#12867d",
-          dark: "#0f6a63",
-          soft: "#daf1ed",
+          DEFAULT: "rgb(var(--color-brand) / <alpha-value>)",
+          dark: "rgb(var(--color-brand-dark) / <alpha-value>)",
+          soft: "rgb(var(--color-brand-soft) / <alpha-value>)",
         },
-        accent: "#ea5c38",
-        muted: "#f5f9fc",
+        accent: "rgb(var(--color-warn) / <alpha-value>)",
       },
       fontFamily: {
         sans: [

@@ -1010,7 +1010,7 @@ function MarkdownMessage({ text }: { text: string }): JSX.Element {
             <table className="min-w-full border-collapse text-xs">{children}</table>
           </div>
         ),
-        th: ({ children }) => <th className="border-b border-card-border bg-muted px-2 py-1 text-left">{children}</th>,
+        th: ({ children }) => <th className="border-b border-card-border bg-surface-2 px-2 py-1 text-left">{children}</th>,
         td: ({ children }) => <td className="border-b border-card-border px-2 py-1 align-top">{children}</td>,
         code: ({ inline, children }: any) => {
           const raw = flattenMarkdownText(children).replace(/\n$/, "");
@@ -1201,7 +1201,7 @@ function QuestionnaireCard({
             key={option}
             type="button"
             className={cn(
-              "w-full rounded-xl border bg-white px-3 py-2 text-left text-sm transition hover:border-brand/50 hover:bg-brand-soft/30 disabled:cursor-not-allowed disabled:opacity-70",
+              "w-full rounded-xl border bg-surface-1 px-3 py-2 text-left text-sm transition hover:border-brand/50 hover:bg-brand-soft/30 disabled:cursor-not-allowed disabled:opacity-70",
               currentAnswer === option ? "border-brand bg-brand-soft/30" : "border-card-border",
             )}
             onClick={() => onSelectOption(option)}
@@ -1213,13 +1213,13 @@ function QuestionnaireCard({
 
         <div
           className={cn(
-            "flex items-center gap-2 rounded-xl border border-dashed bg-white px-3 py-2",
+            "flex items-center gap-2 rounded-xl border border-dashed bg-surface-1 px-3 py-2",
             currentCustomAnswer.trim() && currentAnswer === currentCustomAnswer ? "border-brand bg-brand-soft/25" : "border-card-border",
           )}
         >
           <span className="text-xs font-semibold uppercase tracking-wide text-foreground/60">Custom</span>
           <input
-            className="h-9 w-full rounded-lg border border-card-border bg-white px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+            className="h-9 w-full rounded-lg border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
             value={currentCustomAnswer}
             onChange={(event) => updateCustomAnswerAt(currentIndex, event.target.value)}
             placeholder="Add your own answer"
@@ -1228,7 +1228,7 @@ function QuestionnaireCard({
         </div>
 
         {totalQuestions > 1 ? (
-          <div className="rounded-xl border border-card-border bg-white/70 px-3 py-2 text-xs text-foreground/70">
+          <div className="rounded-xl border border-card-border bg-surface-1/70 px-3 py-2 text-xs text-foreground/70">
             {selectedAnswers.filter((answer) => answer.trim()).length} of {totalQuestions} answered
           </div>
         ) : null}
@@ -1313,9 +1313,9 @@ function FinalApprovalCard({
           Yes, implement
         </Button>
 
-        <div className="flex items-center gap-2 rounded-xl border border-dashed border-amber-300/80 bg-white px-3 py-2">
+        <div className="flex items-center gap-2 rounded-xl border border-dashed border-amber-300/80 bg-surface-1 px-3 py-2">
           <input
-            className="h-9 w-full rounded-lg border border-card-border bg-white px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+            className="h-9 w-full rounded-lg border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
             value={feedback}
             onChange={(event) => setFeedback(event.target.value)}
             placeholder="Add plan changes before approval"
@@ -1366,7 +1366,7 @@ function ToolEntry({
     const preview = `${entry.pending ? "Running" : "Command"}: ${command}`;
 
     return (
-      <details className="rounded-xl border border-card-border bg-white/80 p-2" open={entry.pending}>
+      <details className="rounded-xl border border-card-border bg-surface-1/80 p-2" open={entry.pending}>
         <summary className="cursor-pointer list-none text-sm font-medium text-foreground">
           <span className="block truncate">{truncatePreview(preview, 132)}</span>
         </summary>
@@ -1426,7 +1426,7 @@ function ToolEntry({
           : "File change update";
 
     return (
-      <details className="rounded-xl border border-card-border bg-white/80 p-2" open={entry.pending}>
+      <details className="rounded-xl border border-card-border bg-surface-1/80 p-2" open={entry.pending}>
         <summary className="cursor-pointer list-none text-sm font-medium text-foreground">
           <span className="block truncate">{preview}</span>
         </summary>
@@ -1454,7 +1454,7 @@ function ToolEntry({
           {fileChangeCount ? (
             <div className="space-y-2">
               {fileChanges.map((change, index) => (
-                <details key={`${change.path}-${index}`} className="rounded-lg border border-card-border bg-muted/70 px-2 py-1">
+                <details key={`${change.path}-${index}`} className="rounded-lg border border-card-border bg-surface-2/70 px-2 py-1">
                   <summary className="flex cursor-pointer items-center justify-between gap-2 text-xs">
                     <span className="min-w-0 truncate font-mono" title={change.path}>
                       {change.path}
@@ -1493,7 +1493,7 @@ function ToolEntry({
   }
 
   return (
-    <details className="rounded-xl border border-card-border bg-white/80 p-2" open={entry.pending}>
+    <details className="rounded-xl border border-card-border bg-surface-1/80 p-2" open={entry.pending}>
       <summary className="cursor-pointer list-none text-sm font-medium text-foreground">
         <span className="block truncate">{truncatePreview(entry.text, 132)}</span>
       </summary>
@@ -3190,7 +3190,7 @@ export function App(): JSX.Element {
   if (!authReady) {
     return (
       <div className="flex h-[100dvh] items-center justify-center bg-[color:var(--bg)] text-[color:var(--text)]">
-        <div className="flex items-center gap-2 rounded-xl border border-card-border bg-white px-4 py-3 shadow-sm">
+        <div className="flex items-center gap-2 rounded-xl border border-card-border bg-surface-1 px-4 py-3 shadow-sm">
           <LoaderCircle className="h-4 w-4 animate-spin" />
           <span className="text-sm">Preparing secure session...</span>
         </div>
@@ -3214,7 +3214,7 @@ export function App(): JSX.Element {
           <CardContent>
             <form className="space-y-3" onSubmit={(event) => void onAuthenticate(event)}>
               <input
-                className="h-11 w-full rounded-xl border border-card-border bg-white px-3 text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
+                className="h-11 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
                 type="password"
                 autoComplete="current-password"
                 value={authPasswordInput}
@@ -3236,7 +3236,7 @@ export function App(): JSX.Element {
 
   return (
     <div className="h-[100dvh] w-full overflow-hidden text-[color:var(--text)]">
-      <header className="fixed inset-x-0 top-0 z-20 border-b border-card-border bg-white/85 px-3 py-2 backdrop-blur lg:hidden">
+      <header className="fixed inset-x-0 top-0 z-20 border-b border-card-border bg-surface-1/85 px-3 py-2 backdrop-blur lg:hidden">
         <div className="mx-auto flex max-w-7xl items-center justify-between">
           <Button size="sm" variant="ghost" onClick={() => setMobileThreadsOpen(true)}>
             <PanelLeft className="mr-1.5 h-4 w-4" /> Chats
@@ -3481,7 +3481,7 @@ function SessionsPanel({
         <div>
           <label className="mb-1 block text-xs font-semibold text-foreground/75">Status filter</label>
           <select
-            className="h-9 w-full rounded-xl border border-card-border bg-white px-3 text-xs outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+            className="h-9 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-xs outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
             value={statusFilter}
             onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}
           >
@@ -3493,7 +3493,7 @@ function SessionsPanel({
           </select>
         </div>
 
-        <label className="flex items-start gap-2 rounded-xl border border-card-border bg-white px-3 py-2 text-xs text-foreground/80">
+        <label className="flex items-start gap-2 rounded-xl border border-card-border bg-surface-1 px-3 py-2 text-xs text-foreground/80">
           <input
             type="checkbox"
             className="mt-0.5 h-4 w-4 rounded border-card-border text-brand focus:ring-brand/20"
@@ -3509,7 +3509,7 @@ function SessionsPanel({
 
         <div className="scrollbar-thin flex-1 space-y-2 overflow-auto pr-1">
           {sessions.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-card-border bg-muted px-3 py-2 text-xs text-foreground/70">
+            <div className="rounded-2xl border border-dashed border-card-border bg-surface-2 px-3 py-2 text-xs text-foreground/70">
               No sessions yet
             </div>
           ) : null}
@@ -3520,7 +3520,7 @@ function SessionsPanel({
               <div
                 key={session.id}
                 className={cn(
-                  "w-full rounded-2xl border bg-white px-3 py-2 text-left shadow-card transition hover:-translate-y-0.5 hover:border-brand/60",
+                  "w-full rounded-2xl border bg-surface-1 px-3 py-2 text-left shadow-card transition hover:-translate-y-0.5 hover:border-brand/60",
                   selectedSessionId === session.id ? "border-brand bg-brand-soft/60" : "border-card-border",
                 )}
               >
@@ -3582,7 +3582,7 @@ function AttachmentChip({ attachment, className, onRemove }: AttachmentChipProps
       {onRemove ? (
         <button
           type="button"
-          className="rounded-full p-0.5 transition hover:bg-black/5"
+          className="rounded-full p-0.5 transition hover:bg-black/5 dark:hover:bg-control-hover/70"
           onClick={onRemove}
           aria-label={`Remove ${attachment.name}`}
           title="Remove attachment"
@@ -3672,7 +3672,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           {props.loading ? <p className="text-sm text-foreground/70">Loading...</p> : null}
 
           {!props.loading && !props.selectedSession ? (
-            <div className="rounded-2xl border border-dashed border-card-border bg-muted px-4 py-3 text-sm text-foreground/75">
+            <div className="rounded-2xl border border-dashed border-card-border bg-surface-2 px-4 py-3 text-sm text-foreground/75">
               Start a new session or pick one from chats.
             </div>
           ) : null}
@@ -3705,11 +3705,11 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 	                  "animate-fade-up rounded-2xl border px-3 py-2 shadow-card",
 	                  entry.role === "user" && "ml-auto max-w-[90%] border-transparent bg-gradient-to-br from-brand to-brand-dark text-white",
                     entry.role === "user" && entry.deliveryStatus === "failed" && "border-rose-200/80 from-rose-600 to-rose-700",
-	                  entry.role === "assistant" && "mr-auto max-w-[90%] border-card-border bg-white",
+	                  entry.role === "assistant" && "mr-auto max-w-[90%] border-card-border bg-surface-1",
 	                  entry.role === "plan" && "mr-auto max-w-full border-brand/35 bg-brand-soft/45",
-	                  entry.role === "tool" && "max-w-full border-dashed border-card-border bg-muted font-mono text-xs",
-                  entry.role === "system" && "mx-auto max-w-fit rounded-full border-card-border bg-white/90 px-3 py-1 text-xs text-foreground/75",
-                  entry.role === "error" && "mr-auto max-w-[90%] border-rose-300 bg-rose-50 text-rose-900",
+	                  entry.role === "tool" && "max-w-full border-dashed border-card-border bg-surface-2 font-mono text-xs",
+                  entry.role === "system" && "mx-auto max-w-fit rounded-full border-card-border bg-surface-1/90 px-3 py-1 text-xs text-foreground/75",
+                  entry.role === "error" && "mr-auto max-w-[90%] border-rose-300 bg-rose-50 text-rose-900 dark:border-danger-fg/40 dark:bg-danger-bg/90 dark:text-danger-fg",
                 )}
               >
                 {entry.role !== "system" && entry.title ? (
@@ -3723,8 +3723,8 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                         key={`${entry.key}_${attachment.id}`}
                         attachment={attachment}
                         className={entry.role === "user"
-                          ? "border-white/20 bg-white/10 text-white"
-                          : "border-card-border bg-white/80 text-foreground"}
+                          ? "border-white/20 bg-surface-1/10 text-white"
+                          : "border-card-border bg-surface-1/80 text-foreground"}
                       />
                     ))}
                   </div>
@@ -3764,7 +3764,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                     {canRetryUserMessage ? (
                       <button
                         type="button"
-                        className="rounded-full border border-white/30 px-2 py-0.5 font-semibold transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
+                      className="rounded-full border border-white/30 px-2 py-0.5 font-semibold transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
                         onClick={() => void props.onRetryMessage(entry)}
                         disabled={props.submitting}
                       >
@@ -3788,7 +3788,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
         </div>
 
         <form
-          className="border-t border-card-border bg-white/75 p-3"
+          className="border-t border-card-border bg-surface-1/75 p-3"
           onSubmit={(event) => {
             event.preventDefault();
             props.onSendButtonClick();
@@ -3811,7 +3811,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           ) : null}
 
           {props.pendingAttachments.length > 0 || props.isUploadingAttachments || props.attachmentError ? (
-            <div className="mb-3 rounded-2xl border border-card-border bg-white/90 px-3 py-2">
+            <div className="mb-3 rounded-2xl border border-card-border bg-surface-1/90 px-3 py-2">
               <div className="flex items-center justify-between gap-2 text-xs font-semibold text-foreground/80">
                 <span>Attachments</span>
                 <span>
@@ -3826,7 +3826,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                     <AttachmentChip
                       key={attachment.id}
                       attachment={attachment}
-                      className="border-card-border bg-muted/60 text-foreground"
+                      className="border-card-border bg-surface-2/60 text-foreground"
                       onRemove={() => props.onRemovePendingAttachment(attachment.id)}
                     />
                   ))}
@@ -3853,12 +3853,12 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 
           <div className="relative flex items-end gap-2">
             {props.slashSuggestions.length > 0 ? (
-              <div className="absolute bottom-full left-0 right-12 z-10 mb-2 space-y-1 rounded-2xl border border-card-border bg-white/95 p-2 shadow-lg backdrop-blur">
+              <div className="absolute bottom-full left-0 right-12 z-10 mb-2 space-y-1 rounded-2xl border border-card-border bg-surface-1/95 p-2 shadow-lg backdrop-blur">
                 {props.slashSuggestions.map((item) => (
                   <button
                     key={item.key}
                     type="button"
-                    className="w-full rounded-xl border border-transparent px-2 py-2 text-left transition hover:border-card-border hover:bg-muted"
+                    className="w-full rounded-xl border border-transparent px-2 py-2 text-left transition hover:border-card-border hover:bg-surface-2"
                     onClick={() => void props.onSelectSlashCommand(item.key)}
                     disabled={props.submitting}
                   >
@@ -3870,7 +3870,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             ) : null}
 
             <textarea
-              className="min-h-[44px] max-h-40 w-full resize-y rounded-2xl border border-card-border bg-white px-3 py-2 text-base md:text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
+              className="min-h-[44px] max-h-40 w-full resize-y rounded-2xl border border-card-border bg-surface-1 px-3 py-2 text-base md:text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
               placeholder="Message Codex... (type / for commands, including /plan)"
               value={props.prompt}
               onChange={(event) => props.setPrompt(event.target.value)}
@@ -3926,11 +3926,11 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           </div>
 
           {props.queueItems.length > 0 ? (
-            <div className="mt-2 rounded-xl border border-card-border bg-white/85 p-2">
+            <div className="mt-2 rounded-xl border border-card-border bg-surface-1/85 p-2">
               <div className="mb-1 text-xs font-semibold text-foreground/80">Queued messages ({props.queueItems.length})</div>
               <div className="space-y-1">
                 {props.queueItems.slice(0, 5).map((item) => (
-                  <div key={item.id} className="flex items-center gap-2 rounded-lg bg-muted/60 px-2 py-1">
+                  <div key={item.id} className="flex items-center gap-2 rounded-lg bg-surface-2/60 px-2 py-1">
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-xs text-foreground/80" title={item.prompt}>
                         {truncatePreview(item.prompt, 140)}
@@ -3941,7 +3941,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                     </div>
                     <button
                       type="button"
-                      className="rounded p-1 text-foreground/70 transition hover:bg-black/5 hover:text-foreground"
+                      className="rounded p-1 text-foreground/70 transition hover:bg-black/5 hover:text-foreground dark:hover:bg-control-hover/70"
                       onClick={() => props.onRemoveQueueItem(item.id)}
                       aria-label="Remove queued message"
                       title="Remove"
@@ -4013,7 +4013,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
 
   return (
     <div className="space-y-4 p-3">
-      <div className="grid grid-cols-2 gap-1 rounded-2xl border border-card-border bg-muted p-1">
+      <div className="grid grid-cols-2 gap-1 rounded-2xl border border-card-border bg-surface-2 p-1">
         <Button size="sm" variant={props.rightPanelTab === "context" ? "primary" : "ghost"} onClick={() => props.setRightPanelTab("context")}>
           Context
         </Button>
@@ -4024,13 +4024,13 @@ function RightPanel(props: RightPanelProps): JSX.Element {
 
       {props.rightPanelTab === "context" ? (
         <>
-          <section className="rounded-2xl border border-card-border bg-white p-3">
+          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-bold">Workspace</h3>
               <Badge>active</Badge>
             </div>
             <select
-              className="h-10 w-full rounded-xl border border-card-border bg-white px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+              className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
               value={props.activeWorkspace}
               onChange={(event) => void props.onChangeWorkspace(event.target.value)}
             >
@@ -4042,7 +4042,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
             </select>
           </section>
 
-          <section className="rounded-2xl border border-card-border bg-white p-3">
+          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-bold">Session</h3>
               {selectedSessionSourceBadge ? (
@@ -4083,7 +4083,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
                   <Button
                     size="sm"
                     variant="ghost"
-                    className="text-rose-700 hover:bg-rose-50 hover:text-rose-800"
+                    className="text-rose-700 hover:bg-rose-50 hover:text-rose-800 dark:hover:bg-danger-bg/90"
                     disabled={props.sessionAction !== null || props.selectedSession.historyOnly}
                     onClick={() => void props.onDeleteSession()}
                   >
@@ -4097,7 +4097,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
             )}
           </section>
 
-          <section className="rounded-2xl border border-card-border bg-white p-3">
+          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-bold">Run defaults</h3>
               <Badge>next run</Badge>
@@ -4107,7 +4107,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
               <div>
                 <label className="mb-1 block text-xs font-semibold text-foreground/75">Model</label>
                 <select
-                  className="h-10 w-full rounded-xl border border-card-border bg-white px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                  className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
                   value={useCustomModel ? "__custom__" : props.model}
                   onChange={(event) => {
                     const next = event.target.value;
@@ -4128,7 +4128,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
                 </select>
                 {useCustomModel ? (
                   <input
-                    className="mt-2 h-10 w-full rounded-xl border border-card-border bg-white px-3 text-base md:text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                    className="mt-2 h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-base md:text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
                     value={props.model}
                     onChange={(event) => props.setModel(event.target.value)}
                     placeholder="Enter model id (e.g. gpt-5.4)"
@@ -4139,7 +4139,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
               <div>
                 <label className="mb-1 block text-xs font-semibold text-foreground/75">Sandbox</label>
                 <select
-                  className="h-10 w-full rounded-xl border border-card-border bg-white px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                  className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
                   value={props.sandbox}
                   onChange={(event) => props.setSandbox(event.target.value as SandboxMode)}
                 >
@@ -4154,7 +4154,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
               <div>
                 <label className="mb-1 block text-xs font-semibold text-foreground/75">Approval policy</label>
                 <select
-                  className="h-10 w-full rounded-xl border border-card-border bg-white px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                  className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
                   value={props.approvalPolicy}
                   onChange={(event) => props.setApprovalPolicy(event.target.value as ApprovalPolicy)}
                 >
@@ -4169,14 +4169,14 @@ function RightPanel(props: RightPanelProps): JSX.Element {
           </section>
 
           {props.debugLogs.length > 0 ? (
-            <section className="rounded-2xl border border-card-border bg-white p-3">
+            <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
               <details>
                 <summary className="cursor-pointer list-none text-sm font-bold text-foreground">
                   Debug logs ({props.debugLogs.length})
                 </summary>
                 <div className="mt-2 space-y-2">
                   {props.debugLogs.map((entry) => (
-                    <div key={entry.key} className="rounded-xl border border-card-border bg-muted/50 px-3 py-2">
+                    <div key={entry.key} className="rounded-xl border border-card-border bg-surface-2/50 px-3 py-2">
                       <div className="mb-1 flex items-center justify-between gap-2 text-[11px] text-foreground/65">
                         <span className="font-mono">{entry.runId}</span>
                         <span>{new Date(entry.at).toLocaleString()}</span>
@@ -4192,7 +4192,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
             </section>
           ) : null}
 
-          <section className="rounded-2xl border border-card-border bg-white p-3">
+          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-bold">Appearance</h3>
               <Badge>theme</Badge>
@@ -4210,7 +4210,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
 
       {props.rightPanelTab === "tools" ? (
         <>
-          <section className="rounded-2xl border border-card-border bg-white p-3">
+          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-bold">Session terminal</h3>
               <Badge>{terminalRunning ? "running" : "stopped"}</Badge>
@@ -4280,7 +4280,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
                   }}
                 >
                   <input
-                    className="h-10 w-full rounded-xl border border-card-border bg-white px-3 font-mono text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
+                    className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 font-mono text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
                     value={props.terminalInput}
                     onChange={(event) => props.setTerminalInput(event.target.value)}
                     placeholder={terminalRunning ? "Type command and press Enter" : "Start terminal to run commands"}
@@ -4296,14 +4296,14 @@ function RightPanel(props: RightPanelProps): JSX.Element {
                 </form>
 
                 {props.terminalHistory.length ? (
-                  <div className="mt-3 rounded-xl border border-card-border bg-white p-2">
+                  <div className="mt-3 rounded-xl border border-card-border bg-surface-1 p-2">
                     <div className="mb-2 flex items-center justify-between">
                       <p className="text-[11px] font-semibold text-foreground/80">Recent commands</p>
                       <Badge>{props.terminalHistory.length}</Badge>
                     </div>
                     <div className="max-h-44 space-y-1 overflow-y-auto pr-1">
                       {props.terminalHistory.map((command, index) => (
-                        <div key={`${command}_${index}`} className="rounded-lg border border-card-border bg-muted px-2 py-1.5">
+                        <div key={`${command}_${index}`} className="rounded-lg border border-card-border bg-surface-2 px-2 py-1.5">
                           <p className="truncate font-mono text-[11px]" title={command}>{command}</p>
                           <div className="mt-1 flex items-center gap-1">
                             <Button
@@ -4337,7 +4337,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
             {props.approvals.length === 0 ? <p className="text-sm text-foreground/70">Approval queue is empty.</p> : null}
 
             {props.approvals.map((item) => (
-              <div key={item.id} className="rounded-xl border border-card-border bg-white p-3">
+              <div key={item.id} className="rounded-xl border border-card-border bg-surface-1 p-3">
                 <div className="mb-2 flex items-center gap-2 text-sm font-semibold">
                   <ShieldAlert className="h-4 w-4 text-[color:var(--warn)]" />
                   Pending escalation
@@ -4383,7 +4383,7 @@ function FileTreeRow({ node, level }: { node: FileTreeNode; level: number }): JS
   const pad = level * 14;
   return (
     <div>
-      <div className="flex items-center gap-2 rounded-lg border border-card-border bg-white p-2" style={{ paddingLeft: 8 + pad }}>
+      <div className="flex items-center gap-2 rounded-lg border border-card-border bg-surface-1 p-2" style={{ paddingLeft: 8 + pad }}>
         {node.type === "directory" ? <FolderTree className="h-3.5 w-3.5" /> : <FileCode2 className="h-3.5 w-3.5" />}
         <span className="truncate">{node.name}</span>
       </div>
