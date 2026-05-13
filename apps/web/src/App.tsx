@@ -134,6 +134,8 @@ const attachmentMaxFiles = 10;
 // Account for the chat stack gap and bottom padding so "visually at bottom"
 // still counts as bottom without making the auto-follow area too large.
 const timelineAutoScrollThresholdPx = 64;
+const eventStreamHeartbeatStaleMs = 30000;
+const eventStreamWatchdogIntervalMs = 10000;
 
 type StoredAuthSession = {
   token: string;
@@ -1371,23 +1373,23 @@ function ToolEntry({
     const preview = `${entry.pending ? "Running" : "Command"}: ${command}`;
 
     return (
-      <details className="rounded-xl border border-card-border bg-surface-1/80 p-2" open={entry.pending}>
-        <summary className="cursor-pointer list-none text-sm font-medium text-foreground">
+      <details className="rounded-lg border border-card-border bg-surface-1/75 p-1.5" open={entry.pending}>
+        <summary className="cursor-pointer list-none text-xs font-medium text-foreground/90">
           <span className="block truncate">{truncatePreview(preview, 132)}</span>
         </summary>
-        <div className="mt-2 space-y-2">
-          <pre className="max-h-32 overflow-auto rounded-xl border border-card-border bg-[#102b3b] p-2 text-xs text-slate-100">{command}</pre>
+        <div className="mt-1.5 space-y-1.5">
+          <pre className="max-h-28 overflow-auto rounded-lg border border-card-border bg-[#102b3b] p-1.5 text-[11px] text-slate-100">{command}</pre>
 
           {visibleOutput.trim() ? (
             <div>
               <div
-                className="max-h-52 overflow-auto whitespace-pre-wrap break-words rounded-xl border border-card-border bg-black/5 p-2 font-mono text-xs"
+                className="max-h-44 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-card-border bg-black/5 p-1.5 font-mono text-[11px]"
                 dangerouslySetInnerHTML={{ __html: ansi.toHtml(visibleOutput) }}
               />
               {shouldTruncate ? (
                 <button
                   type="button"
-                  className="mt-2 text-xs font-medium text-brand underline"
+                  className="mt-1.5 text-[11px] font-medium text-brand underline"
                   onClick={() =>
                     onOpenOutput({
                       title: "Command output",
@@ -1404,10 +1406,10 @@ function ToolEntry({
               ) : null}
             </div>
           ) : (
-            <div className="rounded-lg border border-card-border bg-black/5 px-2 py-1 text-xs text-foreground/70">No output captured.</div>
+            <div className="rounded-lg border border-card-border bg-black/5 px-1.5 py-1 text-[11px] text-foreground/70">No output captured.</div>
           )}
 
-          <div className="flex items-center justify-between gap-2 text-xs text-foreground/75">
+          <div className="flex items-center justify-between gap-2 text-[11px] text-foreground/75">
             <span>
               {statusLabel ? `Status: ${statusLabel}` : entry.pending ? "Running command" : "Command update"}
               {entry.meta?.exitCode !== null && entry.meta?.exitCode !== undefined ? ` | Exit: ${entry.meta.exitCode}` : ""}
@@ -1431,12 +1433,12 @@ function ToolEntry({
           : "File change update";
 
     return (
-      <details className="rounded-xl border border-card-border bg-surface-1/80 p-2" open={entry.pending}>
-        <summary className="cursor-pointer list-none text-sm font-medium text-foreground">
+      <details className="rounded-lg border border-card-border bg-surface-1/75 p-1.5" open={entry.pending}>
+        <summary className="cursor-pointer list-none text-xs font-medium text-foreground/90">
           <span className="block truncate">{preview}</span>
         </summary>
 
-        <div className="mt-2 space-y-2 text-xs">
+        <div className="mt-1.5 space-y-1.5 text-[11px]">
           <div className="grid grid-cols-2 gap-2 text-foreground/75 sm:grid-cols-3">
             <div>
               <span className="font-semibold text-foreground/85">Status:</span> {statusLabel || (entry.pending ? "in progress" : "completed")}
@@ -1457,10 +1459,10 @@ function ToolEntry({
           </div>
 
           {fileChangeCount ? (
-            <div className="space-y-2">
-              {fileChanges.map((change, index) => (
-                <details key={`${change.path}-${index}`} className="rounded-lg border border-card-border bg-surface-2/70 px-2 py-1">
-                  <summary className="flex cursor-pointer items-center justify-between gap-2 text-xs">
+              <div className="space-y-2">
+                {fileChanges.map((change, index) => (
+                <details key={`${change.path}-${index}`} className="rounded-lg border border-card-border bg-surface-2/70 px-1.5 py-1">
+                  <summary className="flex cursor-pointer items-center justify-between gap-2 text-[11px]">
                     <span className="min-w-0 truncate font-mono" title={change.path}>
                       {change.path}
                     </span>
@@ -1468,13 +1470,13 @@ function ToolEntry({
                       {change.kind} +{change.added} -{change.removed}
                     </span>
                   </summary>
-                  <div className="mt-2">
+                  <div className="mt-1.5">
                     {change.diff ? (
-                      <pre className="max-h-52 overflow-auto rounded-lg border border-card-border bg-[#0f2433] p-2 font-mono text-[11px] text-slate-100">
+                      <pre className="max-h-44 overflow-auto rounded-lg border border-card-border bg-[#0f2433] p-1.5 font-mono text-[10px] text-slate-100">
                         {change.diff}
                       </pre>
                     ) : (
-                      <div className="text-xs text-foreground/65">No diff payload returned for this file.</div>
+                      <div className="text-[11px] text-foreground/65">No diff payload returned for this file.</div>
                     )}
                   </div>
                 </details>
@@ -1498,11 +1500,11 @@ function ToolEntry({
   }
 
   return (
-    <details className="rounded-xl border border-card-border bg-surface-1/80 p-2" open={entry.pending}>
-      <summary className="cursor-pointer list-none text-sm font-medium text-foreground">
+    <details className="rounded-lg border border-card-border bg-surface-1/75 p-1.5" open={entry.pending}>
+      <summary className="cursor-pointer list-none text-xs font-medium text-foreground/90">
         <span className="block truncate">{truncatePreview(entry.text, 132)}</span>
       </summary>
-      {entry.text ? <pre className="mt-2 whitespace-pre-wrap break-words text-sm leading-relaxed">{entry.text}</pre> : null}
+      {entry.text ? <pre className="mt-1.5 whitespace-pre-wrap break-words text-[11px] leading-relaxed">{entry.text}</pre> : null}
       {entry.pending ? <ThinkingDots label="Working" /> : null}
     </details>
   );
@@ -1642,6 +1644,7 @@ export function App(): JSX.Element {
   const selectedSessionIdRef = useRef<string | null>(selectedSessionId);
   const showAllHistoryRef = useRef(showAllHistory);
   const isDraftSessionRef = useRef(isDraftSession);
+  const lastEventAtRef = useRef<number>(Date.now());
   const previousTimelineStateRef = useRef<{ sessionKey: string; length: number }>({
     sessionKey: draftSessionKey,
     length: 0,
@@ -1860,105 +1863,164 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     if (!authReady || !isAuthenticated) return;
-    const es = connectEvents((event) => {
-      if (event.kind === "heartbeat") return;
-
-      if (event.kind === "terminal.started" || event.kind === "terminal.stopped") {
-        const terminal = readTerminalSnapshot(event.payload);
-        if (!terminal) return;
-        setTerminalsBySession((prev) => ({ ...prev, [terminal.sessionId]: terminal }));
-        return;
-      }
-
-      if (event.kind === "terminal.output") {
-        const sessionId = typeof event.sessionId === "string"
-          ? event.sessionId
-          : typeof event.payload?.sessionId === "string"
-            ? event.payload.sessionId
-            : "";
-        if (!sessionId) return;
-        const chunk = typeof event.payload?.text === "string" ? event.payload.text : "";
-        if (!chunk) return;
-
-        setTerminalsBySession((prev) => {
-          const existing = prev[sessionId];
-          if (!existing) return prev;
-          const merged = `${existing.output}${chunk}`;
-          const output = merged.length > 220000 ? merged.slice(merged.length - 220000) : merged;
-          return {
-            ...prev,
-            [sessionId]: {
-              ...existing,
-              output,
-              status: "running",
-              updatedAt: event.at || Date.now(),
-            },
-          };
-        });
-        return;
-      }
-
-      if (event.kind === "session.upsert") {
-        const session = readSessionListItem(event.payload?.session);
-        if (!session) return;
-        const previousSessionId = typeof event.payload?.previousSessionId === "string" ? event.payload.previousSessionId : null;
-        applySessionUpsert(session, previousSessionId);
-        return;
-      }
-
-      if (event.kind === "message.upsert" || event.kind === "message.ack" || event.kind === "message.failed") {
-        const message = readChatMessage(event.payload?.message);
-        if (!message) return;
-        applyIncomingMessage(message);
-        if (message.runId && message.runId === selectedRunIdRef.current) {
-          void loadSelectedRunRecord(message.runId);
-        }
-        return;
-      }
-
-      if (event.kind === "run.diffUpdated" && event.runId === selectedRunIdRef.current) {
-        setDiff(event.payload as unknown as DiffSnapshot);
-        return;
-      }
-
-      if (
-        (event.kind === "run.started"
-          || event.kind === "run.completed"
-          || event.kind === "run.failed"
-          || event.kind === "run.stopped")
-        && event.runId
-        && event.runId === selectedRunIdRef.current
-      ) {
-        void loadSelectedRunRecord(event.runId);
-        return;
-      }
-
-      if (event.kind === "run.approvalQueued") {
-        void refreshRunList(selectedSessionIdRef.current);
-      }
-    });
-
+    let es: EventSource | null = null;
     let hasOpenedOnce = false;
     let shouldRefreshSelectedSession = false;
 
-    es.onopen = () => {
-      if (!hasOpenedOnce) {
-        hasOpenedOnce = true;
-        shouldRefreshSelectedSession = false;
-        return;
-      }
+    const refreshSelectedSessionState = () => {
       const currentSelectedSessionId = selectedSessionIdRef.current;
-      if (!shouldRefreshSelectedSession || !currentSelectedSessionId) return;
-      shouldRefreshSelectedSession = false;
-      void loadRunMessagesPage(currentSelectedSessionId, { reset: true });
+      if (currentSelectedSessionId) {
+        void loadRunMessagesPage(currentSelectedSessionId, { reset: true });
+      }
+      const currentSelectedRunId = selectedRunIdRef.current;
+      if (currentSelectedRunId) {
+        void loadSelectedRunRecord(currentSelectedRunId);
+      }
     };
 
-    es.onerror = () => {
-      if (!hasOpenedOnce) return;
+    const refreshRealtimeState = () => {
+      void refreshRunList(selectedSessionIdRef.current);
+      refreshSelectedSessionState();
+    };
+
+    const openEventStream = () => {
+      es?.close();
+      es = connectEvents((event) => {
+        lastEventAtRef.current = Date.now();
+        if (event.kind === "heartbeat") return;
+
+        if (event.kind === "terminal.started" || event.kind === "terminal.stopped") {
+          const terminal = readTerminalSnapshot(event.payload);
+          if (!terminal) return;
+          setTerminalsBySession((prev) => ({ ...prev, [terminal.sessionId]: terminal }));
+          return;
+        }
+
+        if (event.kind === "terminal.output") {
+          const sessionId = typeof event.sessionId === "string"
+            ? event.sessionId
+            : typeof event.payload?.sessionId === "string"
+              ? event.payload.sessionId
+              : "";
+          if (!sessionId) return;
+          const chunk = typeof event.payload?.text === "string" ? event.payload.text : "";
+          if (!chunk) return;
+
+          setTerminalsBySession((prev) => {
+            const existing = prev[sessionId];
+            if (!existing) return prev;
+            const merged = `${existing.output}${chunk}`;
+            const output = merged.length > 220000 ? merged.slice(merged.length - 220000) : merged;
+            return {
+              ...prev,
+              [sessionId]: {
+                ...existing,
+                output,
+                status: "running",
+                updatedAt: event.at || Date.now(),
+              },
+            };
+          });
+          return;
+        }
+
+        if (event.kind === "session.upsert") {
+          const session = readSessionListItem(event.payload?.session);
+          if (!session) return;
+          const previousSessionId = typeof event.payload?.previousSessionId === "string" ? event.payload.previousSessionId : null;
+          applySessionUpsert(session, previousSessionId);
+          return;
+        }
+
+        if (event.kind === "message.upsert" || event.kind === "message.ack" || event.kind === "message.failed") {
+          const message = readChatMessage(event.payload?.message);
+          if (!message) return;
+          applyIncomingMessage(message);
+          if (message.runId && message.runId === selectedRunIdRef.current) {
+            void loadSelectedRunRecord(message.runId);
+          }
+          return;
+        }
+
+        if (event.kind === "run.diffUpdated" && event.runId === selectedRunIdRef.current) {
+          setDiff(event.payload as unknown as DiffSnapshot);
+          return;
+        }
+
+        if (
+          (event.kind === "run.started"
+            || event.kind === "run.completed"
+            || event.kind === "run.failed"
+            || event.kind === "run.stopped")
+          && event.runId
+          && event.runId === selectedRunIdRef.current
+        ) {
+          void loadSelectedRunRecord(event.runId);
+          return;
+        }
+
+        if (event.kind === "run.approvalQueued") {
+          void refreshRunList(selectedSessionIdRef.current);
+        }
+      });
+
+      es.onopen = () => {
+        lastEventAtRef.current = Date.now();
+        if (!hasOpenedOnce) {
+          hasOpenedOnce = true;
+          shouldRefreshSelectedSession = false;
+          return;
+        }
+        if (!shouldRefreshSelectedSession) return;
+        shouldRefreshSelectedSession = false;
+        refreshRealtimeState();
+      };
+
+      es.onerror = () => {
+        if (!hasOpenedOnce) return;
+        shouldRefreshSelectedSession = true;
+      };
+    };
+
+    const ensureFreshRealtimeState = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      if (typeof navigator !== "undefined" && "onLine" in navigator && !navigator.onLine) return;
+
+      refreshRealtimeState();
+
+      const isStale = Date.now() - lastEventAtRef.current > eventStreamHeartbeatStaleMs;
+      if (!es || es.readyState === EventSource.CLOSED || isStale) {
+        shouldRefreshSelectedSession = true;
+        openEventStream();
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      ensureFreshRealtimeState();
+    };
+
+    openEventStream();
+
+    const watchdog = window.setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      if (Date.now() - lastEventAtRef.current <= eventStreamHeartbeatStaleMs) return;
       shouldRefreshSelectedSession = true;
-    };
+      openEventStream();
+      refreshRealtimeState();
+    }, eventStreamWatchdogIntervalMs);
 
-    return () => es.close();
+    window.addEventListener("focus", ensureFreshRealtimeState);
+    window.addEventListener("online", ensureFreshRealtimeState);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(watchdog);
+      window.removeEventListener("focus", ensureFreshRealtimeState);
+      window.removeEventListener("online", ensureFreshRealtimeState);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      es?.close();
+    };
   }, [authReady, isAuthenticated]);
 
   useEffect(() => {
@@ -3712,7 +3774,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                     entry.role === "user" && entry.deliveryStatus === "failed" && "border-rose-200/80 from-rose-600 to-rose-700",
 	                  entry.role === "assistant" && "mr-auto max-w-[90%] border-card-border bg-surface-1",
 	                  entry.role === "plan" && "mr-auto max-w-full border-brand/35 bg-brand-soft/45",
-	                  entry.role === "tool" && "max-w-full border-dashed border-card-border bg-surface-2 font-mono text-xs",
+	                  entry.role === "tool" && "max-w-full rounded-xl border-dashed border-card-border bg-surface-2 px-2.5 py-1.5 font-mono text-[11px] shadow-none",
                   entry.role === "system" && "mx-auto max-w-fit rounded-full border-card-border bg-surface-1/90 px-3 py-1 text-xs text-foreground/75",
                   entry.role === "error" && "mr-auto max-w-[90%] border-rose-300 bg-rose-50 text-rose-900 dark:border-danger-fg/40 dark:bg-danger-bg/90 dark:text-danger-fg",
                 )}
