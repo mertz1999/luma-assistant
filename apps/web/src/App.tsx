@@ -1021,29 +1021,29 @@ function MarkdownMessage({ text }: { text: string }): JSX.Element {
         ),
         th: ({ children }) => <th className="border-b border-card-border bg-surface-2 px-2 py-1 text-left">{children}</th>,
         td: ({ children }) => <td className="border-b border-card-border px-2 py-1 align-top">{children}</td>,
-        code: ({ inline, children }: any) => {
+        code: ({ children }) => {
           const raw = flattenMarkdownText(children).replace(/\n$/, "");
-
-          if (inline) {
-            return <code className="font-[inherit] text-[0.98em] font-medium text-[#0f2433] dark:text-[#f1ece6]">{raw}</code>;
-          }
-
+          return <code className="font-[inherit] text-[0.98em] font-medium text-[#0f2433] dark:text-[#f1ece6]">{raw}</code>;
+        },
+        pre: ({ children }) => {
+          const raw = flattenMarkdownText(children).replace(/\n$/, "");
           const isSingleLine = !raw.includes("\n");
-          if (isSingleLine) {
-            return (
-              <code className="block overflow-x-auto whitespace-nowrap font-[inherit] text-[1.04em] font-semibold tracking-[-0.015em] text-[#0f2433] dark:text-[#f1ece6]">
-                {raw}
-              </code>
-            );
-          }
 
           return (
-            <code className="block overflow-x-auto whitespace-pre-wrap break-words font-[inherit] text-[0.98em] leading-relaxed text-[#0f2433] dark:text-[#f1ece6]">
-              {raw}
-            </code>
+            <div className="my-1.5">
+              <code
+                className={cn(
+                  "block overflow-x-auto font-[inherit] text-[#0f2433] dark:text-[#f1ece6]",
+                  isSingleLine
+                    ? "whitespace-nowrap text-[1.04em] font-semibold tracking-[-0.015em]"
+                    : "whitespace-pre-wrap break-words text-[0.98em] leading-relaxed",
+                )}
+              >
+                {raw}
+              </code>
+            </div>
           );
         },
-        pre: ({ children }) => <div className="my-1.5">{children}</div>,
       }}
     >
       {text}
