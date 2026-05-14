@@ -2240,6 +2240,63 @@ function transcriptEntryToChatMessage(sessionId: string, entry: SessionTranscrip
   };
 }
 
+const HISTORY_MESSAGE_DUPLICATE_WINDOW_MS = 2 * 60 * 1000;
+
+function isHistorySessionMessage(message: ChatMessage): boolean {
+  return message.id.startsWith("history_");
+}
+
+function isTranscriptRenderableMessage(message: ChatMessage): boolean {
+  return message.kind === "message" && (message.role === "user" || message.role === "assistant");
+}
+
+function historyDuplicateKey(message: ChatMessage): string {
+  return `${message.role}\u0000${message.kind}\u0000${message.text.trim()}`;
+}
+
+function normalizeSessionMessages(messages: ChatMessage[]): ChatMessage[] {
+  const byId = new Map<string, ChatMessage>();
+  const order: string[] = [];
+  for (const message of messages) {
+    if (!byId.has(message.id)) order.push(message.id);
+    byId.set(message.id, message);
+  }
+
+  const dedupedById = order.map((id) => byId.get(id)).filter((message): message is ChatMessage => Boolean(message));
+  const localMatches = new Map<string, ChatMessage[]>();
+  for (const message of dedupedById) {
+    if (isHistorySessionMessage(message) || !isTranscriptRenderableMessage(message)) continue;
+    const key = historyDuplicateKey(message);
+    const bucket = localMatches.get(key) || [];
+    bucket.push(message);
+    localMatches.set(key, bucket);
+  }
+
+  const dropHistoryIds = new Set<string>();
+  for (const message of dedupedById) {
+    if (!isHistorySessionMessage(message) || !isTranscriptRenderableMessage(message)) continue;
+    const bucket = localMatches.get(historyDuplicateKey(message));
+    if (!bucket?.length) continue;
+    const matchIndex = bucket.findIndex(
+      (candidate) => Math.abs(candidate.createdAt - message.createdAt) <= HISTORY_MESSAGE_DUPLICATE_WINDOW_MS,
+    );
+    if (matchIndex === -1) continue;
+    dropHistoryIds.add(message.id);
+    bucket.splice(matchIndex, 1);
+  }
+
+  return dedupedById
+    .filter((message) => !dropHistoryIds.has(message.id))
+    .sort((left, right) => {
+      if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt;
+      if (left.sequence !== right.sequence) return left.sequence - right.sequence;
+      if (isHistorySessionMessage(left) !== isHistorySessionMessage(right)) {
+        return isHistorySessionMessage(left) ? 1 : -1;
+      }
+      return left.id.localeCompare(right.id);
+    });
+}
+
 function transcriptToChatMessages(sessionId: string, transcript: SessionTranscriptResponse): ChatMessage[] {
   return transcript.entries.map((entry, index) => transcriptEntryToChatMessage(sessionId, entry, index + 1));
 }
@@ -2486,6 +2543,7 @@ class MessageStore {
       sourceRaw: "in-app",
     });
 
+    this.markSessionInApp(state);
     state.item.status = run.status;
     state.item.updatedAt = run.updatedAt || run.createdAt;
     state.item.workspace = run.config.workspace;
@@ -2506,6 +2564,7 @@ class MessageStore {
       sourceRaw: "in-app",
     });
 
+    this.markSessionInApp(state);
     const next: ChatMessage = {
       ...message,
       sessionId,
@@ -2555,6 +2614,7 @@ class MessageStore {
 
     nextState.item.messageCount = deduped.length;
     nextState.item.lastMessagePreview = previewText(deduped[deduped.length - 1]?.text || "");
+    this.syncSessionSource(nextState);
 
     this.sessions.delete(previousSessionId);
     this.sessions.set(nextSessionId, nextState);
@@ -2606,7 +2666,7 @@ class MessageStore {
     const rows = safeJsonParse<SessionListItem[]>(fs.readFileSync(SESSION_INDEX_PATH, "utf8"), []);
     this.sessions.clear();
     for (const item of rows) {
-      const messages = readMessageLog(item.id);
+      const messages = normalizeSessionMessages(readMessageLog(item.id));
       const state: SessionState = {
         item: {
           ...item,
@@ -2617,6 +2677,7 @@ class MessageStore {
         messageIds: new Map(messages.map((message, index) => [message.id, index])),
         nextSequence: messages.reduce((max, message) => Math.max(max, message.sequence), 0) + 1,
       };
+      this.syncSessionSource(state);
       this.sessions.set(item.id, state);
     }
   }
@@ -2700,6 +2761,27 @@ class MessageStore {
     return state;
   }
 
+  private markSessionInApp(state: SessionState): void {
+    if (state.item.sourceTag === "in-app" && state.item.sourceRaw === "in-app" && !state.item.historyOnly) {
+      return;
+    }
+
+    state.item.sourceTag = "in-app";
+    state.item.sourceRaw = "in-app";
+    state.item.historyOnly = false;
+  }
+
+  private syncSessionSource(state: SessionState): void {
+    const hasLocalEvidence =
+      Boolean(state.item.latestRunId) || state.messages.some((message) => !message.id.startsWith("history_"));
+    if (hasLocalEvidence) {
+      this.markSessionInApp(state);
+      return;
+    }
+
+    state.item.sourceTag = normalizeRunSourceTag(state.item.sourceRaw, state.item.historyOnly);
+  }
+
   private writeMessage(message: ChatMessage, options?: { emitMessage?: boolean }): void {
     const state = this.ensureSession(message.sessionId, {
       title: "Session",
@@ -2708,6 +2790,7 @@ class MessageStore {
       sourceTag: "in-app",
       sourceRaw: "in-app",
     });
+    this.markSessionInApp(state);
     const existingIndex = state.messageIds.get(message.id);
     if (existingIndex === undefined) {
       state.messageIds.set(message.id, state.messages.length);
@@ -2761,6 +2844,7 @@ class MessageStore {
     const historyItem = buildHistorySessionListItem(transcript.session);
     const historyMessages = transcriptToChatMessages(sessionId, transcript);
     const existing = this.sessions.get(sessionId);
+    const existingHasLocalMessages = existing?.messages.some((message) => !message.id.startsWith("history_")) ?? false;
 
     const mergedMessages = existing
       ? [
@@ -2769,11 +2853,17 @@ class MessageStore {
         ]
       : historyMessages;
 
-    const normalizedMessages = mergedMessages.map((message, index) => ({
+    const normalizedMessages = normalizeSessionMessages(mergedMessages).map((message, index) => ({
       ...message,
       sessionId,
       sequence: index + 1,
     }));
+    const hasLocalEvidence =
+      existingHasLocalMessages ||
+      Boolean(existing?.item.latestRunId) ||
+      existing?.item.sourceTag === "in-app" ||
+      existing?.item.sourceRaw === "in-app" ||
+      normalizedMessages.some((message) => !message.id.startsWith("history_"));
 
     const nextItem: SessionListItem = {
       id: sessionId,
@@ -2784,13 +2874,13 @@ class MessageStore {
         historyItem.updatedAt,
         normalizedMessages[normalizedMessages.length - 1]?.createdAt || 0,
       ),
-      sourceTag: historyItem.sourceTag,
-      sourceRaw: historyItem.sourceRaw,
+      sourceTag: hasLocalEvidence ? "in-app" : historyItem.sourceTag,
+      sourceRaw: hasLocalEvidence ? "in-app" : historyItem.sourceRaw,
       workspace: existing?.item.workspace || historyItem.workspace || workspaceFallback,
       latestRunId: existing?.item.latestRunId || null,
       lastMessagePreview: previewText(normalizedMessages[normalizedMessages.length - 1]?.text || historyItem.lastMessagePreview),
       messageCount: normalizedMessages.length,
-      historyOnly: false,
+      historyOnly: !hasLocalEvidence,
     };
 
     const nextState: SessionState = {
