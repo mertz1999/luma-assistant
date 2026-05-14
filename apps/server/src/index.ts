@@ -2261,6 +2261,7 @@ function buildHistorySessionListItem(entry: SessionHistoryEntry): SessionListIte
 }
 
 function readSessionListItems(includeHistory: boolean): SessionListItem[] {
+  messageStore.reconcileWithRuns(runManager.getRuns(false));
   const localItems = messageStore.listLocalSessions();
   if (!includeHistory) return localItems;
 
@@ -2333,6 +2334,7 @@ class MessageStore {
     const meta = this.loadMeta();
     if (meta?.schemaVersion === MESSAGE_STORE_SCHEMA_VERSION && fs.existsSync(SESSION_INDEX_PATH)) {
       this.loadFromDisk();
+      this.reconcileWithRuns(runs.filter((run) => run.archivedAt === null));
       return;
     }
 
@@ -2344,6 +2346,24 @@ class MessageStore {
     return [...this.sessions.values()]
       .map((session) => ({ ...session.item }))
       .sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  reconcileWithRuns(runs: RunRecord[]): void {
+    const activeRuns = runs.filter((run) => run.archivedAt === null);
+    const runById = new Map(activeRuns.map((run) => [run.id, run]));
+
+    for (const [sessionId, state] of [...this.sessions.entries()]) {
+      const latestRunId = state.item.latestRunId;
+      if (!latestRunId) continue;
+
+      const run = runById.get(latestRunId);
+      if (!run) continue;
+
+      const canonicalSessionId = runSessionId(run);
+      if (!canonicalSessionId || canonicalSessionId === sessionId) continue;
+
+      this.renameSession(sessionId, canonicalSessionId, latestRunId);
+    }
   }
 
   hasLocalSession(sessionId: string): boolean {
