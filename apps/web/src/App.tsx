@@ -5,7 +5,9 @@ import DiffViewer from "react-diff-viewer-continued";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  Check,
   CircleStop,
+  Copy,
   FileCode2,
   FolderTree,
   Lock,
@@ -3706,6 +3708,29 @@ type CenterPanelProps = {
 
 function CenterPanel(props: CenterPanelProps): JSX.Element {
   const sourceBadge = props.selectedSession ? getSessionSourceBadge(props.selectedSession) : null;
+  const [copiedEntryKey, setCopiedEntryKey] = useState<string | null>(null);
+  const copyResetTimeoutRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyResetTimeoutRef.current !== null) {
+        window.clearTimeout(copyResetTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  async function copyMessage(entry: TimelineEntry): Promise<void> {
+    if (!entry.text.trim()) return;
+    await navigator.clipboard.writeText(entry.text);
+    setCopiedEntryKey(entry.key);
+    if (copyResetTimeoutRef.current !== null) {
+      window.clearTimeout(copyResetTimeoutRef.current);
+    }
+    copyResetTimeoutRef.current = window.setTimeout(() => {
+      setCopiedEntryKey((current) => (current === entry.key ? null : current));
+      copyResetTimeoutRef.current = null;
+    }, 1600);
+  }
 
   return (
     <>
@@ -3764,16 +3789,19 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               const showUserDeliveryState = entry.role === "user"
                 && (entry.deliveryStatus === "pending" || entry.deliveryStatus === "failed");
               const canRetryUserMessage = entry.role === "user" && entry.deliveryStatus === "failed";
+              const canCopyMessage = (entry.role === "assistant" || entry.role === "plan" || entry.role === "user")
+                && Boolean(entry.text.trim());
 
 	            return (
 	              <article
 	                key={entry.key}
 	                className={cn(
-	                  "animate-fade-up rounded-2xl border px-3 py-2 shadow-card",
+	                  "relative animate-fade-up rounded-2xl border px-3 py-2 shadow-card",
 	                  entry.role === "user" && "ml-auto max-w-[90%] border-transparent bg-gradient-to-br from-brand to-brand-dark text-white",
                     entry.role === "user" && entry.deliveryStatus === "failed" && "border-rose-200/80 from-rose-600 to-rose-700",
-	                  entry.role === "assistant" && "mr-auto max-w-[90%] border-card-border bg-surface-1",
-	                  entry.role === "plan" && "mr-auto max-w-full border-brand/35 bg-brand-soft/45",
+	                  entry.role === "assistant" && "mr-auto max-w-[90%] border-card-border bg-surface-1 pb-8",
+	                  entry.role === "plan" && "mr-auto max-w-full border-brand/35 bg-brand-soft/45 pb-8",
+	                  entry.role === "user" && !showUserDeliveryState && "pb-8",
 	                  entry.role === "tool" && "max-w-full rounded-xl border-dashed border-card-border bg-surface-2 px-2.5 py-1.5 font-mono text-[11px] shadow-none",
                   entry.role === "system" && "mx-auto max-w-fit rounded-full border-card-border bg-surface-1/90 px-3 py-1 text-xs text-foreground/75",
                   entry.role === "error" && "mr-auto max-w-[90%] border-rose-300 bg-rose-50 text-rose-900 dark:border-danger-fg/40 dark:bg-danger-bg/90 dark:text-danger-fg",
@@ -3824,6 +3852,24 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 	                ) : (
 	                  <div className="break-words text-sm leading-relaxed">{entry.text}</div>
 	                )}
+
+                {canCopyMessage ? (
+                  <button
+                    type="button"
+                    className={cn(
+                      "absolute right-2 rounded-full border px-1.5 py-1 transition",
+                      entry.role === "user"
+                        ? "border-white/20 bg-white/10 text-white/90 hover:bg-white/15"
+                        : "border-card-border bg-surface-1/90 text-foreground/70 hover:bg-surface-2 hover:text-foreground",
+                      showUserDeliveryState ? "bottom-8" : "bottom-2",
+                    )}
+                    onClick={() => void copyMessage(entry)}
+                    aria-label={copiedEntryKey === entry.key ? "Message copied" : "Copy message"}
+                    title={copiedEntryKey === entry.key ? "Copied" : "Copy message"}
+                  >
+                    {copiedEntryKey === entry.key ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                  </button>
+                ) : null}
 
                 {showUserDeliveryState ? (
                   <div className="mt-2 flex items-center justify-end gap-2 text-[11px] text-white/85">
