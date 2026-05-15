@@ -3843,6 +3843,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
   const sourceBadge = props.selectedSession ? getSessionSourceBadge(props.selectedSession) : null;
   const [copiedEntryKey, setCopiedEntryKey] = useState<string | null>(null);
   const copyResetTimeoutRef = useRef<number | null>(null);
+  const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const timelineBlocks = useMemo(() => buildTimelineRenderBlocks(props.timeline), [props.timeline]);
   const selectedSessionRunning = Boolean(props.selectedSession && !props.selectedSession.historyOnly && props.selectedSession.status === "running");
 
@@ -3853,6 +3854,25 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
       }
     };
   }, []);
+
+  useEffect(() => {
+    const node = composerTextareaRef.current;
+    if (!node) return;
+
+    const styles = window.getComputedStyle(node);
+    const lineHeight = Number.parseFloat(styles.lineHeight) || 20;
+    const paddingTop = Number.parseFloat(styles.paddingTop) || 0;
+    const paddingBottom = Number.parseFloat(styles.paddingBottom) || 0;
+    const borderTop = Number.parseFloat(styles.borderTopWidth) || 0;
+    const borderBottom = Number.parseFloat(styles.borderBottomWidth) || 0;
+    const minHeight = 44;
+    const maxHeight = Math.ceil((lineHeight * 5) + paddingTop + paddingBottom + borderTop + borderBottom);
+
+    node.style.height = "auto";
+    const nextHeight = Math.min(Math.max(node.scrollHeight, minHeight), maxHeight);
+    node.style.height = `${nextHeight}px`;
+    node.style.overflowY = node.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, [props.prompt]);
 
   async function copyMessage(entry: TimelineEntry): Promise<void> {
     if (!entry.text.trim()) return;
@@ -4163,7 +4183,9 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             ) : null}
 
             <textarea
-              className="min-h-[44px] max-h-40 w-full resize-y rounded-2xl border border-card-border bg-surface-1 px-3 py-2 text-base md:text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
+              ref={composerTextareaRef}
+              rows={1}
+              className="min-h-[44px] w-full resize-none rounded-2xl border border-card-border bg-surface-1 px-3 py-2 text-base md:text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
               placeholder="Message Codex... (type / for commands, including /plan)"
               value={props.prompt}
               onChange={(event) => props.setPrompt(event.target.value)}
