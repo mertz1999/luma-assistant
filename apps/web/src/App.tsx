@@ -102,6 +102,18 @@ type TimelineEntry = {
   meta?: ChatMessage["meta"];
 };
 
+type TimelineRenderBlock =
+  | {
+      kind: "entry";
+      key: string;
+      entry: TimelineEntry;
+    }
+  | {
+      kind: "tool-group";
+      key: string;
+      entries: TimelineEntry[];
+    };
+
 type SessionCard = {
   id: string;
   sessionId: string;
@@ -718,6 +730,68 @@ function buildLocalTimelineEntry(
     sequence: at,
     deliveryStatus: "sent",
     attachments: [],
+  };
+}
+
+function buildTimelineRenderBlocks(entries: TimelineEntry[]): TimelineRenderBlock[] {
+  const blocks: TimelineRenderBlock[] = [];
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (!entry) continue;
+    if (entry.role !== "tool") {
+      blocks.push({ kind: "entry", key: entry.key, entry });
+      continue;
+    }
+
+    const group = [entry];
+    while (entries[index + 1]?.role === "tool") {
+      group.push(entries[index + 1]);
+      index += 1;
+    }
+
+    if (group.length === 1) {
+      blocks.push({ kind: "entry", key: entry.key, entry });
+      continue;
+    }
+
+    blocks.push({
+      kind: "tool-group",
+      key: `tool_group_${group[0]?.key || index}`,
+      entries: group,
+    });
+  }
+
+  return blocks;
+}
+
+function toolEntryTypeLabel(entry: TimelineEntry): string {
+  const type = String(entry.meta?.type || "").toLowerCase();
+  if (type === "commandexecution") return "command";
+  if (type === "filechange") return "file change";
+  return "tool update";
+}
+
+function summarizeToolGroup(entries: TimelineEntry[]): { summary: string; detail: string; preview: string } {
+  const typeCounts = new Map<string, number>();
+  let runningCount = 0;
+
+  for (const entry of entries) {
+    if (entry.pending) runningCount += 1;
+    const label = toolEntryTypeLabel(entry);
+    typeCounts.set(label, (typeCounts.get(label) || 0) + 1);
+  }
+
+  const detailParts = [...typeCounts.entries()].map(([label, count]) => `${count} ${label}${count === 1 ? "" : "s"}`);
+  if (runningCount > 0) detailParts.push(`${runningCount} running`);
+
+  const firstEntry = entries[0];
+  const previewSource = firstEntry && String(firstEntry.meta?.command || firstEntry.text || "").trim();
+
+  return {
+    summary: `${entries.length} tool ${entries.length === 1 ? "message" : "messages"}`,
+    detail: detailParts.join(" | "),
+    preview: previewSource ? truncatePreview(previewSource, 120) : "",
   };
 }
 
@@ -1509,6 +1583,55 @@ function ToolEntry({
       {entry.text ? <pre className="mt-1.5 whitespace-pre-wrap break-words text-[11px] leading-relaxed">{entry.text}</pre> : null}
       {entry.pending ? <ThinkingDots label="Working" /> : null}
     </details>
+  );
+}
+
+function ToolEntryGroup({
+  entries,
+  ansi,
+  onOpenOutput,
+}: {
+  entries: TimelineEntry[];
+  ansi: Convert;
+  onOpenOutput: (state: ToolDetailModalState) => void;
+}): JSX.Element {
+  const [loaded, setLoaded] = useState(false);
+  const groupSummary = useMemo(() => summarizeToolGroup(entries), [entries]);
+
+  return (
+    <article className="max-w-full animate-fade-up rounded-xl border border-dashed border-card-border bg-surface-2 px-2.5 py-2 shadow-none">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="mb-1 flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-foreground/70">
+            <Layers className="h-3.5 w-3.5" />
+            Tool batch
+          </div>
+          <p className="text-[11px] font-semibold text-foreground/90">{groupSummary.summary}</p>
+          {groupSummary.detail ? <p className="mt-0.5 text-[11px] text-foreground/70">{groupSummary.detail}</p> : null}
+          {!loaded && groupSummary.preview ? (
+            <p className="mt-1 truncate text-[11px] text-foreground/60">{groupSummary.preview}</p>
+          ) : null}
+        </div>
+
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-7 shrink-0 px-2.5 text-[11px]"
+          onClick={() => setLoaded((current) => !current)}
+        >
+          {loaded ? "Hide tools" : `Load ${entries.length}`}
+        </Button>
+      </div>
+
+      {loaded ? (
+        <div className="mt-2 space-y-1.5">
+          {entries.map((entry) => (
+            <ToolEntry key={entry.key} entry={entry} ansi={ansi} onOpenOutput={onOpenOutput} />
+          ))}
+        </div>
+      ) : null}
+    </article>
   );
 }
 
@@ -3710,6 +3833,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
   const sourceBadge = props.selectedSession ? getSessionSourceBadge(props.selectedSession) : null;
   const [copiedEntryKey, setCopiedEntryKey] = useState<string | null>(null);
   const copyResetTimeoutRef = useRef<number | null>(null);
+  const timelineBlocks = useMemo(() => buildTimelineRenderBlocks(props.timeline), [props.timeline]);
 
   useEffect(() => {
     return () => {
@@ -3784,11 +3908,16 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             </div>
           ) : null}
 
-	          {props.timeline.map((entry) => {
-	            const hasLaterUserMessage = props.timeline.some((item) => item.role === "user" && item.at > entry.at);
-              const showUserDeliveryState = entry.role === "user"
-                && (entry.deliveryStatus === "pending" || entry.deliveryStatus === "failed");
-              const canRetryUserMessage = entry.role === "user" && entry.deliveryStatus === "failed";
+		          {timelineBlocks.map((block) => {
+                if (block.kind === "tool-group") {
+                  return <ToolEntryGroup key={block.key} entries={block.entries} ansi={props.ansi} onOpenOutput={props.setToolDetailModal} />;
+                }
+
+                const entry = block.entry;
+		            const hasLaterUserMessage = props.timeline.some((item) => item.role === "user" && item.at > entry.at);
+	              const showUserDeliveryState = entry.role === "user"
+	                && (entry.deliveryStatus === "pending" || entry.deliveryStatus === "failed");
+	              const canRetryUserMessage = entry.role === "user" && entry.deliveryStatus === "failed";
               const canCopyMessage = (entry.role === "assistant" || entry.role === "plan" || entry.role === "user")
                 && Boolean(entry.text.trim());
 
