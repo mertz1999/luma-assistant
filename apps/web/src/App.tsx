@@ -621,7 +621,7 @@ function findSessionByRunId(sessions: SessionCard[], runId: string | null): Sess
 }
 
 function chatMessageToTimelineEntry(message: ChatMessage): TimelineEntry {
-  const normalizedText = message.role === "assistant" || message.role === "plan" || message.role === "user"
+  const normalizedText = message.role === "assistant" || message.role === "plan"
     ? normalizeMessageTextForDisplay(message.text)
     : message.text;
   return {
@@ -3077,6 +3077,16 @@ export function App(): JSX.Element {
     }
 
     try {
+      const shouldQueueBehindActiveRun = sessionKey !== draftSessionKey && runningSessionIds.has(sessionKey);
+      if (shouldQueueBehindActiveRun) {
+        enqueueMessage(buildQueuedMessage(sessionKey, trimmedPrompt, {
+          attachments: pendingAttachments,
+        }));
+        setPrompt("");
+        clearComposerAttachments();
+        return;
+      }
+
       await submitSessionMessage(trimmedPrompt, {
         sessionKey,
         attachments: pendingAttachments,
@@ -3834,6 +3844,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
   const [copiedEntryKey, setCopiedEntryKey] = useState<string | null>(null);
   const copyResetTimeoutRef = useRef<number | null>(null);
   const timelineBlocks = useMemo(() => buildTimelineRenderBlocks(props.timeline), [props.timeline]);
+  const selectedSessionRunning = Boolean(props.selectedSession && !props.selectedSession.historyOnly && props.selectedSession.status === "running");
 
   useEffect(() => {
     return () => {
@@ -3979,8 +3990,14 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 	                    dangerouslySetInnerHTML={{ __html: props.ansi.toHtml(entry.text) }}
 	                  />
 	                ) : (
-	                  <div className="break-words text-sm leading-relaxed">{entry.text}</div>
-	                )}
+		                  <div className={cn(
+                        "break-words text-sm leading-relaxed",
+                        entry.role === "user" && "whitespace-pre-wrap",
+                      )}
+                      >
+                        {entry.text}
+                      </div>
+		                )}
 
                 {canCopyMessage ? (
                   <button
@@ -4093,7 +4110,41 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             </div>
           ) : null}
 
-          <div className="relative flex items-end gap-2">
+          {props.queueItems.length > 0 ? (
+            <div className="mb-3 rounded-xl border border-card-border bg-surface-1/85 p-2">
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <div className="text-xs font-semibold text-foreground/80">Queued messages ({props.queueItems.length})</div>
+                {selectedSessionRunning ? (
+                  <div className="text-[11px] text-foreground/60">Will send after current run finishes</div>
+                ) : null}
+              </div>
+              <div className="space-y-1">
+                {props.queueItems.slice(0, 5).map((item) => (
+                  <div key={item.id} className="flex items-center gap-2 rounded-lg bg-surface-2/60 px-2 py-1">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-xs text-foreground/80" title={item.prompt}>
+                        {truncatePreview(item.prompt, 140)}
+                      </div>
+                      {item.attachments.length > 0 ? (
+                        <div className="text-[11px] text-foreground/60">{formatAttachmentSummary(item.attachments)}</div>
+                      ) : null}
+                    </div>
+                    <button
+                      type="button"
+                      className="rounded p-1 text-foreground/70 transition hover:bg-black/5 hover:text-foreground dark:hover:bg-control-hover/70"
+                      onClick={() => props.onRemoveQueueItem(item.id)}
+                      aria-label="Remove queued message"
+                      title="Remove"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+	          <div className="relative flex items-end gap-2">
             {props.slashSuggestions.length > 0 ? (
               <div className="absolute bottom-full left-0 right-12 z-10 mb-2 space-y-1 rounded-2xl border border-card-border bg-surface-1/95 p-2 shadow-lg backdrop-blur">
                 {props.slashSuggestions.map((item) => (
@@ -4121,8 +4172,8 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             <Button
               type="button"
               disabled={props.submitting || props.isUploadingAttachments}
-              aria-label="Send message"
-              title="Send message"
+              aria-label={selectedSessionRunning ? "Queue message" : "Send message"}
+              title={selectedSessionRunning ? "Queue message" : "Send message"}
               onClick={props.onSendButtonClick}
               className="h-[44px] w-[44px] shrink-0 rounded-full p-0"
             >
@@ -4167,34 +4218,6 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             </Button>
           </div>
 
-          {props.queueItems.length > 0 ? (
-            <div className="mt-2 rounded-xl border border-card-border bg-surface-1/85 p-2">
-              <div className="mb-1 text-xs font-semibold text-foreground/80">Queued messages ({props.queueItems.length})</div>
-              <div className="space-y-1">
-                {props.queueItems.slice(0, 5).map((item) => (
-                  <div key={item.id} className="flex items-center gap-2 rounded-lg bg-surface-2/60 px-2 py-1">
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-xs text-foreground/80" title={item.prompt}>
-                        {truncatePreview(item.prompt, 140)}
-                      </div>
-                      {item.attachments.length > 0 ? (
-                        <div className="text-[11px] text-foreground/60">{formatAttachmentSummary(item.attachments)}</div>
-                      ) : null}
-                    </div>
-                    <button
-                      type="button"
-                      className="rounded p-1 text-foreground/70 transition hover:bg-black/5 hover:text-foreground dark:hover:bg-control-hover/70"
-                      onClick={() => props.onRemoveQueueItem(item.id)}
-                      aria-label="Remove queued message"
-                      title="Remove"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : null}
         </form>
       </CardContent>
     </>
