@@ -1379,16 +1379,18 @@ function FinalApprovalCard({
   }
 
   return (
-    <section className="rounded-2xl border border-amber-300/70 bg-amber-50/80 p-3">
+    <section className="rounded-2xl border border-amber-300/70 bg-amber-50/80 p-3 dark:border-[#8b6a24]/45 dark:bg-[#20190e]/95 dark:shadow-[0_10px_28px_rgba(0,0,0,0.28),inset_0_1px_0_rgba(255,226,168,0.06)]">
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-foreground/70">Final approval</p>
-          <h3 className="text-sm font-semibold">Do you want to implement this plan?</h3>
+          <p className="text-xs font-semibold uppercase tracking-wide text-foreground/70 dark:text-amber-100/65">Final approval</p>
+          <h3 className="text-sm font-semibold dark:text-amber-50">Do you want to implement this plan?</h3>
         </div>
-        <Badge>{isDisabled ? "Submitted" : "Required"}</Badge>
+        <Badge className="dark:border-[#8b6a24]/40 dark:bg-[#312614] dark:text-amber-100/90">
+          {isDisabled ? "Submitted" : "Required"}
+        </Badge>
       </div>
 
-      <div className="mb-3 text-sm leading-relaxed">
+      <div className="mb-3 text-sm leading-relaxed dark:text-stone-200">
         <MarkdownMessage text={text.trim() || "Do you want to implement this plan now?"} />
       </div>
 
@@ -1398,9 +1400,9 @@ function FinalApprovalCard({
           Yes, implement
         </Button>
 
-        <div className="flex items-center gap-2 rounded-xl border border-dashed border-amber-300/80 bg-surface-1 px-3 py-2">
+        <div className="flex items-center gap-2 rounded-xl border border-dashed border-amber-300/80 bg-surface-1 px-3 py-2 dark:border-[#8b6a24]/40 dark:bg-[#17130e]">
           <input
-            className="h-9 w-full rounded-lg border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+            className="h-9 w-full rounded-lg border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 dark:border-[#5f4d25]/35 dark:bg-[#100d09] dark:text-stone-100 dark:placeholder:text-stone-400 dark:focus:border-[#c59c39] dark:focus:ring-[#c59c39]/20"
             value={feedback}
             onChange={(event) => setFeedback(event.target.value)}
             placeholder="Add plan changes before approval"
@@ -1410,6 +1412,7 @@ function FinalApprovalCard({
             type="button"
             variant="ghost"
             size="sm"
+            className="dark:border-[#5f4d25]/35 dark:bg-[#241d12] dark:text-amber-50 dark:hover:border-[#8b6a24]/45 dark:hover:bg-[#2c2316]"
             onClick={() => void submitFeedback()}
             disabled={isDisabled || submitting !== null || !feedback.trim()}
           >
