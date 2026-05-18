@@ -190,12 +190,15 @@ export type RunMessageEntry = {
   at: number;
   attachments?: AttachmentRef[];
   meta?: {
-    type?: "commandexecution" | "filechange";
+    type?: "commandexecution" | "filechange" | "mcptoolcall" | "websearch";
     runId?: string;
     status?: string;
     command?: string;
     output?: string;
     exitCode?: number | null;
+    server?: string;
+    tool?: string;
+    query?: string;
     fileChanges?: RunMessageFileChange[];
     errorMessage?: string;
     path?: string;
@@ -243,12 +246,15 @@ export type ChatMessage = {
   deliveryStatus: "pending" | "sent" | "failed" | "streaming";
   attachments: AttachmentRef[];
   meta?: {
-    type?: "commandexecution" | "filechange";
+    type?: "commandexecution" | "filechange" | "mcptoolcall" | "websearch";
     runId?: string;
     status?: string;
     command?: string;
     output?: string;
     exitCode?: number | null;
+    server?: string;
+    tool?: string;
+    query?: string;
     fileChanges?: RunMessageFileChange[];
     errorMessage?: string;
     path?: string;

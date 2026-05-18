@@ -769,6 +769,8 @@ function toolEntryTypeLabel(entry: TimelineEntry): string {
   const type = String(entry.meta?.type || "").toLowerCase();
   if (type === "commandexecution") return "command";
   if (type === "filechange") return "file change";
+  if (type === "mcptoolcall") return "MCP tool";
+  if (type === "websearch") return "web search";
   return "tool update";
 }
 
@@ -1441,12 +1443,27 @@ function ToolEntry({
   const status = entry.meta?.status || null;
   const statusLabel = status ? String(status).replace(/[-_]/g, " ") : null;
 
-  if (type === "commandexecution") {
+  if (type === "commandexecution" || type === "mcptoolcall" || type === "websearch") {
     const command = entry.meta?.command || entry.text;
-    const output = entry.meta?.output || "";
+    const output = entry.meta?.output || entry.meta?.errorMessage || "";
     const shouldTruncate = output.length > toolOutputModalLimit;
     const visibleOutput = shouldTruncate ? output.slice(0, toolOutputModalLimit) : output;
-    const preview = `${entry.pending ? "Running" : "Command"}: ${command}`;
+    const toolLabel = type === "mcptoolcall"
+      ? "MCP tool"
+      : type === "websearch"
+        ? "Web search"
+        : "Command";
+    const runningLabel = type === "mcptoolcall"
+      ? "Running MCP tool"
+      : type === "websearch"
+        ? "Running web search"
+        : "Running command";
+    const previewSource = type === "mcptoolcall"
+      ? `MCP ${entry.meta?.server || "mcp"}.${entry.meta?.tool || "tool"}`
+      : type === "websearch"
+        ? (entry.meta?.query || command)
+        : command;
+    const preview = `${entry.pending ? runningLabel : toolLabel}: ${previewSource}`;
 
     return (
       <details className="rounded-lg border border-card-border bg-surface-1/75 p-1.5" open={entry.pending}>
@@ -1468,7 +1485,7 @@ function ToolEntry({
                   className="mt-1.5 text-[11px] font-medium text-brand underline"
                   onClick={() =>
                     onOpenOutput({
-                      title: "Command output",
+                      title: `${toolLabel} output`,
                       command,
                       output,
                       status: status || undefined,
@@ -1487,7 +1504,7 @@ function ToolEntry({
 
           <div className="flex items-center justify-between gap-2 text-[11px] text-foreground/75">
             <span>
-              {statusLabel ? `Status: ${statusLabel}` : entry.pending ? "Running command" : "Command update"}
+              {statusLabel ? `Status: ${statusLabel}` : entry.pending ? runningLabel : `${toolLabel} update`}
               {entry.meta?.exitCode !== null && entry.meta?.exitCode !== undefined ? ` | Exit: ${entry.meta.exitCode}` : ""}
             </span>
             {entry.pending ? <ThinkingDots label="Running" /> : null}

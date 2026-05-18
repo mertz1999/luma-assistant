@@ -1889,6 +1889,44 @@ function readTextField(value: unknown): string {
     .join("");
 }
 
+function stringifyToolValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function readToolOutputText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!isRecord(value)) return stringifyToolValue(value);
+
+  if (typeof value.output === "string" && value.output.trim()) return value.output;
+
+  const contentText = readTextField(value.content);
+  if (contentText.trim()) return contentText;
+
+  if (value.structured_content !== null && value.structured_content !== undefined) {
+    return stringifyToolValue(value.structured_content);
+  }
+
+  return stringifyToolValue(value);
+}
+
+function formatMcpToolCommand(server: unknown, tool: unknown, args: unknown): string {
+  const serverName = typeof server === "string" && server.trim() ? server : "mcp";
+  const toolName = typeof tool === "string" && tool.trim() ? tool : "tool";
+  const argsText = stringifyToolValue(args) || "{}";
+  return `${serverName}.${toolName}(${argsText})`;
+}
+
+function formatWebSearchCommand(item: Record<string, unknown>): string {
+  const query = typeof item.query === "string" && item.query.trim() ? item.query : "search";
+  return `search("${query}")`;
+}
+
 function parseRunFileChanges(item: Record<string, unknown>): RunMessageFileChange[] {
   const raw = Array.isArray(item.changes) ? item.changes : [];
   const result: RunMessageFileChange[] = [];
@@ -1977,6 +2015,34 @@ function buildRunMessageEntries(run: RunRecord): RunMessageEntry[] {
         errorMessage?: string;
         path?: string;
         durationMs?: number;
+      }
+    >();
+
+  const mcpToolByItemId = new Map<
+    string,
+      {
+        itemId: string;
+        at: number;
+        status: string;
+        pending: boolean;
+        server: string;
+        tool: string;
+        command: string;
+        output: string;
+        errorMessage?: string;
+      }
+    >();
+
+  const webSearchByItemId = new Map<
+    string,
+      {
+        itemId: string;
+        at: number;
+        status: string;
+        pending: boolean;
+        query: string;
+        command: string;
+        output: string;
       }
     >();
 
@@ -2079,6 +2145,57 @@ function buildRunMessageEntries(run: RunRecord): RunMessageEntry[] {
       continue;
     }
 
+    if (itemType === "mcp_tool_call" && (parsedType === "item.started" || parsedType === "item.completed")) {
+      const existing = mcpToolByItemId.get(itemId) || {
+        itemId,
+        at: event.at,
+        status: parsedType === "item.started" ? "in_progress" : "completed",
+        pending: parsedType === "item.started",
+        server: typeof item?.server === "string" ? item.server : "mcp",
+        tool: typeof item?.tool === "string" ? item.tool : "tool",
+        command: formatMcpToolCommand(item?.server, item?.tool, item?.arguments),
+        output: "",
+        errorMessage: undefined,
+      };
+
+      if (event.at < existing.at) existing.at = event.at;
+      if (typeof item?.status === "string" && item.status.trim()) existing.status = item.status;
+      if (typeof item?.server === "string" && item.server.trim()) existing.server = item.server;
+      if (typeof item?.tool === "string" && item.tool.trim()) existing.tool = item.tool;
+      existing.command = formatMcpToolCommand(existing.server, existing.tool, item?.arguments);
+      const output = readToolOutputText(item?.result);
+      if (output.trim()) existing.output = output;
+      const errorMessage = readToolOutputText(item?.error);
+      if (errorMessage.trim()) existing.errorMessage = errorMessage;
+      existing.pending = parsedType === "item.started" || existing.status === "in_progress";
+
+      mcpToolByItemId.set(itemId, existing);
+      continue;
+    }
+
+    if (itemType === "web_search" && (parsedType === "item.started" || parsedType === "item.completed")) {
+      const existing = webSearchByItemId.get(itemId) || {
+        itemId,
+        at: event.at,
+        status: parsedType === "item.started" ? "in_progress" : "completed",
+        pending: parsedType === "item.started",
+        query: typeof item?.query === "string" ? item.query : "",
+        command: formatWebSearchCommand(item || {}),
+        output: "",
+      };
+
+      if (event.at < existing.at) existing.at = event.at;
+      if (typeof item?.status === "string" && item.status.trim()) existing.status = item.status;
+      if (typeof item?.query === "string") existing.query = item.query;
+      existing.command = formatWebSearchCommand(item || {});
+      const output = stringifyToolValue(item?.action);
+      if (output.trim()) existing.output = output;
+      existing.pending = parsedType === "item.started" || existing.status === "in_progress";
+
+      webSearchByItemId.set(itemId, existing);
+      continue;
+    }
+
     if (itemType === "error") {
       const message = typeof item?.message === "string" ? item.message : raw;
       entries.push({
@@ -2134,7 +2251,43 @@ function buildRunMessageEntries(run: RunRecord): RunMessageEntry[] {
     };
   });
 
-  entries.push(...commandEntries, ...fileEntries);
+  const mcpEntries = [...mcpToolByItemId.values()].map((call) => ({
+    key: `${run.id}_${call.itemId}_mcp_tool`,
+    role: "tool" as const,
+    title: "Tool",
+    text: `MCP ${call.server}.${call.tool}`,
+    pending: call.pending,
+    at: call.at,
+    meta: {
+      type: "mcptoolcall" as const,
+      runId: run.id,
+      status: call.status || (call.pending ? "in_progress" : "completed"),
+      command: call.command,
+      output: call.output,
+      server: call.server,
+      tool: call.tool,
+      errorMessage: call.errorMessage,
+    },
+  }));
+
+  const webSearchEntries = [...webSearchByItemId.values()].map((search) => ({
+    key: `${run.id}_${search.itemId}_web_search`,
+    role: "tool" as const,
+    title: "Tool",
+    text: search.query ? `Web search: ${search.query}` : "Web search",
+    pending: search.pending,
+    at: search.at,
+    meta: {
+      type: "websearch" as const,
+      runId: run.id,
+      status: search.status || (search.pending ? "in_progress" : "completed"),
+      command: search.command,
+      output: search.output,
+      query: search.query,
+    },
+  }));
+
+  entries.push(...commandEntries, ...fileEntries, ...mcpEntries, ...webSearchEntries);
 
   if (run.usage) {
     entries.push({
@@ -2421,6 +2574,87 @@ class MessageStore {
 
       this.renameSession(sessionId, canonicalSessionId, latestRunId);
     }
+
+    const runsBySession = new Map<string, RunRecord[]>();
+    for (const run of activeRuns) {
+      const sessionId = runSessionId(run);
+      const existing = runsBySession.get(sessionId) || [];
+      existing.push(run);
+      runsBySession.set(sessionId, existing);
+    }
+
+    for (const [sessionId, sessionRuns] of runsBySession.entries()) {
+      this.reconcileProjectedRunMessages(sessionId, sessionRuns);
+    }
+  }
+
+  private reconcileProjectedRunMessages(sessionId: string, runs: RunRecord[]): void {
+    if (runs.length === 0) return;
+
+    const orderedDesc = [...runs].sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt));
+    const orderedAsc = [...runs].sort((a, b) => a.createdAt - b.createdAt);
+    const latestRun = orderedDesc[0];
+    const firstPrompt = orderedAsc.find((run) => run.config.prompt.trim())?.config.prompt.trim() || "";
+    const titleFallback = normalizeRunListName(firstPrompt || latestRun?.summary || "Session", latestRun?.summary || "Session");
+
+    const state = this.ensureSession(sessionId, {
+      title: titleFallback,
+      workspace: latestRun?.config.workspace || "",
+      status: latestRun?.status || "completed",
+      sourceTag: "in-app",
+      sourceRaw: "in-app",
+    });
+
+    const projectedMessages = buildSessionMessageEntries(runs)
+      .map((entry, index) => timelineEntryToChatMessage(sessionId, entry, index + 1));
+    const normalizedMessages = normalizeSessionMessages([...state.messages, ...projectedMessages]).map((message, index) => ({
+      ...message,
+      sessionId,
+      sequence: index + 1,
+    }));
+
+    const previousSerialized = state.messages.map((message) => JSON.stringify(message)).join("\n");
+    const nextSerialized = normalizedMessages.map((message) => JSON.stringify(message)).join("\n");
+    const messagesChanged = previousSerialized !== nextSerialized;
+    const nextUpdatedAt = Math.max(
+      state.item.updatedAt,
+      latestRun ? (latestRun.updatedAt || latestRun.createdAt) : 0,
+      normalizedMessages[normalizedMessages.length - 1]?.createdAt || 0,
+    );
+    const nextPreview = previewText(normalizedMessages[normalizedMessages.length - 1]?.text || state.item.lastMessagePreview || "");
+    const metadataChanged =
+      state.item.status !== (latestRun?.status || state.item.status)
+      || state.item.workspace !== (latestRun?.config.workspace || state.item.workspace)
+      || state.item.latestRunId !== (latestRun?.id || state.item.latestRunId)
+      || state.item.messageCount !== normalizedMessages.length
+      || state.item.lastMessagePreview !== nextPreview
+      || state.item.updatedAt !== nextUpdatedAt
+      || (!state.item.title.trim() && titleFallback !== state.item.title);
+
+    if (!messagesChanged && !metadataChanged) return;
+
+    state.messages = normalizedMessages;
+    state.messageIds = new Map(normalizedMessages.map((message, index) => [message.id, index]));
+    state.nextSequence = normalizedMessages.length + 1;
+    state.item.status = latestRun?.status || state.item.status;
+    state.item.workspace = latestRun?.config.workspace || state.item.workspace;
+    state.item.latestRunId = latestRun?.id || state.item.latestRunId;
+    state.item.updatedAt = nextUpdatedAt;
+    state.item.messageCount = normalizedMessages.length;
+    state.item.lastMessagePreview = nextPreview;
+    if (!state.item.title.trim()) state.item.title = titleFallback;
+    this.syncSessionSource(state);
+
+    if (messagesChanged) {
+      this.enqueueWrite(async () => {
+        await fs.promises.mkdir(MESSAGE_LOG_DIR, { recursive: true });
+        const fileContent = normalizedMessages.map((message) => JSON.stringify(message)).join("\n");
+        await fs.promises.writeFile(messageLogPath(sessionId), `${fileContent}${fileContent ? "\n" : ""}`);
+      });
+    }
+
+    this.scheduleSnapshot();
+    this.emitSessionUpsert(state.item);
   }
 
   hasLocalSession(sessionId: string): boolean {
@@ -3310,6 +3544,63 @@ class MessageProjector {
           command,
           output,
           exitCode: typeof item?.exit_code === "number" ? item.exit_code : null,
+        },
+      });
+      return;
+    }
+
+    if (itemType === "mcp_tool_call" && (type === "item.started" || type === "item.completed")) {
+      const status = typeof item?.status === "string" ? item.status : (type === "item.started" ? "in_progress" : "completed");
+      const server = typeof item?.server === "string" && item.server.trim() ? item.server : "mcp";
+      const tool = typeof item?.tool === "string" && item.tool.trim() ? item.tool : "tool";
+      const output = readToolOutputText(item?.result);
+      const errorMessage = readToolOutputText(item?.error);
+      this.messageStore.upsertGeneratedMessage(sessionId, {
+        id: `${event.run.id}_${itemId}_mcp_tool`,
+        clientMessageId: null,
+        runId: event.run.id,
+        role: "tool",
+        kind: "tool",
+        title: "Tool",
+        text: `MCP ${server}.${tool}`,
+        createdAt: event.run.updatedAt,
+        deliveryStatus: type === "item.started" || status === "in_progress" ? "streaming" : "sent",
+        attachments: [],
+        meta: {
+          type: "mcptoolcall",
+          runId: event.run.id,
+          status,
+          command: formatMcpToolCommand(server, tool, item?.arguments),
+          output,
+          server,
+          tool,
+          errorMessage: errorMessage || undefined,
+        },
+      });
+      return;
+    }
+
+    if (itemType === "web_search" && (type === "item.started" || type === "item.completed")) {
+      const status = typeof item?.status === "string" ? item.status : (type === "item.started" ? "in_progress" : "completed");
+      const query = typeof item?.query === "string" ? item.query : "";
+      this.messageStore.upsertGeneratedMessage(sessionId, {
+        id: `${event.run.id}_${itemId}_web_search`,
+        clientMessageId: null,
+        runId: event.run.id,
+        role: "tool",
+        kind: "tool",
+        title: "Tool",
+        text: query ? `Web search: ${query}` : "Web search",
+        createdAt: event.run.updatedAt,
+        deliveryStatus: type === "item.started" || status === "in_progress" ? "streaming" : "sent",
+        attachments: [],
+        meta: {
+          type: "websearch",
+          runId: event.run.id,
+          status,
+          command: formatWebSearchCommand(item || {}),
+          output: stringifyToolValue(item?.action),
+          query,
         },
       });
       return;
