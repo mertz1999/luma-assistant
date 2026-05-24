@@ -2407,6 +2407,41 @@ function historyDuplicateKey(message: ChatMessage): string {
   return `${message.role}\u0000${message.kind}\u0000${message.text.trim()}`;
 }
 
+function compareSessionMessages(left: ChatMessage, right: ChatMessage): number {
+  if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt;
+  if (left.sequence !== right.sequence) return left.sequence - right.sequence;
+  if (isHistorySessionMessage(left) !== isHistorySessionMessage(right)) {
+    return isHistorySessionMessage(left) ? 1 : -1;
+  }
+  return left.id.localeCompare(right.id);
+}
+
+function isLocalOutgoingUserMessage(message: ChatMessage): boolean {
+  return message.role === "user" && message.kind === "message" && message.id.startsWith("msg_");
+}
+
+function isProjectedRunUserMessage(message: ChatMessage): boolean {
+  return message.role === "user" && message.kind === "message" && message.id.startsWith("run_") && message.id.endsWith("_user");
+}
+
+function fileChangePath(message: ChatMessage): string {
+  const firstChange = Array.isArray(message.meta?.fileChanges) ? message.meta.fileChanges[0] : null;
+  if (firstChange && typeof firstChange.path === "string" && firstChange.path.trim()) {
+    return firstChange.path.trim();
+  }
+  return typeof message.meta?.path === "string" ? message.meta.path.trim() : "";
+}
+
+function isDuplicateFileChangeMessage(left: ChatMessage, right: ChatMessage): boolean {
+  if (left.role !== "tool" || right.role !== "tool" || left.kind !== "tool" || right.kind !== "tool") return false;
+  if (left.meta?.type !== "filechange" || right.meta?.type !== "filechange") return false;
+  if ((left.meta?.runId || null) !== (right.meta?.runId || null)) return false;
+  if ((left.meta?.status || null) !== (right.meta?.status || null)) return false;
+  if (left.text.trim() !== right.text.trim()) return false;
+  if (fileChangePath(left) !== fileChangePath(right)) return false;
+  return Math.abs(left.createdAt - right.createdAt) <= HISTORY_MESSAGE_DUPLICATE_WINDOW_MS;
+}
+
 function normalizeSessionMessages(messages: ChatMessage[]): ChatMessage[] {
   const byId = new Map<string, ChatMessage>();
   const order: string[] = [];
@@ -2438,16 +2473,43 @@ function normalizeSessionMessages(messages: ChatMessage[]): ChatMessage[] {
     bucket.splice(matchIndex, 1);
   }
 
-  return dedupedById
-    .filter((message) => !dropHistoryIds.has(message.id))
-    .sort((left, right) => {
-      if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt;
-      if (left.sequence !== right.sequence) return left.sequence - right.sequence;
-      if (isHistorySessionMessage(left) !== isHistorySessionMessage(right)) {
-        return isHistorySessionMessage(left) ? 1 : -1;
-      }
-      return left.id.localeCompare(right.id);
-    });
+  const localUserMatches = new Map<string, ChatMessage[]>();
+  for (const message of dedupedById) {
+    if (!isLocalOutgoingUserMessage(message)) continue;
+    const key = historyDuplicateKey(message);
+    const bucket = localUserMatches.get(key) || [];
+    bucket.push(message);
+    localUserMatches.set(key, bucket);
+  }
+
+  const dropProjectedPromptIds = new Set<string>();
+  for (const message of dedupedById) {
+    if (!isProjectedRunUserMessage(message)) continue;
+    const bucket = localUserMatches.get(historyDuplicateKey(message));
+    if (!bucket?.length) continue;
+    const matchIndex = bucket.findIndex(
+      (candidate) => Math.abs(candidate.createdAt - message.createdAt) <= HISTORY_MESSAGE_DUPLICATE_WINDOW_MS,
+    );
+    if (matchIndex === -1) continue;
+    dropProjectedPromptIds.add(message.id);
+    bucket.splice(matchIndex, 1);
+  }
+
+  const sorted = dedupedById
+    .filter((message) => !dropHistoryIds.has(message.id) && !dropProjectedPromptIds.has(message.id))
+    .sort(compareSessionMessages);
+
+  const normalized: ChatMessage[] = [];
+  for (const message of sorted) {
+    const previous = normalized[normalized.length - 1];
+    if (previous && isDuplicateFileChangeMessage(previous, message)) {
+      normalized[normalized.length - 1] = message;
+      continue;
+    }
+    normalized.push(message);
+  }
+
+  return normalized;
 }
 
 function transcriptToChatMessages(sessionId: string, transcript: SessionTranscriptResponse): ChatMessage[] {
@@ -2669,6 +2731,25 @@ class MessageStore {
   getMessagesPage(sessionId: string, beforeCursor: string | null, limit = SESSION_MESSAGE_PAGE_SIZE): SessionMessagesResponse | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
+
+    const normalizedMessages = normalizeSessionMessages(state.messages).map((message, index) => ({
+      ...message,
+      sequence: index + 1,
+    }));
+    const normalizedChanged = normalizedMessages.length !== state.messages.length
+      || normalizedMessages.some((message, index) => {
+        const current = state.messages[index];
+        return !current || current.id !== message.id || current.sequence !== message.sequence;
+      });
+    if (normalizedChanged) {
+      state.messages = normalizedMessages;
+      state.messageIds = new Map(normalizedMessages.map((message, index) => [message.id, index]));
+      state.nextSequence = normalizedMessages.reduce((max, message) => Math.max(max, message.sequence), 0) + 1;
+      state.item.messageCount = normalizedMessages.length;
+      state.item.lastMessagePreview = previewText(normalizedMessages[normalizedMessages.length - 1]?.text || "");
+      this.syncSessionSource(state);
+      this.scheduleSnapshot();
+    }
 
     const end = decodeCursor(beforeCursor) ?? state.messages.length;
     const safeEnd = Math.min(Math.max(end, 0), state.messages.length);

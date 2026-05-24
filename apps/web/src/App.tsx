@@ -647,6 +647,72 @@ function sameTimelineMessage(left: TimelineEntry, right: TimelineEntry): boolean
   return Boolean(left.clientMessageId && right.clientMessageId && left.clientMessageId === right.clientMessageId);
 }
 
+function normalizeTimelineEntryText(entry: TimelineEntry): string {
+  return entry.text.replace(/\s+/g, " ").trim();
+}
+
+function isLocalStoredUserEntry(entry: TimelineEntry): boolean {
+  return entry.role === "user" && entry.kind === "message" && Boolean(entry.messageId?.startsWith("msg_"));
+}
+
+function isProjectedRunPromptEntry(entry: TimelineEntry): boolean {
+  return entry.role === "user" && entry.kind === "message" && Boolean(entry.messageId?.startsWith("run_") && entry.messageId.endsWith("_user"));
+}
+
+function fileChangePathFromEntry(entry: TimelineEntry): string {
+  const changes = Array.isArray(entry.meta?.fileChanges) ? entry.meta.fileChanges : [];
+  const firstChange = changes[0];
+  if (firstChange && typeof firstChange.path === "string" && firstChange.path.trim()) {
+    return firstChange.path.trim();
+  }
+  return typeof entry.meta?.path === "string" ? entry.meta.path.trim() : "";
+}
+
+function isDuplicatePromptEntry(left: TimelineEntry, right: TimelineEntry): boolean {
+  if (left.sessionId !== right.sessionId || left.role !== "user" || right.role !== "user" || left.kind !== "message" || right.kind !== "message") {
+    return false;
+  }
+  if (normalizeTimelineEntryText(left) !== normalizeTimelineEntryText(right)) return false;
+  if (Math.abs(left.at - right.at) > 2 * 60 * 1000) return false;
+  return (
+    (isLocalStoredUserEntry(left) && isProjectedRunPromptEntry(right))
+    || (isLocalStoredUserEntry(right) && isProjectedRunPromptEntry(left))
+  );
+}
+
+function isDuplicateFileChangeEntry(left: TimelineEntry, right: TimelineEntry): boolean {
+  if (left.sessionId !== right.sessionId || left.role !== "tool" || right.role !== "tool" || left.kind !== "tool" || right.kind !== "tool") {
+    return false;
+  }
+  if (left.meta?.type !== "filechange" || right.meta?.type !== "filechange") return false;
+  if ((left.meta?.runId || null) !== (right.meta?.runId || null)) return false;
+  if ((left.meta?.status || null) !== (right.meta?.status || null)) return false;
+  if (normalizeTimelineEntryText(left) !== normalizeTimelineEntryText(right)) return false;
+  if (fileChangePathFromEntry(left) !== fileChangePathFromEntry(right)) return false;
+  return Math.abs(left.at - right.at) <= 2 * 60 * 1000;
+}
+
+function sameSemanticTimelineMessage(left: TimelineEntry, right: TimelineEntry): boolean {
+  return sameTimelineMessage(left, right) || isDuplicatePromptEntry(left, right) || isDuplicateFileChangeEntry(left, right);
+}
+
+function mergeSemanticTimelineEntry(existing: TimelineEntry, next: TimelineEntry): TimelineEntry {
+  if (sameTimelineMessage(existing, next)) return next;
+  if (isDuplicatePromptEntry(existing, next)) {
+    const local = isLocalStoredUserEntry(existing) ? existing : next;
+    const projected = local === existing ? next : existing;
+    return {
+      ...local,
+      pending: local.pending && projected.pending,
+      deliveryStatus: local.deliveryStatus === "pending" ? projected.deliveryStatus : local.deliveryStatus,
+      meta: { ...(projected.meta || {}), ...(local.meta || {}) },
+      at: Math.min(existing.at, next.at),
+      sequence: Math.min(existing.sequence, next.sequence),
+    };
+  }
+  return next;
+}
+
 function mergeTimelineEntries(older: TimelineEntry[], newer: TimelineEntry[]): TimelineEntry[] {
   const merged: TimelineEntry[] = [];
   const seenMessageIds = new Set<string>();
@@ -665,9 +731,9 @@ function mergeTimelineEntries(older: TimelineEntry[], newer: TimelineEntry[]): T
 
 function upsertTimelineEntry(entries: TimelineEntry[], nextEntry: TimelineEntry): TimelineEntry[] {
   const next = [...entries];
-  const index = next.findIndex((entry) => sameTimelineMessage(entry, nextEntry));
+  const index = next.findIndex((entry) => sameSemanticTimelineMessage(entry, nextEntry));
   if (index >= 0) {
-    next[index] = nextEntry;
+    next[index] = mergeSemanticTimelineEntry(next[index], nextEntry);
   } else {
     next.push(nextEntry);
   }
@@ -1097,29 +1163,23 @@ function MarkdownMessage({ text }: { text: string }): JSX.Element {
         ),
         th: ({ children }) => <th className="border-b border-card-border bg-surface-2 px-2 py-1 text-left">{children}</th>,
         td: ({ children }) => <td className="border-b border-card-border px-2 py-1 align-top">{children}</td>,
-        code: ({ children }) => {
+        code: ({ className, children }) => {
           const raw = flattenMarkdownText(children).replace(/\n$/, "");
-          return <code className="font-[inherit] text-[0.98em] font-medium text-[#0f2433] dark:text-[#f1ece6]">{raw}</code>;
-        },
-        pre: ({ children }) => {
-          const raw = flattenMarkdownText(children).replace(/\n$/, "");
-          const isSingleLine = !raw.includes("\n");
-
+          const isBlock = Boolean(className) || raw.includes("\n");
           return (
-            <div className="my-1.5">
-              <code
-                className={cn(
-                  "block overflow-x-auto font-[inherit] text-[#0f2433] dark:text-[#f1ece6]",
-                  isSingleLine
-                    ? "whitespace-nowrap text-[1.04em] font-semibold tracking-[-0.015em]"
-                    : "whitespace-pre-wrap break-words text-[0.98em] leading-relaxed",
-                )}
-              >
-                {raw}
-              </code>
-            </div>
+            <code
+              className={cn(
+                isBlock
+                  ? "block whitespace-pre-wrap break-words bg-transparent font-mono text-[0.95em] leading-relaxed text-[#0f2433] dark:text-[#f1ece6]"
+                  : "rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-[0.92em] text-[#0f2433] dark:bg-[#2a2622] dark:text-[#f1ece6]",
+                className,
+              )}
+            >
+              {raw}
+            </code>
           );
         },
+        pre: ({ children }) => <pre className="my-1.5 overflow-x-auto rounded-xl bg-surface-2 px-3 py-2 dark:bg-[#171616]">{children}</pre>,
       }}
     >
       {text}
@@ -2404,7 +2464,9 @@ export function App(): JSX.Element {
     if (isDraftSessionRef.current) return;
 
     const sessions = buildSessionCards(normalizedItems);
-    const preferred = preferredSessionId ? sessions.find((session) => session.id === preferredSessionId) : null;
+    const preferred = preferredSessionId && !selectedSessionIdRef.current
+      ? sessions.find((session) => session.id === preferredSessionId)
+      : null;
     if (preferred) {
       setSelectedSessionId(preferred.id);
       setSelectedRunId(preferred.latestRunId);
@@ -2415,8 +2477,8 @@ export function App(): JSX.Element {
       const current = sessions.find((session) => session.id === selectedSessionIdRef.current);
       if (current) {
         setSelectedRunId(current.latestRunId);
-        return;
       }
+      return;
     }
 
     if (selectedRunIdRef.current) {
