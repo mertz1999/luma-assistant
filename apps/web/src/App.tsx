@@ -1,10 +1,11 @@
-import { isValidElement, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { isValidElement, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import Convert from "ansi-to-html";
 import DiffViewer from "react-diff-viewer-continued";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  AtSign,
   Check,
   CircleStop,
   Copy,
@@ -39,6 +40,8 @@ import type {
   SandboxMode,
   SendMessageInput,
   SessionListItem,
+  SkillListItem,
+  SelectedSkillRef,
   TerminalSessionSnapshot,
   WorkspaceOption,
 } from "@agentic/shared";
@@ -52,6 +55,7 @@ import {
   getDiff,
   getFileTree,
   getMcpStatus,
+  getSkills,
   getSessionList,
   getSessionMessages,
   getSystemStatus,
@@ -175,6 +179,7 @@ type QueuedMessage = {
   sandbox: SandboxMode;
   approvalPolicy: ApprovalPolicy;
   planMode: boolean;
+  skills: SelectedSkillRef[];
 };
 
 type SpeechRecognitionAlternativeLike = {
@@ -467,6 +472,7 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
         const createdAt = typeof item.createdAt === "number" ? item.createdAt : Date.now();
         const planMode = typeof item.planMode === "boolean" ? item.planMode : false;
         const attachments = readAttachmentRefs(item.attachments);
+        const skills = readSelectedSkillRefs(item.skills);
 
         if (!id || !prompt || !workspace || !model || !isSandboxMode(item.sandbox) || !isApprovalPolicy(item.approvalPolicy)) {
           continue;
@@ -483,6 +489,7 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
           sandbox: item.sandbox,
           approvalPolicy: item.approvalPolicy,
           planMode,
+          skills,
         });
       }
 
@@ -894,6 +901,72 @@ function readAttachmentRefs(input: unknown): AttachmentRef[] {
     .map((value) => readAttachmentRef(value))
     .filter((value): value is AttachmentRef => value !== null)
     .slice(0, attachmentMaxFiles);
+}
+
+function readSelectedSkillRef(input: unknown): SelectedSkillRef | null {
+  if (!isRecord(input)) return null;
+  const id = typeof input.id === "string" ? input.id.trim() : "";
+  const skillPath = typeof input.path === "string" ? input.path.trim() : "";
+  return id && skillPath ? { id, path: skillPath } : null;
+}
+
+function readSelectedSkillRefs(input: unknown): SelectedSkillRef[] {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  const refs: SelectedSkillRef[] = [];
+  for (const value of input) {
+    const ref = readSelectedSkillRef(value);
+    if (!ref) continue;
+    const key = `${ref.id}\n${ref.path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    refs.push(ref);
+    if (refs.length >= 20) break;
+  }
+  return refs;
+}
+
+function selectedSkillRef(skill: SkillListItem): SelectedSkillRef {
+  return { id: skill.id, path: skill.path };
+}
+
+function skillDisplayName(ref: SelectedSkillRef, catalog: SkillListItem[]): string {
+  const match = catalog.find((skill) => skill.id === ref.id || skill.path === ref.path);
+  if (match) return match.name;
+  return ref.path.split(/[\\/]/).filter(Boolean).slice(-2, -1)[0] || ref.path.split(/[\\/]/).pop() || "Skill";
+}
+
+function formatSkillSummary(refs: SelectedSkillRef[], catalog: SkillListItem[]): string {
+  if (refs.length === 0) return "";
+  const names = refs.slice(0, 2).map((ref) => skillDisplayName(ref, catalog));
+  const suffix = refs.length > names.length ? ` +${refs.length - names.length}` : "";
+  return `Skills: ${names.join(", ")}${suffix}`;
+}
+
+type SkillQueryToken = {
+  start: number;
+  end: number;
+  query: string;
+};
+
+function findSkillQueryToken(value: string): SkillQueryToken | null {
+  for (let index = value.length - 1; index >= 0; index -= 1) {
+    if (value[index] !== "@") continue;
+    if (index > 0 && !/\s/.test(value[index - 1])) continue;
+    const token = value.slice(index + 1);
+    if (/\s/.test(token)) return null;
+    return { start: index, end: value.length, query: token };
+  }
+  return null;
+}
+
+function removeSkillQueryToken(value: string, token: SkillQueryToken | null): string {
+  if (!token) return value;
+  const before = value.slice(0, token.start).replace(/[ \t]+$/g, "");
+  const after = value.slice(token.end).replace(/^[ \t]+/g, "");
+  if (!before) return after;
+  if (!after) return before;
+  return `${before} ${after}`;
 }
 
 function readChatMessage(input: unknown): ChatMessage | null {
@@ -1801,6 +1874,12 @@ export function App(): JSX.Element {
   const [diff, setDiff] = useState<DiffSnapshot | null>(null);
 
   const [prompt, setPrompt] = useState("");
+  const [skillCatalog, setSkillCatalog] = useState<SkillListItem[]>([]);
+  const [skillsLoading, setSkillsLoading] = useState(false);
+  const [skillsError, setSkillsError] = useState<string | null>(null);
+  const [skillPickerOpen, setSkillPickerOpen] = useState(false);
+  const [selectedSkills, setSelectedSkills] = useState<SkillListItem[]>([]);
+  const [highlightedSkillIndex, setHighlightedSkillIndex] = useState(0);
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentRef[]>([]);
   const [pendingAttachmentWorkspace, setPendingAttachmentWorkspace] = useState<string | null>(null);
   const [uploadingAttachmentNames, setUploadingAttachmentNames] = useState<string[]>([]);
@@ -2281,6 +2360,21 @@ export function App(): JSX.Element {
     const token = trimmed.split(/\s+/)[0].toLowerCase();
     return slashCommandSuggestions.filter((item) => item.key.startsWith(token) || item.key.includes(token));
   }, [prompt]);
+  const skillQueryToken = useMemo(() => findSkillQueryToken(prompt), [prompt]);
+  const selectedSkillIds = useMemo(() => new Set(selectedSkills.map((skill) => skill.id)), [selectedSkills]);
+  const filteredSkills = useMemo(() => {
+    const query = (skillQueryToken?.query || "").toLowerCase();
+    return skillCatalog
+      .filter((skill) => !selectedSkillIds.has(skill.id))
+      .filter((skill) => {
+        if (!query) return true;
+        return skill.name.toLowerCase().includes(query)
+          || skill.description.toLowerCase().includes(query)
+          || skill.path.toLowerCase().includes(query)
+          || skill.source.toLowerCase().includes(query);
+      })
+      .slice(0, 30);
+  }, [skillCatalog, selectedSkillIds, skillQueryToken]);
   const runningSessionIds = useMemo(() => {
     const ids = new Set<string>();
     for (const item of allSessions) {
@@ -2295,6 +2389,22 @@ export function App(): JSX.Element {
     : "Agentic CLI";
 
   const hasPendingTimelineEntry = timeline.some((entry) => entry.pending);
+
+  useEffect(() => {
+    if (!skillQueryToken) {
+      setSkillPickerOpen(false);
+      setHighlightedSkillIndex(0);
+      return;
+    }
+    setSkillPickerOpen(true);
+    setHighlightedSkillIndex(0);
+  }, [skillQueryToken?.start, skillQueryToken?.query]);
+
+  useEffect(() => {
+    if (filteredSkills.length > 0 && highlightedSkillIndex >= filteredSkills.length) {
+      setHighlightedSkillIndex(Math.max(0, filteredSkills.length - 1));
+    }
+  }, [filteredSkills.length, highlightedSkillIndex]);
 
   useEffect(() => {
     const previous = previousTimelineStateRef.current;
@@ -2416,13 +2526,17 @@ export function App(): JSX.Element {
   async function loadBootstrapLite(): Promise<void> {
     setLoading(true);
     setLoadingRunList(true);
+    setSkillsLoading(true);
     try {
-      const [payload, listPayload] = await Promise.all([
+      const [payload, listPayload, skillsPayload] = await Promise.all([
         getBootstrapLite(),
         getSessionList(runListPageSize, null, showAllHistoryRef.current),
+        getSkills(),
       ]);
       setWorkspaces(payload.workspaces);
       setWorkspace(payload.activeWorkspace);
+      setSkillCatalog(skillsPayload.skills);
+      setSkillsError(null);
       const normalizedItems = normalizeSessionItems(listPayload.items);
       setRunItems(normalizedItems);
       setRunListNextCursor(listPayload.nextCursor);
@@ -2450,7 +2564,22 @@ export function App(): JSX.Element {
       setSelectedRunId(null);
     } finally {
       setLoadingRunList(false);
+      setSkillsLoading(false);
       setLoading(false);
+    }
+  }
+
+  async function refreshSkillCatalog(workspace = activeWorkspace): Promise<void> {
+    if (!workspace) return;
+    setSkillsLoading(true);
+    try {
+      const payload = await getSkills(workspace);
+      setSkillCatalog(payload.skills);
+      setSkillsError(null);
+    } catch (error) {
+      setSkillsError(error instanceof Error ? error.message : "Failed to load skills");
+    } finally {
+      setSkillsLoading(false);
     }
   }
 
@@ -2705,6 +2834,7 @@ export function App(): JSX.Element {
       planMode?: boolean;
       sandbox?: SandboxMode;
       approvalPolicy?: ApprovalPolicy;
+      skills?: SelectedSkillRef[];
     },
   ): QueuedMessage {
     const planMode = overrides?.planMode ?? shouldUsePlanMode(sessionKey);
@@ -2719,6 +2849,7 @@ export function App(): JSX.Element {
       sandbox: overrides?.sandbox ?? (planMode ? "read-only" : sandbox),
       approvalPolicy: overrides?.approvalPolicy ?? (planMode ? "never" : approvalPolicy),
       planMode,
+      skills: readSelectedSkillRefs(overrides?.skills ?? selectedSkills.map(selectedSkillRef)),
     };
   }
 
@@ -2727,6 +2858,7 @@ export function App(): JSX.Element {
     const queued: QueuedMessage = {
       ...request,
       attachments: readAttachmentRefs(request.attachments),
+      skills: readSelectedSkillRefs(request.skills),
       id: request.id || `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       createdAt: request.createdAt || Date.now(),
     };
@@ -2768,6 +2900,7 @@ export function App(): JSX.Element {
       sandbox: request.sandbox,
       approvalPolicy: request.approvalPolicy,
       planMode: request.planMode,
+      skills: request.skills,
       sessionId: request.sessionKey === draftSessionKey ? undefined : request.sessionKey,
     };
 
@@ -2846,6 +2979,7 @@ export function App(): JSX.Element {
       planMode?: boolean;
       sandbox?: SandboxMode;
       approvalPolicy?: ApprovalPolicy;
+      skills?: SelectedSkillRef[];
       focusSession?: boolean;
       onBeforeSubmit?: () => void;
       onError?: (message: string) => void;
@@ -2859,6 +2993,7 @@ export function App(): JSX.Element {
       planMode: options?.planMode,
       sandbox: options?.sandbox,
       approvalPolicy: options?.approvalPolicy,
+      skills: options?.skills,
     });
     const focusSession = options?.focusSession ?? (selectedSessionId === sessionKey || sessionKey === draftSessionKey);
 
@@ -2883,6 +3018,54 @@ export function App(): JSX.Element {
     setUploadingAttachmentNames([]);
     if (composerFileInputRef.current) {
       composerFileInputRef.current.value = "";
+    }
+  }
+
+  function updatePrompt(value: string): void {
+    setPrompt(value);
+    if (findSkillQueryToken(value)) {
+      setSkillPickerOpen(true);
+    }
+  }
+
+  function selectSkill(skill: SkillListItem): void {
+    setSelectedSkills((current) => {
+      if (current.some((item) => item.id === skill.id)) return current;
+      return [...current, skill].slice(0, 20);
+    });
+    setPrompt((current) => removeSkillQueryToken(current, findSkillQueryToken(current)));
+    setSkillPickerOpen(false);
+    setHighlightedSkillIndex(0);
+  }
+
+  function removeSelectedSkill(skillId: string): void {
+    setSelectedSkills((current) => current.filter((skill) => skill.id !== skillId));
+  }
+
+  function onComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>): void {
+    if (!skillPickerOpen) return;
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setSkillPickerOpen(false);
+      return;
+    }
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setHighlightedSkillIndex((current) => Math.min(current + 1, Math.max(0, filteredSkills.length - 1)));
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setHighlightedSkillIndex((current) => Math.max(0, current - 1));
+      return;
+    }
+
+    if (event.key === "Enter" && filteredSkills.length > 0) {
+      event.preventDefault();
+      selectSkill(filteredSkills[highlightedSkillIndex] || filteredSkills[0]);
     }
   }
 
@@ -3128,6 +3311,7 @@ export function App(): JSX.Element {
     const trimmedPrompt = prompt.trim();
     const slashCommand = parseSlashCommand(prompt);
     const sessionKey = selectedSessionId || draftSessionKey;
+    const selectedSkillRefs = selectedSkills.map(selectedSkillRef);
 
     if (trimmedPrompt.startsWith("/") && !slashCommand) {
       const now = Date.now();
@@ -3163,19 +3347,25 @@ export function App(): JSX.Element {
       if (shouldQueueBehindActiveRun) {
         enqueueMessage(buildQueuedMessage(sessionKey, trimmedPrompt, {
           attachments: pendingAttachments,
+          skills: selectedSkillRefs,
         }));
         setPrompt("");
         clearComposerAttachments();
+        setSelectedSkills([]);
+        setSkillPickerOpen(false);
         return;
       }
 
       await submitSessionMessage(trimmedPrompt, {
         sessionKey,
         attachments: pendingAttachments,
+        skills: selectedSkillRefs,
         onError: (message) => window.alert(message),
       });
       setPrompt("");
       clearComposerAttachments();
+      setSelectedSkills([]);
+      setSkillPickerOpen(false);
     } catch {
       // handled above
     } finally {
@@ -3219,11 +3409,16 @@ export function App(): JSX.Element {
   async function onChangeWorkspace(nextWorkspace: string): Promise<void> {
     await setActiveWorkspace(nextWorkspace);
     setWorkspace(nextWorkspace);
+    setSelectedSkills([]);
+    setSkillPickerOpen(false);
     await loadFileTree();
+    await refreshSkillCatalog(nextWorkspace);
   }
 
   function onSelectSession(sessionId: string): void {
     setIsDraftSession(false);
+    setSelectedSkills([]);
+    setSkillPickerOpen(false);
     const target = allSessions.find((item) => item.id === sessionId);
     if (target) {
       setSelectedSessionId(target.id);
@@ -3239,6 +3434,8 @@ export function App(): JSX.Element {
     setSelectedRunRecord(null);
     setDiff(null);
     setPrompt("");
+    setSelectedSkills([]);
+    setSkillPickerOpen(false);
     clearComposerAttachments();
     setPlanState(draftSessionKey, "idle");
     setSlashEntriesBySession((prev) => {
@@ -3560,7 +3757,18 @@ export function App(): JSX.Element {
             timeline={visibleTimeline}
             hiddenTimelineCount={hiddenTimelineCount}
             prompt={prompt}
-            setPrompt={setPrompt}
+            setPrompt={updatePrompt}
+            skillCatalog={skillCatalog}
+            filteredSkills={filteredSkills}
+            selectedSkills={selectedSkills}
+            skillsLoading={skillsLoading}
+            skillsError={skillsError}
+            skillPickerOpen={skillPickerOpen}
+            highlightedSkillIndex={highlightedSkillIndex}
+            onRefreshSkills={refreshSkillCatalog}
+            onSelectSkill={selectSkill}
+            onRemoveSelectedSkill={removeSelectedSkill}
+            onComposerKeyDown={onComposerKeyDown}
             pendingAttachments={pendingAttachments}
             attachmentError={attachmentError}
             uploadingAttachmentNames={uploadingAttachmentNames}
@@ -3886,6 +4094,17 @@ type CenterPanelProps = {
   hiddenTimelineCount: number;
   prompt: string;
   setPrompt: (value: string) => void;
+  skillCatalog: SkillListItem[];
+  filteredSkills: SkillListItem[];
+  selectedSkills: SkillListItem[];
+  skillsLoading: boolean;
+  skillsError: string | null;
+  skillPickerOpen: boolean;
+  highlightedSkillIndex: number;
+  onRefreshSkills: () => Promise<void>;
+  onSelectSkill: (skill: SkillListItem) => void;
+  onRemoveSelectedSkill: (skillId: string) => void;
+  onComposerKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   pendingAttachments: AttachmentRef[];
   attachmentError: string | null;
   uploadingAttachmentNames: string[];
@@ -4171,6 +4390,30 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             </div>
           ) : null}
 
+          {props.selectedSkills.length > 0 ? (
+            <div className="mb-3 flex flex-wrap gap-2">
+              {props.selectedSkills.map((skill) => (
+                <div
+                  key={skill.id}
+                  className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-card-border bg-surface-2/80 px-2 py-1 text-xs text-foreground"
+                  title={skill.path}
+                >
+                  <AtSign className="h-3.5 w-3.5 text-foreground/60" />
+                  <span className="max-w-[220px] truncate">{skill.name}</span>
+                  <button
+                    type="button"
+                    className="rounded-full p-0.5 text-foreground/65 transition hover:bg-black/5 hover:text-foreground dark:hover:bg-control-hover/70"
+                    onClick={() => props.onRemoveSelectedSkill(skill.id)}
+                    aria-label={`Remove ${skill.name}`}
+                    title="Remove"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
           {props.pendingAttachments.length > 0 || props.isUploadingAttachments || props.attachmentError ? (
             <div className="mb-3 rounded-2xl border border-card-border bg-surface-1/90 px-3 py-2">
               <div className="flex items-center justify-between gap-2 text-xs font-semibold text-foreground/80">
@@ -4230,6 +4473,9 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                       {item.attachments.length > 0 ? (
                         <div className="text-[11px] text-foreground/60">{formatAttachmentSummary(item.attachments)}</div>
                       ) : null}
+                      {item.skills.length > 0 ? (
+                        <div className="text-[11px] text-foreground/60">{formatSkillSummary(item.skills, props.skillCatalog)}</div>
+                      ) : null}
                     </div>
                     <button
                       type="button"
@@ -4247,6 +4493,66 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           ) : null}
 
 	          <div className="relative flex items-end gap-2">
+            <Dialog.Root open={props.skillPickerOpen} modal={false}>
+              <Dialog.Content
+                onOpenAutoFocus={(event) => event.preventDefault()}
+                onCloseAutoFocus={(event) => event.preventDefault()}
+                className="absolute bottom-full left-0 right-12 z-20 mb-2 max-h-[360px] overflow-hidden rounded-2xl border border-card-border bg-surface-1/95 p-2 shadow-xl outline-none backdrop-blur"
+              >
+                <Dialog.Title className="flex items-center justify-between gap-2 px-1 pb-2 text-xs font-semibold text-foreground/80">
+                  <span className="inline-flex items-center gap-1.5">
+                    <AtSign className="h-3.5 w-3.5" />
+                    Skills
+                  </span>
+                  <button
+                    type="button"
+                    className="rounded px-1.5 py-0.5 text-[11px] font-medium text-foreground/65 transition hover:bg-surface-2 hover:text-foreground"
+                    onClick={() => void props.onRefreshSkills()}
+                    disabled={props.skillsLoading}
+                  >
+                    {props.skillsLoading ? "Loading" : "Reload"}
+                  </button>
+                </Dialog.Title>
+                <Dialog.Description className="sr-only">
+                  Select a skill to attach it to the next message.
+                </Dialog.Description>
+
+                {props.skillsError ? (
+                  <div className="rounded-xl border border-rose-200 bg-rose-50 px-2 py-2 text-xs text-rose-800 dark:border-danger-fg/40 dark:bg-danger-bg/80 dark:text-danger-fg">
+                    {props.skillsError}
+                  </div>
+                ) : props.filteredSkills.length > 0 ? (
+                  <div className="max-h-[292px] space-y-1 overflow-auto pr-1">
+                    {props.filteredSkills.map((skill, index) => (
+                      <button
+                        key={skill.id}
+                        type="button"
+                        className={cn(
+                          "w-full rounded-xl border px-2 py-2 text-left transition",
+                          index === props.highlightedSkillIndex
+                            ? "border-brand/45 bg-brand-soft/50"
+                            : "border-transparent hover:border-card-border hover:bg-surface-2",
+                        )}
+                        onClick={() => props.onSelectSkill(skill)}
+                      >
+                        <div className="flex min-w-0 items-center justify-between gap-2">
+                          <span className="truncate text-xs font-semibold text-foreground">{skill.name}</span>
+                          <Badge className="shrink-0 bg-surface-2 text-[10px] text-foreground/70">{skill.source}</Badge>
+                        </div>
+                        {skill.description ? (
+                          <div className="mt-0.5 max-h-8 overflow-hidden text-[11px] leading-snug text-foreground/65">{skill.description}</div>
+                        ) : null}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-dashed border-card-border px-2 py-3 text-center text-xs text-foreground/60">
+                    {props.skillsLoading ? "Loading skills..." : props.skillCatalog.length === 0 ? "No skills found." : "No matching skills."}
+                  </div>
+                )}
+              </Dialog.Content>
+            </Dialog.Root>
+
             {props.slashSuggestions.length > 0 ? (
               <div className="absolute bottom-full left-0 right-12 z-10 mb-2 space-y-1 rounded-2xl border border-card-border bg-surface-1/95 p-2 shadow-lg backdrop-blur">
                 {props.slashSuggestions.map((item) => (
@@ -4271,6 +4577,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               placeholder="Message Codex... (type / for commands, including /plan)"
               value={props.prompt}
               onChange={(event) => props.setPrompt(event.target.value)}
+              onKeyDown={props.onComposerKeyDown}
             />
 
             <Button

@@ -18,6 +18,7 @@ import type {
   SessionListResponse,
   SessionMessagesResponse,
   SessionTranscriptResponse,
+  SkillListResponse,
   SseEvent,
   StartRunInput,
   TerminalSessionSnapshot,
@@ -125,6 +126,11 @@ export function getAccountStatus(): Promise<CodexAccountStatusResponse> {
 
 export function getSystemStatus(): Promise<CodexSystemStatusResponse> {
   return request("/api/system/status");
+}
+
+export function getSkills(workspace?: string): Promise<SkillListResponse> {
+  const suffix = workspace ? `?${new URLSearchParams({ workspace }).toString()}` : "";
+  return request(`/api/skills${suffix}`);
 }
 
 export function startRun(input: StartRunInput): Promise<{ run: RunRecord }> {

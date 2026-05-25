@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { createHash } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
@@ -36,6 +37,7 @@ import {
   type RunEventEntry,
   type RunRecord,
   type RunSourceTag,
+  type SelectedSkillRef,
   type SendMessageAccepted,
   type SendMessageInput,
   type SessionListItem,
@@ -44,6 +46,8 @@ import {
   type SessionMessagesResponse,
   type SessionTranscriptEntry,
   type SessionTranscriptResponse,
+  type SkillListItem,
+  type SkillListResponse,
   type SseEvent,
   type TerminalSessionSnapshot,
   type WorkspaceOption,
@@ -150,6 +154,11 @@ type ResolvedAttachment = {
   absolutePath: string;
 };
 
+type ResolvedSkill = {
+  item: SkillListItem;
+  content: string;
+};
+
 type PersistedUiState = {
   activeWorkspace: string;
   manualWorkspaces: string[];
@@ -188,6 +197,7 @@ type MessageOutboxItem = {
   sandbox: RunConfig["sandbox"];
   approvalPolicy: RunConfig["approvalPolicy"];
   planMode: boolean;
+  skills: SelectedSkillRef[];
   attempts: number;
   status: OutboxStatus;
   nextAttemptAt: number | null;
@@ -360,6 +370,25 @@ function normalizeAttachmentRefs(input: unknown): AttachmentRef[] {
   return next;
 }
 
+function normalizeSelectedSkillRefs(input: unknown): SelectedSkillRef[] {
+  if (!Array.isArray(input)) return [];
+
+  const next: SelectedSkillRef[] = [];
+  const seen = new Set<string>();
+  for (const value of input) {
+    if (!isRecord(value) || typeof value.id !== "string" || typeof value.path !== "string") continue;
+    const id = value.id.trim();
+    const skillPath = value.path.trim();
+    if (!id || !skillPath) continue;
+    const key = `${id}\n${skillPath}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push({ id, path: skillPath });
+    if (next.length >= 20) break;
+  }
+  return next;
+}
+
 function normalizeMimeType(input: string | undefined): string {
   const raw = (input || "").split(";")[0]?.trim().toLowerCase();
   return raw || "application/octet-stream";
@@ -445,6 +474,191 @@ function resolveRunAttachments(config: RunConfig): ResolvedAttachment[] {
     }
     return { ref, absolutePath };
   });
+}
+
+class SkillResolutionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SkillResolutionError";
+  }
+}
+
+function skillIdForPath(skillPath: string): string {
+  const normalized = path.resolve(skillPath).split(path.sep).join(path.posix.sep);
+  return `skill_${createHash("sha256").update(normalized).digest("hex").slice(0, 16)}`;
+}
+
+function canonicalizeExistingPath(inputPath: string): string | null {
+  try {
+    return fs.realpathSync(path.resolve(inputPath));
+  } catch {
+    return null;
+  }
+}
+
+function parseSkillMetadata(content: string, skillPath: string): { name: string; description: string } {
+  let body = content.replace(/\r\n/g, "\n");
+  let frontmatterName = "";
+  let frontmatterDescription = "";
+
+  if (body.startsWith("---\n")) {
+    const endIndex = body.indexOf("\n---", 4);
+    if (endIndex >= 0) {
+      const frontmatter = body.slice(4, endIndex).split("\n");
+      for (const line of frontmatter) {
+        const match = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+        if (!match) continue;
+        const key = match[1].toLowerCase();
+        const value = match[2].trim().replace(/^['"]|['"]$/g, "");
+        if (key === "name") frontmatterName = value;
+        if (key === "description") frontmatterDescription = value;
+      }
+      body = body.slice(endIndex + 4);
+    }
+  }
+
+  const firstHeading = body
+    .split("\n")
+    .map((line) => line.match(/^#{1,6}\s+(.+?)\s*#*\s*$/)?.[1]?.trim() || "")
+    .find(Boolean) || "";
+
+  const firstParagraph = body
+    .split(/\n\s*\n/)
+    .map((block) => block.trim())
+    .filter((block) => block && !block.startsWith("#") && !block.startsWith("```"))[0] || "";
+
+  const fallbackName = path.basename(path.dirname(skillPath)) || path.basename(skillPath);
+  return {
+    name: frontmatterName || firstHeading || fallbackName,
+    description: frontmatterDescription || firstParagraph.replace(/\s+/g, " ").slice(0, 280),
+  };
+}
+
+function getSkillRoots(workspace: string): Array<{ root: string; source: string; scope: string }> {
+  return [
+    { root: path.join(os.homedir(), ".codex", "skills"), source: "global", scope: "user" },
+    { root: path.join(workspace, ".codex", "skills"), source: "workspace", scope: "repo" },
+  ];
+}
+
+function scanSkillRoot(root: string, source: string, scope: string, seenPaths: Set<string>, seenDirs: Set<string>): SkillListItem[] {
+  const canonicalRoot = canonicalizeExistingPath(root);
+  if (!canonicalRoot) return [];
+
+  const results: SkillListItem[] = [];
+  const visit = (directory: string) => {
+    const canonicalDirectory = canonicalizeExistingPath(directory);
+    if (!canonicalDirectory || seenDirs.has(canonicalDirectory)) return;
+    seenDirs.add(canonicalDirectory);
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(entryPath);
+        continue;
+      }
+      if (!entry.isFile() || !/^skill\.md$/i.test(entry.name)) continue;
+
+      const canonicalPath = canonicalizeExistingPath(entryPath);
+      if (!canonicalPath || seenPaths.has(canonicalPath)) continue;
+
+      let content = "";
+      try {
+        content = fs.readFileSync(canonicalPath, "utf8");
+      } catch {
+        continue;
+      }
+
+      const metadata = parseSkillMetadata(content, canonicalPath);
+      seenPaths.add(canonicalPath);
+      results.push({
+        id: skillIdForPath(canonicalPath),
+        name: metadata.name,
+        description: metadata.description,
+        path: canonicalPath,
+        source,
+        scope,
+      });
+    }
+  };
+
+  visit(canonicalRoot);
+  return results;
+}
+
+function discoverSkills(workspace: string): SkillListItem[] {
+  const seenPaths = new Set<string>();
+  const seenDirs = new Set<string>();
+  const skills = getSkillRoots(workspace).flatMap((root) => scanSkillRoot(root.root, root.source, root.scope, seenPaths, seenDirs));
+  return skills.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+}
+
+function resolveSelectedSkills(workspace: string, selected: unknown): ResolvedSkill[] {
+  const refs = normalizeSelectedSkillRefs(selected);
+  if (refs.length === 0) return [];
+
+  const catalogByPath = new Map(discoverSkills(workspace).map((skill) => [skill.path, skill]));
+  const resolved = new Map<string, ResolvedSkill>();
+  for (const ref of refs) {
+    const canonicalPath = canonicalizeExistingPath(ref.path);
+    if (!canonicalPath) {
+      throw new SkillResolutionError(`Selected skill is not readable or no longer exists: ${ref.path}`);
+    }
+
+    const expectedId = skillIdForPath(canonicalPath);
+    if (ref.id !== expectedId) {
+      throw new SkillResolutionError(`Selected skill id does not match path: ${ref.path}`);
+    }
+
+    const item = catalogByPath.get(canonicalPath);
+    if (!item) {
+      throw new SkillResolutionError(`Selected skill is outside the configured skill roots: ${ref.path}`);
+    }
+
+    let content = "";
+    try {
+      content = fs.readFileSync(canonicalPath, "utf8");
+    } catch {
+      throw new SkillResolutionError(`Selected skill is not readable: ${ref.path}`);
+    }
+
+    resolved.set(canonicalPath, { item, content });
+  }
+
+  return [...resolved.values()].sort((a, b) => a.item.path.localeCompare(b.item.path));
+}
+
+function buildSkillBackedPrompt(prompt: string, skills: ResolvedSkill[]): string {
+  if (skills.length === 0) return prompt;
+
+  const lines = [
+    "Selected skills are active for this turn only.",
+    "Apply the following SKILL.md instructions before answering the user request.",
+    "",
+    "Active skills:",
+    ...skills.map((skill, index) => `${index + 1}. ${skill.item.name} (${skill.item.path})`),
+    "",
+  ];
+
+  for (const skill of skills) {
+    lines.push(`--- BEGIN SKILL: ${skill.item.name} ---`);
+    lines.push(`Path: ${skill.item.path}`);
+    lines.push("");
+    lines.push(skill.content.trimEnd());
+    lines.push(`--- END SKILL: ${skill.item.name} ---`);
+    lines.push("");
+  }
+
+  lines.push("Original user request:");
+  lines.push(prompt);
+  return lines.join("\n");
 }
 
 function normalizeSandboxMode(input: string | undefined): "read-only" | "workspace-write" | "danger-full-access" {
@@ -622,8 +836,10 @@ class RunManager extends EventEmitter {
 
     const effectiveConfig = resolveEffectiveRunConfig(config);
     const resolvedAttachments = resolveRunAttachments(effectiveConfig);
+    const resolvedSkills = resolveSelectedSkills(effectiveConfig.workspace, effectiveConfig.skills);
     const promptBase = buildPromptWithAttachments(effectiveConfig.prompt, resolvedAttachments);
-    const prompt = effectiveConfig.planMode ? buildPlanModePrompt(promptBase) : promptBase;
+    const promptWithPlan = effectiveConfig.planMode ? buildPlanModePrompt(promptBase) : promptBase;
+    const prompt = buildSkillBackedPrompt(promptWithPlan, resolvedSkills);
     const imageArgs = resolvedAttachments
       .filter((attachment) => attachment.ref.kind === "image")
       .flatMap((attachment) => ["-i", attachment.absolutePath]);
@@ -1352,15 +1568,18 @@ function buildPlanModePrompt(prompt: string): string {
 
 function resolveEffectiveRunConfig(config: RunConfig): RunConfig {
   const attachments = normalizeAttachmentRefs(config.attachments);
+  const skills = normalizeSelectedSkillRefs(config.skills);
   if (!config.planMode) {
     return {
       ...config,
       attachments,
+      skills,
     };
   }
   return {
     ...config,
     attachments,
+    skills,
     sandbox: "read-only",
     approvalPolicy: "never",
   };
@@ -3436,6 +3655,7 @@ class OutboxProcessor {
           planMode: item.planMode,
           sessionId: item.provisionalSession ? undefined : item.sessionId,
           attachments: item.attachments,
+          skills: item.skills,
         });
 
         item.latestRunId = run.id;
@@ -4002,6 +4222,22 @@ app.get("/api/bootstrap-lite", (_req, res) => {
   res.json(apiOk(payload));
 });
 
+app.get("/api/skills", (req, res) => {
+  const requestedWorkspace = typeof req.query.workspace === "string" && req.query.workspace.trim()
+    ? req.query.workspace.trim()
+    : uiState.activeWorkspace;
+  const workspace = path.resolve(requestedWorkspace);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+
+  const payload: SkillListResponse = {
+    skills: discoverSkills(workspace),
+  };
+  res.json(apiOk(payload));
+});
+
 app.get("/api/workspaces", (_req, res) => {
   res.json(apiOk({ activeWorkspace: uiState.activeWorkspace, workspaces: getWorkspaces() }));
 });
@@ -4154,12 +4390,28 @@ app.post("/api/messages/send", (req, res) => {
     return;
   }
 
+  let selectedSkills: SelectedSkillRef[] = [];
+  try {
+    selectedSkills = resolveSelectedSkills(workspace, parsed.data.skills).map((skill) => ({
+      id: skill.item.id,
+      path: skill.item.path,
+    }));
+  } catch (error) {
+    if (error instanceof SkillResolutionError) {
+      res.status(400).json(apiErr(error.message));
+      return;
+    }
+    res.status(500).json(apiErr(error instanceof Error ? error.message : "Failed to resolve selected skills"));
+    return;
+  }
+
   const startedAt = Date.now();
   const sessionId = parsed.data.sessionId?.trim() || `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const provisionalSession = !parsed.data.sessionId?.trim();
   const acceptedMessage = messageStore.acceptOutgoingMessage(sessionId, {
     ...parsed.data,
     workspace,
+    skills: selectedSkills,
   });
 
   outboxProcessor?.enqueue({
@@ -4174,6 +4426,7 @@ app.post("/api/messages/send", (req, res) => {
     sandbox: parsed.data.sandbox,
     approvalPolicy: parsed.data.approvalPolicy,
     planMode: parsed.data.planMode,
+    skills: selectedSkills,
   });
 
   const response: SendMessageAccepted = {
@@ -4235,11 +4488,12 @@ app.post("/api/runs/start", (req, res) => {
       planMode: parsed.data.planMode,
       sessionId: parsed.data.sessionId,
       attachments: parsed.data.attachments,
+      skills: parsed.data.skills,
     });
 
     res.json(apiOk({ run }));
   } catch (error) {
-    res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to start run"));
+    res.status(error instanceof SkillResolutionError ? 400 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to start run"));
   }
 });
 
@@ -4280,7 +4534,7 @@ app.post("/api/runs/:runId/rerun", (req, res) => {
 
     res.json(apiOk({ run }));
   } catch (error) {
-    res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to rerun"));
+    res.status(error instanceof SkillResolutionError ? 400 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to rerun"));
   }
 });
 
@@ -4312,7 +4566,7 @@ app.post("/api/runs/:runId/approval/:approvalId/accept", (req, res) => {
     });
     res.json(apiOk({ run, approval }));
   } catch (error) {
-    res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to run escalation"));
+    res.status(error instanceof SkillResolutionError ? 400 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to run escalation"));
   }
 });
 

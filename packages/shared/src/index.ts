@@ -26,6 +26,26 @@ export const attachmentRefSchema = z.object({
 });
 export type AttachmentRef = z.infer<typeof attachmentRefSchema>;
 
+export const skillListItemSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  description: z.string(),
+  path: z.string().min(1),
+  source: z.string().min(1),
+  scope: z.string().min(1),
+});
+export type SkillListItem = z.infer<typeof skillListItemSchema>;
+
+export const selectedSkillRefSchema = z.object({
+  id: z.string().min(1),
+  path: z.string().min(1),
+});
+export type SelectedSkillRef = z.infer<typeof selectedSkillRefSchema>;
+
+export type SkillListResponse = {
+  skills: SkillListItem[];
+};
+
 export const runConfigSchema = z.object({
   workspace: z.string().min(1),
   prompt: z.string().min(1),
@@ -35,6 +55,7 @@ export const runConfigSchema = z.object({
   planMode: z.boolean().default(false),
   sessionId: z.string().optional(),
   attachments: z.array(attachmentRefSchema).max(10).default([]),
+  skills: z.array(selectedSkillRefSchema).max(20).default([]),
 });
 export type RunConfig = z.infer<typeof runConfigSchema>;
 
@@ -47,6 +68,7 @@ export const startRunSchema = z.object({
   planMode: z.boolean().default(false),
   sessionId: z.string().optional(),
   attachments: z.array(attachmentRefSchema).max(10).default([]),
+  skills: z.array(selectedSkillRefSchema).max(20).default([]),
 });
 export type StartRunInput = z.infer<typeof startRunSchema>;
 
@@ -60,6 +82,7 @@ export const sendMessageSchema = z.object({
   approvalPolicy: approvalPolicySchema.default("on-request"),
   planMode: z.boolean().default(false),
   attachments: z.array(attachmentRefSchema).max(10).default([]),
+  skills: z.array(selectedSkillRefSchema).max(20).default([]),
 });
 export type SendMessageInput = z.infer<typeof sendMessageSchema>;
 
