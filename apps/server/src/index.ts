@@ -2560,13 +2560,39 @@ function loadPaginatedRunMessages(runId: string, beforeCursor: string | null): {
 
   if (!entries) return null;
 
-  const end = decodeCursor(beforeCursor) ?? entries.length;
-  const safeEnd = Math.min(Math.max(end, 0), entries.length);
-  const start = Math.max(0, safeEnd - RUN_MESSAGE_PAGE_SIZE);
+  const { start, end: safeEnd } = resolveCountedPageWindow(
+    entries,
+    beforeCursor,
+    RUN_MESSAGE_PAGE_SIZE,
+    (entry) => entry.role !== "tool",
+  );
   return {
     entries: entries.slice(start, safeEnd),
     nextCursor: start > 0 ? encodeCursor(start) : null,
   };
+}
+
+function resolveCountedPageWindow<T>(
+  items: T[],
+  beforeCursor: string | null,
+  limit: number,
+  countsTowardLimit: (item: T) => boolean,
+): { start: number; end: number } {
+  const end = decodeCursor(beforeCursor) ?? items.length;
+  const safeEnd = Math.min(Math.max(end, 0), items.length);
+  let start = safeEnd;
+  let counted = 0;
+
+  while (start > 0) {
+    const item = items[start - 1];
+    if (countsTowardLimit(item)) {
+      if (counted >= limit) break;
+      counted += 1;
+    }
+    start -= 1;
+  }
+
+  return { start, end: safeEnd };
 }
 
 function messageKindForRole(role: ChatMessage["role"]): ChatMessage["kind"] {
@@ -2970,9 +2996,12 @@ class MessageStore {
       this.scheduleSnapshot();
     }
 
-    const end = decodeCursor(beforeCursor) ?? state.messages.length;
-    const safeEnd = Math.min(Math.max(end, 0), state.messages.length);
-    const start = Math.max(0, safeEnd - limit);
+    const { start, end: safeEnd } = resolveCountedPageWindow(
+      state.messages,
+      beforeCursor,
+      limit,
+      (message) => message.kind !== "tool" && message.role !== "tool",
+    );
     return {
       sessionId,
       messages: state.messages.slice(start, safeEnd).map((message) => ({
@@ -4612,9 +4641,12 @@ app.get("/api/sessions/:sessionId/messages", (req, res) => {
   }
 
   const historyMessages = transcript.entries.map((entry, index) => transcriptEntryToChatMessage(req.params.sessionId, entry, index + 1));
-  const end = decodeCursor(before) ?? historyMessages.length;
-  const safeEnd = Math.min(Math.max(end, 0), historyMessages.length);
-  const start = Math.max(0, safeEnd - limit);
+  const { start, end: safeEnd } = resolveCountedPageWindow(
+    historyMessages,
+    before,
+    limit,
+    (message) => message.kind !== "tool" && message.role !== "tool",
+  );
   const response: SessionMessagesResponse = {
     sessionId: req.params.sessionId,
     messages: historyMessages.slice(start, safeEnd),
