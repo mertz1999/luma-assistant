@@ -120,6 +120,33 @@ Important variables:
 - `TERMINAL_DISABLE_PTY=1`: force plain-pipe terminal mode
 - `TERMINAL_SHELL=/bin/bash`: explicitly choose the shell used by session terminals
 
+### Luma Telegram MCP
+
+The app includes a local MCP server, registered in Codex as `luma-tel` by default, that can upload generated files to a Telegram group topic.
+
+1. Create a Telegram bot with `@BotFather` using `/newbot`.
+2. Add the bot to your Telegram group and grant permission to send files.
+3. Enable topics in the group, create the target topic, and send a message in that topic.
+4. Fetch updates:
+
+```bash
+curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates"
+```
+
+Use `message.chat.id` as `TELEGRAM_CHAT_ID` and `message.message_thread_id` as `TELEGRAM_MESSAGE_FILE_THREAD_ID`.
+
+```env
+TELEGRAM_BOT_TOKEN=123456:abc...
+TELEGRAM_CHAT_ID=-1001234567890
+TELEGRAM_MESSAGE_FILE_THREAD_ID=42
+TELEGRAM_MCP_PORT=9013
+TELEGRAM_MCP_NAME=luma-tel
+TELEGRAM_ALLOWED_ROOTS=/Users/applestation/Project
+TELEGRAM_MAX_FILE_BYTES=52428800
+```
+
+`make run` and `make deploy-start` automatically ensure Codex has a `luma-tel` MCP entry pointing at the local MCP URL. If the old default `telegram-file` entry points at the same URL, the ensure script removes it.
+
 Legacy compatibility is also supported:
 
 - `DEFAULT_SANDBOX_TYPE`
@@ -139,7 +166,7 @@ make deploy-status
 What they do:
 
 - `make install`: install project dependencies
-- `make run`: install-if-needed, free the API and web ports, then start both server and web app
+- `make run`: install-if-needed, register Telegram MCP if needed, free the API/web/MCP ports, then start server, web, and Telegram MCP
 - `make deploy-start`: production build plus PM2 start/reload
 - `make deploy-stop`: stop PM2 services
 - `make deploy-status`: show PM2 process state
@@ -217,8 +244,9 @@ If you are publishing or deploying this project for others, treat `data/` as run
 
 ```text
 apps/
-  server/   Express API, run manager, auth, SSE, terminal bridge
-  web/      React UI
+  server/        Express API, run manager, auth, SSE, terminal bridge
+  telegram-mcp/  local MCP server for Telegram file uploads
+  web/           React UI
 packages/
   shared/   shared types and schemas
 scripts/

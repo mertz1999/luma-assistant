@@ -943,6 +943,10 @@ function formatSkillSummary(refs: SelectedSkillRef[], catalog: SkillListItem[]):
   return `Skills: ${names.join(", ")}${suffix}`;
 }
 
+function isSystemSkill(skill: SkillListItem): boolean {
+  return skill.path.split(/[\\/]/).includes(".system");
+}
+
 type SkillQueryToken = {
   start: number;
   end: number;
@@ -1879,6 +1883,7 @@ export function App(): JSX.Element {
   const [skillsError, setSkillsError] = useState<string | null>(null);
   const [skillPickerOpen, setSkillPickerOpen] = useState(false);
   const [selectedSkills, setSelectedSkills] = useState<SkillListItem[]>([]);
+  const [showSystemSkills, setShowSystemSkills] = useState(false);
   const [highlightedSkillIndex, setHighlightedSkillIndex] = useState(0);
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentRef[]>([]);
   const [pendingAttachmentWorkspace, setPendingAttachmentWorkspace] = useState<string | null>(null);
@@ -2365,6 +2370,7 @@ export function App(): JSX.Element {
   const filteredSkills = useMemo(() => {
     const query = (skillQueryToken?.query || "").toLowerCase();
     return skillCatalog
+      .filter((skill) => showSystemSkills || !isSystemSkill(skill))
       .filter((skill) => !selectedSkillIds.has(skill.id))
       .filter((skill) => {
         if (!query) return true;
@@ -2374,7 +2380,7 @@ export function App(): JSX.Element {
           || skill.source.toLowerCase().includes(query);
       })
       .slice(0, 30);
-  }, [skillCatalog, selectedSkillIds, skillQueryToken]);
+  }, [skillCatalog, selectedSkillIds, showSystemSkills, skillQueryToken]);
   const runningSessionIds = useMemo(() => {
     const ids = new Set<string>();
     for (const item of allSessions) {
@@ -3761,11 +3767,13 @@ export function App(): JSX.Element {
             skillCatalog={skillCatalog}
             filteredSkills={filteredSkills}
             selectedSkills={selectedSkills}
+            showSystemSkills={showSystemSkills}
             skillsLoading={skillsLoading}
             skillsError={skillsError}
             skillPickerOpen={skillPickerOpen}
             highlightedSkillIndex={highlightedSkillIndex}
             onRefreshSkills={refreshSkillCatalog}
+            onToggleShowSystemSkills={() => setShowSystemSkills((current) => !current)}
             onSelectSkill={selectSkill}
             onRemoveSelectedSkill={removeSelectedSkill}
             onComposerKeyDown={onComposerKeyDown}
@@ -4097,11 +4105,13 @@ type CenterPanelProps = {
   skillCatalog: SkillListItem[];
   filteredSkills: SkillListItem[];
   selectedSkills: SkillListItem[];
+  showSystemSkills: boolean;
   skillsLoading: boolean;
   skillsError: string | null;
   skillPickerOpen: boolean;
   highlightedSkillIndex: number;
   onRefreshSkills: () => Promise<void>;
+  onToggleShowSystemSkills: () => void;
   onSelectSkill: (skill: SkillListItem) => void;
   onRemoveSelectedSkill: (skillId: string) => void;
   onComposerKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
@@ -4504,14 +4514,30 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                     <AtSign className="h-3.5 w-3.5" />
                     Skills
                   </span>
-                  <button
-                    type="button"
-                    className="rounded px-1.5 py-0.5 text-[11px] font-medium text-foreground/65 transition hover:bg-surface-2 hover:text-foreground"
-                    onClick={() => void props.onRefreshSkills()}
-                    disabled={props.skillsLoading}
-                  >
-                    {props.skillsLoading ? "Loading" : "Reload"}
-                  </button>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      aria-pressed={props.showSystemSkills}
+                      className={cn(
+                        "rounded px-1.5 py-0.5 text-[11px] font-medium transition",
+                        props.showSystemSkills
+                          ? "bg-brand-soft text-brand-dark dark:text-brand"
+                          : "text-foreground/65 hover:bg-surface-2 hover:text-foreground",
+                      )}
+                      onClick={props.onToggleShowSystemSkills}
+                      title={props.showSystemSkills ? "Hide system skills" : "Show system skills"}
+                    >
+                      System
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded px-1.5 py-0.5 text-[11px] font-medium text-foreground/65 transition hover:bg-surface-2 hover:text-foreground"
+                      onClick={() => void props.onRefreshSkills()}
+                      disabled={props.skillsLoading}
+                    >
+                      {props.skillsLoading ? "Loading" : "Reload"}
+                    </button>
+                  </div>
                 </Dialog.Title>
                 <Dialog.Description className="sr-only">
                   Select a skill to attach it to the next message.
@@ -4547,7 +4573,13 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                   </div>
                 ) : (
                   <div className="rounded-xl border border-dashed border-card-border px-2 py-3 text-center text-xs text-foreground/60">
-                    {props.skillsLoading ? "Loading skills..." : props.skillCatalog.length === 0 ? "No skills found." : "No matching skills."}
+                    {props.skillsLoading
+                      ? "Loading skills..."
+                      : props.skillCatalog.length === 0
+                        ? "No skills found."
+                        : props.showSystemSkills
+                          ? "No matching skills."
+                          : "No matching non-system skills."}
                   </div>
                 )}
               </Dialog.Content>

@@ -7,13 +7,14 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "concurrently -n server,web -c cyan,green \"npm run dev -w @agentic/server\" \"npm run dev -w @agentic/web\"",
-    "build": "npm run build -w @agentic/shared && npm run build -w @agentic/server && npm run build -w @agentic/web",
-    "typecheck": "npm run build -w @agentic/shared && npm run typecheck -w @agentic/server && npm run typecheck -w @agentic/web",
+    "dev": "concurrently -n server,web,telegram-mcp -c cyan,green,magenta \"npm run dev -w @agentic/server\" \"npm run dev -w @agentic/web\" \"npm run dev -w @agentic/telegram-mcp\"",
+    "build": "npm run build -w @agentic/shared && npm run build -w @agentic/server && npm run build -w @agentic/web && npm run build -w @agentic/telegram-mcp",
+    "typecheck": "npm run build -w @agentic/shared && npm run typecheck -w @agentic/server && npm run typecheck -w @agentic/web && npm run typecheck -w @agentic/telegram-mcp",
     "start": "npm run start -w @agentic/server"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",
+    "pm2": "^7.0.1",
     "typescript": "^5.8.3"
   },
   "engines": {
