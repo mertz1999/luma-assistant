@@ -6,6 +6,8 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   AtSign,
+  Bot,
+  CalendarClock,
   Check,
   CircleStop,
   Copy,
@@ -21,14 +23,20 @@ import {
   PanelLeft,
   PanelRight,
   Paperclip,
+  Pause,
   Play,
+  RefreshCw,
   Rocket,
   Send,
   ShieldAlert,
   Sun,
+  Trash2,
   X,
 } from "lucide-react";
 import type {
+  AgentListItem,
+  AgentSchedule,
+  AgentScheduleExecution,
   ApprovalPolicy,
   ApprovalQueueItem,
   AttachmentRef,
@@ -44,12 +52,16 @@ import type {
   SelectedSkillRef,
   TerminalSessionSnapshot,
   WorkspaceOption,
+  SkillSyncResult,
 } from "@agentic/shared";
 import {
   archiveSession,
   connectEvents,
+  createAgentSchedule,
   deleteSession,
+  deleteAgentSchedule,
   sendMessage,
+  getAgentSchedules,
   getAccountStatus,
   getBootstrapLite,
   getDiff,
@@ -62,15 +74,18 @@ import {
   getTerminal,
   interruptTerminal,
   loginWithPassword,
+  reloadAgentsAndSkills,
   getRun,
   rerun,
   retryMessage,
+  runAgentScheduleNow,
   setApiAuthToken,
   sendTerminalInput,
   setActiveWorkspace,
   startTerminal,
   stopRun,
   stopTerminal,
+  updateAgentSchedule,
   uploadAttachment,
 } from "@/lib/api";
 import { parsePlanningMessage, type PlanningSegment } from "@/lib/planning";
@@ -1885,6 +1900,16 @@ export function App(): JSX.Element {
   const [selectedSkills, setSelectedSkills] = useState<SkillListItem[]>([]);
   const [showSystemSkills, setShowSystemSkills] = useState(false);
   const [highlightedSkillIndex, setHighlightedSkillIndex] = useState(0);
+  const [agents, setAgents] = useState<AgentListItem[]>([]);
+  const [agentSchedules, setAgentSchedules] = useState<AgentSchedule[]>([]);
+  const [upcomingAgentSchedules, setUpcomingAgentSchedules] = useState<AgentSchedule[]>([]);
+  const [agentExecutions, setAgentExecutions] = useState<AgentScheduleExecution[]>([]);
+  const [skillSyncResult, setSkillSyncResult] = useState<SkillSyncResult | null>(null);
+  const [agentsLoading, setAgentsLoading] = useState(false);
+  const [agentsError, setAgentsError] = useState<string | null>(null);
+  const [selectedAgentId, setSelectedAgentId] = useState("");
+  const [agentScheduleTime, setAgentScheduleTime] = useState("09:00");
+  const [agentActionId, setAgentActionId] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentRef[]>([]);
   const [pendingAttachmentWorkspace, setPendingAttachmentWorkspace] = useState<string | null>(null);
   const [uploadingAttachmentNames, setUploadingAttachmentNames] = useState<string[]>([]);
@@ -2326,6 +2351,15 @@ export function App(): JSX.Element {
     void loadFileTree();
   }, [activeWorkspace]);
 
+  useEffect(() => {
+    if (!authReady || !isAuthenticated || rightPanelTab !== "agents") return;
+    void refreshAgentSchedules();
+    const timer = window.setInterval(() => {
+      void refreshAgentSchedules();
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, [authReady, isAuthenticated, rightPanelTab]);
+
   const allSessions = useMemo(() => buildSessionCards(runItems), [runItems]);
   const filteredSessions = useMemo(() => {
     if (statusFilter === "all") return allSessions;
@@ -2529,20 +2563,42 @@ export function App(): JSX.Element {
     }
   }
 
+  function applyAgentScheduleState(payload: {
+    agents: AgentListItem[];
+    schedules: AgentSchedule[];
+    upcoming: AgentSchedule[];
+    executions: AgentScheduleExecution[];
+    skillSync: SkillSyncResult;
+  }): void {
+    setAgents(payload.agents);
+    setAgentSchedules(payload.schedules);
+    setUpcomingAgentSchedules(payload.upcoming);
+    setAgentExecutions(payload.executions);
+    setSkillSyncResult(payload.skillSync);
+    setAgentsError(null);
+    setSelectedAgentId((current) => {
+      if (current && payload.agents.some((agent) => agent.id === current)) return current;
+      return payload.agents[0]?.id || "";
+    });
+  }
+
   async function loadBootstrapLite(): Promise<void> {
     setLoading(true);
     setLoadingRunList(true);
     setSkillsLoading(true);
+    setAgentsLoading(true);
     try {
-      const [payload, listPayload, skillsPayload] = await Promise.all([
+      const [payload, listPayload, skillsPayload, agentPayload] = await Promise.all([
         getBootstrapLite(),
         getSessionList(runListPageSize, null, showAllHistoryRef.current),
         getSkills(),
+        getAgentSchedules(),
       ]);
       setWorkspaces(payload.workspaces);
       setWorkspace(payload.activeWorkspace);
       setSkillCatalog(skillsPayload.skills);
       setSkillsError(null);
+      applyAgentScheduleState(agentPayload);
       const normalizedItems = normalizeSessionItems(listPayload.items);
       setRunItems(normalizedItems);
       setRunListNextCursor(listPayload.nextCursor);
@@ -2571,6 +2627,7 @@ export function App(): JSX.Element {
     } finally {
       setLoadingRunList(false);
       setSkillsLoading(false);
+      setAgentsLoading(false);
       setLoading(false);
     }
   }
@@ -2585,6 +2642,39 @@ export function App(): JSX.Element {
     } catch (error) {
       setSkillsError(error instanceof Error ? error.message : "Failed to load skills");
     } finally {
+      setSkillsLoading(false);
+    }
+  }
+
+  async function refreshAgentSchedules(): Promise<void> {
+    setAgentsLoading(true);
+    try {
+      const payload = await getAgentSchedules();
+      applyAgentScheduleState(payload);
+    } catch (error) {
+      setAgentsError(error instanceof Error ? error.message : "Failed to load agents");
+    } finally {
+      setAgentsLoading(false);
+    }
+  }
+
+  async function onReloadAgentsAndSkills(): Promise<void> {
+    setAgentsLoading(true);
+    setSkillsLoading(true);
+    try {
+      const [agentPayload, skillsPayload] = await Promise.all([
+        reloadAgentsAndSkills(),
+        getSkills(activeWorkspace),
+      ]);
+      applyAgentScheduleState(agentPayload);
+      setSkillCatalog(skillsPayload.skills);
+      setSkillsError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to reload agents and skills";
+      setAgentsError(message);
+      setSkillsError(message);
+    } finally {
+      setAgentsLoading(false);
       setSkillsLoading(false);
     }
   }
@@ -3421,6 +3511,94 @@ export function App(): JSX.Element {
     await refreshSkillCatalog(nextWorkspace);
   }
 
+  async function onCreateAgentSchedule(): Promise<void> {
+    if (!selectedAgentId || !activeWorkspace) return;
+    const match = agentScheduleTime.match(/^(\d{2}):(\d{2})$/);
+    if (!match) {
+      setAgentsError("Use HH:mm for Tehran time.");
+      return;
+    }
+    const hour = Number(match[1]);
+    const minute = Number(match[2]);
+    if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+      setAgentsError("Use a valid Tehran time from 00:00 to 23:59.");
+      return;
+    }
+
+    setAgentActionId("create");
+    try {
+      await createAgentSchedule({
+        agentId: selectedAgentId,
+        hour,
+        minute,
+        workspace: activeWorkspace,
+        model,
+        sandbox,
+        approvalPolicy,
+        skills: selectedSkills.map(selectedSkillRef),
+      });
+      await refreshAgentSchedules();
+    } catch (error) {
+      setAgentsError(error instanceof Error ? error.message : "Failed to create schedule");
+    } finally {
+      setAgentActionId(null);
+    }
+  }
+
+  async function onToggleAgentSchedule(schedule: AgentSchedule): Promise<void> {
+    setAgentActionId(schedule.id);
+    try {
+      await updateAgentSchedule(schedule.id, { status: schedule.status === "active" ? "paused" : "active" });
+      await refreshAgentSchedules();
+    } catch (error) {
+      setAgentsError(error instanceof Error ? error.message : "Failed to update schedule");
+    } finally {
+      setAgentActionId(null);
+    }
+  }
+
+  async function onDeleteAgentSchedule(schedule: AgentSchedule): Promise<void> {
+    setAgentActionId(schedule.id);
+    try {
+      await deleteAgentSchedule(schedule.id);
+      await refreshAgentSchedules();
+    } catch (error) {
+      setAgentsError(error instanceof Error ? error.message : "Failed to delete schedule");
+    } finally {
+      setAgentActionId(null);
+    }
+  }
+
+  async function onRunAgentScheduleNow(schedule: AgentSchedule): Promise<void> {
+    setAgentActionId(schedule.id);
+    try {
+      const payload = await runAgentScheduleNow(schedule.id);
+      await refreshAgentSchedules();
+      await refreshRunList(payload.execution.sessionId);
+      if (payload.execution.sessionId) {
+        setIsDraftSession(false);
+        setSelectedSessionId(payload.execution.sessionId);
+        setSelectedRunId(payload.execution.runId);
+        void loadRunMessagesPage(payload.execution.sessionId, { reset: true });
+        if (payload.execution.runId) void loadSelectedRunRecord(payload.execution.runId);
+      }
+    } catch (error) {
+      setAgentsError(error instanceof Error ? error.message : "Failed to start agent");
+    } finally {
+      setAgentActionId(null);
+    }
+  }
+
+  function onSelectAgentExecution(execution: AgentScheduleExecution): void {
+    if (!execution.sessionId) return;
+    setIsDraftSession(false);
+    setSelectedSessionId(execution.sessionId);
+    setSelectedRunId(execution.runId);
+    void loadRunMessagesPage(execution.sessionId, { reset: true });
+    if (execution.runId) void loadSelectedRunRecord(execution.runId);
+    setMobileContextOpen(false);
+  }
+
   function onSelectSession(sessionId: string): void {
     setIsDraftSession(false);
     setSelectedSkills([]);
@@ -3851,6 +4029,26 @@ export function App(): JSX.Element {
             sessionAction={sessionAction}
             onArchiveSession={onArchiveSession}
             onDeleteSession={onDeleteSession}
+            agents={agents}
+            agentSchedules={agentSchedules}
+            upcomingAgentSchedules={upcomingAgentSchedules}
+            agentExecutions={agentExecutions}
+            skillSyncResult={skillSyncResult}
+            agentsLoading={agentsLoading}
+            agentsError={agentsError}
+            selectedAgentId={selectedAgentId}
+            setSelectedAgentId={setSelectedAgentId}
+            agentScheduleTime={agentScheduleTime}
+            setAgentScheduleTime={setAgentScheduleTime}
+            selectedSkills={selectedSkills}
+            skillCatalog={skillCatalog}
+            agentActionId={agentActionId}
+            onReloadAgentsAndSkills={onReloadAgentsAndSkills}
+            onCreateAgentSchedule={onCreateAgentSchedule}
+            onToggleAgentSchedule={onToggleAgentSchedule}
+            onDeleteAgentSchedule={onDeleteAgentSchedule}
+            onRunAgentScheduleNow={onRunAgentScheduleNow}
+            onSelectAgentExecution={onSelectAgentExecution}
           />
         </Card>
       </div>
@@ -3925,6 +4123,26 @@ export function App(): JSX.Element {
                 sessionAction={sessionAction}
                 onArchiveSession={onArchiveSession}
                 onDeleteSession={onDeleteSession}
+                agents={agents}
+                agentSchedules={agentSchedules}
+                upcomingAgentSchedules={upcomingAgentSchedules}
+                agentExecutions={agentExecutions}
+                skillSyncResult={skillSyncResult}
+                agentsLoading={agentsLoading}
+                agentsError={agentsError}
+                selectedAgentId={selectedAgentId}
+                setSelectedAgentId={setSelectedAgentId}
+                agentScheduleTime={agentScheduleTime}
+                setAgentScheduleTime={setAgentScheduleTime}
+                selectedSkills={selectedSkills}
+                skillCatalog={skillCatalog}
+                agentActionId={agentActionId}
+                onReloadAgentsAndSkills={onReloadAgentsAndSkills}
+                onCreateAgentSchedule={onCreateAgentSchedule}
+                onToggleAgentSchedule={onToggleAgentSchedule}
+                onDeleteAgentSchedule={onDeleteAgentSchedule}
+                onRunAgentScheduleNow={onRunAgentScheduleNow}
+                onSelectAgentExecution={onSelectAgentExecution}
                 mobile
               />
             </Card>
@@ -4668,8 +4886,8 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 }
 
 type RightPanelProps = {
-  rightPanelTab: "context" | "tools";
-  setRightPanelTab: (tab: "context" | "tools") => void;
+  rightPanelTab: "context" | "tools" | "agents";
+  setRightPanelTab: (tab: "context" | "tools" | "agents") => void;
   toolTab: "approvals" | "diff" | "files";
   setToolTab: (tab: "approvals" | "diff" | "files") => void;
   workspaces: WorkspaceOption[];
@@ -4704,8 +4922,44 @@ type RightPanelProps = {
   sessionAction: "archive" | "delete" | null;
   onArchiveSession: () => Promise<void>;
   onDeleteSession: () => Promise<void>;
+  agents: AgentListItem[];
+  agentSchedules: AgentSchedule[];
+  upcomingAgentSchedules: AgentSchedule[];
+  agentExecutions: AgentScheduleExecution[];
+  skillSyncResult: SkillSyncResult | null;
+  agentsLoading: boolean;
+  agentsError: string | null;
+  selectedAgentId: string;
+  setSelectedAgentId: (agentId: string) => void;
+  agentScheduleTime: string;
+  setAgentScheduleTime: (time: string) => void;
+  selectedSkills: SkillListItem[];
+  skillCatalog: SkillListItem[];
+  agentActionId: string | null;
+  onReloadAgentsAndSkills: () => Promise<void>;
+  onCreateAgentSchedule: () => Promise<void>;
+  onToggleAgentSchedule: (schedule: AgentSchedule) => Promise<void>;
+  onDeleteAgentSchedule: (schedule: AgentSchedule) => Promise<void>;
+  onRunAgentScheduleNow: (schedule: AgentSchedule) => Promise<void>;
+  onSelectAgentExecution: (execution: AgentScheduleExecution) => void;
   mobile?: boolean;
 };
+
+function formatDateTime(value: number | null): string {
+  if (!value) return "-";
+  return new Date(value).toLocaleString();
+}
+
+function formatTehranSchedule(schedule: AgentSchedule): string {
+  return `${String(schedule.time.hour).padStart(2, "0")}:${String(schedule.time.minute).padStart(2, "0")} Tehran`;
+}
+
+function executionStatusClass(status: AgentScheduleExecution["status"]): string {
+  if (status === "completed") return "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/30 dark:text-emerald-200";
+  if (status === "running" || status === "queued") return "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900/40 dark:bg-blue-950/30 dark:text-blue-200";
+  if (status === "skipped") return "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-100";
+  return "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/40 dark:bg-rose-950/30 dark:text-rose-200";
+}
 
 function RightPanel(props: RightPanelProps): JSX.Element {
   const [useCustomModel, setUseCustomModel] = useState(() => !modelOptions.includes(props.model));
@@ -4721,12 +4975,15 @@ function RightPanel(props: RightPanelProps): JSX.Element {
 
   return (
     <div className="space-y-4 p-3">
-      <div className="grid grid-cols-2 gap-1 rounded-2xl border border-card-border bg-surface-2 p-1">
+      <div className="grid grid-cols-3 gap-1 rounded-2xl border border-card-border bg-surface-2 p-1">
         <Button size="sm" variant={props.rightPanelTab === "context" ? "primary" : "ghost"} onClick={() => props.setRightPanelTab("context")}>
           Context
         </Button>
         <Button size="sm" variant={props.rightPanelTab === "tools" ? "primary" : "ghost"} onClick={() => props.setRightPanelTab("tools")}>
           Tools
+        </Button>
+        <Button size="sm" variant={props.rightPanelTab === "agents" ? "primary" : "ghost"} onClick={() => props.setRightPanelTab("agents")}>
+          Agents
         </Button>
       </div>
 
@@ -5063,7 +5320,238 @@ function RightPanel(props: RightPanelProps): JSX.Element {
         </>
       ) : null}
 
+      {props.rightPanelTab === "agents" ? (
+        <AgentsPanel
+          agents={props.agents}
+          schedules={props.agentSchedules}
+          upcoming={props.upcomingAgentSchedules}
+          executions={props.agentExecutions}
+          skillSyncResult={props.skillSyncResult}
+          loading={props.agentsLoading}
+          error={props.agentsError}
+          selectedAgentId={props.selectedAgentId}
+          setSelectedAgentId={props.setSelectedAgentId}
+          scheduleTime={props.agentScheduleTime}
+          setScheduleTime={props.setAgentScheduleTime}
+          selectedSkills={props.selectedSkills}
+          skillCatalog={props.skillCatalog}
+          actionId={props.agentActionId}
+          onReload={props.onReloadAgentsAndSkills}
+          onCreateSchedule={props.onCreateAgentSchedule}
+          onToggleSchedule={props.onToggleAgentSchedule}
+          onDeleteSchedule={props.onDeleteAgentSchedule}
+          onRunNow={props.onRunAgentScheduleNow}
+          onSelectExecution={props.onSelectAgentExecution}
+        />
+      ) : null}
+
       {props.mobile ? <div className="h-4" /> : null}
+    </div>
+  );
+}
+
+type AgentsPanelProps = {
+  agents: AgentListItem[];
+  schedules: AgentSchedule[];
+  upcoming: AgentSchedule[];
+  executions: AgentScheduleExecution[];
+  skillSyncResult: SkillSyncResult | null;
+  loading: boolean;
+  error: string | null;
+  selectedAgentId: string;
+  setSelectedAgentId: (agentId: string) => void;
+  scheduleTime: string;
+  setScheduleTime: (time: string) => void;
+  selectedSkills: SkillListItem[];
+  skillCatalog: SkillListItem[];
+  actionId: string | null;
+  onReload: () => Promise<void>;
+  onCreateSchedule: () => Promise<void>;
+  onToggleSchedule: (schedule: AgentSchedule) => Promise<void>;
+  onDeleteSchedule: (schedule: AgentSchedule) => Promise<void>;
+  onRunNow: (schedule: AgentSchedule) => Promise<void>;
+  onSelectExecution: (execution: AgentScheduleExecution) => void;
+};
+
+function AgentsPanel(props: AgentsPanelProps): JSX.Element {
+  const selectedAgent = props.agents.find((agent) => agent.id === props.selectedAgentId) || null;
+  const selectedSkillRefs = props.selectedSkills.map(selectedSkillRef);
+  const syncConflictCount = props.skillSyncResult?.conflicts.length || 0;
+  const syncErrorCount = props.skillSyncResult?.errors.length || 0;
+
+  return (
+    <div className="space-y-3">
+      <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <h3 className="flex items-center gap-2 text-sm font-bold">
+            <Bot className="h-4 w-4" />
+            Agent schedule
+          </h3>
+          <Button size="sm" variant="ghost" onClick={() => void props.onReload()} disabled={props.loading}>
+            {props.loading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+          </Button>
+        </div>
+
+        {props.error ? (
+          <div className="mb-2 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-900/40 dark:bg-rose-950/30 dark:text-rose-200">
+            {props.error}
+          </div>
+        ) : null}
+
+        <div className="space-y-2">
+          <div>
+            <label className="mb-1 block text-xs font-semibold text-foreground/75">Agent</label>
+            <select
+              className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+              value={props.selectedAgentId}
+              onChange={(event) => props.setSelectedAgentId(event.target.value)}
+              disabled={props.agents.length === 0}
+            >
+              {props.agents.length === 0 ? <option value="">No agents found</option> : null}
+              {props.agents.map((agent) => (
+                <option key={agent.id} value={agent.id}>
+                  {agent.name}
+                </option>
+              ))}
+            </select>
+            {selectedAgent ? (
+              <p className="mt-1 line-clamp-3 text-xs text-foreground/65">{selectedAgent.description || selectedAgent.promptPreview}</p>
+            ) : (
+              <p className="mt-1 text-xs text-foreground/65">No repo agents found.</p>
+            )}
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-semibold text-foreground/75">Daily time</label>
+            <input
+              type="time"
+              className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+              value={props.scheduleTime}
+              onChange={(event) => props.setScheduleTime(event.target.value)}
+            />
+            <p className="mt-1 text-xs text-foreground/60">Asia/Tehran</p>
+          </div>
+
+          <div className="rounded-xl border border-card-border bg-surface-2 px-3 py-2 text-xs text-foreground/70">
+            {selectedSkillRefs.length > 0 ? formatSkillSummary(selectedSkillRefs, props.skillCatalog) : "No selected skills"}
+          </div>
+
+          <Button
+            className="w-full justify-center"
+            onClick={() => void props.onCreateSchedule()}
+            disabled={!props.selectedAgentId || props.actionId === "create" || props.loading}
+          >
+            {props.actionId === "create" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : <CalendarClock className="mr-1.5 h-4 w-4" />}
+            Create schedule
+          </Button>
+        </div>
+      </section>
+
+      {props.skillSyncResult ? (
+        <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+          <div className="mb-1 flex items-center justify-between">
+            <h3 className="text-sm font-bold">Skill sync</h3>
+            <Badge>{syncConflictCount + syncErrorCount > 0 ? "attention" : "ok"}</Badge>
+          </div>
+          <p className="text-xs text-foreground/70">
+            copied {props.skillSyncResult.copied.length}, updated {props.skillSyncResult.updated.length}, conflicts {syncConflictCount}, errors {syncErrorCount}
+          </p>
+          {props.skillSyncResult.conflicts.slice(0, 3).map((conflict) => (
+            <p key={`${conflict.slug}_${conflict.targetPath}`} className="mt-1 break-all text-[11px] text-amber-700 dark:text-amber-200">
+              {conflict.slug}: {conflict.reason}
+            </p>
+          ))}
+          {props.skillSyncResult.errors.slice(0, 3).map((error) => (
+            <p key={`${error.slug}_${error.sourcePath}`} className="mt-1 break-all text-[11px] text-rose-700 dark:text-rose-200">
+              {error.slug}: {error.message}
+            </p>
+          ))}
+        </section>
+      ) : null}
+
+      <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+        <div className="mb-2 flex items-center justify-between">
+          <h3 className="text-sm font-bold">Schedules</h3>
+          <Badge>{props.schedules.length}</Badge>
+        </div>
+        <div className="space-y-2">
+          {props.schedules.length === 0 ? <p className="text-xs text-foreground/70">No schedules yet.</p> : null}
+          {props.schedules.map((schedule) => (
+            <div key={schedule.id} className="rounded-xl border border-card-border bg-surface-2 px-3 py-2">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold">{schedule.agentName}</p>
+                  <p className="text-xs text-foreground/65">
+                    {formatTehranSchedule(schedule)} | next {formatDateTime(schedule.nextRunAt)}
+                  </p>
+                  {schedule.runConfig.skills.length > 0 ? (
+                    <p className="mt-0.5 text-[11px] text-foreground/60">{formatSkillSummary(schedule.runConfig.skills, props.skillCatalog)}</p>
+                  ) : null}
+                </div>
+                <Badge>{schedule.status}</Badge>
+              </div>
+              <div className="mt-2 grid grid-cols-3 gap-1">
+                <Button size="sm" variant="ghost" className="px-2" onClick={() => void props.onRunNow(schedule)} disabled={props.actionId === schedule.id}>
+                  {props.actionId === schedule.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+                </Button>
+                <Button size="sm" variant="ghost" className="px-2" onClick={() => void props.onToggleSchedule(schedule)} disabled={props.actionId === schedule.id}>
+                  {schedule.status === "active" ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                </Button>
+                <Button size="sm" variant="ghost" className="px-2 text-rose-700" onClick={() => void props.onDeleteSchedule(schedule)} disabled={props.actionId === schedule.id}>
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+        <div className="mb-2 flex items-center justify-between">
+          <h3 className="text-sm font-bold">Upcoming</h3>
+          <Badge>{props.upcoming.length}</Badge>
+        </div>
+        <div className="space-y-1.5">
+          {props.upcoming.length === 0 ? <p className="text-xs text-foreground/70">No active upcoming runs.</p> : null}
+          {props.upcoming.slice(0, 8).map((schedule) => (
+            <div key={`upcoming_${schedule.id}`} className="flex items-center justify-between gap-3 rounded-lg border border-card-border bg-surface-2 px-2 py-1.5 text-xs">
+              <span className="min-w-0 truncate">{schedule.agentName}</span>
+              <span className="shrink-0 text-foreground/65">{formatDateTime(schedule.nextRunAt)}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+        <div className="mb-2 flex items-center justify-between">
+          <h3 className="text-sm font-bold">Latest executions</h3>
+          <Badge>{props.executions.length}</Badge>
+        </div>
+        <div className="space-y-2">
+          {props.executions.length === 0 ? <p className="text-xs text-foreground/70">No executions recorded.</p> : null}
+          {props.executions.map((execution) => (
+            <button
+              key={execution.id}
+              type="button"
+              className="w-full rounded-xl border border-card-border bg-surface-2 px-3 py-2 text-left transition hover:border-brand/50 disabled:cursor-default disabled:hover:border-card-border"
+              disabled={!execution.sessionId}
+              onClick={() => props.onSelectExecution(execution)}
+            >
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <span className="min-w-0 truncate text-sm font-semibold">{execution.agentName}</span>
+                <span className={cn("shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-semibold", executionStatusClass(execution.status))}>
+                  {execution.status}
+                </span>
+              </div>
+              <p className="text-[11px] text-foreground/65">scheduled {formatDateTime(execution.scheduledFor)}</p>
+              <p className="text-[11px] text-foreground/65">
+                started {formatDateTime(execution.startedAt)} | completed {formatDateTime(execution.completedAt)}
+              </p>
+              {execution.error ? <p className="mt-1 line-clamp-2 text-[11px] text-rose-700 dark:text-rose-200">{execution.error}</p> : null}
+            </button>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }

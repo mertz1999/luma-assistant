@@ -13,11 +13,19 @@ import type { IPty } from "node-pty";
 import {
   approvalPolicySchema,
   attachmentRefSchema,
+  createAgentScheduleSchema,
   rerunSchema,
   sendMessageSchema,
   setWorkspaceSchema,
   startRunSchema,
+  updateAgentScheduleSchema,
   type ApiResponse,
+  type AgentListItem,
+  type AgentListResponse,
+  type AgentSchedule,
+  type AgentScheduleExecution,
+  type AgentScheduleListResponse,
+  type AgentScheduleTime,
   type ApprovalQueueItem,
   type AppBootstrap,
   type AppBootstrapLite,
@@ -46,6 +54,7 @@ import {
   type SessionMessagesResponse,
   type SessionTranscriptEntry,
   type SessionTranscriptResponse,
+  type SkillSyncResult,
   type SkillListItem,
   type SkillListResponse,
   type SseEvent,
@@ -59,6 +68,9 @@ const require = createRequire(import.meta.url);
 
 const APP_STATE_PATH = path.resolve(rootDir, "data/ui-state.json");
 const RUNS_PATH = path.resolve(rootDir, "data/runs.json");
+const AGENTS_DIR = path.resolve(rootDir, "agents");
+const REPO_SKILLS_DIR = path.resolve(rootDir, "skills");
+const AGENT_SCHEDULES_PATH = path.resolve(rootDir, "data/agent-schedules.json");
 const SESSION_INDEX_PATH = path.resolve(rootDir, "data/session-index.json");
 const MESSAGE_STORE_META_PATH = path.resolve(rootDir, "data/message-store-meta.json");
 const MESSAGE_OUTBOX_PATH = path.resolve(rootDir, "data/message-outbox.json");
@@ -91,6 +103,8 @@ const RUNS_PERSIST_DEBOUNCE_MS = Number(process.env.RUNS_PERSIST_DEBOUNCE_MS || 
 const SESSION_INDEX_PERSIST_DEBOUNCE_MS = Number(process.env.SESSION_INDEX_PERSIST_DEBOUNCE_MS || 500);
 const MESSAGE_OUTBOX_RETRY_DELAYS_MS = [1000, 3000, 10000];
 const MESSAGE_STORE_SCHEMA_VERSION = 1;
+const TEHRAN_TIMEZONE = "Asia/Tehran";
+const MANAGED_SKILL_MARKER = ".agentic-managed-skill.json";
 
 const IMAGE_ATTACHMENT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 const IMAGE_ATTACHMENT_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -157,6 +171,15 @@ type ResolvedAttachment = {
 type ResolvedSkill = {
   item: SkillListItem;
   content: string;
+};
+
+type DiscoveredAgent = AgentListItem & {
+  prompt: string;
+};
+
+type PersistedAgentScheduleState = {
+  schedules: AgentSchedule[];
+  executions: AgentScheduleExecution[];
 };
 
 type PersistedUiState = {
@@ -598,6 +621,227 @@ function discoverSkills(workspace: string): SkillListItem[] {
   const seenDirs = new Set<string>();
   const skills = getSkillRoots(workspace).flatMap((root) => scanSkillRoot(root.root, root.source, root.scope, seenPaths, seenDirs));
   return skills.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+}
+
+function parseSimpleFrontmatter(content: string): { frontmatter: Record<string, string>; body: string } {
+  let body = content.replace(/\r\n/g, "\n");
+  const frontmatter: Record<string, string> = {};
+
+  if (!body.startsWith("---\n")) {
+    return { frontmatter, body };
+  }
+
+  const endIndex = body.indexOf("\n---", 4);
+  if (endIndex < 0) {
+    return { frontmatter, body };
+  }
+
+  for (const line of body.slice(4, endIndex).split("\n")) {
+    const match = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!match) continue;
+    frontmatter[match[1].toLowerCase()] = match[2].trim().replace(/^['"]|['"]$/g, "");
+  }
+
+  body = body.slice(endIndex + 4).replace(/^\s+/, "");
+  return { frontmatter, body };
+}
+
+function fallbackTitleFromMarkdown(body: string, fallback: string): string {
+  const heading = body
+    .split("\n")
+    .map((line) => line.match(/^#{1,6}\s+(.+?)\s*#*\s*$/)?.[1]?.trim() || "")
+    .find(Boolean);
+  if (heading) return heading.slice(0, 120);
+
+  const firstLine = body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  return firstLine ? firstLine.slice(0, 80) : fallback;
+}
+
+function agentIdForPath(agentPath: string): string {
+  const normalized = path.resolve(agentPath).split(path.sep).join(path.posix.sep);
+  return `agent_${createHash("sha256").update(normalized).digest("hex").slice(0, 16)}`;
+}
+
+function slugForRelativeDir(relativeDir: string): string {
+  const normalized = relativeDir.split(path.sep).join(path.posix.sep).replace(/^\.\/?/, "");
+  const slug = normalized
+    .split("/")
+    .filter(Boolean)
+    .join("__")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "agent";
+}
+
+function discoverAgents(): DiscoveredAgent[] {
+  const canonicalRoot = canonicalizeExistingPath(AGENTS_DIR);
+  if (!canonicalRoot) return [];
+
+  const agents: DiscoveredAgent[] = [];
+  const visit = (directory: string) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    const agentFile = entries.find((entry) => entry.isFile() && /^agent\.md$/i.test(entry.name));
+    if (agentFile) {
+      const agentPath = path.join(directory, agentFile.name);
+      const canonicalPath = canonicalizeExistingPath(agentPath);
+      if (!canonicalPath) return;
+
+      try {
+        const stat = fs.statSync(canonicalPath);
+        const content = fs.readFileSync(canonicalPath, "utf8");
+        const parsed = parseSimpleFrontmatter(content);
+        const prompt = parsed.body.trim();
+        const relativeDir = path.relative(canonicalRoot, path.dirname(canonicalPath));
+        const slug = slugForRelativeDir(relativeDir);
+        const name = parsed.frontmatter.name || fallbackTitleFromMarkdown(prompt, slug);
+        const firstParagraph = prompt
+          .split(/\n\s*\n/)
+          .map((block) => block.trim())
+          .filter((block) => block && !block.startsWith("#") && !block.startsWith("```"))[0] || "";
+        agents.push({
+          id: agentIdForPath(canonicalPath),
+          slug,
+          name,
+          description: parsed.frontmatter.description || firstParagraph.replace(/\s+/g, " ").slice(0, 280),
+          path: canonicalPath,
+          promptPreview: prompt.replace(/\s+/g, " ").slice(0, 220),
+          updatedAt: stat.mtimeMs,
+          prompt,
+        });
+      } catch {
+        return;
+      }
+      return;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+      visit(path.join(directory, entry.name));
+    }
+  };
+
+  visit(canonicalRoot);
+  return agents.sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+}
+
+function publicAgents(agents = discoverAgents()): AgentListItem[] {
+  return agents.map(({ prompt: _prompt, ...agent }) => agent);
+}
+
+function discoverRepoSkillDirectories(): Array<{ slug: string; sourcePath: string }> {
+  const canonicalRoot = canonicalizeExistingPath(REPO_SKILLS_DIR);
+  if (!canonicalRoot) return [];
+
+  const results: Array<{ slug: string; sourcePath: string }> = [];
+  const visit = (directory: string) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    if (entries.some((entry) => entry.isFile() && /^skill\.md$/i.test(entry.name))) {
+      const canonicalPath = canonicalizeExistingPath(directory);
+      if (canonicalPath) {
+        results.push({
+          slug: slugForRelativeDir(path.relative(canonicalRoot, canonicalPath)),
+          sourcePath: canonicalPath,
+        });
+      }
+      return;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+      visit(path.join(directory, entry.name));
+    }
+  };
+
+  visit(canonicalRoot);
+  return results.sort((a, b) => a.slug.localeCompare(b.slug));
+}
+
+function readManagedSkillMarker(targetPath: string): boolean {
+  const markerPath = path.join(targetPath, MANAGED_SKILL_MARKER);
+  if (!fs.existsSync(markerPath)) return false;
+  try {
+    const payload = safeJsonParse<Record<string, unknown>>(fs.readFileSync(markerPath, "utf8"), {});
+    return payload.managedBy === "agentic-assistant";
+  } catch {
+    return false;
+  }
+}
+
+function writeManagedSkillMarker(targetPath: string, sourcePath: string): void {
+  fs.writeFileSync(
+    path.join(targetPath, MANAGED_SKILL_MARKER),
+    JSON.stringify(
+      {
+        managedBy: "agentic-assistant",
+        sourcePath,
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+function syncRepoSkills(): SkillSyncResult {
+  const result: SkillSyncResult = {
+    copied: [],
+    updated: [],
+    conflicts: [],
+    errors: [],
+  };
+  const globalSkillsRoot = path.join(os.homedir(), ".codex", "skills");
+
+  for (const skill of discoverRepoSkillDirectories()) {
+    const targetPath = path.join(globalSkillsRoot, skill.slug);
+    try {
+      if (fs.existsSync(targetPath)) {
+        if (!readManagedSkillMarker(targetPath)) {
+          result.conflicts.push({
+            slug: skill.slug,
+            sourcePath: skill.sourcePath,
+            targetPath,
+            reason: `Target exists without ${MANAGED_SKILL_MARKER}`,
+          });
+          continue;
+        }
+        fs.rmSync(targetPath, { recursive: true, force: true });
+        fs.cpSync(skill.sourcePath, targetPath, { recursive: true });
+        writeManagedSkillMarker(targetPath, skill.sourcePath);
+        result.updated.push(skill.slug);
+      } else {
+        fs.mkdirSync(globalSkillsRoot, { recursive: true });
+        fs.cpSync(skill.sourcePath, targetPath, { recursive: true });
+        writeManagedSkillMarker(targetPath, skill.sourcePath);
+        result.copied.push(skill.slug);
+      }
+    } catch (error) {
+      result.errors.push({
+        slug: skill.slug,
+        sourcePath: skill.sourcePath,
+        message: error instanceof Error ? error.message : "Failed to sync skill",
+      });
+    }
+  }
+
+  return result;
 }
 
 function resolveSelectedSkills(workspace: string, selected: unknown): ResolvedSkill[] {
@@ -1208,6 +1452,375 @@ class RunManager extends EventEmitter {
       this.persistTimer = null;
     }
     persistRuns(this.getRuns(true), this.getApprovals());
+  }
+}
+
+function tehranDateParts(timestamp: number): { year: number; month: number; day: number; hour: number; minute: number; second: number } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: TEHRAN_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(timestamp));
+  const value = (type: string) => Number(parts.find((part) => part.type === type)?.value || 0);
+  return {
+    year: value("year"),
+    month: value("month"),
+    day: value("day"),
+    hour: value("hour"),
+    minute: value("minute"),
+    second: value("second"),
+  };
+}
+
+function tehranLocalToTimestamp(year: number, month: number, day: number, hour: number, minute: number): number {
+  let guess = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
+  for (let index = 0; index < 3; index += 1) {
+    const actual = tehranDateParts(guess);
+    const actualLocal = Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute, actual.second, 0);
+    const desiredLocal = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
+    const diff = actualLocal - desiredLocal;
+    if (diff === 0) break;
+    guess -= diff;
+  }
+  return guess;
+}
+
+function addLocalDays(year: number, month: number, day: number, days: number): { year: number; month: number; day: number } {
+  const next = new Date(Date.UTC(year, month - 1, day + days, 0, 0, 0, 0));
+  return {
+    year: next.getUTCFullYear(),
+    month: next.getUTCMonth() + 1,
+    day: next.getUTCDate(),
+  };
+}
+
+function nextTehranDailyRun(time: AgentScheduleTime, afterTimestamp = Date.now()): number {
+  const parts = tehranDateParts(afterTimestamp);
+  let candidate = tehranLocalToTimestamp(parts.year, parts.month, parts.day, time.hour, time.minute);
+  if (candidate <= afterTimestamp) {
+    const nextDay = addLocalDays(parts.year, parts.month, parts.day, 1);
+    candidate = tehranLocalToTimestamp(nextDay.year, nextDay.month, nextDay.day, time.hour, time.minute);
+  }
+  return candidate;
+}
+
+function loadPersistedAgentSchedules(): PersistedAgentScheduleState {
+  if (!fs.existsSync(AGENT_SCHEDULES_PATH)) {
+    return { schedules: [], executions: [] };
+  }
+  const payload = safeJsonParse<PersistedAgentScheduleState>(fs.readFileSync(AGENT_SCHEDULES_PATH, "utf8"), {
+    schedules: [],
+    executions: [],
+  });
+  return {
+    schedules: Array.isArray(payload.schedules) ? payload.schedules : [],
+    executions: Array.isArray(payload.executions) ? payload.executions : [],
+  };
+}
+
+class AgentScheduleManager {
+  private schedules = new Map<string, AgentSchedule>();
+
+  private executions = new Map<string, AgentScheduleExecution>();
+
+  private executionByRunId = new Map<string, string>();
+
+  private timer: NodeJS.Timeout | null = null;
+
+  constructor(
+    private readonly runManager: RunManager,
+    private readonly startScheduledRun: (
+      schedule: AgentSchedule,
+      prompt: string,
+      execution: AgentScheduleExecution,
+    ) => { run: RunRecord; sessionId: string },
+  ) {}
+
+  load(): void {
+    const persisted = loadPersistedAgentSchedules();
+    const now = Date.now();
+    for (const schedule of persisted.schedules) {
+      const normalized = this.normalizeSchedule(schedule, now);
+      this.schedules.set(normalized.id, normalized);
+    }
+    for (const execution of persisted.executions) {
+      const staleRunning = execution.status === "running" || execution.status === "queued";
+      this.executions.set(execution.id, {
+        ...execution,
+        status: staleRunning ? "failed" : execution.status,
+        startedAt: typeof execution.startedAt === "number" ? execution.startedAt : null,
+        completedAt: staleRunning ? now : (typeof execution.completedAt === "number" ? execution.completedAt : null),
+        sessionId: typeof execution.sessionId === "string" ? execution.sessionId : null,
+        runId: typeof execution.runId === "string" ? execution.runId : null,
+        error: staleRunning
+          ? "Server restarted before this scheduled execution completed."
+          : (typeof execution.error === "string" ? execution.error : null),
+      });
+      if (execution.runId) this.executionByRunId.set(execution.runId, execution.id);
+    }
+    this.persist();
+    this.scheduleTimer();
+  }
+
+  list(): Pick<AgentScheduleListResponse, "schedules" | "upcoming" | "executions"> {
+    const schedules = [...this.schedules.values()].sort((a, b) => a.createdAt - b.createdAt);
+    const upcoming = schedules
+      .filter((schedule) => schedule.status === "active" && schedule.nextRunAt !== null)
+      .sort((a, b) => (a.nextRunAt ?? 0) - (b.nextRunAt ?? 0));
+    const executions = [...this.executions.values()]
+      .sort((a, b) => Math.max(b.startedAt || 0, b.scheduledFor) - Math.max(a.startedAt || 0, a.scheduledFor))
+      .slice(0, 80);
+    return { schedules, upcoming, executions };
+  }
+
+  create(input: {
+    agentId: string;
+    hour: number;
+    minute: number;
+    workspace: string;
+    model: string;
+    sandbox: RunConfig["sandbox"];
+    approvalPolicy: RunConfig["approvalPolicy"];
+    skills: SelectedSkillRef[];
+  }): AgentSchedule {
+    const agent = discoverAgents().find((item) => item.id === input.agentId);
+    if (!agent) throw new Error("Agent not found");
+
+    const now = Date.now();
+    const time: AgentScheduleTime = {
+      hour: input.hour,
+      minute: input.minute,
+      timezone: TEHRAN_TIMEZONE,
+    };
+    const schedule: AgentSchedule = {
+      id: `schedule_${now}_${Math.random().toString(36).slice(2, 8)}`,
+      agentId: agent.id,
+      agentPath: agent.path,
+      agentName: agent.name,
+      status: "active",
+      time,
+      nextRunAt: nextTehranDailyRun(time, now),
+      createdAt: now,
+      updatedAt: now,
+      lastRunAt: null,
+      runConfig: {
+        workspace: input.workspace,
+        model: input.model,
+        sandbox: input.sandbox,
+        approvalPolicy: input.approvalPolicy,
+        skills: normalizeSelectedSkillRefs(input.skills),
+      },
+    };
+
+    this.schedules.set(schedule.id, schedule);
+    this.persist();
+    this.scheduleTimer();
+    return schedule;
+  }
+
+  updateStatus(scheduleId: string, status: AgentSchedule["status"]): AgentSchedule | null {
+    const current = this.schedules.get(scheduleId);
+    if (!current) return null;
+    const now = Date.now();
+    const next: AgentSchedule = {
+      ...current,
+      status,
+      updatedAt: now,
+      nextRunAt: status === "active" ? nextTehranDailyRun(current.time, now) : null,
+    };
+    this.schedules.set(scheduleId, next);
+    this.persist();
+    this.scheduleTimer();
+    return next;
+  }
+
+  delete(scheduleId: string): boolean {
+    const deleted = this.schedules.delete(scheduleId);
+    if (deleted) {
+      this.persist();
+      this.scheduleTimer();
+    }
+    return deleted;
+  }
+
+  runNow(scheduleId: string): AgentScheduleExecution | null {
+    const schedule = this.schedules.get(scheduleId);
+    if (!schedule) return null;
+    return this.executeSchedule(schedule, Date.now());
+  }
+
+  onRunLifecycle(event: RunLifecycleEvent): void {
+    const executionId = this.executionByRunId.get(event.run.id);
+    if (!executionId) return;
+    const execution = this.executions.get(executionId);
+    if (!execution) return;
+
+    if (event.kind === "updated") {
+      const sessionId = runSessionId(event.run);
+      if (sessionId && sessionId !== execution.sessionId) {
+        this.executions.set(executionId, { ...execution, sessionId });
+        this.persist();
+      }
+      return;
+    }
+
+    if (event.kind !== "completed" && event.kind !== "failed" && event.kind !== "stopped") return;
+    const next: AgentScheduleExecution = {
+      ...execution,
+      status: event.kind,
+      completedAt: Date.now(),
+      sessionId: runSessionId(event.run),
+      error: event.kind === "failed" ? event.run.lastError || "Run failed" : execution.error,
+    };
+    this.executions.set(executionId, next);
+    this.persist();
+  }
+
+  flushSync(): void {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    writeJsonAtomicSync(AGENT_SCHEDULES_PATH, this.snapshot());
+  }
+
+  private normalizeSchedule(schedule: AgentSchedule, now: number): AgentSchedule {
+    const time: AgentScheduleTime = {
+      hour: schedule.time.hour,
+      minute: schedule.time.minute,
+      timezone: TEHRAN_TIMEZONE,
+    };
+    return {
+      ...schedule,
+      time,
+      status: schedule.status === "paused" ? "paused" : "active",
+      nextRunAt: schedule.status === "paused" ? null : nextTehranDailyRun(time, now),
+      runConfig: {
+        ...schedule.runConfig,
+        skills: normalizeSelectedSkillRefs(schedule.runConfig.skills),
+      },
+    };
+  }
+
+  private scheduleTimer(): void {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+
+    const nextAt = [...this.schedules.values()]
+      .filter((schedule) => schedule.status === "active" && schedule.nextRunAt !== null)
+      .map((schedule) => schedule.nextRunAt as number)
+      .sort((a, b) => a - b)[0];
+    if (typeof nextAt !== "number") return;
+
+    const delay = Math.min(Math.max(nextAt - Date.now(), 0), 60_000);
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.runDueSchedules();
+      this.scheduleTimer();
+    }, delay);
+  }
+
+  private runDueSchedules(): void {
+    const now = Date.now();
+    const due = [...this.schedules.values()]
+      .filter((schedule) => schedule.status === "active" && schedule.nextRunAt !== null && schedule.nextRunAt <= now)
+      .sort((a, b) => (a.nextRunAt ?? 0) - (b.nextRunAt ?? 0));
+
+    for (const schedule of due) {
+      this.executeSchedule(schedule, schedule.nextRunAt || now);
+    }
+  }
+
+  private executeSchedule(schedule: AgentSchedule, scheduledFor: number): AgentScheduleExecution {
+    const executionId = `agent_exec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const execution: AgentScheduleExecution = {
+      id: executionId,
+      scheduleId: schedule.id,
+      agentId: schedule.agentId,
+      agentName: schedule.agentName,
+      status: "queued",
+      scheduledFor,
+      startedAt: null,
+      completedAt: null,
+      sessionId: null,
+      runId: null,
+      error: null,
+    };
+    this.executions.set(execution.id, execution);
+
+    const nextSchedule: AgentSchedule = {
+      ...schedule,
+      lastRunAt: scheduledFor,
+      updatedAt: Date.now(),
+      nextRunAt: schedule.status === "active"
+        ? nextTehranDailyRun(schedule.time, Math.max(Date.now(), scheduledFor + 60_000))
+        : null,
+    };
+    this.schedules.set(schedule.id, nextSchedule);
+
+    const failExecution = (status: "failed" | "skipped", message: string): AgentScheduleExecution => {
+      const failed: AgentScheduleExecution = {
+        ...execution,
+        status,
+        completedAt: Date.now(),
+        error: message,
+      };
+      this.executions.set(execution.id, failed);
+      this.persist();
+      this.scheduleTimer();
+      return failed;
+    };
+
+    const agent = discoverAgents().find((item) => item.id === schedule.agentId && item.path === schedule.agentPath);
+    if (!agent || !agent.prompt.trim()) {
+      return failExecution("failed", `Agent file is missing, unreadable, or empty: ${schedule.agentPath}`);
+    }
+
+    if (!this.runManager.hasCapacity()) {
+      return failExecution("skipped", `Maximum concurrent runs reached (${MAX_CONCURRENT_RUNS})`);
+    }
+
+    try {
+      const started: AgentScheduleExecution = {
+        ...execution,
+        status: "running",
+        startedAt: Date.now(),
+      };
+      this.executions.set(execution.id, started);
+      const { run, sessionId } = this.startScheduledRun(nextSchedule, agent.prompt, started);
+      const running: AgentScheduleExecution = {
+        ...started,
+        runId: run.id,
+        sessionId,
+      };
+      this.executions.set(execution.id, running);
+      this.executionByRunId.set(run.id, execution.id);
+      this.persist();
+      this.scheduleTimer();
+      return running;
+    } catch (error) {
+      return failExecution("failed", error instanceof Error ? error.message : "Failed to start scheduled run");
+    }
+  }
+
+  private persist(): void {
+    writeJsonAtomicSync(AGENT_SCHEDULES_PATH, this.snapshot());
+  }
+
+  private snapshot(): PersistedAgentScheduleState {
+    return {
+      schedules: [...this.schedules.values()].sort((a, b) => a.createdAt - b.createdAt),
+      executions: [...this.executions.values()]
+        .sort((a, b) => Math.max(b.startedAt || 0, b.scheduledFor) - Math.max(a.startedAt || 0, a.scheduledFor))
+        .slice(0, 500),
+    };
   }
 }
 
@@ -4070,12 +4683,51 @@ outboxProcessor = new OutboxProcessor(
 );
 
 const terminalManager = new TerminalManager(() => uiState.activeWorkspace);
+let latestSkillSyncResult = syncRepoSkills();
+const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, prompt, execution) => {
+  const sessionId = `agent_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const message = messageStore.acceptOutgoingMessage(sessionId, {
+    clientMessageId: execution.id,
+    sessionId,
+    text: prompt,
+    workspace: schedule.runConfig.workspace,
+    model: schedule.runConfig.model,
+    sandbox: schedule.runConfig.sandbox,
+    approvalPolicy: schedule.runConfig.approvalPolicy,
+    planMode: false,
+    attachments: [],
+    skills: schedule.runConfig.skills,
+  });
+
+  try {
+    const run = runManager.startRun({
+      workspace: schedule.runConfig.workspace,
+      prompt,
+      model: schedule.runConfig.model,
+      sandbox: schedule.runConfig.sandbox,
+      approvalPolicy: schedule.runConfig.approvalPolicy,
+      planMode: false,
+      attachments: [],
+      skills: schedule.runConfig.skills,
+    });
+    messageProjector.registerRun(run.id, sessionId);
+    messageStore.updateSessionFromRun(run, sessionId);
+    messageStore.bindMessageToRun(sessionId, message.id, run.id);
+    messageStore.markMessageSent(sessionId, message.id);
+    return { run, sessionId };
+  } catch (error) {
+    messageStore.markMessageFailed(sessionId, message.id, error instanceof Error ? error.message : "Failed to start scheduled run");
+    throw error;
+  }
+});
+agentScheduleManager.load();
 
 runManager.on("sse", (event: SseEvent) => {
   broadcastSse(event);
 });
 runManager.on("run.lifecycle", (event: RunLifecycleEvent) => {
   messageProjector.onLifecycle(event);
+  agentScheduleManager.onRunLifecycle(event);
 });
 runManager.on("run.parsed", (event: RunParsedEvent) => {
   messageProjector.onParsed(event);
@@ -4252,6 +4904,7 @@ app.get("/api/bootstrap-lite", (_req, res) => {
 });
 
 app.get("/api/skills", (req, res) => {
+  latestSkillSyncResult = syncRepoSkills();
   const requestedWorkspace = typeof req.query.workspace === "string" && req.query.workspace.trim()
     ? req.query.workspace.trim()
     : uiState.activeWorkspace;
@@ -4265,6 +4918,118 @@ app.get("/api/skills", (req, res) => {
     skills: discoverSkills(workspace),
   };
   res.json(apiOk(payload));
+});
+
+app.get("/api/agents", (_req, res) => {
+  latestSkillSyncResult = syncRepoSkills();
+  const payload: AgentListResponse = {
+    agents: publicAgents(),
+    skillSync: latestSkillSyncResult,
+  };
+  res.json(apiOk(payload));
+});
+
+app.post("/api/agents/reload", (_req, res) => {
+  latestSkillSyncResult = syncRepoSkills();
+  const schedules = agentScheduleManager.list();
+  const payload: AgentScheduleListResponse = {
+    agents: publicAgents(),
+    schedules: schedules.schedules,
+    upcoming: schedules.upcoming,
+    executions: schedules.executions,
+    skillSync: latestSkillSyncResult,
+  };
+  res.json(apiOk(payload));
+});
+
+app.get("/api/agent-schedules", (_req, res) => {
+  const schedules = agentScheduleManager.list();
+  const payload: AgentScheduleListResponse = {
+    agents: publicAgents(),
+    schedules: schedules.schedules,
+    upcoming: schedules.upcoming,
+    executions: schedules.executions,
+    skillSync: latestSkillSyncResult,
+  };
+  res.json(apiOk(payload));
+});
+
+app.post("/api/agent-schedules", (req, res) => {
+  const parsed = createAgentScheduleSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid schedule payload"));
+    return;
+  }
+
+  const workspace = path.resolve(parsed.data.workspace || uiState.activeWorkspace);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+
+  let selectedSkills: SelectedSkillRef[] = [];
+  try {
+    selectedSkills = resolveSelectedSkills(workspace, parsed.data.skills).map((skill) => ({
+      id: skill.item.id,
+      path: skill.item.path,
+    }));
+  } catch (error) {
+    if (error instanceof SkillResolutionError) {
+      res.status(400).json(apiErr(error.message));
+      return;
+    }
+    res.status(500).json(apiErr(error instanceof Error ? error.message : "Failed to resolve selected skills"));
+    return;
+  }
+
+  try {
+    const schedule = agentScheduleManager.create({
+      agentId: parsed.data.agentId,
+      hour: parsed.data.hour,
+      minute: parsed.data.minute,
+      workspace,
+      model: parsed.data.model,
+      sandbox: parsed.data.sandbox,
+      approvalPolicy: parsed.data.approvalPolicy,
+      skills: selectedSkills,
+    });
+    res.json(apiOk({ schedule }));
+  } catch (error) {
+    res.status(400).json(apiErr(error instanceof Error ? error.message : "Failed to create schedule"));
+  }
+});
+
+app.patch("/api/agent-schedules/:id", (req, res) => {
+  const parsed = updateAgentScheduleSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid schedule payload"));
+    return;
+  }
+
+  const schedule = agentScheduleManager.updateStatus(req.params.id, parsed.data.status);
+  if (!schedule) {
+    res.status(404).json(apiErr("Schedule not found"));
+    return;
+  }
+  res.json(apiOk({ schedule }));
+});
+
+app.delete("/api/agent-schedules/:id", (req, res) => {
+  const deleted = agentScheduleManager.delete(req.params.id);
+  if (!deleted) {
+    res.status(404).json(apiErr("Schedule not found"));
+    return;
+  }
+  res.json(apiOk({ deleted: true }));
+});
+
+app.post("/api/agent-schedules/:id/run-now", (req, res) => {
+  const execution = agentScheduleManager.runNow(req.params.id);
+  if (!execution) {
+    res.status(404).json(apiErr("Schedule not found"));
+    return;
+  }
+  res.json(apiOk({ execution }));
 });
 
 app.get("/api/workspaces", (_req, res) => {
@@ -4870,6 +5635,7 @@ function flushPersistentStateSync(): void {
   runManager.flushPersistedStateSync();
   messageStore.flushSync();
   outboxProcessor?.flushSync();
+  agentScheduleManager.flushSync();
 }
 
 process.on("beforeExit", () => {

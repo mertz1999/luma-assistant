@@ -1,5 +1,7 @@
 import type {
   ApprovalQueueItem,
+  AgentListResponse,
+  AgentScheduleListResponse,
   AppBootstrap,
   AppBootstrapLite,
   AttachmentRef,
@@ -21,6 +23,8 @@ import type {
   SkillListResponse,
   SseEvent,
   StartRunInput,
+  CreateAgentScheduleInput,
+  UpdateAgentScheduleInput,
   TerminalSessionSnapshot,
 } from "@agentic/shared";
 
@@ -131,6 +135,52 @@ export function getSystemStatus(): Promise<CodexSystemStatusResponse> {
 export function getSkills(workspace?: string): Promise<SkillListResponse> {
   const suffix = workspace ? `?${new URLSearchParams({ workspace }).toString()}` : "";
   return request(`/api/skills${suffix}`);
+}
+
+export function getAgents(): Promise<AgentListResponse> {
+  return request("/api/agents");
+}
+
+export function reloadAgentsAndSkills(): Promise<AgentScheduleListResponse> {
+  return request("/api/agents/reload", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export function getAgentSchedules(): Promise<AgentScheduleListResponse> {
+  return request("/api/agent-schedules");
+}
+
+export function createAgentSchedule(input: CreateAgentScheduleInput): Promise<{ schedule: AgentScheduleListResponse["schedules"][number] }> {
+  return request("/api/agent-schedules", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateAgentSchedule(
+  scheduleId: string,
+  input: UpdateAgentScheduleInput,
+): Promise<{ schedule: AgentScheduleListResponse["schedules"][number] }> {
+  return request(`/api/agent-schedules/${encodeURIComponent(scheduleId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteAgentSchedule(scheduleId: string): Promise<{ deleted: boolean }> {
+  return request(`/api/agent-schedules/${encodeURIComponent(scheduleId)}`, {
+    method: "DELETE",
+    body: JSON.stringify({}),
+  });
+}
+
+export function runAgentScheduleNow(scheduleId: string): Promise<{ execution: AgentScheduleListResponse["executions"][number] }> {
+  return request(`/api/agent-schedules/${encodeURIComponent(scheduleId)}/run-now`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
 export function startRun(input: StartRunInput): Promise<{ run: RunRecord }> {

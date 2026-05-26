@@ -46,6 +46,103 @@ export type SkillListResponse = {
   skills: SkillListItem[];
 };
 
+export const agentListItemSchema = z.object({
+  id: z.string().min(1),
+  slug: z.string().min(1),
+  name: z.string().min(1),
+  description: z.string(),
+  path: z.string().min(1),
+  promptPreview: z.string(),
+  updatedAt: z.number().int().nonnegative(),
+});
+export type AgentListItem = z.infer<typeof agentListItemSchema>;
+
+export const agentScheduleTimeSchema = z.object({
+  hour: z.number().int().min(0).max(23),
+  minute: z.number().int().min(0).max(59),
+  timezone: z.literal("Asia/Tehran").default("Asia/Tehran"),
+});
+export type AgentScheduleTime = z.infer<typeof agentScheduleTimeSchema>;
+
+export const agentScheduleStatusSchema = z.enum(["active", "paused"]);
+export type AgentScheduleStatus = z.infer<typeof agentScheduleStatusSchema>;
+
+export const agentScheduleExecutionStatusSchema = z.enum(["queued", "running", "completed", "failed", "stopped", "skipped"]);
+export type AgentScheduleExecutionStatus = z.infer<typeof agentScheduleExecutionStatusSchema>;
+
+export const agentScheduleSchema = z.object({
+  id: z.string().min(1),
+  agentId: z.string().min(1),
+  agentPath: z.string().min(1),
+  agentName: z.string().min(1),
+  status: agentScheduleStatusSchema,
+  time: agentScheduleTimeSchema,
+  nextRunAt: z.number().int().nonnegative().nullable(),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+  lastRunAt: z.number().int().nonnegative().nullable(),
+  runConfig: z.object({
+    workspace: z.string().min(1),
+    model: z.string().min(1),
+    sandbox: sandboxSchema,
+    approvalPolicy: approvalPolicySchema,
+    skills: z.array(selectedSkillRefSchema).max(20).default([]),
+  }),
+});
+export type AgentSchedule = z.infer<typeof agentScheduleSchema>;
+
+export const agentScheduleExecutionSchema = z.object({
+  id: z.string().min(1),
+  scheduleId: z.string().min(1),
+  agentId: z.string().min(1),
+  agentName: z.string().min(1),
+  status: agentScheduleExecutionStatusSchema,
+  scheduledFor: z.number().int().nonnegative(),
+  startedAt: z.number().int().nonnegative().nullable(),
+  completedAt: z.number().int().nonnegative().nullable(),
+  sessionId: z.string().nullable(),
+  runId: z.string().nullable(),
+  error: z.string().nullable(),
+});
+export type AgentScheduleExecution = z.infer<typeof agentScheduleExecutionSchema>;
+
+export const createAgentScheduleSchema = z.object({
+  agentId: z.string().min(1),
+  hour: z.number().int().min(0).max(23),
+  minute: z.number().int().min(0).max(59),
+  workspace: z.string().min(1),
+  model: z.string().min(1),
+  sandbox: sandboxSchema,
+  approvalPolicy: approvalPolicySchema,
+  skills: z.array(selectedSkillRefSchema).max(20).default([]),
+});
+export type CreateAgentScheduleInput = z.infer<typeof createAgentScheduleSchema>;
+
+export const updateAgentScheduleSchema = z.object({
+  status: agentScheduleStatusSchema,
+});
+export type UpdateAgentScheduleInput = z.infer<typeof updateAgentScheduleSchema>;
+
+export type SkillSyncResult = {
+  copied: string[];
+  updated: string[];
+  conflicts: Array<{ slug: string; sourcePath: string; targetPath: string; reason: string }>;
+  errors: Array<{ slug: string; sourcePath: string; message: string }>;
+};
+
+export type AgentScheduleListResponse = {
+  agents: AgentListItem[];
+  schedules: AgentSchedule[];
+  upcoming: AgentSchedule[];
+  executions: AgentScheduleExecution[];
+  skillSync: SkillSyncResult;
+};
+
+export type AgentListResponse = {
+  agents: AgentListItem[];
+  skillSync: SkillSyncResult;
+};
+
 export const runConfigSchema = z.object({
   workspace: z.string().min(1),
   prompt: z.string().min(1),

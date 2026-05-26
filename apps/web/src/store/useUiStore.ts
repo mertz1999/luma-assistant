@@ -1,7 +1,7 @@
 import { create } from "zustand";
 
 type ToolTab = "approvals" | "diff" | "files";
-type RightPanelTab = "context" | "tools";
+type RightPanelTab = "context" | "tools" | "agents";
 
 type UiStore = {
   selectedRunId: string | null;
