@@ -122,7 +122,7 @@ Important variables:
 
 ### Luma Telegram MCP
 
-The app includes a local MCP server, registered in Codex as `luma-tel` by default, that can upload generated files to a Telegram group topic.
+The app includes a local MCP server, registered in Codex as `luma-tel` by default, that can send messages and upload generated files to Telegram group topics.
 
 1. Create a Telegram bot with `@BotFather` using `/newbot`.
 2. Add the bot to your Telegram group and grant permission to send files.
@@ -133,12 +133,13 @@ The app includes a local MCP server, registered in Codex as `luma-tel` by defaul
 curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates"
 ```
 
-Use `message.chat.id` as `TELEGRAM_CHAT_ID` and `message.message_thread_id` as `TELEGRAM_MESSAGE_FILE_THREAD_ID`.
+Use `message.chat.id` as `TELEGRAM_CHAT_ID`. Use `message.message_thread_id` as `TELEGRAM_MESSAGE_FILE_THREAD_ID` for file uploads and `TELEGRAM_MESSAGE_TEXT_THREAD_ID` for plain text messages.
 
 ```env
 TELEGRAM_BOT_TOKEN=123456:abc...
 TELEGRAM_CHAT_ID=-1001234567890
 TELEGRAM_MESSAGE_FILE_THREAD_ID=42
+TELEGRAM_MESSAGE_TEXT_THREAD_ID=43
 TELEGRAM_MCP_PORT=9013
 TELEGRAM_MCP_NAME=luma-tel
 TELEGRAM_ALLOWED_ROOTS=/Users/applestation/Project

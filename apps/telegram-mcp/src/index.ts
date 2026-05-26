@@ -1,11 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
+import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import dotenv from "dotenv";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import * as z from "zod/v4";
+
+const execFileAsync = promisify(execFile);
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const rootDir = findWorkspaceRoot(process.cwd()) || findWorkspaceRoot(packageDir) || path.resolve(packageDir, "..", "..");
@@ -17,6 +21,7 @@ const MCP_HOST = process.env.TELEGRAM_MCP_HOST || "127.0.0.1";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const TELEGRAM_MAX_FILE_BYTES = Number(process.env.TELEGRAM_MAX_FILE_BYTES || 50 * 1024 * 1024);
 const FILE_THREAD_ENV = "TELEGRAM_MESSAGE_FILE_THREAD_ID";
+const TEXT_THREAD_ENV = "TELEGRAM_MESSAGE_TEXT_THREAD_ID";
 const LEGACY_THREAD_ENV = "TELEGRAM_MESSAGE_THREAD_ID";
 
 type TelegramApiResponse<T> = {
@@ -49,6 +54,17 @@ type TelegramSendDocumentResult = {
   };
 };
 
+type TelegramSendMessageResult = {
+  message_id: number;
+  chat?: {
+    id: number | string;
+    title?: string;
+    type?: string;
+  };
+  message_thread_id?: number;
+  text?: string;
+};
+
 type SendFileResult = {
   ok: boolean;
   message_id: number;
@@ -57,6 +73,14 @@ type SendFileResult = {
   file_path: string;
   file_name: string;
   file_size: number;
+};
+
+type SendMessageResult = {
+  ok: boolean;
+  message_id: number;
+  chat_id: string;
+  message_thread_id: string | null;
+  text: string;
 };
 
 type TestConnectionResult = {
@@ -176,8 +200,8 @@ function resolveChatId(input?: string | number): string {
   return chatId;
 }
 
-function resolveThreadId(input?: string | number | null): string | null {
-  const raw = input ?? process.env[FILE_THREAD_ENV] ?? process.env[LEGACY_THREAD_ENV] ?? "";
+function resolveThreadId(input?: string | number | null, primaryEnv = FILE_THREAD_ENV): string | null {
+  const raw = input ?? process.env[primaryEnv] ?? process.env[FILE_THREAD_ENV] ?? process.env[LEGACY_THREAD_ENV] ?? "";
   const value = String(raw).trim();
   return value ? value : null;
 }
@@ -188,6 +212,11 @@ async function callTelegram<T>(method: string, init: RequestInit = {}): Promise<
   try {
     response = await fetch(`${TELEGRAM_API_BASE}/bot${token}/${method}`, init);
   } catch (error) {
+    const curlResult = await callTelegramWithCurl<T>(method, init, token);
+    if (curlResult.ok) return curlResult.result;
+    if (curlResult.error) {
+      throw new Error(curlResult.error);
+    }
     throw new Error(`Telegram API ${method} network request failed: ${formatErrorMessage(error)}`);
   }
 
@@ -202,6 +231,45 @@ async function callTelegram<T>(method: string, init: RequestInit = {}): Promise<
     throw new Error(payload.description || `Telegram API ${method} failed with HTTP ${response.status}`);
   }
   return payload.result;
+}
+
+async function callTelegramWithCurl<T>(
+  method: string,
+  init: RequestInit,
+  token: string,
+): Promise<{ ok: true; result: T } | { ok: false; error?: string }> {
+  const args = ["-sS", "--connect-timeout", "10", "--max-time", "30"];
+  const body = init.body;
+
+  if (body instanceof URLSearchParams) {
+    args.push("-X", String(init.method || "POST"));
+    for (const [key, value] of body.entries()) {
+      args.push("--data-urlencode", `${key}=${value}`);
+    }
+  } else if (body === undefined || body === null) {
+    if (init.method && init.method !== "GET") args.push("-X", String(init.method));
+  } else {
+    return { ok: false };
+  }
+
+  args.push(`${TELEGRAM_API_BASE}/bot${token}/${method}`);
+
+  try {
+    const { stdout } = await execFileAsync("curl", args, {
+      timeout: 35_000,
+      maxBuffer: 1024 * 1024,
+    });
+    const payload = JSON.parse(stdout) as TelegramApiResponse<T>;
+    if (!payload.ok || payload.result === undefined) {
+      return {
+        ok: false,
+        error: payload.description || `Telegram API ${method} failed through curl fallback`,
+      };
+    }
+    return { ok: true, result: payload.result };
+  } catch {
+    return { ok: false };
+  }
 }
 
 async function testTelegramConnection(chatIdInput?: string | number, threadIdInput?: string | number | null): Promise<TestConnectionResult> {
@@ -267,6 +335,42 @@ async function sendTelegramFile(args: {
   };
 }
 
+async function sendTelegramMessage(args: {
+  text: string;
+  chat_id?: string | number;
+  message_thread_id?: string | number | null;
+  parse_mode?: "HTML" | "Markdown" | "MarkdownV2";
+  disable_notification?: boolean;
+}): Promise<SendMessageResult> {
+  const text = args.text.trim();
+  if (!text) throw new Error("Telegram message text is empty.");
+
+  const chatId = resolveChatId(args.chat_id);
+  const threadId = resolveThreadId(args.message_thread_id, TEXT_THREAD_ENV);
+
+  const body = new URLSearchParams({
+    chat_id: chatId,
+    text: text.slice(0, 4096),
+  });
+  if (threadId) body.set("message_thread_id", threadId);
+  if (args.parse_mode) body.set("parse_mode", args.parse_mode);
+  if (args.disable_notification !== undefined) body.set("disable_notification", String(Boolean(args.disable_notification)));
+
+  const result = await callTelegram<TelegramSendMessageResult>("sendMessage", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  return {
+    ok: true,
+    message_id: result.message_id,
+    chat_id: String(result.chat?.id ?? chatId),
+    message_thread_id: String(result.message_thread_id ?? threadId ?? "") || null,
+    text: result.text || text.slice(0, 4096),
+  };
+}
+
 function toolSuccess<T extends Record<string, unknown>>(result: T) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
@@ -302,7 +406,7 @@ function createServer(): McpServer {
     { name: MCP_NAME, version: "0.1.0" },
     {
       instructions:
-        "Use send_file to upload a local generated file to the configured Telegram group topic. Never ask for or expose TELEGRAM_BOT_TOKEN.",
+        "Use send_file to upload a local generated file to the configured Telegram group topic, and send_message to post text. Never ask for or expose TELEGRAM_BOT_TOKEN.",
     },
   );
 
@@ -319,6 +423,28 @@ function createServer(): McpServer {
     async ({ chat_id, message_thread_id }) => {
       try {
         return toolSuccess({ ...(await testTelegramConnection(chat_id, message_thread_id)) });
+      } catch (error) {
+        return toolFailure(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "send_message",
+    {
+      title: "Send Message To Telegram",
+      description: "Post a plain text message to the configured Telegram group topic using Telegram sendMessage.",
+      inputSchema: {
+        text: z.string().min(1).max(4096).describe("Telegram message text. Telegram limits messages to 4096 characters."),
+        chat_id: z.union([z.string(), z.number()]).optional().describe("Telegram chat id. Defaults to TELEGRAM_CHAT_ID."),
+        message_thread_id: z.union([z.string(), z.number()]).nullable().optional().describe("Telegram topic/thread id. Defaults to TELEGRAM_MESSAGE_TEXT_THREAD_ID, then TELEGRAM_MESSAGE_FILE_THREAD_ID."),
+        parse_mode: z.enum(["HTML", "Markdown", "MarkdownV2"]).optional().describe("Optional Telegram parse mode."),
+        disable_notification: z.boolean().optional().describe("Whether Telegram should send the message silently."),
+      },
+    },
+    async (args) => {
+      try {
+        return toolSuccess({ ...(await sendTelegramMessage(args)) });
       } catch (error) {
         return toolFailure(error);
       }
