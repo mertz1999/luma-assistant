@@ -5,24 +5,26 @@
 <h1 align="center">Luma Assistant</h1>
 
 <p align="center">
-  Self-hosted Codex workspace with agents, Tehran-time schedules, repo skills, MCP tools, Telegram automation, terminals, and persistent session history.
+  Self-hosted web application for your Codex CLI with remote URL access, cron-style jobs, sandbox terminals, MCP, plan mode, agents, skills, and persistent session history.
 </p>
 
 ## What It Is
 
-Luma Assistant wraps Codex in a browser workspace and local API server. It is built for running Codex against real repositories while keeping prompts, sessions, tool activity, approvals, terminals, scheduled agents, and MCP integrations visible in one operator-focused UI.
+Luma Assistant connects to the Codex CLI on your machine or server and gives it a browser UI. You can install it on a server, protect it with authentication and HTTPS, and use your Codex workspace from anywhere with a URL.
+
+It keeps the core Codex CLI workflow available in the app: plan mode, MCP tools, workspace instructions such as `AGENTS.md`, agents, skills, approvals, terminal access, live tool output, diffs, and session history.
 
 ## Capabilities
 
-- `Codex web workspace`: start new sessions, continue old ones, stream live output, review diffs, and inspect grouped tool activity.
-- `Agents`: discover repo-owned agents from `agents/<slug>/AGENT.md` and run the latest prompt body manually or on a schedule.
-- `Tehran schedules`: create daily `Asia/Tehran` schedules that snapshot workspace, model, sandbox, approval policy, and selected skills.
-- `Repo skill sync`: copy managed repo skills from `skills/**/SKILL.md` into `~/.codex/skills` without overwriting unmanaged global skills.
+- `Connect to your Codex CLI`: run Codex from a web app while keeping live output, approvals, diffs, plan mode, MCP, and session history visible.
+- `Use it anywhere by URL`: deploy Luma Assistant on a server and access your workspace from desktop, phone, or another machine.
+- `Cron-style jobs`: schedule specific assistant work for specific moments and inspect each run as a normal Codex session.
+- `Sandbox terminal`: open a controlled terminal from the browser when you need direct command access from your phone or another place.
+- `Agents and instructions`: use Codex workspace instructions such as `AGENTS.md`, plus repo-owned scheduled agents from `agents/<slug>/AGENT.md`.
 - `MCP visibility`: surface MCP calls, web searches, shell commands, file changes, and run status in the normal session timeline.
+- `Repo skill sync`: copy managed repo skills from `skills/**/SKILL.md` into `~/.codex/skills` without overwriting unmanaged global skills.
 - `Telegram MCP`: run a local Telegram MCP server for sending rendered Markdown messages and generated files to Telegram topics.
-- `Terminal`: open a per-session terminal with command history from the same app window.
-- `Auth`: protect the browser UI with a password and JWT-backed local browser session.
-- `History`: keep local runtime data under `data/` and show compatible Codex history alongside in-app sessions.
+- `Auth and history`: protect the browser UI with a password and keep local runtime data under `data/`.
 
 ## Stack
 
@@ -62,11 +64,11 @@ Open the web app:
 http://localhost:5175
 ```
 
-If you change `HOST` or `WEB_PORT`, use that address instead.
+If you deploy it on a server, put it behind HTTPS and open it from your chosen domain or server URL.
 
 ## Configuration
 
-The root `.env` controls the local runtime:
+The root `.env` controls the runtime:
 
 ```env
 API_PORT=9001
@@ -86,17 +88,23 @@ Important variables:
 - `PASSWORD`: browser login password.
 - `JWT_SECRET`: secret used to sign auth tokens.
 - `CODEX_PATH`: path to the Codex executable if it is not simply `codex`.
-- `DEFAULT_MODEL`: default Codex model for new sessions and new schedules.
+- `DEFAULT_MODEL`: default Codex model for new sessions and new scheduled jobs.
 - `DEFAULT_SANDBOX`: default sandbox mode for new sessions.
 - `MAX_CONCURRENT_RUNS`: server-side cap for active Codex runs.
 - `TERMINAL_DISABLE_PTY=1`: force plain-pipe terminal mode.
 - `TERMINAL_SHELL=/bin/bash`: choose the shell used by session terminals.
 
-Legacy browser storage keys and local session sources are tolerated so existing sessions, auth, theme, and queued prompts are not dropped during the rename.
+Legacy browser storage keys and local session sources are tolerated so existing sessions, auth, theme, and queued prompts are not dropped during upgrades.
+
+## Cron-Style Jobs
+
+Scheduled jobs let Luma Assistant run specific assistant work at specific moments. Each execution creates a new Codex session, records status, and can be opened in the normal chat viewer.
+
+Schedule creation snapshots the selected workspace, model, sandbox, approval policy, and selected skills. The agent prompt body is read at run time, so updating the agent file changes future executions.
 
 ## Agents
 
-Agents live in the repository and are not copied into Codex home:
+Repo-owned scheduled agents live here:
 
 ```text
 agents/
@@ -112,10 +120,12 @@ name: Daily Planner
 description: Summarizes today's work.
 ---
 
-Use the TickTick MCP server and prepare today's plan.
+Use the configured MCP tools and prepare today's plan.
 ```
 
-The Markdown body after frontmatter is the exact prompt used for scheduled runs. Schedule execution reads the current agent file at run time, so editing `AGENT.md` updates future runs without recreating the schedule.
+The Markdown body after frontmatter is the exact prompt used for scheduled jobs.
+
+Codex workspace instructions such as `AGENTS.md` remain part of the normal Codex CLI workflow and are honored by Codex in the selected workspace.
 
 ## Skills
 
@@ -182,7 +192,7 @@ The root npm workspaces are:
 
 ## Landing Page
 
-The standalone marketing site lives in `landing-page/`.
+The standalone landing page lives in `landing-page/`.
 
 ```bash
 npm ci --prefix landing-page
@@ -255,7 +265,7 @@ Security notes:
 ## Repository Layout
 
 ```text
-agents/          repo-owned agent prompts
+agents/          repo-owned scheduled agent prompts
 apps/
   server/        Express API, scheduler, run manager, auth, SSE, terminal bridge
   telegram-mcp/  local MCP server for Telegram messages and file uploads
@@ -275,4 +285,4 @@ data/            private runtime data and logs
 - `Connection refused` on HTTPS usually means no process is listening on port `443`, the reverse proxy is stopped, or the firewall is rejecting the port.
 - `Codex not found` means `CODEX_PATH` does not point at an executable Codex CLI.
 - `Skill conflict` means a global `~/.codex/skills/<slug>` exists without Luma Assistant's managed marker and was intentionally left untouched.
-- `Schedule skipped` can happen when the global run capacity is full.
+- `Scheduled job skipped` can happen when the global run capacity is full.

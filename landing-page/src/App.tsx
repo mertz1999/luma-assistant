@@ -34,66 +34,66 @@ const screenshots = {
 };
 
 const highlights = [
-  ["Daily agents", "Run Tehran-time jobs from repo prompts"],
-  ["Skills sync", "Publish managed Codex skills safely"],
-  ["MCP view", "See tools, Telegram, TickTick, and web calls"],
-  ["Sessions", "Open any scheduled run like a normal chat"],
+  ["Remote Codex", "Use your Codex CLI from any browser"],
+  ["Cron jobs", "Run specific work at specific moments"],
+  ["Sandbox terminal", "Open a controlled terminal from your phone"],
+  ["Core Codex", "Plan mode, MCP, AGENTS.md, agents, and history"],
 ];
 
 const featureRows = [
   {
     icon: Bot,
-    title: "Agent routines that feel native",
-    text: "Create repo-owned agents, schedule them for Tehran time, and let every execution land in the same chat history as manual Codex work.",
+    title: "Connect to your Codex CLI",
+    text: "Use the Codex CLI you already trust, but from a persistent web application with sessions, approvals, history, and live tool output.",
   },
   {
     icon: MessageSquareText,
-    title: "Telegram-ready outcomes",
-    text: "Ask agents to produce clean Markdown summaries and send them through the Telegram MCP server with formatting intact.",
+    title: "Install it on a server",
+    text: "Run Luma Assistant on your own server, put it behind HTTPS, and reach your Codex workspace anywhere you have the URL.",
   },
   {
     icon: Layers3,
-    title: "Skill sync without surprises",
-    text: "Copy managed repo skills into Codex home, update your own managed copies, and surface conflicts instead of overwriting local work.",
+    title: "Cron-style assistant jobs",
+    text: "Create scheduled jobs for specific recurring work, then open every result as a normal Codex session with messages and status.",
   },
   {
     icon: Network,
     title: "MCP tools in plain sight",
-    text: "Watch TickTick, Telegram, web search, shell commands, diffs, approvals, and terminal work flow through one timeline.",
+    text: "Keep MCP calls visible beside shell commands, web searches, file changes, diffs, approvals, and assistant responses.",
   },
   {
     icon: TerminalSquare,
-    title: "Operator-grade workspace",
-    text: "Use persistent sessions, per-session terminals, queued prompts, model defaults, sandbox controls, and visible run state.",
+    title: "Sandbox terminal anywhere",
+    text: "Open a per-session sandbox terminal from your laptop, phone, or another machine when you need direct command access.",
   },
   {
     icon: ShieldCheck,
-    title: "Self-hosted by design",
-    text: "Run on your own host with password auth, PM2 process names, Nginx examples, private data files, and GitHub Pages docs.",
+    title: "Codex CLI core included",
+    text: "Plan mode, MCP, workspace instructions like AGENTS.md, agents, skills, approvals, and session history stay available from the UI.",
   },
 ];
 
 const workflow = [
   {
-    title: "Write an agent once",
-    text: "Store the prompt in AGENT.md with optional frontmatter for name and description.",
+    title: "Connect your CLI",
+    text: "Point Luma Assistant at Codex, authenticate once, and select the workspace you want to operate.",
   },
   {
-    title: "Schedule or trigger it",
-    text: "Snapshot workspace, model, sandbox, approval policy, and selected skills at schedule creation.",
+    title: "Use it from a URL",
+    text: "Install it on a server, protect it with auth and HTTPS, then open it from desktop or mobile.",
   },
   {
-    title: "Inspect every run",
-    text: "Failed, skipped, running, and completed executions stay visible with linked sessions.",
+    title: "Automate recurring work",
+    text: "Create cron-style jobs for specific tasks and inspect each execution in normal session history.",
   },
   {
-    title: "Ship the result",
-    text: "Send a polished Telegram digest or keep working in the normal Codex chat viewer.",
+    title: "Drop into terminal",
+    text: "Use the sandbox terminal when you need hands-on command access from wherever you are.",
   },
 ];
 
 function App() {
-  const [mode, setMode] = useState<Mode>("dark");
+  const [mode, setMode] = useState<Mode>("light");
   const activeScreenshots = screenshots[mode];
   const isDark = mode === "dark";
 
@@ -163,14 +163,14 @@ function Hero({
               }`}
             >
               <RefreshCw className="h-4 w-4" aria-hidden="true" />
-              Your Codex workspace, on schedule
+              Your Codex CLI, reachable by URL
             </p>
             <h1 className="max-w-xl text-5xl font-semibold leading-none sm:text-6xl lg:text-7xl">
               Luma Assistant
             </h1>
             <p className={`mt-6 max-w-xl text-lg leading-8 ${isDark ? "text-white/70" : "text-[#14251f]/70"}`}>
-              A self-hosted application for running Codex like an operating desk: agents, Tehran-time schedules, repo
-              skills, MCP tools, terminals, history, and Telegram delivery in one focused UI.
+              A self-hosted web app for your Codex CLI. Install it on a server, open it from anywhere, schedule
+              recurring work, use MCP and plan mode, and drop into a sandbox terminal when you need control.
             </p>
             <div className="mt-8 flex flex-col gap-3 sm:flex-row">
               <a
@@ -290,10 +290,10 @@ function ProofStrip() {
     <section className="border-y border-[#14251f]/10 bg-white text-[#14251f]">
       <div className="mx-auto grid max-w-7xl gap-4 px-5 py-6 sm:grid-cols-2 sm:px-8 lg:grid-cols-4 lg:px-10">
         {[
-          ["Asia/Tehran", "Daily schedule timezone"],
-          ["luma-tel", "Telegram MCP server"],
-          ["~/.codex/skills", "Managed skill target"],
-          ["data/", "Private runtime history"],
+          ["Codex CLI", "Connected through your own server"],
+          ["Cron jobs", "Specific work at specific moments"],
+          ["Terminal", "Sandbox access from desktop or phone"],
+          ["MCP + Plan", "Core Codex features in the UI"],
         ].map(([label, text]) => (
           <div className="rounded-lg border border-[#14251f]/10 bg-[#f5f4ef] p-4" key={label}>
             <p className="text-lg font-semibold">{label}</p>
@@ -310,13 +310,13 @@ function FeatureGrid() {
     <section className="bg-[#f5f4ef] text-[#14251f]">
       <div className="mx-auto max-w-7xl px-5 py-16 sm:px-8 lg:px-10">
         <div className="max-w-3xl">
-          <p className="text-sm font-semibold text-[#2f6f5e]">Built for real assistant operations</p>
+          <p className="text-sm font-semibold text-[#2f6f5e]">Built for remote Codex work</p>
           <h2 className="mt-3 text-3xl font-semibold leading-tight sm:text-4xl">
-            Not a chat demo. A workspace for recurring work.
+            Your Codex CLI becomes an application you can use anywhere.
           </h2>
           <p className="mt-4 text-base leading-7 text-[#14251f]/70">
-            Luma Assistant makes the recurring parts of Codex work visible and repeatable while keeping every scheduled
-            run inspectable in normal session history.
+            Luma Assistant keeps the core Codex CLI experience intact while adding a browser UI, server deployment,
+            scheduled jobs, mobile-friendly terminal access, and persistent session history.
           </p>
         </div>
 
@@ -347,9 +347,9 @@ function WorkflowShowcase({
     <section className={`${isDark ? "bg-[#101412] text-[#f3f0e7]" : "bg-white text-[#14251f]"}`}>
       <div className="mx-auto grid max-w-7xl gap-10 px-5 py-16 sm:px-8 lg:grid-cols-[0.92fr_1.08fr] lg:px-10">
         <div>
-          <p className={`text-sm font-semibold ${isDark ? "text-[#8ce4cd]" : "text-[#2f6f5e]"}`}>From prompt to delivery</p>
+          <p className={`text-sm font-semibold ${isDark ? "text-[#8ce4cd]" : "text-[#2f6f5e]"}`}>From URL to terminal</p>
           <h2 className="mt-3 text-3xl font-semibold leading-tight sm:text-4xl">
-            Schedule the work, then inspect the exact session.
+            Use Codex remotely without losing the CLI features.
           </h2>
           <div className="mt-8 space-y-4">
             {workflow.map((item, index) => (
@@ -412,11 +412,11 @@ function FinalCta() {
             Ready for self-hosted automation
           </p>
           <h2 className="text-3xl font-semibold leading-tight sm:text-4xl">
-            Give Codex a schedule, a skill set, and a delivery channel.
+            Put your Codex CLI online for yourself.
           </h2>
           <p className="mt-4 max-w-2xl text-sm leading-6 text-white/70">
-            Clone Luma Assistant, connect Codex and Telegram, add your own agents, and keep recurring assistant work
-            visible from the same application.
+            Clone Luma Assistant, connect your Codex CLI, deploy it on a server, and use plan mode, MCP, agents,
+            cron-style jobs, and sandbox terminal access from one application.
           </p>
         </div>
         <div className="flex flex-col gap-3 sm:flex-row lg:flex-col">
