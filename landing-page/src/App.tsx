@@ -49,13 +49,6 @@ const remoteFeatureScreenshots = [
   },
 ];
 
-const highlights = [
-  ["Remote Codex", "Use your Codex CLI from any browser"],
-  ["Cron jobs", "Run specific work at specific moments"],
-  ["Sandbox terminal", "Open a controlled terminal from your phone"],
-  ["Offline voice", "Dictate prompts with offline voice-to-text"],
-];
-
 const featureRows = [
   {
     icon: Bot,
@@ -94,25 +87,6 @@ const featureRows = [
   },
 ];
 
-const workflow = [
-  {
-    title: "Connect your CLI",
-    text: "Point Luma Assistant at Codex, authenticate once, and select the workspace you want to operate.",
-  },
-  {
-    title: "Use it from a URL",
-    text: "Install it on a server, protect it with auth and HTTPS, then open it from desktop or mobile.",
-  },
-  {
-    title: "Automate recurring work",
-    text: "Create cron-style jobs for specific tasks and inspect each execution in normal session history.",
-  },
-  {
-    title: "Drop into terminal",
-    text: "Use the sandbox terminal when you need hands-on command access from wherever you are.",
-  },
-];
-
 function App() {
   const [mode, setMode] = useState<Mode>("light");
   const activeScreenshots = screenshots[mode];
@@ -129,7 +103,6 @@ function App() {
   return (
     <main className={`min-h-screen overflow-hidden ${shell}`}>
       <Hero mode={mode} setMode={setMode} activeScreenshots={activeScreenshots} />
-      <ProofStrip />
       <FeatureGrid />
       <WorkflowShowcase mode={mode} />
       <FinalCta />
@@ -212,19 +185,6 @@ function Hero({
                 Read setup guide
               </a>
             </div>
-            <div className="mt-8 grid max-w-xl grid-cols-2 gap-3">
-              {highlights.map(([title, text]) => (
-                <div
-                  className={`rounded-lg border p-4 ${
-                    isDark ? "border-white/10 bg-white/10" : "border-[#14251f]/10 bg-white/70"
-                  }`}
-                  key={title}
-                >
-                  <p className="text-sm font-semibold">{title}</p>
-                  <p className={`mt-1 text-xs leading-5 ${isDark ? "text-white/60" : "text-[#14251f]/60"}`}>{text}</p>
-                </div>
-              ))}
-            </div>
           </div>
 
           <ProductStage mode={mode} activeScreenshots={activeScreenshots} />
@@ -306,26 +266,6 @@ function ProductStage({
   );
 }
 
-function ProofStrip() {
-  return (
-    <section className="border-y border-[#14251f]/10 bg-white text-[#14251f]">
-      <div className="mx-auto grid max-w-7xl gap-4 px-5 py-6 sm:grid-cols-2 sm:px-8 lg:grid-cols-4 lg:px-10">
-        {[
-          ["Codex CLI", "Connected through your own server"],
-          ["Cron jobs", "Specific work at specific moments"],
-          ["Terminal", "Sandbox access from desktop or phone"],
-          ["Voice input", "Offline voice-to-text prompts"],
-        ].map(([label, text]) => (
-          <div className="rounded-lg border border-[#14251f]/10 bg-[#f5f4ef] p-4" key={label}>
-            <p className="text-lg font-semibold">{label}</p>
-            <p className="mt-1 text-sm text-[#14251f]/60">{text}</p>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
 function FeatureGrid() {
   return (
     <section className="bg-[#f5f4ef] text-[#14251f]">
@@ -364,35 +304,11 @@ function WorkflowShowcase({
 
   return (
     <section className={`${isDark ? "bg-[#101412] text-[#f3f0e7]" : "bg-white text-[#14251f]"}`}>
-      <div className="mx-auto grid max-w-7xl gap-10 px-5 py-16 sm:px-8 lg:grid-cols-[0.78fr_1.22fr] lg:px-10">
-        <div>
-          <p className={`text-sm font-semibold ${isDark ? "text-[#8ce4cd]" : "text-[#2f6f5e]"}`}>From URL to terminal</p>
-          <h2 className="mt-3 text-3xl font-semibold leading-tight sm:text-4xl">
-            Use Codex remotely without losing the CLI features.
-          </h2>
-          <div className="mt-8 space-y-4">
-            {workflow.map((item, index) => (
-              <div
-                className={`grid grid-cols-[2.4rem_1fr] gap-4 rounded-lg border p-4 ${
-                  isDark ? "border-white/10 bg-white/10" : "border-[#14251f]/10 bg-[#f5f4ef]"
-                }`}
-                key={item.title}
-              >
-                <div className="flex h-9 w-9 items-center justify-center rounded-md bg-[#2f8f7e] text-sm font-bold text-white">
-                  {index + 1}
-                </div>
-                <div>
-                  <h3 className="font-semibold">{item.title}</h3>
-                  <p className={`mt-1 text-sm leading-6 ${isDark ? "text-white/60" : "text-[#14251f]/60"}`}>
-                    {item.text}
-                  </p>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="grid items-start gap-4 sm:grid-cols-3 lg:-mt-14 xl:-mt-20">
+      <div className="mx-auto max-w-7xl px-5 py-16 sm:px-8 lg:px-10">
+        <h2 className="text-center text-3xl font-semibold leading-tight sm:text-4xl">
+          Use it in your phone as PWA
+        </h2>
+        <div className="mt-10 grid items-start gap-4 sm:grid-cols-3 lg:mt-12">
           {remoteFeatureScreenshots.map((screenshot, index) => (
             <figure
               className={`overflow-hidden rounded-lg border shadow-[0_24px_70px_rgba(20,37,31,0.14)] ${
