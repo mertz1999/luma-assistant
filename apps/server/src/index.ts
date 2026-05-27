@@ -60,7 +60,7 @@ import {
   type SseEvent,
   type TerminalSessionSnapshot,
   type WorkspaceOption,
-} from "@agentic/shared";
+} from "@luma/shared";
 
 const rootDir = path.resolve(process.env.INIT_CWD || process.cwd());
 dotenv.config({ path: path.resolve(rootDir, ".env") });
@@ -87,7 +87,7 @@ const MAX_CONCURRENT_RUNS = Number(process.env.MAX_CONCURRENT_RUNS || 8);
 const AUTH_PASSWORD = process.env.PASSWORD || process.env.APP_PASSWORD || "";
 const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
 const AUTH_TOKEN_TTL_SECONDS = Number(process.env.AUTH_TOKEN_TTL_SECONDS || 24 * 60 * 60);
-const JWT_SECRET = process.env.JWT_SECRET || AUTH_PASSWORD || "agentic-cli-default-jwt-secret";
+const JWT_SECRET = process.env.JWT_SECRET || AUTH_PASSWORD || "luma-assistant-default-jwt-secret";
 const PLAN_MODE_FILE_PATH = path.resolve(rootDir, "plan.md");
 const ATTACHMENT_STAGING_DIR = path.join(".agentic", "attachments");
 const ATTACHMENT_MAX_BYTES = Number(process.env.ATTACHMENT_MAX_BYTES || 15 * 1024 * 1024);
@@ -104,7 +104,10 @@ const SESSION_INDEX_PERSIST_DEBOUNCE_MS = Number(process.env.SESSION_INDEX_PERSI
 const MESSAGE_OUTBOX_RETRY_DELAYS_MS = [1000, 3000, 10000];
 const MESSAGE_STORE_SCHEMA_VERSION = 1;
 const TEHRAN_TIMEZONE = "Asia/Tehran";
-const MANAGED_SKILL_MARKER = ".agentic-managed-skill.json";
+const LOCAL_SESSION_SOURCE = "luma-assistant";
+const LEGACY_LOCAL_SESSION_SOURCE = "agentic-cli";
+const MANAGED_SKILL_MARKER = ".luma-managed-skill.json";
+const LEGACY_MANAGED_SKILL_MARKER = ".agentic-managed-skill.json";
 
 const IMAGE_ATTACHMENT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 const IMAGE_ATTACHMENT_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -289,7 +292,7 @@ function normalizeRunSourceTag(sourceRaw: string, historyOnly: boolean): RunSour
 
   const normalized = sourceRaw.trim().toLowerCase();
   if (normalized === "vscode") return "vscode";
-  if (normalized === "cli" || normalized === "agentic-cli") return "cli";
+  if (normalized === "cli" || normalized === LEGACY_LOCAL_SESSION_SOURCE || normalized === LOCAL_SESSION_SOURCE) return "cli";
   if (normalized === "exec") return "exec";
   return "other";
 }
@@ -775,14 +778,17 @@ function discoverRepoSkillDirectories(): Array<{ slug: string; sourcePath: strin
 }
 
 function readManagedSkillMarker(targetPath: string): boolean {
-  const markerPath = path.join(targetPath, MANAGED_SKILL_MARKER);
-  if (!fs.existsSync(markerPath)) return false;
-  try {
-    const payload = safeJsonParse<Record<string, unknown>>(fs.readFileSync(markerPath, "utf8"), {});
-    return payload.managedBy === "agentic-assistant";
-  } catch {
-    return false;
+  for (const markerName of [MANAGED_SKILL_MARKER, LEGACY_MANAGED_SKILL_MARKER]) {
+    const markerPath = path.join(targetPath, markerName);
+    if (!fs.existsSync(markerPath)) continue;
+    try {
+      const payload = safeJsonParse<Record<string, unknown>>(fs.readFileSync(markerPath, "utf8"), {});
+      if (payload.managedBy === "luma-assistant" || payload.managedBy === "agentic-assistant") return true;
+    } catch {
+      return false;
+    }
   }
+  return false;
 }
 
 function writeManagedSkillMarker(targetPath: string, sourcePath: string): void {
@@ -790,7 +796,7 @@ function writeManagedSkillMarker(targetPath: string, sourcePath: string): void {
     path.join(targetPath, MANAGED_SKILL_MARKER),
     JSON.stringify(
       {
-        managedBy: "agentic-assistant",
+        managedBy: "luma-assistant",
         sourcePath,
         updatedAt: new Date().toISOString(),
       },
@@ -2462,13 +2468,17 @@ function isGeneratedSessionSummary(summary: string): boolean {
 }
 
 function choosePreferredSessionSummary(entries: SessionHistoryEntry[]): string {
-  const externalWithRealSummary = entries.find((entry) => entry.source !== "agentic-cli" && !isGeneratedSessionSummary(entry.summary));
+  const externalWithRealSummary = entries.find((entry) => !isLocalSessionSource(entry.source) && !isGeneratedSessionSummary(entry.summary));
   if (externalWithRealSummary) return externalWithRealSummary.summary;
 
   const realSummary = entries.find((entry) => !isGeneratedSessionSummary(entry.summary));
   if (realSummary) return realSummary.summary;
 
   return entries[0]?.summary || "";
+}
+
+function isLocalSessionSource(source: string): boolean {
+  return source === LOCAL_SESSION_SOURCE || source === LEGACY_LOCAL_SESSION_SOURCE;
 }
 
 function isArchiveWorkspacePath(cwd: string): boolean {
@@ -2596,7 +2606,7 @@ function loadCodexSessionHistory(limit = 0, options?: { includeExec?: boolean })
     const parsed = readCodexSessionFile(file);
     if (!parsed) continue;
     if (!options?.includeExec && parsed.entry.source === "exec") continue;
-    if (parsed.entry.source !== "agentic-cli" && isArchiveWorkspacePath(parsed.entry.cwd)) continue;
+    if (!isLocalSessionSource(parsed.entry.source) && isArchiveWorkspacePath(parsed.entry.cwd)) continue;
     out.push(parsed.entry);
   }
 
@@ -4107,7 +4117,7 @@ class MessageStore {
       .then(task)
       .catch((error) => {
         // eslint-disable-next-line no-console
-        console.error("[agentic-cli/message-store] write failed", error);
+        console.error("[luma-assistant/message-store] write failed", error);
       });
   }
 }
@@ -4247,7 +4257,7 @@ class OutboxProcessor {
       .then(() => writeJsonAtomic(MESSAGE_OUTBOX_PATH, { items: this.items }))
       .catch((error) => {
         // eslint-disable-next-line no-console
-        console.error("[agentic-cli/outbox] persist failed", error);
+        console.error("[luma-assistant/outbox] persist failed", error);
       });
   }
 
@@ -4634,7 +4644,7 @@ app.post("/api/auth/login", (req, res) => {
   const expiresIn = Math.max(60, AUTH_TOKEN_TTL_SECONDS);
   const token = jwt.sign(
     {
-      sub: "agentic-cli-user",
+      sub: "luma-assistant-user",
       iat: nowSeconds,
     },
     JWT_SECRET,
@@ -5107,7 +5117,7 @@ app.get("/api/sessions/list", (req, res) => {
   };
   if (process.env.MESSAGE_PERF_LOG === "1") {
     // eslint-disable-next-line no-console
-    console.log(`[agentic-cli/message-perf] sessions.list durationMs=${Date.now() - startedAt} payloadBytes=${Buffer.byteLength(JSON.stringify(response))}`);
+    console.log(`[luma-assistant/message-perf] sessions.list durationMs=${Date.now() - startedAt} payloadBytes=${Buffer.byteLength(JSON.stringify(response))}`);
   }
   res.json(apiOk(response));
 });
@@ -5243,7 +5253,7 @@ app.post("/api/messages/send", (req, res) => {
 
   if (process.env.MESSAGE_PERF_LOG === "1") {
     // eslint-disable-next-line no-console
-    console.log(`[agentic-cli/message-perf] messages.send ackMs=${Date.now() - startedAt}`);
+    console.log(`[luma-assistant/message-perf] messages.send ackMs=${Date.now() - startedAt}`);
   }
 
   res.json(apiOk(response));
@@ -5393,7 +5403,7 @@ app.get("/api/sessions/:sessionId/messages", (req, res) => {
   if (payload) {
     if (process.env.MESSAGE_PERF_LOG === "1") {
       // eslint-disable-next-line no-console
-      console.log(`[agentic-cli/message-perf] sessions.messages durationMs=${Date.now() - startedAt} payloadBytes=${Buffer.byteLength(JSON.stringify(payload))}`);
+      console.log(`[luma-assistant/message-perf] sessions.messages durationMs=${Date.now() - startedAt} payloadBytes=${Buffer.byteLength(JSON.stringify(payload))}`);
     }
     res.json(apiOk(payload));
     return;
@@ -5420,7 +5430,7 @@ app.get("/api/sessions/:sessionId/messages", (req, res) => {
   };
   if (process.env.MESSAGE_PERF_LOG === "1") {
     // eslint-disable-next-line no-console
-    console.log(`[agentic-cli/message-perf] sessions.messages durationMs=${Date.now() - startedAt} payloadBytes=${Buffer.byteLength(JSON.stringify(response))}`);
+    console.log(`[luma-assistant/message-perf] sessions.messages durationMs=${Date.now() - startedAt} payloadBytes=${Buffer.byteLength(JSON.stringify(response))}`);
   }
   res.json(apiOk(response));
 });
@@ -5559,7 +5569,7 @@ app.get("/api/sessions/history", (_req, res) => {
     id,
     timestamp: new Date(row.latest.updatedAt || row.latest.createdAt).toISOString(),
     cwd: row.latest.config.workspace,
-    source: "agentic-cli",
+    source: LOCAL_SESSION_SOURCE,
     model: row.latest.config.model,
     cliVersion: undefined,
     summary: normalizeSessionTitle(row.firstPrompt || row.latest.summary || "", `Session in ${row.latest.config.workspace || "unknown cwd"}`),
@@ -5655,6 +5665,6 @@ process.on("SIGTERM", () => {
 app.listen(API_PORT, HOST, () => {
   // eslint-disable-next-line no-console
   console.log(
-    `[agentic-cli/server] listening on http://${HOST}:${API_PORT} | auth=${AUTH_ENABLED ? "enabled" : "disabled"}`,
+    `[luma-assistant/server] listening on http://${HOST}:${API_PORT} | auth=${AUTH_ENABLED ? "enabled" : "disabled"}`,
   );
 });

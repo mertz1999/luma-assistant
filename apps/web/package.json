@@ -1,5 +1,5 @@
 {
-  "name": "@agentic/web",
+  "name": "@luma/web",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -10,7 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@agentic/shared": "0.1.0",
+    "@luma/shared": "0.1.0",
     "@radix-ui/react-dialog": "^1.1.15",
     "@tanstack/react-query": "^5.72.2",
     "ansi-to-html": "^0.7.2",

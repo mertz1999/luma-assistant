@@ -53,7 +53,7 @@ import type {
   TerminalSessionSnapshot,
   WorkspaceOption,
   SkillSyncResult,
-} from "@agentic/shared";
+} from "@luma/shared";
 import {
   archiveSession,
   connectEvents,
@@ -157,12 +157,15 @@ const toolOutputModalLimit = 2500;
 const draftSessionKey = "__draft__";
 const runListPageSize = 60;
 const messagePageSize = 30;
-const queueStorageKey = "agentic_cli_queue_v1";
-const terminalHistoryStorageKey = "agentic_cli_terminal_history_v1";
+const queueStorageKey = "luma_assistant_queue_v1";
+const legacyQueueStorageKey = "agentic_cli_queue_v1";
+const terminalHistoryStorageKey = "luma_assistant_terminal_history_v1";
+const legacyTerminalHistoryStorageKey = "agentic_cli_terminal_history_v1";
 const terminalHistoryLimit = 80;
-const authSessionStorageKey = "agentic_cli_auth_session_v1";
+const authSessionStorageKey = "luma_assistant_auth_session_v1";
+const legacyAuthSessionStorageKey = "agentic_cli_auth_session_v1";
 const authSessionMaxAgeMs = 24 * 60 * 60 * 1000;
-const planInstructionPath = "/Users/applestation/Project/archive/agentic-assistant/plan.md";
+const planInstructionPath = "plan.md";
 const attachmentMaxFiles = 10;
 // Account for the chat stack gap and bottom padding so "visually at bottom"
 // still counts as bottom without making the auto-follow area too large.
@@ -174,6 +177,17 @@ type StoredAuthSession = {
   token: string;
   expiresAt: number;
 };
+
+function getLocalStorageWithLegacy(primaryKey: string, legacyKey: string): string | null {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(primaryKey) || window.localStorage.getItem(legacyKey);
+}
+
+function removeLocalStorageWithLegacy(primaryKey: string, legacyKey: string): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.removeItem(primaryKey);
+  window.localStorage.removeItem(legacyKey);
+}
 
 type SlashCommandKey = "/mcp" | "/account" | "/status" | "/help" | "/speech" | "/plan";
 
@@ -419,7 +433,7 @@ function loadTerminalCommandHistory(): Record<string, string[]> {
   if (typeof window === "undefined") return {};
 
   try {
-    const raw = window.localStorage.getItem(terminalHistoryStorageKey);
+    const raw = getLocalStorageWithLegacy(terminalHistoryStorageKey, legacyTerminalHistoryStorageKey);
     if (!raw) return {};
 
     const parsed = JSON.parse(raw) as unknown;
@@ -445,7 +459,7 @@ function loadTerminalCommandHistory(): Record<string, string[]> {
 function loadStoredAuthSession(): StoredAuthSession | null {
   if (typeof window === "undefined") return null;
   try {
-    const raw = window.localStorage.getItem(authSessionStorageKey);
+    const raw = getLocalStorageWithLegacy(authSessionStorageKey, legacyAuthSessionStorageKey);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as unknown;
     if (!isRecord(parsed)) return null;
@@ -467,7 +481,7 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
   if (typeof window === "undefined") return {};
 
   try {
-    const raw = window.localStorage.getItem(queueStorageKey);
+    const raw = getLocalStorageWithLegacy(queueStorageKey, legacyQueueStorageKey);
     if (!raw) return {};
     const parsed = JSON.parse(raw) as unknown;
     if (!isRecord(parsed)) return {};
@@ -2019,9 +2033,10 @@ export function App(): JSX.Element {
         expiresAt: Math.min(authExpiresAt, Date.now() + authSessionMaxAgeMs),
       };
       window.localStorage.setItem(authSessionStorageKey, JSON.stringify(session));
+      window.localStorage.removeItem(legacyAuthSessionStorageKey);
       return;
     }
-    window.localStorage.removeItem(authSessionStorageKey);
+    removeLocalStorageWithLegacy(authSessionStorageKey, legacyAuthSessionStorageKey);
   }, [authReady, isAuthenticated, authToken, authExpiresAt]);
 
   useEffect(() => {
@@ -2032,9 +2047,9 @@ export function App(): JSX.Element {
       setAuthExpiresAt(0);
       setAuthError("Session expired. Please enter password again.");
     };
-    window.addEventListener("agentic:unauthorized", onUnauthorized as EventListener);
+    window.addEventListener("luma:unauthorized", onUnauthorized as EventListener);
     return () => {
-      window.removeEventListener("agentic:unauthorized", onUnauthorized as EventListener);
+      window.removeEventListener("luma:unauthorized", onUnauthorized as EventListener);
     };
   }, [authReady, isAuthenticated]);
 
@@ -2143,10 +2158,11 @@ export function App(): JSX.Element {
 
     try {
       if (Object.keys(queuedBySession).length === 0) {
-        window.localStorage.removeItem(queueStorageKey);
+        removeLocalStorageWithLegacy(queueStorageKey, legacyQueueStorageKey);
         return;
       }
       window.localStorage.setItem(queueStorageKey, JSON.stringify(queuedBySession));
+      window.localStorage.removeItem(legacyQueueStorageKey);
     } catch {
       // ignore localStorage write errors
     }
@@ -2157,10 +2173,11 @@ export function App(): JSX.Element {
 
     try {
       if (Object.keys(terminalHistoryBySession).length === 0) {
-        window.localStorage.removeItem(terminalHistoryStorageKey);
+        removeLocalStorageWithLegacy(terminalHistoryStorageKey, legacyTerminalHistoryStorageKey);
         return;
       }
       window.localStorage.setItem(terminalHistoryStorageKey, JSON.stringify(terminalHistoryBySession));
+      window.localStorage.removeItem(legacyTerminalHistoryStorageKey);
     } catch {
       // ignore localStorage write errors
     }
@@ -2426,7 +2443,7 @@ export function App(): JSX.Element {
 
   const mobileHeaderTitle = selectedSession
     ? truncatePreview(selectedSession.summary || `Session ${selectedSession.id}`, 34)
-    : "Agentic CLI";
+    : "Luma Assistant";
 
   const hasPendingTimelineEntry = timeline.some((entry) => entry.pending);
 

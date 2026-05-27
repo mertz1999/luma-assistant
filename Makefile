@@ -49,13 +49,13 @@ install-pm2:
 	fi
 
 stop-pm2-apps: install-pm2
-	-$(PM2_BIN) delete agentic-cli-server
-	-$(PM2_BIN) delete agentic-cli-web
-	-$(PM2_BIN) delete agentic-telegram-mcp
+	-$(PM2_BIN) delete luma-assistant-server
+	-$(PM2_BIN) delete luma-assistant-web
+	-$(PM2_BIN) delete luma-telegram-mcp
 	@if [ -d "$(CURDIR)/data/pm2" ]; then \
-		PM2_HOME="$(CURDIR)/data/pm2" $(PM2_BIN) delete agentic-cli-server || true; \
-		PM2_HOME="$(CURDIR)/data/pm2" $(PM2_BIN) delete agentic-cli-web || true; \
-		PM2_HOME="$(CURDIR)/data/pm2" $(PM2_BIN) delete agentic-telegram-mcp || true; \
+		PM2_HOME="$(CURDIR)/data/pm2" $(PM2_BIN) delete luma-assistant-server || true; \
+		PM2_HOME="$(CURDIR)/data/pm2" $(PM2_BIN) delete luma-assistant-web || true; \
+		PM2_HOME="$(CURDIR)/data/pm2" $(PM2_BIN) delete luma-telegram-mcp || true; \
 	fi
 
 stop-dev-processes:

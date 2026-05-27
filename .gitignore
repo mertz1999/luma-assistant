@@ -1,6 +1,7 @@
 node_modules
 apps/*/dist
 packages/*/dist
+landing-page/dist
 .env
 .DS_Store
 data/*

@@ -26,7 +26,7 @@ import type {
   CreateAgentScheduleInput,
   UpdateAgentScheduleInput,
   TerminalSessionSnapshot,
-} from "@agentic/shared";
+} from "@luma/shared";
 
 type ApiResponse<T> =
   | { ok: true; data: T }
@@ -40,7 +40,7 @@ export function setApiAuthToken(token: string | null): void {
 
 function emitUnauthorized(): void {
   if (typeof window === "undefined") return;
-  window.dispatchEvent(new CustomEvent("agentic:unauthorized"));
+  window.dispatchEvent(new CustomEvent("luma:unauthorized"));
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {

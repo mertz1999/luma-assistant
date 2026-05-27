@@ -1,11 +1,11 @@
-# Copy to /etc/nginx/sites-available/agentic-cli.conf and customize domain + SSL paths.
+# Copy to /etc/nginx/sites-available/luma-assistant.conf and customize domain + SSL paths.
 # Then symlink into /etc/nginx/sites-enabled and reload nginx.
 
-upstream agentic_cli_web {
+upstream luma_assistant_web {
   server 127.0.0.1:5175;
 }
 
-upstream agentic_cli_api {
+upstream luma_assistant_api {
   server 127.0.0.1:9001;
 }
 
@@ -32,7 +32,7 @@ server {
 
   # API and SSE
   location /api/events {
-    proxy_pass http://agentic_cli_api;
+    proxy_pass http://luma_assistant_api;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -44,7 +44,7 @@ server {
   }
 
   location /api/ {
-    proxy_pass http://agentic_cli_api;
+    proxy_pass http://luma_assistant_api;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -54,7 +54,7 @@ server {
 
   # Web app (Vite preview)
   location / {
-    proxy_pass http://agentic_cli_web;
+    proxy_pass http://luma_assistant_web;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

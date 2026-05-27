@@ -1,70 +1,48 @@
 <p align="center">
-  <img src="apps/web/public/favicon.svg" alt="Agentic Assistant logo" width="96" height="96" />
+  <img src="apps/web/public/favicon.svg" alt="Luma Assistant logo" width="96" height="96" />
 </p>
 
-<h1 align="center">Agentic Assistant</h1>
+<h1 align="center">Luma Assistant</h1>
 
 <p align="center">
-  A self-hosted web panel for running Codex in real workspaces, reviewing every tool call, managing approvals, and keeping session history in one place.
+  Self-hosted Codex workspace with agents, Tehran-time schedules, repo skills, MCP tools, Telegram automation, terminals, and persistent session history.
 </p>
 
 ## What It Is
 
-Agentic Assistant wraps the Codex CLI with a browser UI and a local server. It is designed for people who want the power of Codex in a persistent, inspectable interface instead of a terminal-only workflow.
+Luma Assistant wraps Codex in a browser workspace and local API server. It is built for running Codex against real repositories while keeping prompts, sessions, tool activity, approvals, terminals, scheduled agents, and MCP integrations visible in one operator-focused UI.
 
-You point it at your machine, sign in with a simple password, and get a chat-style workspace where you can:
+## Capabilities
 
-- start and continue Codex sessions
-- watch live tool activity and streamed output
-- work with plan mode and explicit approval gates
-- open a per-session terminal
-- review session history from local app runs and external Codex history
-- archive or delete sessions you no longer need
-
-## Features
-
-- `Live Codex sessions`
-  Start new runs, continue existing sessions, and see updates stream into the UI through SSE.
-- `Session-aware timeline`
-  Rendered markdown, reasoning blocks, plan updates, tool output, diffs, errors, and status changes all stay attached to the session that produced them.
-- `Tool visibility that scales`
-  Consecutive tool messages are grouped into a compact batch, with lazy expansion when you want the details.
-- `MCP and web search visibility`
-  MCP tool calls and web searches are projected into the same timeline as shell commands and file changes.
-- `Plan mode with final approval`
-  Planning turns stay read-only until the user grants final approval, which makes it safer to use for higher-risk tasks.
-- `Queued follow-up messages`
-  If a session is already running, new prompts can queue behind the active run instead of being lost.
-- `Per-session terminal`
-  Open a terminal tied to the selected session, run commands manually, and reuse recent command history.
-- `Imported history`
-  The UI can surface local in-app sessions alongside external Codex history, including source badges like `in-app`, `exec`, `cli`, and `vscode`.
-- `Copy-friendly chat UI`
-  Normal user, assistant, and plan messages can be copied as raw markdown.
-- `Session cleanup`
-  Archive or delete completed local sessions from the UI.
-- `Self-hosted auth`
-  A password-protected login page issues a local JWT-backed auth session for browser access.
-- `Dark mode support`
-  The interface includes a tuned dark theme for long-running operator workflows.
+- `Codex web workspace`: start new sessions, continue old ones, stream live output, review diffs, and inspect grouped tool activity.
+- `Agents`: discover repo-owned agents from `agents/<slug>/AGENT.md` and run the latest prompt body manually or on a schedule.
+- `Tehran schedules`: create daily `Asia/Tehran` schedules that snapshot workspace, model, sandbox, approval policy, and selected skills.
+- `Repo skill sync`: copy managed repo skills from `skills/**/SKILL.md` into `~/.codex/skills` without overwriting unmanaged global skills.
+- `MCP visibility`: surface MCP calls, web searches, shell commands, file changes, and run status in the normal session timeline.
+- `Telegram MCP`: run a local Telegram MCP server for sending rendered Markdown messages and generated files to Telegram topics.
+- `Terminal`: open a per-session terminal with command history from the same app window.
+- `Auth`: protect the browser UI with a password and JWT-backed local browser session.
+- `History`: keep local runtime data under `data/` and show compatible Codex history alongside in-app sessions.
 
 ## Stack
 
-- `Web`: React 18, Vite, TypeScript, Tailwind-style utility classes
-- `Server`: Express, TypeScript, `node-pty`, JWT auth
-- `Shared types`: workspace package under `packages/shared`
+- `Root package`: `luma-assistant`
+- `Server`: Express, TypeScript, `node-pty`, JWT auth, SSE
+- `Web`: React, Vite, TypeScript, Tailwind-style UI utilities
+- `Shared types`: `@luma/shared`
+- `Telegram MCP`: `@luma/telegram-mcp`
 - `Process management`: PM2
-- `Proxy`: Nginx example config included
+- `Proxy`: Nginx example config
+- `Landing page`: independent Vite + React + Tailwind app in `landing-page/`
 
 ## Requirements
 
-- `Node.js >= 22`
-- `npm`
-- `Codex CLI` installed and available in `PATH`, or configured through `CODEX_PATH`
-- A Unix-like environment for the best terminal experience
-  PTY is supported, with a fallback mode available if PTY is disabled or unavailable.
+- Node.js `>= 22`
+- npm
+- Codex CLI available in `PATH`, or set through `CODEX_PATH`
+- A Unix-like host for the best terminal experience
 
-Before using the app, make sure Codex itself is authenticated:
+Authenticate Codex before using the app:
 
 ```bash
 codex login
@@ -72,29 +50,23 @@ codex login
 
 ## Quick Start
 
-1. Clone the repository.
-2. Copy the environment template.
-3. Set a password and JWT secret.
-4. Install dependencies.
-5. Start the app.
-
 ```bash
 cp .env.example .env
 npm install
 make run
 ```
 
-Then open:
+Open the web app:
 
 ```text
 http://localhost:5175
 ```
 
-If you changed `HOST` or `WEB_PORT` in `.env`, use that address instead.
+If you change `HOST` or `WEB_PORT`, use that address instead.
 
 ## Configuration
 
-The root `.env` controls the runtime:
+The root `.env` controls the local runtime:
 
 ```env
 API_PORT=9001
@@ -111,29 +83,70 @@ MAX_CONCURRENT_RUNS=8
 
 Important variables:
 
-- `PASSWORD`: required for browser login
-- `JWT_SECRET`: secret used to sign auth tokens
-- `CODEX_PATH`: path to the Codex executable if it is not simply `codex`
-- `DEFAULT_MODEL`: default model passed to Codex for new runs
-- `DEFAULT_SANDBOX`: default sandbox mode for new runs
-- `MAX_CONCURRENT_RUNS`: server-side cap for concurrent runs
-- `TERMINAL_DISABLE_PTY=1`: force plain-pipe terminal mode
-- `TERMINAL_SHELL=/bin/bash`: explicitly choose the shell used by session terminals
+- `PASSWORD`: browser login password.
+- `JWT_SECRET`: secret used to sign auth tokens.
+- `CODEX_PATH`: path to the Codex executable if it is not simply `codex`.
+- `DEFAULT_MODEL`: default Codex model for new sessions and new schedules.
+- `DEFAULT_SANDBOX`: default sandbox mode for new sessions.
+- `MAX_CONCURRENT_RUNS`: server-side cap for active Codex runs.
+- `TERMINAL_DISABLE_PTY=1`: force plain-pipe terminal mode.
+- `TERMINAL_SHELL=/bin/bash`: choose the shell used by session terminals.
 
-### Luma Telegram MCP
+Legacy browser storage keys and local session sources are tolerated so existing sessions, auth, theme, and queued prompts are not dropped during the rename.
 
-The app includes a local MCP server, registered in Codex as `luma-tel` by default, that can send messages and upload generated files to Telegram group topics.
+## Agents
 
-1. Create a Telegram bot with `@BotFather` using `/newbot`.
-2. Add the bot to your Telegram group and grant permission to send files.
-3. Enable topics in the group, create the target topic, and send a message in that topic.
+Agents live in the repository and are not copied into Codex home:
+
+```text
+agents/
+  my-agent/
+    AGENT.md
+```
+
+`AGENT.md` supports optional frontmatter:
+
+```markdown
+---
+name: Daily Planner
+description: Summarizes today's work.
+---
+
+Use the TickTick MCP server and prepare today's plan.
+```
+
+The Markdown body after frontmatter is the exact prompt used for scheduled runs. Schedule execution reads the current agent file at run time, so editing `AGENT.md` updates future runs without recreating the schedule.
+
+## Skills
+
+Repo-managed skills are discovered recursively from:
+
+```text
+skills/**/SKILL.md
+```
+
+On server startup and manual skill reload, Luma Assistant copies each skill folder to:
+
+```text
+~/.codex/skills/<slug>
+```
+
+Managed copies include a marker file and can be updated safely. If a destination folder already exists without the managed marker, it is reported as a conflict and is not overwritten.
+
+## Telegram MCP
+
+The repo includes a Telegram MCP server registered as `luma-tel` by default. It can send Markdown messages and upload generated files to Telegram group topics.
+
+1. Create a bot with `@BotFather`.
+2. Add the bot to your group and grant send permissions.
+3. Enable topics, create the target topic, and send one message in that topic.
 4. Fetch updates:
 
 ```bash
 curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates"
 ```
 
-Use `message.chat.id` as `TELEGRAM_CHAT_ID`. Use `message.message_thread_id` as `TELEGRAM_MESSAGE_FILE_THREAD_ID` for file uploads and `TELEGRAM_MESSAGE_TEXT_THREAD_ID` for plain text messages.
+Use `message.chat.id` as `TELEGRAM_CHAT_ID`. Use `message.message_thread_id` for the target topic IDs.
 
 ```env
 TELEGRAM_BOT_TOKEN=123456:abc...
@@ -146,14 +159,9 @@ TELEGRAM_ALLOWED_ROOTS=/Users/applestation/Project
 TELEGRAM_MAX_FILE_BYTES=52428800
 ```
 
-`make run` and `make deploy-start` automatically ensure Codex has a `luma-tel` MCP entry pointing at the local MCP URL. If the old default `telegram-file` entry points at the same URL, the ensure script removes it.
+`make run` and `make deploy-start` ensure the local Codex MCP entry points at the Telegram MCP server.
 
-Legacy compatibility is also supported:
-
-- `DEFAULT_SANDBOX_TYPE`
-- `DEFAULT_NETWORK_ACCESS`
-
-## Local Development
+## Development
 
 Useful commands:
 
@@ -161,37 +169,43 @@ Useful commands:
 make install
 make run
 make kill-ports
-make deploy-status
+npm run typecheck
+npm run build
 ```
 
-What they do:
+The root npm workspaces are:
 
-- `make install`: install project dependencies
-- `make run`: install-if-needed, register Telegram MCP if needed, free the API/web/MCP ports, then start server, web, and Telegram MCP
-- `make deploy-start`: production build plus PM2 start/reload
-- `make deploy-stop`: stop PM2 services
-- `make deploy-status`: show PM2 process state
-- `make deploy-logs`: tail PM2 logs
+- `@luma/shared`
+- `@luma/server`
+- `@luma/web`
+- `@luma/telegram-mcp`
+
+## Landing Page
+
+The standalone marketing site lives in `landing-page/`.
+
+```bash
+npm ci --prefix landing-page
+npm run build --prefix landing-page
+```
+
+The Vite app uses `base: "/luma-assistant/"` for the default GitHub Pages URL. GitHub Pages deployment is configured in `.github/workflows/deploy-landing-page.yml`.
 
 ## Production Deployment
 
 ### PM2
 
-The repo includes a PM2 ecosystem file at `scripts/pm2/ecosystem.config.cjs`.
+Production process definitions live at:
+
+```text
+scripts/pm2/ecosystem.config.cjs
+```
 
 Start production services:
 
 ```bash
 make deploy-start
 ```
-
-That flow will:
-
-- ensure dependencies exist
-- build the shared package, server, and web app
-- start the API with PM2
-- serve the web app through `vite preview` with PM2
-- write logs to `data/logs`
 
 Operational commands:
 
@@ -201,68 +215,64 @@ make deploy-logs
 make deploy-stop
 ```
 
+PM2 process names are:
+
+- `luma-assistant-server`
+- `luma-assistant-web`
+- `luma-telegram-mcp`
+
 ### Nginx
 
-An example reverse proxy is included at `scripts/nginx/agentic-cli.conf.example`.
+An example reverse proxy is included at:
+
+```text
+scripts/nginx/luma-assistant.conf.example
+```
 
 Typical setup:
 
 ```bash
-sudo cp scripts/nginx/agentic-cli.conf.example /etc/nginx/sites-available/agentic-cli.conf
-sudo ln -sf /etc/nginx/sites-available/agentic-cli.conf /etc/nginx/sites-enabled/agentic-cli.conf
+sudo cp scripts/nginx/luma-assistant.conf.example /etc/nginx/sites-available/luma-assistant.conf
+sudo ln -sf /etc/nginx/sites-available/luma-assistant.conf /etc/nginx/sites-enabled/luma-assistant.conf
 sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-Before reloading Nginx, customize:
+Customize `server_name`, TLS certificate paths, and upstream ports before reloading Nginx. The example handles `/api/events` as non-buffered SSE, `/api/*` as API traffic, and `/` as web app traffic.
 
-- `server_name`
-- `ssl_certificate`
-- `ssl_certificate_key`
-- upstream ports if you changed `API_PORT` or `WEB_PORT`
+## Data And Security
 
-The example config is already set up to handle:
+Runtime state stays under `data/`, including session metadata, message history, schedules, PM2 logs, and generated app state. Treat `data/` as private runtime state and do not delete it during upgrades unless you intentionally want to reset local history.
 
-- `/api/events` as a non-buffered SSE stream
-- `/api/*` API requests
-- `/` web app traffic
+Security notes:
 
-## Data and Persistence
-
-The app keeps local state under `data/`, including PM2 logs and persisted run/session metadata. It also hydrates external Codex history when available, so the UI can show both local app sessions and sessions created outside the app.
-
-If you are publishing or deploying this project for others, treat `data/` as runtime state, not source code.
-
-## Security Notes
-
-- Change `PASSWORD` and `JWT_SECRET` before exposing the app to a network.
-- Put the app behind HTTPS if it is reachable outside localhost.
-- Review your default sandbox policy carefully.
-  The example `.env` uses `danger-full-access`, which is convenient for a trusted personal machine but not a safe default for every environment.
-- Codex runs with access to your selected workspace, so deploy it only where that trust model is acceptable.
+- Change `PASSWORD` and `JWT_SECRET` before exposing the app.
+- Put the app behind HTTPS when reachable outside localhost.
+- Review `DEFAULT_SANDBOX`; `danger-full-access` is convenient for trusted personal hosts but high trust.
+- Codex runs with access to the selected workspace and enabled MCP tools.
+- Telegram credentials grant bot access to configured chats and topics.
 
 ## Repository Layout
 
 ```text
+agents/          repo-owned agent prompts
 apps/
-  server/        Express API, run manager, auth, SSE, terminal bridge
-  telegram-mcp/  local MCP server for Telegram file uploads
-  web/           React UI
+  server/        Express API, scheduler, run manager, auth, SSE, terminal bridge
+  telegram-mcp/  local MCP server for Telegram messages and file uploads
+  web/           React workspace UI
+landing-page/    independent GitHub Pages site
 packages/
-  shared/   shared types and schemas
+  shared/        shared schemas and TypeScript types
 scripts/
-  nginx/    reverse proxy example
-  pm2/      production process definitions
-data/       runtime data and logs
+  nginx/         reverse proxy example
+  pm2/           production process definitions
+skills/          repo-managed Codex skills
+data/            private runtime data and logs
 ```
 
-## Who This Is For
+## Troubleshooting
 
-Agentic Assistant is a strong fit if you want:
-
-- a self-hosted Codex UI on your own machine or server
-- more visibility into tool execution than a plain terminal session
-- session persistence and reviewability
-- a lightweight operator panel instead of a large multi-user platform
-
-It is less suited to multi-tenant SaaS-style deployments without adding your own hardening, user model, and access controls.
+- `Connection refused` on HTTPS usually means no process is listening on port `443`, the reverse proxy is stopped, or the firewall is rejecting the port.
+- `Codex not found` means `CODEX_PATH` does not point at an executable Codex CLI.
+- `Skill conflict` means a global `~/.codex/skills/<slug>` exists without Luma Assistant's managed marker and was intentionally left untouched.
+- `Schedule skipped` can happen when the global run capacity is full.

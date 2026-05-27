@@ -1,6 +1,6 @@
 {
-  "name": "Agentic CLI",
-  "short_name": "Agentic",
+  "name": "Luma Assistant",
+  "short_name": "Luma",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#f8fafc",

@@ -1,5 +1,5 @@
 {
-  "name": "agentic-cli-wrapper",
+  "name": "luma-assistant",
   "private": true,
   "version": "0.1.0",
   "workspaces": [
@@ -7,10 +7,10 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "concurrently -n server,web,telegram-mcp -c cyan,green,magenta \"npm run dev -w @agentic/server\" \"npm run dev -w @agentic/web\" \"npm run dev -w @agentic/telegram-mcp\"",
-    "build": "npm run build -w @agentic/shared && npm run build -w @agentic/server && npm run build -w @agentic/web && npm run build -w @agentic/telegram-mcp",
-    "typecheck": "npm run build -w @agentic/shared && npm run typecheck -w @agentic/server && npm run typecheck -w @agentic/web && npm run typecheck -w @agentic/telegram-mcp",
-    "start": "npm run start -w @agentic/server"
+    "dev": "concurrently -n server,web,telegram-mcp -c cyan,green,magenta \"npm run dev -w @luma/server\" \"npm run dev -w @luma/web\" \"npm run dev -w @luma/telegram-mcp\"",
+    "build": "npm run build -w @luma/shared && npm run build -w @luma/server && npm run build -w @luma/web && npm run build -w @luma/telegram-mcp",
+    "typecheck": "npm run build -w @luma/shared && npm run typecheck -w @luma/server && npm run typecheck -w @luma/web && npm run typecheck -w @luma/telegram-mcp",
+    "start": "npm run start -w @luma/server"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",

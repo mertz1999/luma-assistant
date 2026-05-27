@@ -20,7 +20,7 @@ type UiStore = {
 
 function getInitialTheme(): "light" | "dark" {
   if (typeof window === "undefined") return "light";
-  const saved = window.localStorage.getItem("agentic_cli_theme");
+  const saved = window.localStorage.getItem("luma_assistant_theme") || window.localStorage.getItem("agentic_cli_theme");
   if (saved === "dark" || saved === "light") return saved;
   return "light";
 }
@@ -40,7 +40,8 @@ export const useUiStore = create<UiStore>((set, get) => ({
   toggleTheme: () => {
     const next = get().theme === "light" ? "dark" : "light";
     if (typeof window !== "undefined") {
-      window.localStorage.setItem("agentic_cli_theme", next);
+      window.localStorage.setItem("luma_assistant_theme", next);
+      window.localStorage.removeItem("agentic_cli_theme");
       document.documentElement.setAttribute("data-theme", next);
     }
     set({ theme: next });

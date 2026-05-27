@@ -12,10 +12,10 @@ const host = process.env.HOST || '0.0.0.0';
 module.exports = {
   apps: [
     {
-      name: 'agentic-cli-server',
+      name: 'luma-assistant-server',
       cwd: root,
       script: 'npm',
-      args: 'run start -w @agentic/server',
+      args: 'run start -w @luma/server',
       env: {
         ...process.env,
         NODE_ENV: 'production',
@@ -31,10 +31,10 @@ module.exports = {
       error_file: path.join(root, 'data', 'logs', 'server.err.log'),
     },
     {
-      name: 'agentic-cli-web',
+      name: 'luma-assistant-web',
       cwd: root,
       script: 'npm',
-      args: `run preview -w @agentic/web -- --host 0.0.0.0 --port ${webPort}`,
+      args: `run preview -w @luma/web -- --host 0.0.0.0 --port ${webPort}`,
       env: {
         ...process.env,
         NODE_ENV: 'production',
@@ -47,10 +47,10 @@ module.exports = {
       error_file: path.join(root, 'data', 'logs', 'web.err.log'),
     },
     {
-      name: 'agentic-telegram-mcp',
+      name: 'luma-telegram-mcp',
       cwd: root,
       script: 'npm',
-      args: 'run start -w @agentic/telegram-mcp',
+      args: 'run start -w @luma/telegram-mcp',
       env: {
         ...process.env,
         NODE_ENV: 'production',
