@@ -6,3 +6,6 @@ landing-page/dist
 .DS_Store
 data/*
 !data/.gitkeep
+
+# Raw screenshots used to generate sanitized public landing assets.
+inc/images/Screenshot 2026-05-27 at 11.*

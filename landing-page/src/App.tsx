@@ -33,6 +33,21 @@ const screenshots = {
   },
 };
 
+const remoteFeatureScreenshots = [
+  {
+    src: `${baseUrl}screenshots/remote-chat-mobile.png`,
+    alt: "Luma Assistant mobile chat session view",
+  },
+  {
+    src: `${baseUrl}screenshots/remote-agents-mobile.png`,
+    alt: "Luma Assistant mobile agents schedule view",
+  },
+  {
+    src: `${baseUrl}screenshots/remote-chats-blurred.png`,
+    alt: "Luma Assistant mobile chat list with private session names blurred",
+  },
+];
+
 const highlights = [
   ["Remote Codex", "Use your Codex CLI from any browser"],
   ["Cron jobs", "Run specific work at specific moments"],
@@ -110,7 +125,7 @@ function App() {
       <Hero mode={mode} setMode={setMode} activeScreenshots={activeScreenshots} />
       <ProofStrip />
       <FeatureGrid />
-      <WorkflowShowcase mode={mode} activeScreenshots={activeScreenshots} />
+      <WorkflowShowcase mode={mode} />
       <FinalCta />
     </main>
   );
@@ -336,10 +351,8 @@ function FeatureGrid() {
 
 function WorkflowShowcase({
   mode,
-  activeScreenshots,
 }: {
   mode: Mode;
-  activeScreenshots: { desktop: string; mobile: string };
 }) {
   const isDark = mode === "dark";
 
@@ -373,29 +386,21 @@ function WorkflowShowcase({
           </div>
         </div>
 
-        <div className="grid gap-4 sm:grid-cols-[0.72fr_0.28fr]">
-          <div
-            className={`overflow-hidden rounded-lg border ${
-              isDark ? "border-white/10 bg-[#191d1a]" : "border-[#14251f]/10 bg-white"
-            }`}
-          >
-            <img
-              className="block aspect-[2876/1550] h-full w-full object-cover object-left-top"
-              src={activeScreenshots.desktop}
-              alt={`Desktop ${mode} mode session history`}
-            />
-          </div>
-          <div
-            className={`overflow-hidden rounded-lg border ${
-              isDark ? "border-white/10 bg-[#191d1a]" : "border-[#14251f]/10 bg-white"
-            }`}
-          >
-            <img
-              className="block aspect-[830/1557] h-full w-full object-cover object-top"
-              src={activeScreenshots.mobile}
-              alt={`Mobile ${mode} mode session view`}
-            />
-          </div>
+        <div className="grid items-end gap-4 sm:grid-cols-3">
+          {remoteFeatureScreenshots.map((screenshot, index) => (
+            <figure
+              className={`overflow-hidden rounded-lg border shadow-[0_24px_70px_rgba(20,37,31,0.14)] ${
+                isDark ? "border-white/10 bg-[#191d1a]" : "border-[#14251f]/10 bg-white"
+              } ${index === 0 ? "sm:translate-y-8" : index === 1 ? "sm:-translate-y-6" : "sm:translate-y-3"}`}
+              key={screenshot.src}
+            >
+              <img
+                className="block aspect-[9/18] w-full object-cover object-top"
+                src={screenshot.src}
+                alt={screenshot.alt}
+              />
+            </figure>
+          ))}
         </div>
       </div>
     </section>
