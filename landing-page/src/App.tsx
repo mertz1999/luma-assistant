@@ -5,6 +5,7 @@ import {
   Github,
   Layers3,
   MessageSquareText,
+  Mic,
   Moon,
   Network,
   Play,
@@ -52,7 +53,7 @@ const highlights = [
   ["Remote Codex", "Use your Codex CLI from any browser"],
   ["Cron jobs", "Run specific work at specific moments"],
   ["Sandbox terminal", "Open a controlled terminal from your phone"],
-  ["Core Codex", "Plan mode, MCP, AGENTS.md, agents, and history"],
+  ["Offline voice", "Dictate prompts with offline voice-to-text"],
 ];
 
 const featureRows = [
@@ -80,6 +81,11 @@ const featureRows = [
     icon: TerminalSquare,
     title: "Sandbox terminal anywhere",
     text: "Open a per-session sandbox terminal from your laptop, phone, or another machine when you need direct command access.",
+  },
+  {
+    icon: Mic,
+    title: "Offline voice-to-text",
+    text: "Dictate prompts into the assistant with voice-to-text support designed for use without relying on a remote transcription service.",
   },
   {
     icon: ShieldCheck,
@@ -308,7 +314,7 @@ function ProofStrip() {
           ["Codex CLI", "Connected through your own server"],
           ["Cron jobs", "Specific work at specific moments"],
           ["Terminal", "Sandbox access from desktop or phone"],
-          ["MCP + Plan", "Core Codex features in the UI"],
+          ["Voice input", "Offline voice-to-text prompts"],
         ].map(([label, text]) => (
           <div className="rounded-lg border border-[#14251f]/10 bg-[#f5f4ef] p-4" key={label}>
             <p className="text-lg font-semibold">{label}</p>
@@ -358,7 +364,7 @@ function WorkflowShowcase({
 
   return (
     <section className={`${isDark ? "bg-[#101412] text-[#f3f0e7]" : "bg-white text-[#14251f]"}`}>
-      <div className="mx-auto grid max-w-7xl gap-10 px-5 py-16 sm:px-8 lg:grid-cols-[0.92fr_1.08fr] lg:px-10">
+      <div className="mx-auto grid max-w-7xl gap-10 px-5 py-16 sm:px-8 lg:grid-cols-[0.78fr_1.22fr] lg:px-10">
         <div>
           <p className={`text-sm font-semibold ${isDark ? "text-[#8ce4cd]" : "text-[#2f6f5e]"}`}>From URL to terminal</p>
           <h2 className="mt-3 text-3xl font-semibold leading-tight sm:text-4xl">
@@ -386,16 +392,16 @@ function WorkflowShowcase({
           </div>
         </div>
 
-        <div className="grid items-end gap-4 sm:grid-cols-3">
+        <div className="grid items-start gap-4 sm:grid-cols-3 lg:-mt-14 xl:-mt-20">
           {remoteFeatureScreenshots.map((screenshot, index) => (
             <figure
               className={`overflow-hidden rounded-lg border shadow-[0_24px_70px_rgba(20,37,31,0.14)] ${
                 isDark ? "border-white/10 bg-[#191d1a]" : "border-[#14251f]/10 bg-white"
-              } ${index === 0 ? "sm:translate-y-8" : index === 1 ? "sm:-translate-y-6" : "sm:translate-y-3"}`}
+              } ${index === 0 ? "sm:translate-y-12 lg:translate-y-20" : index === 1 ? "sm:translate-y-0 lg:translate-y-4" : "sm:translate-y-12 lg:translate-y-20"}`}
               key={screenshot.src}
             >
               <img
-                className="block aspect-[9/18] w-full object-cover object-top"
+                className="block aspect-[9/18] w-full object-cover object-top lg:aspect-[9/17]"
                 src={screenshot.src}
                 alt={screenshot.alt}
               />

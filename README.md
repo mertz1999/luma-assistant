@@ -5,14 +5,14 @@
 <h1 align="center">Luma Assistant</h1>
 
 <p align="center">
-  Self-hosted web application for your Codex CLI with remote URL access, cron-style jobs, sandbox terminals, MCP, plan mode, agents, skills, and persistent session history.
+  Self-hosted web application for your Codex CLI with remote URL access, cron-style jobs, sandbox terminals, offline voice-to-text, MCP, plan mode, agents, skills, and persistent session history.
 </p>
 
 ## What It Is
 
 Luma Assistant connects to the Codex CLI on your machine or server and gives it a browser UI. You can install it on a server, protect it with authentication and HTTPS, and use your Codex workspace from anywhere with a URL.
 
-It keeps the core Codex CLI workflow available in the app: plan mode, MCP tools, workspace instructions such as `AGENTS.md`, agents, skills, approvals, terminal access, live tool output, diffs, and session history.
+It keeps the core Codex CLI workflow available in the app: plan mode, MCP tools, workspace instructions such as `AGENTS.md`, agents, skills, approvals, terminal access, voice input, live tool output, diffs, and session history.
 
 ## Capabilities
 
@@ -20,6 +20,7 @@ It keeps the core Codex CLI workflow available in the app: plan mode, MCP tools,
 - `Use it anywhere by URL`: deploy Luma Assistant on a server and access your workspace from desktop, phone, or another machine.
 - `Cron-style jobs`: schedule specific assistant work for specific moments and inspect each run as a normal Codex session.
 - `Sandbox terminal`: open a controlled terminal from the browser when you need direct command access from your phone or another place.
+- `Offline voice-to-text`: dictate prompts into the assistant without relying on a remote transcription service.
 - `Agents and instructions`: use Codex workspace instructions such as `AGENTS.md`, plus repo-owned scheduled agents from `agents/<slug>/AGENT.md`.
 - `MCP visibility`: surface MCP calls, web searches, shell commands, file changes, and run status in the normal session timeline.
 - `Repo skill sync`: copy managed repo skills from `skills/**/SKILL.md` into `~/.codex/skills` without overwriting unmanaged global skills.
