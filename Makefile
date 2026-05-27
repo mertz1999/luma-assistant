@@ -22,6 +22,9 @@ install-if-needed:
 	@if [ ! -d node_modules ]; then \
 		echo "node_modules missing; installing dependencies..."; \
 		npm install --include=optional --no-audit --no-fund; \
+		elif ! node -e "for (const pkg of ['@luma/shared/package.json','@luma/server/package.json','@luma/web/package.json','@luma/telegram-mcp/package.json']) { try { require.resolve(pkg); } catch { process.exit(1); } }"; then \
+			echo "Luma workspace links missing; reinstalling dependencies..."; \
+			npm install --include=optional --no-audit --no-fund; \
 		elif ! node -e "try{require.resolve('node-pty/package.json');process.exit(0)}catch{process.exit(1)}"; then \
 			echo "node-pty missing; reinstalling dependencies..."; \
 			npm install --include=optional --no-audit --no-fund; \
