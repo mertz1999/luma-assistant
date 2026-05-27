@@ -308,7 +308,7 @@ function WorkflowShowcase({
         <h2 className="text-center text-3xl font-semibold leading-tight sm:text-4xl">
           Use it in your phone as PWA
         </h2>
-        <div className="mt-10 grid items-start gap-4 sm:grid-cols-3 lg:mt-12">
+        <div className="mx-auto mt-10 grid max-w-4xl items-start gap-4 sm:grid-cols-3 lg:mt-12">
           {remoteFeatureScreenshots.map((screenshot, index) => (
             <figure
               className={`overflow-hidden rounded-lg border shadow-[0_24px_70px_rgba(20,37,31,0.14)] ${
@@ -317,7 +317,7 @@ function WorkflowShowcase({
               key={screenshot.src}
             >
               <img
-                className="block aspect-[9/18] w-full object-cover object-top lg:aspect-[9/17]"
+                className="block aspect-[9/18] w-full object-cover object-top"
                 src={screenshot.src}
                 alt={screenshot.alt}
               />
