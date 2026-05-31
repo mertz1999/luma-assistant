@@ -350,6 +350,7 @@ export type SessionListItem = {
   lastMessagePreview: string;
   messageCount: number;
   historyOnly: boolean;
+  scheduled?: boolean;
 };
 
 export type ChatMessage = {

@@ -146,6 +146,7 @@ type SessionCard = {
   sourceRaw: string;
   workspace: string;
   historyOnly: boolean;
+  scheduled: boolean;
 };
 
 type PlanSessionState = "idle" | "armed" | "active";
@@ -599,6 +600,7 @@ function buildSessionCards(items: SessionListItem[]): SessionCard[] {
     sourceRaw: item.sourceRaw,
     workspace: item.workspace,
     historyOnly: item.historyOnly,
+    scheduled: Boolean(item.scheduled),
   }));
 }
 
@@ -2379,9 +2381,12 @@ export function App(): JSX.Element {
 
   const allSessions = useMemo(() => buildSessionCards(runItems), [runItems]);
   const filteredSessions = useMemo(() => {
-    if (statusFilter === "all") return allSessions;
-    return allSessions.filter((session) => session.status === statusFilter);
-  }, [allSessions, statusFilter]);
+    const visibleSessions = showAllHistory
+      ? allSessions
+      : allSessions.filter((session) => !session.scheduled);
+    if (statusFilter === "all") return visibleSessions;
+    return visibleSessions.filter((session) => session.status === statusFilter);
+  }, [allSessions, showAllHistory, statusFilter]);
 
   const selectedSession = useMemo(
     () => allSessions.find((session) => session.id === selectedSessionId) || null,

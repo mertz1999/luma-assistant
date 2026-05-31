@@ -1584,6 +1584,22 @@ class AgentScheduleManager {
     return { schedules, upcoming, executions };
   }
 
+  getScheduledSessionIds(): Set<string> {
+    return new Set(
+      [...this.executions.values()]
+        .map((execution) => execution.sessionId)
+        .filter((sessionId): sessionId is string => Boolean(sessionId)),
+    );
+  }
+
+  getScheduledRunIds(): Set<string> {
+    return new Set(
+      [...this.executions.values()]
+        .map((execution) => execution.runId)
+        .filter((runId): runId is string => Boolean(runId)),
+    );
+  }
+
   create(input: {
     agentId: string;
     hour: number;
@@ -3400,9 +3416,22 @@ function buildHistorySessionListItem(entry: SessionHistoryEntry): SessionListIte
   };
 }
 
+function markScheduledSessionListItems(items: SessionListItem[]): SessionListItem[] {
+  const scheduledSessionIds = agentScheduleManager.getScheduledSessionIds();
+  const scheduledRunIds = agentScheduleManager.getScheduledRunIds();
+  if (scheduledSessionIds.size === 0 && scheduledRunIds.size === 0) return items;
+
+  return items.map((item) => {
+    const scheduled =
+      scheduledSessionIds.has(item.id) ||
+      (item.latestRunId ? scheduledRunIds.has(item.latestRunId) : false);
+    return scheduled ? { ...item, scheduled: true } : item;
+  });
+}
+
 function readSessionListItems(includeHistory: boolean): SessionListItem[] {
   messageStore.reconcileWithRuns(runManager.getRuns(false));
-  const localItems = messageStore.listLocalSessions();
+  const localItems = markScheduledSessionListItems(messageStore.listLocalSessions());
   if (!includeHistory) return localItems;
 
   const localIds = new Set(localItems.map((item) => item.id));
@@ -3410,7 +3439,7 @@ function readSessionListItems(includeHistory: boolean): SessionListItem[] {
     .filter((entry) => !localIds.has(entry.id))
     .map((entry) => buildHistorySessionListItem(entry));
 
-  return [...localItems, ...historyItems].sort((a, b) => b.updatedAt - a.updatedAt);
+  return markScheduledSessionListItems([...localItems, ...historyItems]).sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 function messageLogPath(sessionId: string): string {
