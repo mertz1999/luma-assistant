@@ -45,6 +45,7 @@ import {
   type RunEventEntry,
   type RunRecord,
   type RunSourceTag,
+  type SelectedAgentRef,
   type SelectedSkillRef,
   type SendMessageAccepted,
   type SendMessageInput,
@@ -176,6 +177,11 @@ type ResolvedSkill = {
   content: string;
 };
 
+type ResolvedAgent = {
+  item: DiscoveredAgent;
+  content: string;
+};
+
 type DiscoveredAgent = AgentListItem & {
   prompt: string;
 };
@@ -224,6 +230,7 @@ type MessageOutboxItem = {
   approvalPolicy: RunConfig["approvalPolicy"];
   planMode: boolean;
   skills: SelectedSkillRef[];
+  agents: SelectedAgentRef[];
   attempts: number;
   status: OutboxStatus;
   nextAttemptAt: number | null;
@@ -415,6 +422,25 @@ function normalizeSelectedSkillRefs(input: unknown): SelectedSkillRef[] {
   return next;
 }
 
+function normalizeSelectedAgentRefs(input: unknown): SelectedAgentRef[] {
+  if (!Array.isArray(input)) return [];
+
+  const next: SelectedAgentRef[] = [];
+  const seen = new Set<string>();
+  for (const value of input) {
+    if (!isRecord(value) || typeof value.id !== "string" || typeof value.path !== "string") continue;
+    const id = value.id.trim();
+    const agentPath = value.path.trim();
+    if (!id || !agentPath) continue;
+    const key = `${id}\n${agentPath}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push({ id, path: agentPath });
+    if (next.length >= 10) break;
+  }
+  return next;
+}
+
 function normalizeMimeType(input: string | undefined): string {
   const raw = (input || "").split(";")[0]?.trim().toLowerCase();
   return raw || "application/octet-stream";
@@ -506,6 +532,13 @@ class SkillResolutionError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "SkillResolutionError";
+  }
+}
+
+class AgentResolutionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AgentResolutionError";
   }
 }
 
@@ -885,6 +918,38 @@ function resolveSelectedSkills(workspace: string, selected: unknown): ResolvedSk
   return [...resolved.values()].sort((a, b) => a.item.path.localeCompare(b.item.path));
 }
 
+function resolveSelectedAgents(selected: unknown): ResolvedAgent[] {
+  const refs = normalizeSelectedAgentRefs(selected);
+  if (refs.length === 0) return [];
+
+  const catalogByPath = new Map(discoverAgents().map((agent) => [agent.path, agent]));
+  const resolved = new Map<string, ResolvedAgent>();
+  for (const ref of refs) {
+    const canonicalPath = canonicalizeExistingPath(ref.path);
+    if (!canonicalPath) {
+      throw new AgentResolutionError(`Selected agent is not readable or no longer exists: ${ref.path}`);
+    }
+
+    const expectedId = agentIdForPath(canonicalPath);
+    if (ref.id !== expectedId) {
+      throw new AgentResolutionError(`Selected agent id does not match path: ${ref.path}`);
+    }
+
+    const item = catalogByPath.get(canonicalPath);
+    if (!item) {
+      throw new AgentResolutionError(`Selected agent is outside the configured agents root: ${ref.path}`);
+    }
+
+    if (!item.prompt.trim()) {
+      throw new AgentResolutionError(`Selected agent is empty: ${ref.path}`);
+    }
+
+    resolved.set(canonicalPath, { item, content: item.prompt });
+  }
+
+  return [...resolved.values()].sort((a, b) => a.item.path.localeCompare(b.item.path));
+}
+
 function buildSkillBackedPrompt(prompt: string, skills: ResolvedSkill[]): string {
   if (skills.length === 0) return prompt;
 
@@ -903,6 +968,32 @@ function buildSkillBackedPrompt(prompt: string, skills: ResolvedSkill[]): string
     lines.push("");
     lines.push(skill.content.trimEnd());
     lines.push(`--- END SKILL: ${skill.item.name} ---`);
+    lines.push("");
+  }
+
+  lines.push("Original user request:");
+  lines.push(prompt);
+  return lines.join("\n");
+}
+
+function buildAgentBackedPrompt(prompt: string, agents: ResolvedAgent[]): string {
+  if (agents.length === 0) return prompt;
+
+  const lines = [
+    "Selected repo agents are active for this turn only.",
+    "Apply the following AGENT.md instructions as specialized role/context before answering the user request.",
+    "",
+    "Active agents:",
+    ...agents.map((agent, index) => `${index + 1}. ${agent.item.name} (${agent.item.path})`),
+    "",
+  ];
+
+  for (const agent of agents) {
+    lines.push(`--- BEGIN AGENT: ${agent.item.name} ---`);
+    lines.push(`Path: ${agent.item.path}`);
+    lines.push("");
+    lines.push(agent.content.trimEnd());
+    lines.push(`--- END AGENT: ${agent.item.name} ---`);
     lines.push("");
   }
 
@@ -1087,9 +1178,11 @@ class RunManager extends EventEmitter {
     const effectiveConfig = resolveEffectiveRunConfig(config);
     const resolvedAttachments = resolveRunAttachments(effectiveConfig);
     const resolvedSkills = resolveSelectedSkills(effectiveConfig.workspace, effectiveConfig.skills);
+    const resolvedAgents = resolveSelectedAgents(effectiveConfig.agents);
     const promptBase = buildPromptWithAttachments(effectiveConfig.prompt, resolvedAttachments);
     const promptWithPlan = effectiveConfig.planMode ? buildPlanModePrompt(promptBase) : promptBase;
-    const prompt = buildSkillBackedPrompt(promptWithPlan, resolvedSkills);
+    const promptWithAgents = buildAgentBackedPrompt(promptWithPlan, resolvedAgents);
+    const prompt = buildSkillBackedPrompt(promptWithAgents, resolvedSkills);
     const imageArgs = resolvedAttachments
       .filter((attachment) => attachment.ref.kind === "image")
       .flatMap((attachment) => ["-i", attachment.absolutePath]);
@@ -2204,17 +2297,20 @@ function buildPlanModePrompt(prompt: string): string {
 function resolveEffectiveRunConfig(config: RunConfig): RunConfig {
   const attachments = normalizeAttachmentRefs(config.attachments);
   const skills = normalizeSelectedSkillRefs(config.skills);
+  const agents = normalizeSelectedAgentRefs(config.agents);
   if (!config.planMode) {
     return {
       ...config,
       attachments,
       skills,
+      agents,
     };
   }
   return {
     ...config,
     attachments,
     skills,
+    agents,
     sandbox: "read-only",
     approvalPolicy: "never",
   };
@@ -4242,7 +4338,7 @@ class OutboxProcessor {
     this.persistSoon();
     this.emitOutboxUpdated();
     this.scheduleProcessing(0);
-    return { ...item, attachments: normalizeAttachmentRefs(item.attachments) };
+    return { ...item, attachments: normalizeAttachmentRefs(item.attachments), agents: normalizeSelectedAgentRefs(item.agents) };
   }
 
   flushSync(): void {
@@ -4256,7 +4352,12 @@ class OutboxProcessor {
   private load(): void {
     if (!fs.existsSync(MESSAGE_OUTBOX_PATH)) return;
     const payload = safeJsonParse<{ items: MessageOutboxItem[] }>(fs.readFileSync(MESSAGE_OUTBOX_PATH, "utf8"), { items: [] });
-    this.items = payload.items || [];
+    this.items = (payload.items || []).map((item) => ({
+      ...item,
+      attachments: normalizeAttachmentRefs(item.attachments),
+      skills: normalizeSelectedSkillRefs(item.skills),
+      agents: normalizeSelectedAgentRefs(item.agents),
+    }));
     if (this.items.some((item) => item.status === "pending" || item.status === "processing")) {
       this.scheduleProcessing(0);
     }
@@ -4337,6 +4438,7 @@ class OutboxProcessor {
           sessionId: item.provisionalSession ? undefined : item.sessionId,
           attachments: item.attachments,
           skills: item.skills,
+          agents: item.agents,
         });
 
         item.latestRunId = run.id;
@@ -4736,6 +4838,7 @@ const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, pro
     planMode: false,
     attachments: [],
     skills: schedule.runConfig.skills,
+    agents: [],
   });
 
   try {
@@ -4748,6 +4851,7 @@ const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, pro
       planMode: false,
       attachments: [],
       skills: schedule.runConfig.skills,
+      agents: [],
     });
     messageProjector.registerRun(run.id, sessionId);
     messageStore.updateSessionFromRun(run, sessionId);
@@ -5224,17 +5328,26 @@ app.post("/api/messages/send", (req, res) => {
   }
 
   let selectedSkills: SelectedSkillRef[] = [];
+  let selectedAgents: SelectedAgentRef[] = [];
   try {
     selectedSkills = resolveSelectedSkills(workspace, parsed.data.skills).map((skill) => ({
       id: skill.item.id,
       path: skill.item.path,
+    }));
+    selectedAgents = resolveSelectedAgents(parsed.data.agents).map((agent) => ({
+      id: agent.item.id,
+      path: agent.item.path,
     }));
   } catch (error) {
     if (error instanceof SkillResolutionError) {
       res.status(400).json(apiErr(error.message));
       return;
     }
-    res.status(500).json(apiErr(error instanceof Error ? error.message : "Failed to resolve selected skills"));
+    if (error instanceof AgentResolutionError) {
+      res.status(400).json(apiErr(error.message));
+      return;
+    }
+    res.status(500).json(apiErr(error instanceof Error ? error.message : "Failed to resolve selected context"));
     return;
   }
 
@@ -5245,6 +5358,7 @@ app.post("/api/messages/send", (req, res) => {
     ...parsed.data,
     workspace,
     skills: selectedSkills,
+    agents: selectedAgents,
   });
 
   outboxProcessor?.enqueue({
@@ -5260,6 +5374,7 @@ app.post("/api/messages/send", (req, res) => {
     approvalPolicy: parsed.data.approvalPolicy,
     planMode: parsed.data.planMode,
     skills: selectedSkills,
+    agents: selectedAgents,
   });
 
   const response: SendMessageAccepted = {
@@ -5322,11 +5437,12 @@ app.post("/api/runs/start", (req, res) => {
       sessionId: parsed.data.sessionId,
       attachments: parsed.data.attachments,
       skills: parsed.data.skills,
+      agents: parsed.data.agents,
     });
 
     res.json(apiOk({ run }));
   } catch (error) {
-    res.status(error instanceof SkillResolutionError ? 400 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to start run"));
+    res.status(error instanceof SkillResolutionError || error instanceof AgentResolutionError ? 400 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to start run"));
   }
 });
 
@@ -5367,7 +5483,7 @@ app.post("/api/runs/:runId/rerun", (req, res) => {
 
     res.json(apiOk({ run }));
   } catch (error) {
-    res.status(error instanceof SkillResolutionError ? 400 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to rerun"));
+    res.status(error instanceof SkillResolutionError || error instanceof AgentResolutionError ? 400 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to rerun"));
   }
 });
 
@@ -5399,7 +5515,7 @@ app.post("/api/runs/:runId/approval/:approvalId/accept", (req, res) => {
     });
     res.json(apiOk({ run, approval }));
   } catch (error) {
-    res.status(error instanceof SkillResolutionError ? 400 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to run escalation"));
+    res.status(error instanceof SkillResolutionError || error instanceof AgentResolutionError ? 400 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to run escalation"));
   }
 });
 

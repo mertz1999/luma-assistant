@@ -46,6 +46,7 @@ import type {
   RunRecord,
   RunSourceTag,
   SandboxMode,
+  SelectedAgentRef,
   SendMessageInput,
   SessionListItem,
   SkillListItem,
@@ -210,6 +211,7 @@ type QueuedMessage = {
   approvalPolicy: ApprovalPolicy;
   planMode: boolean;
   skills: SelectedSkillRef[];
+  agents: SelectedAgentRef[];
 };
 
 type SpeechRecognitionAlternativeLike = {
@@ -503,6 +505,7 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
         const planMode = typeof item.planMode === "boolean" ? item.planMode : false;
         const attachments = readAttachmentRefs(item.attachments);
         const skills = readSelectedSkillRefs(item.skills);
+        const agents = readSelectedAgentRefs(item.agents);
 
         if (!id || !prompt || !workspace || !model || !isSandboxMode(item.sandbox) || !isApprovalPolicy(item.approvalPolicy)) {
           continue;
@@ -520,6 +523,7 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
           approvalPolicy: item.approvalPolicy,
           planMode,
           skills,
+          agents,
         });
       }
 
@@ -957,8 +961,35 @@ function readSelectedSkillRefs(input: unknown): SelectedSkillRef[] {
   return refs;
 }
 
+function readSelectedAgentRef(input: unknown): SelectedAgentRef | null {
+  if (!isRecord(input)) return null;
+  const id = typeof input.id === "string" ? input.id.trim() : "";
+  const agentPath = typeof input.path === "string" ? input.path.trim() : "";
+  return id && agentPath ? { id, path: agentPath } : null;
+}
+
+function readSelectedAgentRefs(input: unknown): SelectedAgentRef[] {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  const refs: SelectedAgentRef[] = [];
+  for (const value of input) {
+    const ref = readSelectedAgentRef(value);
+    if (!ref) continue;
+    const key = `${ref.id}\n${ref.path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    refs.push(ref);
+    if (refs.length >= 10) break;
+  }
+  return refs;
+}
+
 function selectedSkillRef(skill: SkillListItem): SelectedSkillRef {
   return { id: skill.id, path: skill.path };
+}
+
+function selectedAgentRef(agent: AgentListItem): SelectedAgentRef {
+  return { id: agent.id, path: agent.path };
 }
 
 function skillDisplayName(ref: SelectedSkillRef, catalog: SkillListItem[]): string {
@@ -974,6 +1005,19 @@ function formatSkillSummary(refs: SelectedSkillRef[], catalog: SkillListItem[]):
   return `Skills: ${names.join(", ")}${suffix}`;
 }
 
+function agentDisplayName(ref: SelectedAgentRef, catalog: AgentListItem[]): string {
+  const match = catalog.find((agent) => agent.id === ref.id || agent.path === ref.path);
+  if (match) return match.name;
+  return ref.path.split(/[\\/]/).filter(Boolean).slice(-2, -1)[0] || ref.path.split(/[\\/]/).pop() || "Agent";
+}
+
+function formatAgentSummary(refs: SelectedAgentRef[], catalog: AgentListItem[]): string {
+  if (refs.length === 0) return "";
+  const names = refs.slice(0, 2).map((ref) => agentDisplayName(ref, catalog));
+  const suffix = refs.length > names.length ? ` +${refs.length - names.length}` : "";
+  return `Agents: ${names.join(", ")}${suffix}`;
+}
+
 function isSystemSkill(skill: SkillListItem): boolean {
   return skill.path.split(/[\\/]/).includes(".system");
 }
@@ -987,8 +1031,21 @@ type SkillQueryToken = {
 function findSkillQueryToken(value: string): SkillQueryToken | null {
   for (let index = value.length - 1; index >= 0; index -= 1) {
     if (value[index] !== "@") continue;
+    if (value[index + 1] === "@") continue;
     if (index > 0 && !/\s/.test(value[index - 1])) continue;
     const token = value.slice(index + 1);
+    if (/\s/.test(token)) return null;
+    if (token.startsWith("@")) return null;
+    return { start: index, end: value.length, query: token };
+  }
+  return null;
+}
+
+function findAgentQueryToken(value: string): SkillQueryToken | null {
+  for (let index = value.length - 2; index >= 0; index -= 1) {
+    if (value[index] !== "@" || value[index + 1] !== "@") continue;
+    if (index > 0 && !/\s/.test(value[index - 1])) continue;
+    const token = value.slice(index + 2);
     if (/\s/.test(token)) return null;
     return { start: index, end: value.length, query: token };
   }
@@ -1917,6 +1974,9 @@ export function App(): JSX.Element {
   const [showSystemSkills, setShowSystemSkills] = useState(false);
   const [highlightedSkillIndex, setHighlightedSkillIndex] = useState(0);
   const [agents, setAgents] = useState<AgentListItem[]>([]);
+  const [agentPickerOpen, setAgentPickerOpen] = useState(false);
+  const [selectedPromptAgents, setSelectedPromptAgents] = useState<AgentListItem[]>([]);
+  const [highlightedAgentIndex, setHighlightedAgentIndex] = useState(0);
   const [agentSchedules, setAgentSchedules] = useState<AgentSchedule[]>([]);
   const [upcomingAgentSchedules, setUpcomingAgentSchedules] = useState<AgentSchedule[]>([]);
   const [agentExecutions, setAgentExecutions] = useState<AgentScheduleExecution[]>([]);
@@ -2421,8 +2481,10 @@ export function App(): JSX.Element {
     const token = trimmed.split(/\s+/)[0].toLowerCase();
     return slashCommandSuggestions.filter((item) => item.key.startsWith(token) || item.key.includes(token));
   }, [prompt]);
+  const agentQueryToken = useMemo(() => findAgentQueryToken(prompt), [prompt]);
   const skillQueryToken = useMemo(() => findSkillQueryToken(prompt), [prompt]);
   const selectedSkillIds = useMemo(() => new Set(selectedSkills.map((skill) => skill.id)), [selectedSkills]);
+  const selectedPromptAgentIds = useMemo(() => new Set(selectedPromptAgents.map((agent) => agent.id)), [selectedPromptAgents]);
   const filteredSkills = useMemo(() => {
     const query = (skillQueryToken?.query || "").toLowerCase();
     return skillCatalog
@@ -2437,6 +2499,19 @@ export function App(): JSX.Element {
       })
       .slice(0, 30);
   }, [skillCatalog, selectedSkillIds, showSystemSkills, skillQueryToken]);
+  const filteredPromptAgents = useMemo(() => {
+    const query = (agentQueryToken?.query || "").toLowerCase();
+    return agents
+      .filter((agent) => !selectedPromptAgentIds.has(agent.id))
+      .filter((agent) => {
+        if (!query) return true;
+        return agent.name.toLowerCase().includes(query)
+          || agent.description.toLowerCase().includes(query)
+          || agent.slug.toLowerCase().includes(query)
+          || agent.path.toLowerCase().includes(query);
+      })
+      .slice(0, 30);
+  }, [agents, selectedPromptAgentIds, agentQueryToken]);
   const runningSessionIds = useMemo(() => {
     const ids = new Set<string>();
     for (const item of allSessions) {
@@ -2453,20 +2528,35 @@ export function App(): JSX.Element {
   const hasPendingTimelineEntry = timeline.some((entry) => entry.pending);
 
   useEffect(() => {
-    if (!skillQueryToken) {
+    if (agentQueryToken) {
       setSkillPickerOpen(false);
-      setHighlightedSkillIndex(0);
+      setAgentPickerOpen(true);
+      setHighlightedAgentIndex(0);
       return;
     }
+    if (!skillQueryToken) {
+      setSkillPickerOpen(false);
+      setAgentPickerOpen(false);
+      setHighlightedSkillIndex(0);
+      setHighlightedAgentIndex(0);
+      return;
+    }
+    setAgentPickerOpen(false);
     setSkillPickerOpen(true);
     setHighlightedSkillIndex(0);
-  }, [skillQueryToken?.start, skillQueryToken?.query]);
+  }, [agentQueryToken?.start, agentQueryToken?.query, skillQueryToken?.start, skillQueryToken?.query]);
 
   useEffect(() => {
     if (filteredSkills.length > 0 && highlightedSkillIndex >= filteredSkills.length) {
       setHighlightedSkillIndex(Math.max(0, filteredSkills.length - 1));
     }
   }, [filteredSkills.length, highlightedSkillIndex]);
+
+  useEffect(() => {
+    if (filteredPromptAgents.length > 0 && highlightedAgentIndex >= filteredPromptAgents.length) {
+      setHighlightedAgentIndex(Math.max(0, filteredPromptAgents.length - 1));
+    }
+  }, [filteredPromptAgents.length, highlightedAgentIndex]);
 
   useEffect(() => {
     const previous = previousTimelineStateRef.current;
@@ -2953,6 +3043,7 @@ export function App(): JSX.Element {
       sandbox?: SandboxMode;
       approvalPolicy?: ApprovalPolicy;
       skills?: SelectedSkillRef[];
+      agents?: SelectedAgentRef[];
     },
   ): QueuedMessage {
     const planMode = overrides?.planMode ?? shouldUsePlanMode(sessionKey);
@@ -2968,6 +3059,7 @@ export function App(): JSX.Element {
       approvalPolicy: overrides?.approvalPolicy ?? (planMode ? "never" : approvalPolicy),
       planMode,
       skills: readSelectedSkillRefs(overrides?.skills ?? selectedSkills.map(selectedSkillRef)),
+      agents: readSelectedAgentRefs(overrides?.agents ?? selectedPromptAgents.map(selectedAgentRef)),
     };
   }
 
@@ -2977,6 +3069,7 @@ export function App(): JSX.Element {
       ...request,
       attachments: readAttachmentRefs(request.attachments),
       skills: readSelectedSkillRefs(request.skills),
+      agents: readSelectedAgentRefs(request.agents),
       id: request.id || `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       createdAt: request.createdAt || Date.now(),
     };
@@ -3019,6 +3112,7 @@ export function App(): JSX.Element {
       approvalPolicy: request.approvalPolicy,
       planMode: request.planMode,
       skills: request.skills,
+      agents: request.agents,
       sessionId: request.sessionKey === draftSessionKey ? undefined : request.sessionKey,
     };
 
@@ -3098,6 +3192,7 @@ export function App(): JSX.Element {
       sandbox?: SandboxMode;
       approvalPolicy?: ApprovalPolicy;
       skills?: SelectedSkillRef[];
+      agents?: SelectedAgentRef[];
       focusSession?: boolean;
       onBeforeSubmit?: () => void;
       onError?: (message: string) => void;
@@ -3112,6 +3207,7 @@ export function App(): JSX.Element {
       sandbox: options?.sandbox,
       approvalPolicy: options?.approvalPolicy,
       skills: options?.skills,
+      agents: options?.agents,
     });
     const focusSession = options?.focusSession ?? (selectedSessionId === sessionKey || sessionKey === draftSessionKey);
 
@@ -3141,8 +3237,12 @@ export function App(): JSX.Element {
 
   function updatePrompt(value: string): void {
     setPrompt(value);
-    if (findSkillQueryToken(value)) {
+    if (findAgentQueryToken(value)) {
+      setAgentPickerOpen(true);
+      setSkillPickerOpen(false);
+    } else if (findSkillQueryToken(value)) {
       setSkillPickerOpen(true);
+      setAgentPickerOpen(false);
     }
   }
 
@@ -3156,32 +3256,62 @@ export function App(): JSX.Element {
     setHighlightedSkillIndex(0);
   }
 
+  function selectPromptAgent(agent: AgentListItem): void {
+    setSelectedPromptAgents((current) => {
+      if (current.some((item) => item.id === agent.id)) return current;
+      return [...current, agent].slice(0, 10);
+    });
+    setPrompt((current) => removeSkillQueryToken(current, findAgentQueryToken(current)));
+    setAgentPickerOpen(false);
+    setHighlightedAgentIndex(0);
+  }
+
   function removeSelectedSkill(skillId: string): void {
     setSelectedSkills((current) => current.filter((skill) => skill.id !== skillId));
   }
 
+  function removeSelectedPromptAgent(agentId: string): void {
+    setSelectedPromptAgents((current) => current.filter((agent) => agent.id !== agentId));
+  }
+
   function onComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>): void {
-    if (!skillPickerOpen) return;
+    const activePicker = agentPickerOpen ? "agent" : skillPickerOpen ? "skill" : null;
+    if (!activePicker) return;
 
     if (event.key === "Escape") {
       event.preventDefault();
       setSkillPickerOpen(false);
+      setAgentPickerOpen(false);
       return;
     }
 
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      setHighlightedSkillIndex((current) => Math.min(current + 1, Math.max(0, filteredSkills.length - 1)));
+      if (activePicker === "agent") {
+        setHighlightedAgentIndex((current) => Math.min(current + 1, Math.max(0, filteredPromptAgents.length - 1)));
+      } else {
+        setHighlightedSkillIndex((current) => Math.min(current + 1, Math.max(0, filteredSkills.length - 1)));
+      }
       return;
     }
 
     if (event.key === "ArrowUp") {
       event.preventDefault();
-      setHighlightedSkillIndex((current) => Math.max(0, current - 1));
+      if (activePicker === "agent") {
+        setHighlightedAgentIndex((current) => Math.max(0, current - 1));
+      } else {
+        setHighlightedSkillIndex((current) => Math.max(0, current - 1));
+      }
       return;
     }
 
-    if (event.key === "Enter" && filteredSkills.length > 0) {
+    if (event.key === "Enter" && activePicker === "agent" && filteredPromptAgents.length > 0) {
+      event.preventDefault();
+      selectPromptAgent(filteredPromptAgents[highlightedAgentIndex] || filteredPromptAgents[0]);
+      return;
+    }
+
+    if (event.key === "Enter" && activePicker === "skill" && filteredSkills.length > 0) {
       event.preventDefault();
       selectSkill(filteredSkills[highlightedSkillIndex] || filteredSkills[0]);
     }
@@ -3430,6 +3560,7 @@ export function App(): JSX.Element {
     const slashCommand = parseSlashCommand(prompt);
     const sessionKey = selectedSessionId || draftSessionKey;
     const selectedSkillRefs = selectedSkills.map(selectedSkillRef);
+    const selectedAgentRefs = selectedPromptAgents.map(selectedAgentRef);
 
     if (trimmedPrompt.startsWith("/") && !slashCommand) {
       const now = Date.now();
@@ -3466,11 +3597,14 @@ export function App(): JSX.Element {
         enqueueMessage(buildQueuedMessage(sessionKey, trimmedPrompt, {
           attachments: pendingAttachments,
           skills: selectedSkillRefs,
+          agents: selectedAgentRefs,
         }));
         setPrompt("");
         clearComposerAttachments();
         setSelectedSkills([]);
+        setSelectedPromptAgents([]);
         setSkillPickerOpen(false);
+        setAgentPickerOpen(false);
         return;
       }
 
@@ -3478,12 +3612,15 @@ export function App(): JSX.Element {
         sessionKey,
         attachments: pendingAttachments,
         skills: selectedSkillRefs,
+        agents: selectedAgentRefs,
         onError: (message) => window.alert(message),
       });
       setPrompt("");
       clearComposerAttachments();
       setSelectedSkills([]);
+      setSelectedPromptAgents([]);
       setSkillPickerOpen(false);
+      setAgentPickerOpen(false);
     } catch {
       // handled above
     } finally {
@@ -3528,7 +3665,9 @@ export function App(): JSX.Element {
     await setActiveWorkspace(nextWorkspace);
     setWorkspace(nextWorkspace);
     setSelectedSkills([]);
+    setSelectedPromptAgents([]);
     setSkillPickerOpen(false);
+    setAgentPickerOpen(false);
     await loadFileTree();
     await refreshSkillCatalog(nextWorkspace);
   }
@@ -3624,7 +3763,9 @@ export function App(): JSX.Element {
   function onSelectSession(sessionId: string): void {
     setIsDraftSession(false);
     setSelectedSkills([]);
+    setSelectedPromptAgents([]);
     setSkillPickerOpen(false);
+    setAgentPickerOpen(false);
     const target = allSessions.find((item) => item.id === sessionId);
     if (target) {
       setSelectedSessionId(target.id);
@@ -3641,7 +3782,9 @@ export function App(): JSX.Element {
     setDiff(null);
     setPrompt("");
     setSelectedSkills([]);
+    setSelectedPromptAgents([]);
     setSkillPickerOpen(false);
+    setAgentPickerOpen(false);
     clearComposerAttachments();
     setPlanState(draftSessionKey, "idle");
     setSlashEntriesBySession((prev) => {
@@ -3967,15 +4110,22 @@ export function App(): JSX.Element {
             skillCatalog={skillCatalog}
             filteredSkills={filteredSkills}
             selectedSkills={selectedSkills}
+            agentCatalog={agents}
+            filteredAgents={filteredPromptAgents}
+            selectedAgents={selectedPromptAgents}
             showSystemSkills={showSystemSkills}
             skillsLoading={skillsLoading}
             skillsError={skillsError}
             skillPickerOpen={skillPickerOpen}
+            agentPickerOpen={agentPickerOpen}
             highlightedSkillIndex={highlightedSkillIndex}
+            highlightedAgentIndex={highlightedAgentIndex}
             onRefreshSkills={refreshSkillCatalog}
             onToggleShowSystemSkills={() => setShowSystemSkills((current) => !current)}
             onSelectSkill={selectSkill}
             onRemoveSelectedSkill={removeSelectedSkill}
+            onSelectAgent={selectPromptAgent}
+            onRemoveSelectedAgent={removeSelectedPromptAgent}
             onComposerKeyDown={onComposerKeyDown}
             pendingAttachments={pendingAttachments}
             attachmentError={attachmentError}
@@ -4345,15 +4495,22 @@ type CenterPanelProps = {
   skillCatalog: SkillListItem[];
   filteredSkills: SkillListItem[];
   selectedSkills: SkillListItem[];
+  agentCatalog: AgentListItem[];
+  filteredAgents: AgentListItem[];
+  selectedAgents: AgentListItem[];
   showSystemSkills: boolean;
   skillsLoading: boolean;
   skillsError: string | null;
   skillPickerOpen: boolean;
+  agentPickerOpen: boolean;
   highlightedSkillIndex: number;
+  highlightedAgentIndex: number;
   onRefreshSkills: () => Promise<void>;
   onToggleShowSystemSkills: () => void;
   onSelectSkill: (skill: SkillListItem) => void;
   onRemoveSelectedSkill: (skillId: string) => void;
+  onSelectAgent: (agent: AgentListItem) => void;
+  onRemoveSelectedAgent: (agentId: string) => void;
   onComposerKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   pendingAttachments: AttachmentRef[];
   attachmentError: string | null;
@@ -4722,6 +4879,30 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             </div>
           ) : null}
 
+          {props.selectedAgents.length > 0 ? (
+            <div className="mb-3 flex flex-wrap gap-2">
+              {props.selectedAgents.map((agent) => (
+                <div
+                  key={agent.id}
+                  className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-card-border bg-surface-2/80 px-2 py-1 text-xs text-foreground"
+                  title={agent.path}
+                >
+                  <Bot className="h-3.5 w-3.5 text-foreground/60" />
+                  <span className="max-w-[220px] truncate">{agent.name}</span>
+                  <button
+                    type="button"
+                    className="rounded-full p-0.5 text-foreground/65 transition hover:bg-black/5 hover:text-foreground dark:hover:bg-control-hover/70"
+                    onClick={() => props.onRemoveSelectedAgent(agent.id)}
+                    aria-label={`Remove ${agent.name}`}
+                    title="Remove"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
           {props.pendingAttachments.length > 0 || props.isUploadingAttachments || props.attachmentError ? (
             <div className="mb-3 rounded-2xl border border-card-border bg-surface-1/90 px-3 py-2">
               <div className="flex items-center justify-between gap-2 text-xs font-semibold text-foreground/80">
@@ -4784,6 +4965,9 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                       {item.skills.length > 0 ? (
                         <div className="text-[11px] text-foreground/60">{formatSkillSummary(item.skills, props.skillCatalog)}</div>
                       ) : null}
+                      {item.agents.length > 0 ? (
+                        <div className="text-[11px] text-foreground/60">{formatAgentSummary(item.agents, props.agentCatalog)}</div>
+                      ) : null}
                     </div>
                     <button
                       type="button"
@@ -4801,6 +4985,55 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           ) : null}
 
 	          <div className="relative flex items-end gap-2">
+            <Dialog.Root open={props.agentPickerOpen} modal={false}>
+              <Dialog.Content
+                onOpenAutoFocus={(event) => event.preventDefault()}
+                onCloseAutoFocus={(event) => event.preventDefault()}
+                className="absolute bottom-full left-0 right-12 z-20 mb-2 max-h-[360px] overflow-hidden rounded-2xl border border-card-border bg-surface-1/95 p-2 shadow-xl outline-none backdrop-blur"
+              >
+                <Dialog.Title className="flex items-center justify-between gap-2 px-1 pb-2 text-xs font-semibold text-foreground/80">
+                  <span className="inline-flex items-center gap-1.5">
+                    <Bot className="h-3.5 w-3.5" />
+                    Agents
+                  </span>
+                  <Badge className="shrink-0 bg-surface-2 text-[10px] text-foreground/70">@@</Badge>
+                </Dialog.Title>
+                <Dialog.Description className="sr-only">
+                  Select a repo agent to attach it to the next message.
+                </Dialog.Description>
+
+                {props.filteredAgents.length > 0 ? (
+                  <div className="max-h-[292px] space-y-1 overflow-auto pr-1">
+                    {props.filteredAgents.map((agent, index) => (
+                      <button
+                        key={agent.id}
+                        type="button"
+                        className={cn(
+                          "w-full rounded-xl border px-2 py-2 text-left transition",
+                          index === props.highlightedAgentIndex
+                            ? "border-brand/45 bg-brand-soft/50"
+                            : "border-transparent hover:border-card-border hover:bg-surface-2",
+                        )}
+                        onClick={() => props.onSelectAgent(agent)}
+                      >
+                        <div className="flex min-w-0 items-center justify-between gap-2">
+                          <span className="truncate text-xs font-semibold text-foreground">{agent.name}</span>
+                          <Badge className="shrink-0 bg-surface-2 text-[10px] text-foreground/70">{agent.slug}</Badge>
+                        </div>
+                        {agent.description ? (
+                          <div className="mt-0.5 max-h-8 overflow-hidden text-[11px] leading-snug text-foreground/65">{agent.description}</div>
+                        ) : null}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-dashed border-card-border px-2 py-3 text-center text-xs text-foreground/60">
+                    {props.agentCatalog.length === 0 ? "No agents found." : "No matching agents."}
+                  </div>
+                )}
+              </Dialog.Content>
+            </Dialog.Root>
+
             <Dialog.Root open={props.skillPickerOpen} modal={false}>
               <Dialog.Content
                 onOpenAutoFocus={(event) => event.preventDefault()}

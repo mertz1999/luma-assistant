@@ -57,6 +57,12 @@ export const agentListItemSchema = z.object({
 });
 export type AgentListItem = z.infer<typeof agentListItemSchema>;
 
+export const selectedAgentRefSchema = z.object({
+  id: z.string().min(1),
+  path: z.string().min(1),
+});
+export type SelectedAgentRef = z.infer<typeof selectedAgentRefSchema>;
+
 export const agentScheduleTimeSchema = z.object({
   hour: z.number().int().min(0).max(23),
   minute: z.number().int().min(0).max(59),
@@ -153,6 +159,7 @@ export const runConfigSchema = z.object({
   sessionId: z.string().optional(),
   attachments: z.array(attachmentRefSchema).max(10).default([]),
   skills: z.array(selectedSkillRefSchema).max(20).default([]),
+  agents: z.array(selectedAgentRefSchema).max(10).default([]),
 });
 export type RunConfig = z.infer<typeof runConfigSchema>;
 
@@ -166,6 +173,7 @@ export const startRunSchema = z.object({
   sessionId: z.string().optional(),
   attachments: z.array(attachmentRefSchema).max(10).default([]),
   skills: z.array(selectedSkillRefSchema).max(20).default([]),
+  agents: z.array(selectedAgentRefSchema).max(10).default([]),
 });
 export type StartRunInput = z.infer<typeof startRunSchema>;
 
@@ -180,6 +188,7 @@ export const sendMessageSchema = z.object({
   planMode: z.boolean().default(false),
   attachments: z.array(attachmentRefSchema).max(10).default([]),
   skills: z.array(selectedSkillRefSchema).max(20).default([]),
+  agents: z.array(selectedAgentRefSchema).max(10).default([]),
 });
 export type SendMessageInput = z.infer<typeof sendMessageSchema>;
 
