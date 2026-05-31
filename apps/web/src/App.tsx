@@ -1,4 +1,4 @@
-import { isValidElement, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { isValidElement, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import Convert from "ansi-to-html";
 import DiffViewer from "react-diff-viewer-continued";
@@ -4393,10 +4393,13 @@ type CenterPanelProps = {
 function CenterPanel(props: CenterPanelProps): JSX.Element {
   const sourceBadge = props.selectedSession ? getSessionSourceBadge(props.selectedSession) : null;
   const [copiedEntryKey, setCopiedEntryKey] = useState<string | null>(null);
+  const [attachmentDropActive, setAttachmentDropActive] = useState(false);
   const copyResetTimeoutRef = useRef<number | null>(null);
+  const attachmentDragDepthRef = useRef(0);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const timelineBlocks = useMemo(() => buildTimelineRenderBlocks(props.timeline), [props.timeline]);
   const selectedSessionRunning = Boolean(props.selectedSession && !props.selectedSession.historyOnly && props.selectedSession.status === "running");
+  const attachmentDropDisabled = props.submitting || props.isUploadingAttachments;
 
   useEffect(() => {
     return () => {
@@ -4436,6 +4439,47 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
       setCopiedEntryKey((current) => (current === entry.key ? null : current));
       copyResetTimeoutRef.current = null;
     }, 1600);
+  }
+
+  function dragEventHasFiles(event: ReactDragEvent<HTMLElement>): boolean {
+    return Array.from(event.dataTransfer.types).includes("Files");
+  }
+
+  function resetAttachmentDropState(): void {
+    attachmentDragDepthRef.current = 0;
+    setAttachmentDropActive(false);
+  }
+
+  function onAttachmentDragEnter(event: ReactDragEvent<HTMLElement>): void {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    attachmentDragDepthRef.current += 1;
+    if (!attachmentDropDisabled) setAttachmentDropActive(true);
+  }
+
+  function onAttachmentDragOver(event: ReactDragEvent<HTMLElement>): void {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = attachmentDropDisabled ? "none" : "copy";
+  }
+
+  function onAttachmentDragLeave(event: ReactDragEvent<HTMLElement>): void {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    attachmentDragDepthRef.current = Math.max(0, attachmentDragDepthRef.current - 1);
+    if (attachmentDragDepthRef.current === 0) setAttachmentDropActive(false);
+  }
+
+  function onAttachmentDrop(event: ReactDragEvent<HTMLElement>): void {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    resetAttachmentDropState();
+    if (attachmentDropDisabled) return;
+    void props.onSelectAttachments(event.dataTransfer.files);
   }
 
   return (
@@ -4618,12 +4662,26 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
         </div>
 
         <form
-          className="border-t border-card-border bg-surface-1/75 p-3"
+          className={cn(
+            "relative border-t border-card-border bg-surface-1/75 p-3 transition",
+            attachmentDropActive && "border-brand bg-brand-soft/25",
+          )}
+          onDragEnter={onAttachmentDragEnter}
+          onDragOver={onAttachmentDragOver}
+          onDragLeave={onAttachmentDragLeave}
+          onDragEnd={resetAttachmentDropState}
+          onDrop={onAttachmentDrop}
           onSubmit={(event) => {
             event.preventDefault();
             props.onSendButtonClick();
           }}
         >
+          {attachmentDropActive ? (
+            <div className="pointer-events-none absolute inset-2 z-30 flex items-center justify-center rounded-2xl border-2 border-dashed border-brand bg-surface-1/90 text-sm font-semibold text-brand-dark shadow-soft backdrop-blur dark:text-brand">
+              Drop files to attach
+            </div>
+          ) : null}
+
           <input
             ref={props.composerFileInputRef}
             type="file"
@@ -4877,6 +4935,9 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               <Paperclip className="mr-1.5 h-4 w-4" />
               Attachment
             </Button>
+            <span className="hidden rounded-lg border border-dashed border-card-border px-2 py-1 text-xs text-foreground/60 sm:inline-flex">
+              Drop files here
+            </span>
             <Button
               type="button"
               variant="ghost"
