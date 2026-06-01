@@ -1,4 +1,7 @@
 node_modules
+**/.venv/
+__pycache__/
+**/__pycache__/
 apps/*/dist
 packages/*/dist
 landing-page/dist
