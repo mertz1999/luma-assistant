@@ -232,6 +232,17 @@ export type RunRecord = {
   } | null;
 };
 
+export type TokenUsageSummary = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  totalTokens: number;
+};
+
+export type SessionTokenUsageResponse = {
+  usage: TokenUsageSummary | null;
+};
+
 export type ApprovalQueueItem = {
   id: string;
   runId: string;

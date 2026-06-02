@@ -52,6 +52,7 @@ import type {
   SkillListItem,
   SelectedSkillRef,
   TerminalSessionSnapshot,
+  TokenUsageSummary,
   WorkspaceOption,
   SkillSyncResult,
 } from "@luma/shared";
@@ -71,6 +72,7 @@ import {
   getSkills,
   getSessionList,
   getSessionMessages,
+  getSessionTokenUsage,
   getSystemStatus,
   getTerminal,
   interruptTerminal,
@@ -1106,6 +1108,7 @@ function readSessionListItem(input: unknown): SessionListItem | null {
         lastMessagePreview: input.lastMessagePreview,
         messageCount: input.messageCount,
         historyOnly: input.historyOnly,
+        scheduled: typeof input.scheduled === "boolean" ? input.scheduled : undefined,
       }
     : null;
 }
@@ -1958,6 +1961,9 @@ export function App(): JSX.Element {
   const [messageNextCursorByRunId, setMessageNextCursorByRunId] = useState<Record<string, string | null>>({});
   const [loadingMessagesByRunId, setLoadingMessagesByRunId] = useState<Record<string, boolean>>({});
   const [selectedRunRecord, setSelectedRunRecord] = useState<RunRecord | null>(null);
+  const [tokenUsageBySession, setTokenUsageBySession] = useState<Record<string, TokenUsageSummary | null>>({});
+  const [tokenUsageLoadingSessionId, setTokenUsageLoadingSessionId] = useState<string | null>(null);
+  const [tokenUsageError, setTokenUsageError] = useState<string | null>(null);
   const [showAllHistory, setShowAllHistory] = useState(false);
   const [loadingRunList, setLoadingRunList] = useState(false);
   const [approvals, setApprovals] = useState<ApprovalQueueItem[]>([]);
@@ -2870,6 +2876,19 @@ export function App(): JSX.Element {
       }
     } finally {
       setLoadingMessagesByRunId((prev) => ({ ...prev, [sessionId]: false }));
+    }
+  }
+
+  async function loadTokenUsageForSession(sessionId: string): Promise<void> {
+    setTokenUsageLoadingSessionId(sessionId);
+    setTokenUsageError(null);
+    try {
+      const payload = await getSessionTokenUsage(sessionId);
+      setTokenUsageBySession((prev) => ({ ...prev, [sessionId]: payload.usage }));
+    } catch (error) {
+      setTokenUsageError(error instanceof Error ? error.message : "Failed to load token usage");
+    } finally {
+      setTokenUsageLoadingSessionId((current) => (current === sessionId ? null : current));
     }
   }
 
@@ -4188,6 +4207,10 @@ export function App(): JSX.Element {
             fileNodes={fileNodes}
             selectedSessionId={selectedSessionId}
             selectedSession={selectedSession}
+            selectedSessionTokenUsage={selectedSessionId ? tokenUsageBySession[selectedSessionId] : undefined}
+            tokenUsageLoading={Boolean(selectedSessionId && tokenUsageLoadingSessionId === selectedSessionId)}
+            tokenUsageError={tokenUsageError}
+            onLoadTokenUsage={loadTokenUsageForSession}
             selectedTerminal={selectedTerminal}
             terminalHistory={selectedTerminalHistory}
             terminalInput={terminalInput}
@@ -4282,6 +4305,10 @@ export function App(): JSX.Element {
                 fileNodes={fileNodes}
                 selectedSessionId={selectedSessionId}
                 selectedSession={selectedSession}
+                selectedSessionTokenUsage={selectedSessionId ? tokenUsageBySession[selectedSessionId] : undefined}
+                tokenUsageLoading={Boolean(selectedSessionId && tokenUsageLoadingSessionId === selectedSessionId)}
+                tokenUsageError={tokenUsageError}
+                onLoadTokenUsage={loadTokenUsageForSession}
                 selectedTerminal={selectedTerminal}
                 terminalHistory={selectedTerminalHistory}
                 terminalInput={terminalInput}
@@ -5225,6 +5252,10 @@ type RightPanelProps = {
   fileNodes: FileTreeNode[];
   selectedSessionId: string | null;
   selectedSession: SessionCard | null;
+  selectedSessionTokenUsage: TokenUsageSummary | null | undefined;
+  tokenUsageLoading: boolean;
+  tokenUsageError: string | null;
+  onLoadTokenUsage: (sessionId: string) => Promise<void>;
   selectedTerminal: TerminalSessionSnapshot | null;
   terminalHistory: string[];
   terminalInput: string;
@@ -5346,6 +5377,41 @@ function RightPanel(props: RightPanelProps): JSX.Element {
                 <p className="mb-2 text-xs text-foreground/60">
                   source: {props.selectedSession.sourceRaw || props.selectedSession.sourceTag}
                 </p>
+                <div className="mb-3">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={props.tokenUsageLoading}
+                    onClick={() => void props.onLoadTokenUsage(props.selectedSession!.sessionId)}
+                  >
+                    {props.tokenUsageLoading ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                    Get token usage
+                  </Button>
+                </div>
+                {props.tokenUsageError ? (
+                  <p className="mb-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800 dark:border-danger-fg/40 dark:bg-danger-bg/80 dark:text-danger-fg">
+                    {props.tokenUsageError}
+                  </p>
+                ) : null}
+                {props.selectedSessionTokenUsage ? (
+                  <div className="mb-3 rounded-xl border border-card-border bg-surface-2/70 px-3 py-2 text-xs text-foreground/75">
+                    <div className="mb-1 font-semibold text-foreground">Token usage</div>
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+                      <span>Input</span>
+                      <span className="text-right tabular-nums">{props.selectedSessionTokenUsage.inputTokens.toLocaleString()}</span>
+                      <span>Output</span>
+                      <span className="text-right tabular-nums">{props.selectedSessionTokenUsage.outputTokens.toLocaleString()}</span>
+                      <span>Cached input</span>
+                      <span className="text-right tabular-nums">{props.selectedSessionTokenUsage.cachedInputTokens.toLocaleString()}</span>
+                      <span>Total</span>
+                      <span className="text-right tabular-nums">{props.selectedSessionTokenUsage.totalTokens.toLocaleString()}</span>
+                    </div>
+                  </div>
+                ) : props.selectedSessionTokenUsage === null ? (
+                  <p className="mb-3 rounded-xl border border-card-border bg-surface-2/70 px-3 py-2 text-xs text-foreground/65">
+                    No token usage is available for this session yet.
+                  </p>
+                ) : null}
                 {props.selectedSession.historyOnly ? (
                   <p className="mb-2 text-xs text-foreground/70">
                     External Codex session. Archive and delete only apply to sessions with local app runs.

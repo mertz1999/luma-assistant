@@ -55,11 +55,13 @@ import {
   type SessionMessagesResponse,
   type SessionTranscriptEntry,
   type SessionTranscriptResponse,
+  type SessionTokenUsageResponse,
   type SkillSyncResult,
   type SkillListItem,
   type SkillListResponse,
   type SseEvent,
   type TerminalSessionSnapshot,
+  type TokenUsageSummary,
   type WorkspaceOption,
 } from "@luma/shared";
 
@@ -292,6 +294,30 @@ const TERMINAL_HISTORY_MAX_CHARS = Number(process.env.TERMINAL_HISTORY_MAX_CHARS
 
 function runSessionId(run: RunRecord): string {
   return run.sessionId || run.threadId || run.id;
+}
+
+function aggregateRunTokenUsage(runs: RunRecord[]): TokenUsageSummary | null {
+  let hasUsage = false;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedInputTokens = 0;
+
+  for (const run of runs) {
+    if (!run.usage) continue;
+    hasUsage = true;
+    inputTokens += run.usage.inputTokens ?? 0;
+    outputTokens += run.usage.outputTokens ?? 0;
+    cachedInputTokens += run.usage.cachedInputTokens ?? 0;
+  }
+
+  return hasUsage
+    ? {
+        inputTokens,
+        outputTokens,
+        cachedInputTokens,
+        totalTokens: inputTokens + outputTokens,
+      }
+    : null;
 }
 
 function normalizeRunSourceTag(sourceRaw: string, historyOnly: boolean): RunSourceTag {
@@ -1117,6 +1143,10 @@ class RunManager extends EventEmitter {
 
   getRun(runId: string): RunRecord | null {
     return this.runs.get(runId) || null;
+  }
+
+  getSessionTokenUsage(sessionId: string): TokenUsageSummary | null {
+    return aggregateRunTokenUsage(this.getSessionRuns(sessionId).filter((run) => run.archivedAt === null));
   }
 
   getApprovals(): ApprovalQueueItem[] {
@@ -4812,7 +4842,7 @@ const messageProjector = new MessageProjector(messageStore, {
   handleRunFinished(runId: string): void {
     outboxProcessor?.handleRunFinished(runId);
   },
-} as OutboxProcessor);
+});
 
 outboxProcessor = new OutboxProcessor(
   runManager,
@@ -5538,6 +5568,13 @@ app.get("/api/runs/:runId/messages", (req, res) => {
     return;
   }
   res.json(apiOk({ runId: req.params.runId, ...payload }));
+});
+
+app.get("/api/sessions/:sessionId/token-usage", (req, res) => {
+  const payload: SessionTokenUsageResponse = {
+    usage: runManager.getSessionTokenUsage(req.params.sessionId),
+  };
+  res.json(apiOk(payload));
 });
 
 app.get("/api/sessions/:sessionId/messages", (req, res) => {

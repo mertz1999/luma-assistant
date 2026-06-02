@@ -19,6 +19,7 @@ import type {
   SessionHistoryEntry,
   SessionListResponse,
   SessionMessagesResponse,
+  SessionTokenUsageResponse,
   SessionTranscriptResponse,
   SkillListResponse,
   SseEvent,
@@ -110,6 +111,10 @@ export function getSessionMessages(sessionId: string, before?: string | null): P
   if (before) params.set("before", before);
   const suffix = params.size > 0 ? `?${params.toString()}` : "";
   return request(`/api/sessions/${encodeURIComponent(sessionId)}/messages${suffix}`);
+}
+
+export function getSessionTokenUsage(sessionId: string): Promise<SessionTokenUsageResponse> {
+  return request(`/api/sessions/${encodeURIComponent(sessionId)}/token-usage`);
 }
 
 export function getSessionHistory(): Promise<{ entries: SessionHistoryEntry[] }> {
