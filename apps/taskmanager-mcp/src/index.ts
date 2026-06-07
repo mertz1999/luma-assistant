@@ -53,6 +53,10 @@ type TaskManagerProject = {
   name: string;
   color: string;
   archived: boolean;
+  createdBy: string;
+  userIds: string[];
+  createdAt: number;
+  updatedAt: number;
 };
 
 type TaskManagerTask = {
@@ -298,7 +302,7 @@ function findUser(bootstrap: TaskManagerBootstrap, userRef: string | undefined):
 function findProject(bootstrap: TaskManagerBootstrap, projectRef: string | undefined): TaskManagerProject | null {
   const normalized = projectRef?.trim().toLowerCase();
   if (!normalized) return null;
-  if (["none", "no project", "null"].includes(normalized)) return { id: "", name: "No project", color: "#94a3b8", archived: false };
+  if (["none", "no project", "null"].includes(normalized)) return { id: "", name: "No project", color: "#94a3b8", archived: false, createdBy: "", userIds: [], createdAt: 0, updatedAt: 0 };
   return bootstrap.projects.find((project) => project.id.toLowerCase() === normalized || project.name.toLowerCase() === normalized) || null;
 }
 
@@ -320,6 +324,15 @@ function resolveProjectId(bootstrap: TaskManagerBootstrap, projectId?: string | 
   return found.id || null;
 }
 
+function resolveUserRefs(bootstrap: TaskManagerBootstrap, userRefs: string[] | undefined): string[] {
+  if (!userRefs?.length) return [];
+  return [...new Set(userRefs.map((item) => item.trim()).filter(Boolean).map((item) => {
+    const user = findUser(bootstrap, item);
+    if (!user) throw new Error(`User not found: ${item}`);
+    return user.id;
+  }))];
+}
+
 function simplifyTask(task: TaskManagerTask, bootstrap: TaskManagerBootstrap, timeZone: string): Record<string, unknown> {
   const project = task.projectId ? bootstrap.projects.find((item) => item.id === task.projectId) : null;
   const assignee = task.assigneeId ? bootstrap.users.find((item) => item.id === task.assigneeId) : null;
@@ -336,6 +349,32 @@ function simplifyTask(task: TaskManagerTask, bootstrap: TaskManagerBootstrap, ti
     isDeadline: task.isDeadline,
     completedAt: task.completedAt,
     checklist: task.checklist,
+  };
+}
+
+function simplifyProject(project: TaskManagerProject, bootstrap: TaskManagerBootstrap): Record<string, unknown> {
+  const creator = bootstrap.users.find((user) => user.id === project.createdBy);
+  const accessUsers = project.userIds
+    .map((userId) => bootstrap.users.find((user) => user.id === userId))
+    .filter((user): user is TaskManagerUser => Boolean(user))
+    .map((user) => ({
+      id: user.id,
+      username: user.username,
+      displayName: user.displayName,
+      active: user.active,
+    }));
+
+  return {
+    id: project.id,
+    name: project.name,
+    color: project.color,
+    archived: project.archived,
+    createdBy: creator
+      ? { id: creator.id, username: creator.username, displayName: creator.displayName }
+      : { id: project.createdBy },
+    accessUsers,
+    createdAt: project.createdAt,
+    updatedAt: project.updatedAt,
   };
 }
 
@@ -480,6 +519,103 @@ function createServer(): McpServer {
 
         const result = await apiRequest<{ report: string; timeZone: string }>(`/api/taskmanager/reports/today?${params.toString()}`);
         return toolSuccess({ ok: true, ...result });
+      } catch (error) {
+        return toolFailure(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_users",
+    {
+      title: "List Luma Tasks Users",
+      description: "List Luma Tasks users visible to the authenticated task user. Use this to find valid assignee ids, usernames, and display names.",
+      inputSchema: {
+        active_only: z.boolean().default(true).describe("When true, hide disabled users."),
+        query: z.string().max(120).optional().describe("Optional case-insensitive filter by id, username, or display name."),
+      },
+    },
+    async ({ active_only, query }) => {
+      try {
+        const bootstrap = await getBootstrap();
+        const normalizedQuery = query ? normalizeSearchText(query) : "";
+        const users = bootstrap.users
+          .filter((user) => !active_only || user.active)
+          .filter((user) => {
+            if (!normalizedQuery) return true;
+            return [user.id, user.username, user.displayName, user.role, user.timeZone || ""]
+              .some((value) => normalizeSearchText(value).includes(normalizedQuery));
+          })
+          .sort((a, b) => a.displayName.localeCompare(b.displayName) || a.username.localeCompare(b.username))
+          .map((user) => ({
+            id: user.id,
+            username: user.username,
+            displayName: user.displayName,
+            role: user.role,
+            active: user.active,
+            timeZone: user.timeZone || null,
+          }));
+
+        return toolSuccess({ ok: true, users });
+      } catch (error) {
+        return toolFailure(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_projects",
+    {
+      title: "List Luma Tasks Projects",
+      description: "List Luma Tasks projects visible to the authenticated task user. Use this to check existing projects before creating or assigning tasks.",
+      inputSchema: {
+        include_archived: z.boolean().default(false),
+        query: z.string().max(120).optional().describe("Optional case-insensitive filter by id, name, creator, or access user."),
+      },
+    },
+    async ({ include_archived, query }) => {
+      try {
+        const bootstrap = await getBootstrap();
+        const normalizedQuery = query ? normalizeSearchText(query) : "";
+        const projects = bootstrap.projects
+          .filter((project) => include_archived || !project.archived)
+          .map((project) => simplifyProject(project, bootstrap))
+          .filter((project) => {
+            if (!normalizedQuery) return true;
+            return normalizeSearchText(JSON.stringify(project)).includes(normalizedQuery);
+          });
+
+        return toolSuccess({ ok: true, projects });
+      } catch (error) {
+        return toolFailure(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "create_project",
+    {
+      title: "Create Luma Tasks Project",
+      description: "Create a Luma Tasks project/list. Optionally grant project access to selected users by id, username, or display name.",
+      inputSchema: {
+        name: z.string().min(1).max(80),
+        color: z.string().min(1).max(32).default("#12867d").describe("Project color. Use a hex color such as #12867d."),
+        access_users: z.array(z.string().min(1)).max(200).optional().describe("Users who should have access. Items can be user ids, usernames, or display names."),
+        all_users: z.boolean().default(false).describe("When true, grant access to all active non-admin users."),
+      },
+    },
+    async ({ name, color, access_users, all_users }) => {
+      try {
+        const bootstrap = await getBootstrap();
+        const userIds = all_users
+          ? bootstrap.users.filter((user) => user.active && user.role !== "admin").map((user) => user.id)
+          : resolveUserRefs(bootstrap, access_users);
+        const result = await apiRequest<{ project: TaskManagerProject }>("/api/taskmanager/projects", {
+          method: "POST",
+          body: JSON.stringify({ name, color, userIds }),
+        });
+        const refreshed = await getBootstrap();
+        return toolSuccess({ ok: true, project: simplifyProject(result.project, refreshed) });
       } catch (error) {
         return toolFailure(error);
       }

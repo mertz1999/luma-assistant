@@ -199,8 +199,11 @@ TELEGRAM_MAX_FILE_BYTES=52428800
 The repo also includes a Luma Tasks MCP server registered as `luma-tasks` by default. It connects to the local Luma Tasks API and exposes tools for prompts and agents:
 
 - `get_today_report`: returns the ready-to-send plain-text Today report.
+- `list_users`: lists task-manager users for assignment.
+- `list_projects`: lists visible projects and access users.
 - `list_tasks`: lists visible tasks with filters.
 - `search_tasks`: finds visible tasks by title, description, checklist, project, or assignee.
+- `create_project`: creates projects/lists with optional user access.
 - `create_task`, `update_task`, `complete_task`, `add_comment`: basic task actions.
 
 Default configuration:
