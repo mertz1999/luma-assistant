@@ -13,7 +13,7 @@ PROJECT_PORTS := $(API_PORT) $(WEB_PORT) $(TELEGRAM_MCP_PORT)
 PM2_BIN := npx pm2
 PM2_ECOSYSTEM := scripts/pm2/ecosystem.config.cjs
 
-.PHONY: install install-if-needed install-pm2 stop-dev-processes kill-ports stop-pm2-apps ensure-telegram-mcp run deploy-start deploy-stop deploy-status deploy-logs
+.PHONY: install install-if-needed install-pm2 stop-dev-processes kill-ports stop-pm2-apps ensure-telegram-mcp migrate run deploy-start deploy-stop deploy-status deploy-logs
 
 install:
 	npm install --include=optional --no-audit --no-fund
@@ -86,12 +86,16 @@ kill-ports:
 ensure-telegram-mcp:
 	node scripts/ensure-telegram-mcp.cjs
 
+migrate:
+	npm run migrate
+
 run: install-if-needed ensure-telegram-mcp stop-pm2-apps stop-dev-processes kill-ports
 	npm run dev
 
 deploy-start: install-if-needed install-pm2 ensure-telegram-mcp stop-pm2-apps stop-dev-processes kill-ports
 	@mkdir -p data/logs
 	npm run build
+	npm run migrate
 	API_PORT=$(API_PORT) WEB_PORT=$(WEB_PORT) TELEGRAM_MCP_PORT=$(TELEGRAM_MCP_PORT) HOST=$(HOST) NODE_ENV=production $(PM2_BIN) startOrReload $(PM2_ECOSYSTEM) --update-env
 	$(PM2_BIN) save
 	$(PM2_BIN) status

@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "concurrently -n server,web,telegram-mcp -c cyan,green,magenta \"npm run dev -w @luma/server\" \"npm run dev -w @luma/web\" \"npm run dev -w @luma/telegram-mcp\"",
     "build": "npm run build -w @luma/shared && npm run build -w @luma/server && npm run build -w @luma/web && npm run build -w @luma/telegram-mcp",
+    "migrate": "node scripts/migrate-data.cjs",
     "typecheck": "npm run build -w @luma/shared && npm run typecheck -w @luma/server && npm run typecheck -w @luma/web && npm run typecheck -w @luma/telegram-mcp",
     "start": "npm run start -w @luma/server"
   },

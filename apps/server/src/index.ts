@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
@@ -13,12 +13,22 @@ import type { IPty } from "node-pty";
 import {
   approvalPolicySchema,
   attachmentRefSchema,
+  createTaskManagerCommentSchema,
+  createTaskManagerLabelSchema,
+  createTaskManagerProjectSchema,
+  createTaskManagerTaskSchema,
+  createTaskManagerUserSchema,
   createAgentScheduleSchema,
   rerunSchema,
   sendMessageSchema,
   setWorkspaceSchema,
   startRunSchema,
+  taskManagerLoginSchema,
+  updateTaskManagerProfileSchema,
   updateAgentScheduleSchema,
+  updateTaskManagerProjectSchema,
+  updateTaskManagerTaskSchema,
+  updateTaskManagerUserSchema,
   type ApiResponse,
   type AgentListItem,
   type AgentListResponse,
@@ -61,6 +71,16 @@ import {
   type SkillListResponse,
   type SseEvent,
   type TerminalSessionSnapshot,
+  type TaskManagerActivity,
+  type TaskManagerBootstrap,
+  type TaskManagerComment,
+  type TaskManagerLabel,
+  type TaskManagerPriority,
+  type TaskManagerProject,
+  type TaskManagerRole,
+  type TaskManagerStatus,
+  type TaskManagerTask,
+  type TaskManagerUser,
   type TokenUsageSummary,
   type WorkspaceOption,
 } from "@luma/shared";
@@ -78,6 +98,7 @@ const SESSION_INDEX_PATH = path.resolve(rootDir, "data/session-index.json");
 const MESSAGE_STORE_META_PATH = path.resolve(rootDir, "data/message-store-meta.json");
 const MESSAGE_OUTBOX_PATH = path.resolve(rootDir, "data/message-outbox.json");
 const MESSAGE_LOG_DIR = path.resolve(rootDir, "data/messages");
+const TASK_MANAGER_DATA_PATH = path.resolve(rootDir, "data/taskmanager/state.json");
 
 const API_PORT = Number(process.env.API_PORT || 9001);
 const WEB_PORT = Number(process.env.WEB_PORT || 5175);
@@ -91,6 +112,11 @@ const AUTH_PASSWORD = process.env.PASSWORD || process.env.APP_PASSWORD || "";
 const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
 const AUTH_TOKEN_TTL_SECONDS = Number(process.env.AUTH_TOKEN_TTL_SECONDS || 24 * 60 * 60);
 const JWT_SECRET = process.env.JWT_SECRET || AUTH_PASSWORD || "luma-assistant-default-jwt-secret";
+const TASK_MANAGER_ADMIN_USERNAME = process.env.TASK_MANAGER_ADMIN_USERNAME || "admin";
+const TASK_MANAGER_ADMIN_PASSWORD = process.env.TASK_MANAGER_ADMIN_PASSWORD || "";
+const TASK_MANAGER_JWT_SECRET = process.env.TASK_MANAGER_JWT_SECRET || JWT_SECRET;
+const TASK_MANAGER_TOKEN_TTL_SECONDS = Number(process.env.TASK_MANAGER_TOKEN_TTL_SECONDS || 7 * 24 * 60 * 60);
+const TASK_MANAGER_DEFAULT_TIME_ZONE = process.env.TASK_MANAGER_DEFAULT_TIME_ZONE || "Asia/Tehran";
 const PLAN_MODE_FILE_PATH = path.resolve(rootDir, "plan.md");
 const ATTACHMENT_STAGING_DIR = path.join(".agentic", "attachments");
 const ATTACHMENT_MAX_BYTES = Number(process.env.ATTACHMENT_MAX_BYTES || 15 * 1024 * 1024);
@@ -242,6 +268,30 @@ type MessageOutboxItem = {
   updatedAt: number;
 };
 
+type PersistedTaskManagerUser = TaskManagerUser & {
+  passwordHash: string;
+  passwordSalt: string;
+};
+
+type PersistedTaskManagerState = {
+  users: PersistedTaskManagerUser[];
+  projects: TaskManagerProject[];
+  labels: TaskManagerLabel[];
+  tasks: TaskManagerTask[];
+  comments: TaskManagerComment[];
+  activity: TaskManagerActivity[];
+};
+
+type TaskManagerSession = {
+  userId: string;
+  role: TaskManagerRole;
+  username: string;
+};
+
+type TaskManagerRequest = express.Request & {
+  taskUser?: TaskManagerSession;
+};
+
 type RunLifecycleKind = "started" | "completed" | "failed" | "stopped" | "updated";
 
 type RunLifecycleEvent = {
@@ -379,6 +429,611 @@ function writeJsonAtomicSync(filePath: string, value: unknown): void {
   const tempPath = `${filePath}.tmp`;
   fs.writeFileSync(tempPath, JSON.stringify(value, null, 2));
   fs.renameSync(tempPath, filePath);
+}
+
+function makeTaskManagerId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function hashTaskManagerPassword(password: string, salt = randomBytes(16).toString("hex")): { hash: string; salt: string } {
+  const hash = scryptSync(password, salt, 64).toString("hex");
+  return { hash, salt };
+}
+
+function verifyTaskManagerPassword(password: string, salt: string, expectedHash: string): boolean {
+  const actual = scryptSync(password, salt, 64);
+  const expected = Buffer.from(expectedHash, "hex");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function normalizeTaskManagerTimeZone(timeZone: string | undefined | null): string {
+  const candidate = (timeZone || TASK_MANAGER_DEFAULT_TIME_ZONE).trim();
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: candidate }).format(Date.now());
+    return candidate;
+  } catch {
+    return TASK_MANAGER_DEFAULT_TIME_ZONE;
+  }
+}
+
+function requireValidTaskManagerTimeZone(timeZone: string): string {
+  const normalized = timeZone.trim();
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: normalized }).format(Date.now());
+    return normalized;
+  } catch {
+    throw new Error("Invalid timezone.");
+  }
+}
+
+function taskManagerZonedParts(timestamp: number, timeZone: string): { year: number; month: number; day: number; hour: number; minute: number; second: number } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(timestamp);
+  const value = (type: string): number => Number(parts.find((part) => part.type === type)?.value || "0");
+  return {
+    year: value("year"),
+    month: value("month"),
+    day: value("day"),
+    hour: value("hour"),
+    minute: value("minute"),
+    second: value("second"),
+  };
+}
+
+function taskManagerTimeZoneOffsetMs(timestamp: number, timeZone: string): number {
+  const parts = taskManagerZonedParts(timestamp, timeZone);
+  const asUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
+  return asUtc - timestamp;
+}
+
+function taskManagerZonedTimeToUtc(year: number, month: number, day: number, hour: number, minute: number, second: number, timeZone: string): number {
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, second);
+  const first = utcGuess - taskManagerTimeZoneOffsetMs(utcGuess, timeZone);
+  return utcGuess - taskManagerTimeZoneOffsetMs(first, timeZone);
+}
+
+function taskManagerStartOfToday(timeZone: string): number {
+  const parts = taskManagerZonedParts(Date.now(), timeZone);
+  return taskManagerZonedTimeToUtc(parts.year, parts.month, parts.day, 0, 0, 0, timeZone);
+}
+
+function taskManagerEndOfToday(timeZone: string): number {
+  const parts = taskManagerZonedParts(Date.now(), timeZone);
+  return taskManagerZonedTimeToUtc(parts.year, parts.month, parts.day, 23, 59, 59, timeZone);
+}
+
+function taskManagerCalendarDateWithOffset(year: number, month: number, day: number, offsetDays: number): { year: number; month: number; day: number } {
+  const date = new Date(Date.UTC(year, month - 1, day + offsetDays));
+  return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
+}
+
+function taskManagerEndOfTomorrow(timeZone: string): number {
+  const parts = taskManagerZonedParts(Date.now(), timeZone);
+  const tomorrow = taskManagerCalendarDateWithOffset(parts.year, parts.month, parts.day, 1);
+  return taskManagerZonedTimeToUtc(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59, timeZone);
+}
+
+function taskManagerFormatReportDate(timestamp: number, timeZone: string): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  }).format(timestamp);
+}
+
+function taskManagerFormatShortDate(timestamp: number, timeZone: string): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    month: "short",
+    day: "numeric",
+  }).format(timestamp);
+}
+
+function taskManagerPriorityIcon(priority: TaskManagerPriority): string {
+  if (priority === "urgent") return "🔴";
+  if (priority === "high") return "🟠";
+  if (priority === "medium") return "🟡";
+  return "🟢";
+}
+
+function publicTaskManagerUser(user: PersistedTaskManagerUser): TaskManagerUser {
+  const { passwordHash: _passwordHash, passwordSalt: _passwordSalt, ...safeUser } = user;
+  return safeUser;
+}
+
+function loadPersistedTaskManagerState(): PersistedTaskManagerState {
+  const fallback: PersistedTaskManagerState = {
+    users: [],
+    projects: [],
+    labels: [],
+    tasks: [],
+    comments: [],
+    activity: [],
+  };
+  if (!fs.existsSync(TASK_MANAGER_DATA_PATH)) return fallback;
+  const parsed = safeJsonParse<PersistedTaskManagerState>(fs.readFileSync(TASK_MANAGER_DATA_PATH, "utf8"), fallback);
+  return {
+    users: Array.isArray(parsed.users) ? parsed.users : [],
+    projects: Array.isArray(parsed.projects) ? parsed.projects : [],
+    labels: Array.isArray(parsed.labels) ? parsed.labels : [],
+    tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
+    comments: Array.isArray(parsed.comments) ? parsed.comments : [],
+    activity: Array.isArray(parsed.activity) ? parsed.activity : [],
+  };
+}
+
+class TaskManagerStore {
+  private users = new Map<string, PersistedTaskManagerUser>();
+  private projects = new Map<string, TaskManagerProject>();
+  private labels = new Map<string, TaskManagerLabel>();
+  private tasks = new Map<string, TaskManagerTask>();
+  private comments = new Map<string, TaskManagerComment>();
+  private activity = new Map<string, TaskManagerActivity>();
+
+  constructor() {
+    const persisted = loadPersistedTaskManagerState();
+    for (const user of persisted.users) this.users.set(user.id, { ...user, timeZone: normalizeTaskManagerTimeZone(user.timeZone) });
+    for (const project of persisted.projects) this.projects.set(project.id, { ...project, userIds: project.userIds ?? [] });
+    for (const label of persisted.labels) this.labels.set(label.id, label);
+    for (const task of persisted.tasks) {
+      this.tasks.set(task.id, {
+        ...task,
+        isDeadline: task.isDeadline ?? false,
+        sortOrder: typeof task.sortOrder === "number" ? task.sortOrder : task.createdAt || task.updatedAt || Date.now(),
+      });
+    }
+    for (const comment of persisted.comments) this.comments.set(comment.id, comment);
+    for (const item of persisted.activity) this.activity.set(item.id, item);
+    this.ensureAdminUser();
+    this.ensureDefaults();
+  }
+
+  snapshot(): PersistedTaskManagerState {
+    return {
+      users: [...this.users.values()].sort((a, b) => a.createdAt - b.createdAt),
+      projects: [...this.projects.values()].sort((a, b) => a.createdAt - b.createdAt),
+      labels: [...this.labels.values()].sort((a, b) => a.createdAt - b.createdAt),
+      tasks: [...this.tasks.values()].sort((a, b) => a.sortOrder - b.sortOrder || b.updatedAt - a.updatedAt),
+      comments: [...this.comments.values()].sort((a, b) => a.createdAt - b.createdAt),
+      activity: [...this.activity.values()].sort((a, b) => b.createdAt - a.createdAt),
+    };
+  }
+
+  flushSync(): void {
+    writeJsonAtomicSync(TASK_MANAGER_DATA_PATH, this.snapshot());
+  }
+
+  authenticate(username: string, password: string): { user: TaskManagerUser; token: string; expiresAt: number; expiresInSeconds: number } | null {
+    const normalized = username.trim().toLowerCase();
+    const user = [...this.users.values()].find((item) => item.username.toLowerCase() === normalized);
+    if (!user || !user.active) return null;
+    if (!verifyTaskManagerPassword(password, user.passwordSalt, user.passwordHash)) return null;
+    const now = Date.now();
+    user.lastLoginAt = now;
+    user.updatedAt = now;
+    this.persist();
+    const nowSeconds = Math.floor(now / 1000);
+    const expiresIn = Math.max(60, TASK_MANAGER_TOKEN_TTL_SECONDS);
+    const token = jwt.sign(
+      { sub: user.id, username: user.username, role: user.role, scope: "taskmanager", iat: nowSeconds },
+      TASK_MANAGER_JWT_SECRET,
+      { expiresIn },
+    );
+    return {
+      user: publicTaskManagerUser(user),
+      token,
+      expiresAt: (nowSeconds + expiresIn) * 1000,
+      expiresInSeconds: expiresIn,
+    };
+  }
+
+  getSessionUser(session: TaskManagerSession): TaskManagerUser | null {
+    const user = this.users.get(session.userId);
+    if (!user || !user.active) return null;
+    return publicTaskManagerUser(user);
+  }
+
+  bootstrap(session: TaskManagerSession): TaskManagerBootstrap {
+    const currentUser = this.requireCurrentUser(session);
+    const visibleTasks = [...this.tasks.values()].filter((task) => this.canAccessTask(session, task));
+    const visibleTaskIds = new Set(visibleTasks.map((task) => task.id));
+    const visibleProjects = [...this.projects.values()].filter((project) => this.canAccessProject(session, project));
+    return {
+      currentUser,
+      users: [...this.users.values()].map(publicTaskManagerUser).sort((a, b) => a.displayName.localeCompare(b.displayName)),
+      projects: visibleProjects.sort((a, b) => a.name.localeCompare(b.name)),
+      labels: [...this.labels.values()].sort((a, b) => a.name.localeCompare(b.name)),
+      tasks: visibleTasks.sort((a, b) => a.sortOrder - b.sortOrder || b.updatedAt - a.updatedAt),
+      comments: [...this.comments.values()].filter((comment) => visibleTaskIds.has(comment.taskId)),
+      activity: [...this.activity.values()].filter((item) => visibleTaskIds.has(item.taskId)).sort((a, b) => b.createdAt - a.createdAt),
+    };
+  }
+
+  todayReport(session: TaskManagerSession, input: { timeZone?: string; onlyMine?: boolean; assigneeId?: string; projectId?: string }): { report: string; timeZone: string } {
+    const currentUser = this.requireCurrentUser(session);
+    const timeZone = input.timeZone ? requireValidTaskManagerTimeZone(input.timeZone) : normalizeTaskManagerTimeZone(currentUser.timeZone);
+    const todayEnd = taskManagerEndOfToday(timeZone);
+    const tomorrowEnd = taskManagerEndOfTomorrow(timeZone);
+
+    const visibleTasks = [...this.tasks.values()]
+      .filter((task) => this.canAccessTask(session, task))
+      .filter((task) => task.status !== "done")
+      .filter((task) => task.dueAt !== null && (task.dueAt <= todayEnd || task.isDeadline))
+      .filter((task) => !input.onlyMine || task.assigneeId === session.userId || task.createdBy === session.userId)
+      .filter((task) => !input.assigneeId || task.assigneeId === input.assigneeId)
+      .filter((task) => !input.projectId || task.projectId === input.projectId)
+      .sort((a, b) => {
+        const priorityOrder: Record<TaskManagerPriority, number> = { urgent: 4, high: 3, medium: 2, low: 1 };
+        const dueDiff = (a.dueAt || Number.MAX_SAFE_INTEGER) - (b.dueAt || Number.MAX_SAFE_INTEGER);
+        if (dueDiff !== 0) return dueDiff;
+        return priorityOrder[b.priority] - priorityOrder[a.priority] || a.title.localeCompare(b.title);
+      });
+
+    const usersById = new Map([...this.users.values()].map((user) => [user.id, user]));
+    const projectsById = new Map([...this.projects.values()].map((project) => [project.id, project]));
+    const grouped = new Map<string, { name: string; tasks: TaskManagerTask[] }>();
+
+    for (const task of visibleTasks) {
+      const userId = task.assigneeId || task.createdBy || "unassigned";
+      const user = usersById.get(userId);
+      const name = user?.displayName || user?.username || "Unassigned";
+      const existing = grouped.get(userId);
+      if (existing) {
+        existing.tasks.push(task);
+      } else {
+        grouped.set(userId, { name, tasks: [task] });
+      }
+    }
+
+    const separator = "———————————-";
+    const lines = [
+      separator,
+      "Luma Tasks - Today",
+      `${taskManagerFormatReportDate(Date.now(), timeZone)} · ${timeZone}`,
+      separator,
+      "",
+    ];
+
+    if (grouped.size === 0) {
+      lines.push("No tasks for today.");
+      return { report: lines.join("\n"), timeZone };
+    }
+
+    const groups = [...grouped.values()].sort((a, b) => a.name.localeCompare(b.name));
+    groups.forEach((group, groupIndex) => {
+      lines.push(`${group.name}:`, "");
+      group.tasks.forEach((task, taskIndex) => {
+        const projectName = task.projectId ? projectsById.get(task.projectId)?.name || "No project" : "No project";
+        lines.push(`${taskIndex + 1}. ${taskManagerPriorityIcon(task.priority)} ${task.title} - ${this.reportDateLabel(task, timeZone, todayEnd, tomorrowEnd)} - ${projectName}`);
+      });
+      if (groupIndex < groups.length - 1) lines.push("");
+    });
+
+    return { report: lines.join("\n"), timeZone };
+  }
+
+  createUser(input: { username: string; displayName: string; password: string; role: TaskManagerRole }): TaskManagerUser {
+    const normalized = input.username.trim();
+    if ([...this.users.values()].some((user) => user.username.toLowerCase() === normalized.toLowerCase())) {
+      throw new Error("Username already exists.");
+    }
+    const now = Date.now();
+    const password = hashTaskManagerPassword(input.password);
+    const user: PersistedTaskManagerUser = {
+      id: makeTaskManagerId("tm_user"),
+      username: normalized,
+      displayName: input.displayName.trim(),
+      role: input.role,
+      active: true,
+      timeZone: TASK_MANAGER_DEFAULT_TIME_ZONE,
+      createdAt: now,
+      updatedAt: now,
+      lastLoginAt: null,
+      passwordHash: password.hash,
+      passwordSalt: password.salt,
+    };
+    this.users.set(user.id, user);
+    this.persist();
+    return publicTaskManagerUser(user);
+  }
+
+  updateUser(id: string, input: { displayName?: string; role?: TaskManagerRole; active?: boolean; password?: string; timeZone?: string }): TaskManagerUser {
+    const user = this.users.get(id);
+    if (!user || user.username === TASK_MANAGER_ADMIN_USERNAME) throw new Error("User not found.");
+    if (input.displayName !== undefined) user.displayName = input.displayName.trim();
+    if (input.role !== undefined) user.role = input.role;
+    if (input.active !== undefined) user.active = input.active;
+    if (input.timeZone !== undefined) user.timeZone = requireValidTaskManagerTimeZone(input.timeZone);
+    if (input.password !== undefined) {
+      const password = hashTaskManagerPassword(input.password);
+      user.passwordHash = password.hash;
+      user.passwordSalt = password.salt;
+    }
+    user.updatedAt = Date.now();
+    this.persist();
+    return publicTaskManagerUser(user);
+  }
+
+  updateProfile(session: TaskManagerSession, input: { timeZone: string }): TaskManagerUser {
+    const user = this.users.get(session.userId);
+    if (!user || !user.active) throw new Error("User not found.");
+    user.timeZone = requireValidTaskManagerTimeZone(input.timeZone);
+    user.updatedAt = Date.now();
+    this.persist();
+    return publicTaskManagerUser(user);
+  }
+
+  createProject(input: { name: string; color: string; userIds?: string[] }, userId: string): TaskManagerProject {
+    const now = Date.now();
+    const creator = this.users.get(userId);
+    const allowedUserIds = this.normalizeProjectUserIds(input.userIds || []);
+    if (creator?.role !== "admin" && !allowedUserIds.includes(userId)) allowedUserIds.push(userId);
+    const project: TaskManagerProject = {
+      id: makeTaskManagerId("tm_project"),
+      name: input.name.trim(),
+      color: input.color,
+      archived: false,
+      createdBy: userId,
+      userIds: allowedUserIds,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.projects.set(project.id, project);
+    this.persist();
+    return project;
+  }
+
+  updateProject(id: string, input: { name?: string; color?: string; archived?: boolean; userIds?: string[] }, session?: TaskManagerSession): TaskManagerProject {
+    const project = this.projects.get(id);
+    if (!project) throw new Error("Project not found.");
+    if (input.name !== undefined) project.name = input.name.trim();
+    if (input.color !== undefined) project.color = input.color;
+    if (input.archived !== undefined) project.archived = input.archived;
+    if (input.userIds !== undefined && session?.role !== "admin") throw new Error("Only admins can update project access.");
+    if (input.userIds !== undefined) project.userIds = this.normalizeProjectUserIds(input.userIds);
+    project.updatedAt = Date.now();
+    this.persist();
+    return project;
+  }
+
+  deleteProject(id: string): { deleted: boolean } {
+    const project = this.projects.get(id);
+    if (!project) throw new Error("Project not found.");
+    this.projects.delete(id);
+    for (const task of this.tasks.values()) {
+      if (task.projectId === id) {
+        task.projectId = null;
+        task.updatedAt = Date.now();
+      }
+    }
+    this.persist();
+    return { deleted: true };
+  }
+
+  createLabel(input: { name: string; color: string }): TaskManagerLabel {
+    const label: TaskManagerLabel = {
+      id: makeTaskManagerId("tm_label"),
+      name: input.name.trim(),
+      color: input.color,
+      createdAt: Date.now(),
+    };
+    this.labels.set(label.id, label);
+    this.persist();
+    return label;
+  }
+
+  createTask(input: {
+    title: string;
+    description: string;
+    status: TaskManagerStatus;
+    priority: TaskManagerPriority;
+    projectId: string | null;
+    assigneeId: string | null;
+    dueAt: number | null;
+    isDeadline: boolean;
+    sortOrder?: number;
+    labelIds: string[];
+    checklist: TaskManagerTask["checklist"];
+  }, userId: string): TaskManagerTask {
+    const now = Date.now();
+    const task: TaskManagerTask = {
+      id: makeTaskManagerId("tm_task"),
+      title: input.title.trim(),
+      description: input.description,
+      status: input.status,
+      priority: input.priority,
+      projectId: this.canUseProject(userId, input.projectId) ? input.projectId : null,
+      assigneeId: this.users.has(input.assigneeId || "") ? input.assigneeId : null,
+      createdBy: userId,
+      dueAt: input.dueAt,
+      isDeadline: input.isDeadline,
+      sortOrder: input.sortOrder || now,
+      labelIds: input.labelIds.filter((id) => this.labels.has(id)),
+      checklist: input.checklist,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: input.status === "done" ? now : null,
+    };
+    this.tasks.set(task.id, task);
+    this.recordActivity(task.id, userId, "created", "Task created");
+    this.persist();
+    return task;
+  }
+
+  updateTask(id: string, input: Partial<Omit<TaskManagerTask, "id" | "createdAt" | "updatedAt" | "createdBy">>, session: TaskManagerSession): TaskManagerTask {
+    const task = this.tasks.get(id);
+    if (!task || !this.canAccessTask(session, task)) throw new Error("Task not found.");
+    const beforeStatus = task.status;
+    if (input.title !== undefined) task.title = input.title.trim();
+    if (input.description !== undefined) task.description = input.description;
+    if (input.status !== undefined) task.status = input.status;
+    if (input.priority !== undefined) task.priority = input.priority;
+    if (input.projectId !== undefined) task.projectId = this.canUseProject(session.userId, input.projectId) ? input.projectId : null;
+    if (input.assigneeId !== undefined) task.assigneeId = this.users.has(input.assigneeId || "") ? input.assigneeId : null;
+    if (input.dueAt !== undefined) task.dueAt = input.dueAt;
+    if (input.isDeadline !== undefined) task.isDeadline = input.isDeadline;
+    if (input.sortOrder !== undefined) task.sortOrder = input.sortOrder;
+    if (input.labelIds !== undefined) task.labelIds = input.labelIds.filter((labelId) => this.labels.has(labelId));
+    if (input.checklist !== undefined) task.checklist = input.checklist;
+    if (input.completedAt !== undefined) task.completedAt = input.completedAt;
+    if (input.status !== undefined && input.completedAt === undefined) task.completedAt = input.status === "done" ? Date.now() : null;
+    task.updatedAt = Date.now();
+    this.recordActivity(task.id, session.userId, beforeStatus !== task.status ? "status_changed" : "updated", beforeStatus !== task.status ? `${beforeStatus} -> ${task.status}` : "Task updated");
+    this.persist();
+    return task;
+  }
+
+  deleteTask(id: string, session: TaskManagerSession): { deleted: boolean } {
+    const task = this.tasks.get(id);
+    if (!task || !this.canAccessTask(session, task)) throw new Error("Task not found.");
+    this.tasks.delete(id);
+    for (const [commentId, comment] of this.comments) {
+      if (comment.taskId === id) this.comments.delete(commentId);
+    }
+    for (const [activityId, item] of this.activity) {
+      if (item.taskId === id) this.activity.delete(activityId);
+    }
+    this.persist();
+    return { deleted: true };
+  }
+
+  createComment(taskId: string, body: string, session: TaskManagerSession): TaskManagerComment {
+    const task = this.tasks.get(taskId);
+    if (!task || !this.canAccessTask(session, task)) throw new Error("Task not found.");
+    const now = Date.now();
+    const comment: TaskManagerComment = {
+      id: makeTaskManagerId("tm_comment"),
+      taskId,
+      userId: session.userId,
+      body: body.trim(),
+      createdAt: now,
+    };
+    this.comments.set(comment.id, comment);
+    this.recordActivity(taskId, session.userId, "commented", "Comment added");
+    this.persist();
+    return comment;
+  }
+
+  private ensureAdminUser(): void {
+    const username = TASK_MANAGER_ADMIN_USERNAME.trim() || "admin";
+    const existing = [...this.users.values()].find((user) => user.username.toLowerCase() === username.toLowerCase());
+    const now = Date.now();
+    const passwordValue = TASK_MANAGER_ADMIN_PASSWORD || "change_me_task_admin";
+    const password = hashTaskManagerPassword(passwordValue, existing?.passwordSalt);
+    const admin: PersistedTaskManagerUser = {
+      id: existing?.id || "tm_admin",
+      username,
+      displayName: existing?.displayName || "Task Manager Admin",
+      role: "admin",
+      active: true,
+      timeZone: normalizeTaskManagerTimeZone(existing?.timeZone),
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+      lastLoginAt: existing?.lastLoginAt || null,
+      passwordHash: password.hash,
+      passwordSalt: password.salt,
+    };
+    this.users.set(admin.id, admin);
+    this.persist();
+  }
+
+  private ensureDefaults(): void {
+    if (this.projects.size === 0) {
+      const now = Date.now();
+      this.projects.set("tm_project_inbox", {
+        id: "tm_project_inbox",
+        name: "Inbox",
+        color: "#12867d",
+        archived: false,
+        createdBy: "tm_admin",
+        userIds: [],
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    if (this.labels.size === 0) {
+      const now = Date.now();
+      for (const [id, name, color] of [
+        ["tm_label_followup", "Follow up", "#f97316"],
+        ["tm_label_client", "Client", "#0ea5e9"],
+        ["tm_label_internal", "Internal", "#64748b"],
+      ]) {
+        this.labels.set(id, { id, name, color, createdAt: now });
+      }
+    }
+    this.persist();
+  }
+
+  private requireCurrentUser(session: TaskManagerSession): TaskManagerUser {
+    const user = this.getSessionUser(session);
+    if (!user) throw new Error("Unauthorized");
+    return user;
+  }
+
+  private canAccessTask(session: TaskManagerSession, task: TaskManagerTask): boolean {
+    const project = task.projectId ? this.projects.get(task.projectId) : null;
+    return session.role === "admin" || task.createdBy === session.userId || task.assigneeId === session.userId || Boolean(project && this.canAccessProject(session, project));
+  }
+
+  private canAccessProject(session: TaskManagerSession, project: TaskManagerProject): boolean {
+    return session.role === "admin" || project.createdBy === session.userId || project.userIds.includes(session.userId);
+  }
+
+  private canUseProject(userId: string, projectId: string | null): boolean {
+    if (!projectId) return false;
+    const project = this.projects.get(projectId);
+    if (!project || project.archived) return false;
+    const user = this.users.get(userId);
+    return user?.role === "admin" || project.createdBy === userId || project.userIds.includes(userId);
+  }
+
+  private normalizeProjectUserIds(userIds: string[]): string[] {
+    return [...new Set(userIds)].filter((id) => {
+      const user = this.users.get(id);
+      return Boolean(user?.active && user.role !== "admin");
+    });
+  }
+
+  private reportDateLabel(task: TaskManagerTask, timeZone: string, todayEnd: number, tomorrowEnd: number): string {
+    if (!task.dueAt) return task.isDeadline ? "No date (deadline)" : "No date";
+    let label = "";
+    if (task.dueAt < taskManagerStartOfToday(timeZone)) {
+      label = "Overdue";
+    } else if (task.dueAt <= todayEnd) {
+      label = "Today";
+    } else if (task.dueAt <= tomorrowEnd) {
+      label = "Tomorrow";
+    } else {
+      label = taskManagerFormatShortDate(task.dueAt, timeZone);
+    }
+    return task.isDeadline ? `${label} (deadline)` : label;
+  }
+
+  private recordActivity(taskId: string, userId: string, action: string, detail: string): void {
+    const item: TaskManagerActivity = {
+      id: makeTaskManagerId("tm_activity"),
+      taskId,
+      userId,
+      action,
+      detail,
+      createdAt: Date.now(),
+    };
+    this.activity.set(item.id, item);
+  }
+
+  private persist(): void {
+    writeJsonAtomicSync(TASK_MANAGER_DATA_PATH, this.snapshot());
+  }
 }
 
 function compactJsonForStorage(value: unknown, depth = 0): unknown {
@@ -4784,6 +5439,215 @@ app.use(
   }),
 );
 
+const taskManagerStore = new TaskManagerStore();
+
+function extractTaskManagerSession(req: express.Request): TaskManagerSession | null {
+  const token = extractAuthToken(req);
+  if (!token) return null;
+  try {
+    const decoded = jwt.verify(token, TASK_MANAGER_JWT_SECRET);
+    if (!isRecord(decoded) || decoded.scope !== "taskmanager") return null;
+    const userId = typeof decoded.sub === "string" ? decoded.sub : "";
+    const role = decoded.role === "admin" || decoded.role === "user" ? decoded.role : null;
+    const username = typeof decoded.username === "string" ? decoded.username : "";
+    if (!userId || !role || !username) return null;
+    return { userId, role, username };
+  } catch {
+    return null;
+  }
+}
+
+function requireTaskManagerAuth(req: TaskManagerRequest, res: express.Response, next: express.NextFunction): void {
+  const session = extractTaskManagerSession(req);
+  if (!session || !taskManagerStore.getSessionUser(session)) {
+    res.status(401).json(apiErr("Unauthorized"));
+    return;
+  }
+  req.taskUser = session;
+  next();
+}
+
+function requireTaskManagerAdmin(req: TaskManagerRequest, res: express.Response, next: express.NextFunction): void {
+  if (req.taskUser?.role !== "admin") {
+    res.status(403).json(apiErr("Admin access is required."));
+    return;
+  }
+  next();
+}
+
+function taskSession(req: TaskManagerRequest): TaskManagerSession {
+  if (!req.taskUser) throw new Error("Unauthorized");
+  return req.taskUser;
+}
+
+app.post("/api/taskmanager/auth/login", (req, res) => {
+  const parsed = taskManagerLoginSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid login payload."));
+    return;
+  }
+  const result = taskManagerStore.authenticate(parsed.data.username, parsed.data.password);
+  if (!result) {
+    res.status(401).json(apiErr("Invalid username or password."));
+    return;
+  }
+  res.json(apiOk(result));
+});
+
+app.get("/api/taskmanager/bootstrap", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
+  try {
+    res.json(apiOk(taskManagerStore.bootstrap(taskSession(req))));
+  } catch (error) {
+    res.status(401).json(apiErr(error instanceof Error ? error.message : "Unauthorized"));
+  }
+});
+
+app.get("/api/taskmanager/reports/today", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
+  try {
+    const timeZone =
+      typeof req.query.timezone === "string"
+        ? req.query.timezone
+        : typeof req.query.timeZone === "string"
+          ? req.query.timeZone
+          : undefined;
+    const onlyMine = req.query.onlyMine === "1" || req.query.onlyMine === "true";
+    const assigneeId = typeof req.query.assigneeId === "string" && req.query.assigneeId.trim() ? req.query.assigneeId.trim() : undefined;
+    const projectId = typeof req.query.projectId === "string" && req.query.projectId.trim() ? req.query.projectId.trim() : undefined;
+    const result = taskManagerStore.todayReport(taskSession(req), { timeZone, onlyMine, assigneeId, projectId });
+
+    if (req.query.format === "json") {
+      res.json(apiOk(result));
+      return;
+    }
+
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.send(result.report);
+  } catch (error) {
+    res.status(400).json(apiErr(error instanceof Error ? error.message : "Unable to build today report."));
+  }
+});
+
+app.patch("/api/taskmanager/profile", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
+  const parsed = updateTaskManagerProfileSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid profile payload."));
+    return;
+  }
+  try {
+    res.json(apiOk({ user: taskManagerStore.updateProfile(taskSession(req), parsed.data) }));
+  } catch (error) {
+    res.status(400).json(apiErr(error instanceof Error ? error.message : "Unable to update profile."));
+  }
+});
+
+app.post("/api/taskmanager/users", requireTaskManagerAuth, requireTaskManagerAdmin, (req, res) => {
+  const parsed = createTaskManagerUserSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid user payload."));
+    return;
+  }
+  try {
+    res.json(apiOk({ user: taskManagerStore.createUser(parsed.data) }));
+  } catch (error) {
+    res.status(400).json(apiErr(error instanceof Error ? error.message : "Unable to create user."));
+  }
+});
+
+app.patch("/api/taskmanager/users/:id", requireTaskManagerAuth, requireTaskManagerAdmin, (req, res) => {
+  const parsed = updateTaskManagerUserSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid user payload."));
+    return;
+  }
+  try {
+    res.json(apiOk({ user: taskManagerStore.updateUser(req.params.id, parsed.data) }));
+  } catch (error) {
+    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to update user."));
+  }
+});
+
+app.post("/api/taskmanager/projects", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
+  const parsed = createTaskManagerProjectSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid project payload."));
+    return;
+  }
+  res.json(apiOk({ project: taskManagerStore.createProject(parsed.data, taskSession(req).userId) }));
+});
+
+app.patch("/api/taskmanager/projects/:id", requireTaskManagerAuth, (req, res) => {
+  const parsed = updateTaskManagerProjectSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid project payload."));
+    return;
+  }
+  try {
+    res.json(apiOk({ project: taskManagerStore.updateProject(req.params.id, parsed.data, taskSession(req)) }));
+  } catch (error) {
+    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to update project."));
+  }
+});
+
+app.delete("/api/taskmanager/projects/:id", requireTaskManagerAuth, (req, res) => {
+  try {
+    res.json(apiOk(taskManagerStore.deleteProject(req.params.id)));
+  } catch (error) {
+    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to delete project."));
+  }
+});
+
+app.post("/api/taskmanager/labels", requireTaskManagerAuth, (req, res) => {
+  const parsed = createTaskManagerLabelSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid label payload."));
+    return;
+  }
+  res.json(apiOk({ label: taskManagerStore.createLabel(parsed.data) }));
+});
+
+app.post("/api/taskmanager/tasks", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
+  const parsed = createTaskManagerTaskSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid task payload."));
+    return;
+  }
+  res.json(apiOk({ task: taskManagerStore.createTask(parsed.data, taskSession(req).userId) }));
+});
+
+app.patch("/api/taskmanager/tasks/:id", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
+  const parsed = updateTaskManagerTaskSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid task payload."));
+    return;
+  }
+  try {
+    res.json(apiOk({ task: taskManagerStore.updateTask(req.params.id, parsed.data, taskSession(req)) }));
+  } catch (error) {
+    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to update task."));
+  }
+});
+
+app.delete("/api/taskmanager/tasks/:id", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
+  try {
+    res.json(apiOk(taskManagerStore.deleteTask(req.params.id, taskSession(req))));
+  } catch (error) {
+    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to delete task."));
+  }
+});
+
+app.post("/api/taskmanager/tasks/:id/comments", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
+  const parsed = createTaskManagerCommentSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid comment payload."));
+    return;
+  }
+  try {
+    res.json(apiOk({ comment: taskManagerStore.createComment(req.params.id, parsed.data.body, taskSession(req)) }));
+  } catch (error) {
+    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to create comment."));
+  }
+});
+
 app.post("/api/auth/login", (req, res) => {
   if (!AUTH_ENABLED) {
     res.status(503).json(apiErr("Password auth is not configured on server."));
@@ -5828,6 +6692,7 @@ function flushPersistentStateSync(): void {
   messageStore.flushSync();
   outboxProcessor?.flushSync();
   agentScheduleManager.flushSync();
+  taskManagerStore.flushSync();
 }
 
 process.on("beforeExit", () => {

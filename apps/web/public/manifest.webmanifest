@@ -1,7 +1,10 @@
 {
+  "id": "/",
   "name": "Luma Assistant",
   "short_name": "Luma",
+  "description": "Agentic assistant workspace for Luma.",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#f8fafc",
   "theme_color": "#0ea5e9",

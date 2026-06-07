@@ -489,6 +489,178 @@ export type CodexSystemStatusResponse = {
   tokenStatus: CodexTokenStatus;
 };
 
+export const taskManagerRoleSchema = z.enum(["admin", "user"]);
+export type TaskManagerRole = z.infer<typeof taskManagerRoleSchema>;
+
+export const taskManagerStatusSchema = z.enum(["todo", "in_progress", "blocked", "done"]);
+export type TaskManagerStatus = z.infer<typeof taskManagerStatusSchema>;
+
+export const taskManagerPrioritySchema = z.enum(["low", "medium", "high", "urgent"]);
+export type TaskManagerPriority = z.infer<typeof taskManagerPrioritySchema>;
+
+export const taskManagerUserSchema = z.object({
+  id: z.string().min(1),
+  username: z.string().min(2),
+  displayName: z.string().min(1),
+  role: taskManagerRoleSchema,
+  active: z.boolean(),
+  timeZone: z.string().min(1).max(80).default("Asia/Tehran"),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+  lastLoginAt: z.number().int().nonnegative().nullable(),
+});
+export type TaskManagerUser = z.infer<typeof taskManagerUserSchema>;
+
+export const taskManagerProjectSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  color: z.string().min(1),
+  archived: z.boolean(),
+  createdBy: z.string().min(1),
+  userIds: z.array(z.string().min(1)).default([]),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+});
+export type TaskManagerProject = z.infer<typeof taskManagerProjectSchema>;
+
+export const taskManagerLabelSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  color: z.string().min(1),
+  createdAt: z.number().int().nonnegative(),
+});
+export type TaskManagerLabel = z.infer<typeof taskManagerLabelSchema>;
+
+export const taskManagerChecklistItemSchema = z.object({
+  id: z.string().min(1),
+  text: z.string().min(1),
+  done: z.boolean(),
+});
+export type TaskManagerChecklistItem = z.infer<typeof taskManagerChecklistItemSchema>;
+
+export const taskManagerTaskSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1),
+  description: z.string(),
+  status: taskManagerStatusSchema,
+  priority: taskManagerPrioritySchema,
+  projectId: z.string().min(1).nullable(),
+  assigneeId: z.string().min(1).nullable(),
+  createdBy: z.string().min(1),
+  dueAt: z.number().int().nonnegative().nullable(),
+  isDeadline: z.boolean().default(false),
+  sortOrder: z.number().finite().default(0),
+  labelIds: z.array(z.string().min(1)),
+  checklist: z.array(taskManagerChecklistItemSchema),
+  createdAt: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+  completedAt: z.number().int().nonnegative().nullable(),
+});
+export type TaskManagerTask = z.infer<typeof taskManagerTaskSchema>;
+
+export const taskManagerCommentSchema = z.object({
+  id: z.string().min(1),
+  taskId: z.string().min(1),
+  userId: z.string().min(1),
+  body: z.string().min(1),
+  createdAt: z.number().int().nonnegative(),
+});
+export type TaskManagerComment = z.infer<typeof taskManagerCommentSchema>;
+
+export const taskManagerActivitySchema = z.object({
+  id: z.string().min(1),
+  taskId: z.string().min(1),
+  userId: z.string().min(1),
+  action: z.string().min(1),
+  detail: z.string(),
+  createdAt: z.number().int().nonnegative(),
+});
+export type TaskManagerActivity = z.infer<typeof taskManagerActivitySchema>;
+
+export type TaskManagerBootstrap = {
+  currentUser: TaskManagerUser;
+  users: TaskManagerUser[];
+  projects: TaskManagerProject[];
+  labels: TaskManagerLabel[];
+  tasks: TaskManagerTask[];
+  comments: TaskManagerComment[];
+  activity: TaskManagerActivity[];
+};
+
+export const taskManagerLoginSchema = z.object({
+  username: z.string().min(1),
+  password: z.string().min(1),
+});
+export type TaskManagerLoginInput = z.infer<typeof taskManagerLoginSchema>;
+
+export const createTaskManagerUserSchema = z.object({
+  username: z.string().min(2).max(48).regex(/^[a-zA-Z0-9._-]+$/),
+  displayName: z.string().min(1).max(80),
+  password: z.string().min(8).max(200),
+  role: taskManagerRoleSchema.default("user"),
+});
+export type CreateTaskManagerUserInput = z.infer<typeof createTaskManagerUserSchema>;
+
+export const updateTaskManagerUserSchema = z.object({
+  displayName: z.string().min(1).max(80).optional(),
+  role: taskManagerRoleSchema.optional(),
+  active: z.boolean().optional(),
+  password: z.string().min(8).max(200).optional(),
+  timeZone: z.string().min(1).max(80).optional(),
+});
+export type UpdateTaskManagerUserInput = z.infer<typeof updateTaskManagerUserSchema>;
+
+export const updateTaskManagerProfileSchema = z.object({
+  timeZone: z.string().min(1).max(80),
+});
+export type UpdateTaskManagerProfileInput = z.infer<typeof updateTaskManagerProfileSchema>;
+
+export const createTaskManagerProjectSchema = z.object({
+  name: z.string().min(1).max(80),
+  color: z.string().min(1).max(32).default("#12867d"),
+  userIds: z.array(z.string().min(1)).max(200).default([]),
+});
+export type CreateTaskManagerProjectInput = z.infer<typeof createTaskManagerProjectSchema>;
+
+export const updateTaskManagerProjectSchema = z.object({
+  name: z.string().min(1).max(80).optional(),
+  color: z.string().min(1).max(32).optional(),
+  archived: z.boolean().optional(),
+  userIds: z.array(z.string().min(1)).max(200).optional(),
+});
+export type UpdateTaskManagerProjectInput = z.infer<typeof updateTaskManagerProjectSchema>;
+
+export const createTaskManagerLabelSchema = z.object({
+  name: z.string().min(1).max(40),
+  color: z.string().min(1).max(32).default("#64748b"),
+});
+export type CreateTaskManagerLabelInput = z.infer<typeof createTaskManagerLabelSchema>;
+
+export const createTaskManagerTaskSchema = z.object({
+  title: z.string().min(1).max(160),
+  description: z.string().max(4000).default(""),
+  status: taskManagerStatusSchema.default("todo"),
+  priority: taskManagerPrioritySchema.default("medium"),
+  projectId: z.string().min(1).nullable().default(null),
+  assigneeId: z.string().min(1).nullable().default(null),
+  dueAt: z.number().int().nonnegative().nullable().default(null),
+  isDeadline: z.boolean().default(false),
+  sortOrder: z.number().finite().optional(),
+  labelIds: z.array(z.string().min(1)).max(20).default([]),
+  checklist: z.array(taskManagerChecklistItemSchema).max(50).default([]),
+});
+export type CreateTaskManagerTaskInput = z.infer<typeof createTaskManagerTaskSchema>;
+
+export const updateTaskManagerTaskSchema = createTaskManagerTaskSchema.partial().extend({
+  completedAt: z.number().int().nonnegative().nullable().optional(),
+});
+export type UpdateTaskManagerTaskInput = z.infer<typeof updateTaskManagerTaskSchema>;
+
+export const createTaskManagerCommentSchema = z.object({
+  body: z.string().min(1).max(2000),
+});
+export type CreateTaskManagerCommentInput = z.infer<typeof createTaskManagerCommentSchema>;
+
 export type ApiError = {
   message: string;
 };

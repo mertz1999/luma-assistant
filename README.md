@@ -79,6 +79,11 @@ CODEX_PATH=codex
 PASSWORD=change_me
 JWT_SECRET=change_me_too
 AUTH_TOKEN_TTL_SECONDS=86400
+TASK_MANAGER_ADMIN_USERNAME=admin
+TASK_MANAGER_ADMIN_PASSWORD=change_task_admin_password
+TASK_MANAGER_JWT_SECRET=change_task_manager_secret
+TASK_MANAGER_TOKEN_TTL_SECONDS=604800
+TASK_MANAGER_DEFAULT_TIME_ZONE=Asia/Tehran
 DEFAULT_MODEL=gpt-5.3-codex
 DEFAULT_SANDBOX=danger-full-access
 MAX_CONCURRENT_RUNS=8
@@ -88,6 +93,10 @@ Important variables:
 
 - `PASSWORD`: browser login password.
 - `JWT_SECRET`: secret used to sign auth tokens.
+- `TASK_MANAGER_ADMIN_USERNAME` / `TASK_MANAGER_ADMIN_PASSWORD`: initial admin login for `/taskmanager`.
+- `TASK_MANAGER_JWT_SECRET`: secret used to sign task-manager auth tokens. Falls back to `JWT_SECRET` when omitted.
+- `TASK_MANAGER_TOKEN_TTL_SECONDS`: task-manager login lifetime in seconds.
+- `TASK_MANAGER_DEFAULT_TIME_ZONE`: default timezone for new task-manager users. Users can change their own timezone from `/taskmanager/settings`.
 - `CODEX_PATH`: path to the Codex executable if it is not simply `codex`.
 - `DEFAULT_MODEL`: default Codex model for new sessions and new scheduled jobs.
 - `DEFAULT_SANDBOX`: default sandbox mode for new sessions.
@@ -96,6 +105,18 @@ Important variables:
 - `TERMINAL_SHELL=/bin/bash`: choose the shell used by session terminals.
 
 Legacy browser storage keys and local session sources are tolerated so existing sessions, auth, theme, and queued prompts are not dropped during upgrades.
+
+## Deployment Migrations
+
+`make deploy-start` runs `npm run migrate` after building and before PM2 starts the production processes. The migration runner currently normalizes JSON persistence under `data/`, including task-manager users, projects, tasks, deadlines, sort order, and timezone fields.
+
+You can run migrations manually with:
+
+```bash
+npm run migrate
+```
+
+Migrations are idempotent. When a data file needs changes, a backup is written under `data/backups/` before the file is updated.
 
 ## Cron-Style Jobs
 

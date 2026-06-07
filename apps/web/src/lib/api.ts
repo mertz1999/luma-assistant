@@ -27,6 +27,20 @@ import type {
   CreateAgentScheduleInput,
   UpdateAgentScheduleInput,
   TerminalSessionSnapshot,
+  CreateTaskManagerProjectInput,
+  CreateTaskManagerTaskInput,
+  CreateTaskManagerUserInput,
+  TaskManagerBootstrap,
+  TaskManagerComment,
+  TaskManagerLabel,
+  TaskManagerLoginInput,
+  TaskManagerProject,
+  TaskManagerTask,
+  TaskManagerUser,
+  UpdateTaskManagerProjectInput,
+  UpdateTaskManagerProfileInput,
+  UpdateTaskManagerTaskInput,
+  UpdateTaskManagerUserInput,
 } from "@luma/shared";
 
 type ApiResponse<T> =
@@ -34,9 +48,14 @@ type ApiResponse<T> =
   | { ok: false; error: { message: string } };
 
 let authToken: string | null = null;
+let taskManagerAuthToken: string | null = null;
 
 export function setApiAuthToken(token: string | null): void {
   authToken = token && token.trim() ? token.trim() : null;
+}
+
+export function setTaskManagerAuthToken(token: string | null): void {
+  taskManagerAuthToken = token && token.trim() ? token.trim() : null;
 }
 
 function emitUnauthorized(): void {
@@ -66,10 +85,120 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return payload.data;
 }
 
+async function taskManagerRequest<T>(url: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (taskManagerAuthToken) {
+    headers.set("Authorization", `Bearer ${taskManagerAuthToken}`);
+  }
+
+  const response = await fetch(url, { ...init, headers });
+  const payload = (await response.json()) as ApiResponse<T>;
+  if (!payload.ok) {
+    throw new Error(payload.error.message || "Request failed");
+  }
+  return payload.data;
+}
+
 export function loginWithPassword(password: string): Promise<{ token: string; expiresAt: number; expiresInSeconds: number }> {
   return request("/api/auth/login", {
     method: "POST",
     body: JSON.stringify({ password }),
+  });
+}
+
+export function loginTaskManager(input: TaskManagerLoginInput): Promise<{
+  token: string;
+  expiresAt: number;
+  expiresInSeconds: number;
+  user: TaskManagerUser;
+}> {
+  return taskManagerRequest("/api/taskmanager/auth/login", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function getTaskManagerBootstrap(): Promise<TaskManagerBootstrap> {
+  return taskManagerRequest("/api/taskmanager/bootstrap");
+}
+
+export function createTaskManagerUser(input: CreateTaskManagerUserInput): Promise<{ user: TaskManagerUser }> {
+  return taskManagerRequest("/api/taskmanager/users", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateTaskManagerUser(id: string, input: UpdateTaskManagerUserInput): Promise<{ user: TaskManagerUser }> {
+  return taskManagerRequest(`/api/taskmanager/users/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateTaskManagerProfile(input: UpdateTaskManagerProfileInput): Promise<{ user: TaskManagerUser }> {
+  return taskManagerRequest("/api/taskmanager/profile", {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export function createTaskManagerProject(input: CreateTaskManagerProjectInput): Promise<{ project: TaskManagerProject }> {
+  return taskManagerRequest("/api/taskmanager/projects", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateTaskManagerProject(id: string, input: UpdateTaskManagerProjectInput): Promise<{ project: TaskManagerProject }> {
+  return taskManagerRequest(`/api/taskmanager/projects/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteTaskManagerProject(id: string): Promise<{ deleted: boolean }> {
+  return taskManagerRequest(`/api/taskmanager/projects/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    body: JSON.stringify({}),
+  });
+}
+
+export function createTaskManagerLabel(input: { name: string; color: string }): Promise<{ label: TaskManagerLabel }> {
+  return taskManagerRequest("/api/taskmanager/labels", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function createTaskManagerTask(input: CreateTaskManagerTaskInput): Promise<{ task: TaskManagerTask }> {
+  return taskManagerRequest("/api/taskmanager/tasks", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateTaskManagerTask(id: string, input: UpdateTaskManagerTaskInput): Promise<{ task: TaskManagerTask }> {
+  return taskManagerRequest(`/api/taskmanager/tasks/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteTaskManagerTask(id: string): Promise<{ deleted: boolean }> {
+  return taskManagerRequest(`/api/taskmanager/tasks/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    body: JSON.stringify({}),
+  });
+}
+
+export function createTaskManagerComment(taskId: string, body: string): Promise<{ comment: TaskManagerComment }> {
+  return taskManagerRequest(`/api/taskmanager/tasks/${encodeURIComponent(taskId)}/comments`, {
+    method: "POST",
+    body: JSON.stringify({ body }),
   });
 }
 

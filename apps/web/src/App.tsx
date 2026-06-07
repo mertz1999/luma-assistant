@@ -9,8 +9,10 @@ import {
   Bot,
   CalendarClock,
   Check,
+  ClipboardList,
   CircleStop,
   Copy,
+  ExternalLink,
   FileCode2,
   FolderTree,
   Lock,
@@ -97,6 +99,7 @@ import { useUiStore } from "@/store/useUiStore";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { TaskManager } from "@/TaskManager";
 
 type StatusFilter = "all" | "running" | "completed" | "failed" | "stopped";
 
@@ -1933,6 +1936,10 @@ function ToolDetailModal({
 }
 
 export function App(): JSX.Element {
+  if (typeof window !== "undefined" && window.location.pathname.startsWith("/taskmanager")) {
+    return <TaskManager />;
+  }
+
   const {
     selectedRunId,
     setSelectedRunId,
@@ -5538,6 +5545,27 @@ function RightPanel(props: RightPanelProps): JSX.Element {
               </details>
             </section>
           ) : null}
+
+          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-bold">Other Apps</h3>
+              <Badge>apps</Badge>
+            </div>
+            <button
+              type="button"
+              onClick={() => window.location.assign("/taskmanager")}
+              className="group flex w-full items-center gap-3 rounded-2xl border border-card-border bg-surface-2/70 p-3 text-left transition hover:border-brand/45 hover:bg-brand-soft/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/25"
+            >
+              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-brand text-white shadow-card">
+                <ClipboardList className="h-5 w-5" />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block text-sm font-bold text-foreground">Luma Tasks</span>
+                <span className="block truncate text-xs text-foreground/65">Open the task manager</span>
+              </span>
+              <ExternalLink className="h-4 w-4 shrink-0 text-foreground/45 transition group-hover:text-brand" />
+            </button>
+          </section>
 
           <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
             <div className="mb-2 flex items-center justify-between">
