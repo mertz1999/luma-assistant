@@ -7,6 +7,7 @@ dotenv.config({ path: path.join(root, '.env') });
 const apiPort = String(process.env.API_PORT || '9001');
 const webPort = String(process.env.WEB_PORT || '5175');
 const telegramMcpPort = String(process.env.TELEGRAM_MCP_PORT || '9013');
+const taskManagerMcpPort = String(process.env.TASK_MANAGER_MCP_PORT || '9014');
 const host = process.env.HOST || '0.0.0.0';
 
 module.exports = {
@@ -62,6 +63,23 @@ module.exports = {
       time: true,
       out_file: path.join(root, 'data', 'logs', 'telegram-mcp.out.log'),
       error_file: path.join(root, 'data', 'logs', 'telegram-mcp.err.log'),
+    },
+    {
+      name: 'luma-taskmanager-mcp',
+      cwd: root,
+      script: 'npm',
+      args: 'run start -w @luma/taskmanager-mcp',
+      env: {
+        ...process.env,
+        NODE_ENV: 'production',
+        TASK_MANAGER_MCP_PORT: taskManagerMcpPort,
+      },
+      autorestart: true,
+      max_restarts: 10,
+      restart_delay: 1500,
+      time: true,
+      out_file: path.join(root, 'data', 'logs', 'taskmanager-mcp.out.log'),
+      error_file: path.join(root, 'data', 'logs', 'taskmanager-mcp.err.log'),
     },
   ],
 };

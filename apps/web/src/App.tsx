@@ -5334,7 +5334,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
           Context
         </Button>
         <Button size="sm" variant={props.rightPanelTab === "tools" ? "primary" : "ghost"} onClick={() => props.setRightPanelTab("tools")}>
-          Other Apps
+          Apps
         </Button>
         <Button size="sm" variant={props.rightPanelTab === "agents" ? "primary" : "ghost"} onClick={() => props.setRightPanelTab("agents")}>
           Agents
@@ -5566,7 +5566,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
         <>
           <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
             <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Other Apps</h3>
+              <h3 className="text-sm font-bold">Apps</h3>
               <Badge>apps</Badge>
             </div>
             <button

@@ -34,6 +34,7 @@ It keeps the core Codex CLI workflow available in the app: plan mode, MCP tools,
 - `Web`: React, Vite, TypeScript, Tailwind-style UI utilities
 - `Shared types`: `@luma/shared`
 - `Telegram MCP`: `@luma/telegram-mcp`
+- `Luma Tasks MCP`: `@luma/taskmanager-mcp`
 - `Process management`: PM2
 - `Proxy`: Nginx example config
 - `Landing page`: independent Vite + React + Tailwind app in `landing-page/`
@@ -193,6 +194,30 @@ TELEGRAM_MAX_FILE_BYTES=52428800
 
 `make run` and `make deploy-start` ensure the local Codex MCP entry points at the Telegram MCP server.
 
+## Luma Tasks MCP
+
+The repo also includes a Luma Tasks MCP server registered as `luma-tasks` by default. It connects to the local Luma Tasks API and exposes tools for prompts and agents:
+
+- `get_today_report`: returns the ready-to-send plain-text Today report.
+- `list_tasks`: lists visible tasks with filters.
+- `search_tasks`: finds visible tasks by title, description, checklist, project, or assignee.
+- `create_task`, `update_task`, `complete_task`, `add_comment`: basic task actions.
+
+Default configuration:
+
+```env
+TASK_MANAGER_MCP_PORT=9014
+TASK_MANAGER_MCP_NAME=luma-tasks
+LUMA_TASKS_API_BASE=http://127.0.0.1:9001
+LUMA_TASKS_USERNAME=admin
+LUMA_TASKS_PASSWORD=
+LUMA_TASKS_AUTH_TOKEN=
+```
+
+If `LUMA_TASKS_PASSWORD` is omitted, the MCP server falls back to `TASK_MANAGER_ADMIN_PASSWORD`, then `PASSWORD`. `LUMA_TASKS_AUTH_TOKEN` is optional and can be used instead of username/password, but normal username/password login is preferred because task-manager tokens expire.
+
+`make run` and `make deploy-start` ensure the local Codex MCP entry points at both `luma-tel` and `luma-tasks`.
+
 ## Development
 
 Useful commands:
@@ -211,6 +236,7 @@ The root npm workspaces are:
 - `@luma/server`
 - `@luma/web`
 - `@luma/telegram-mcp`
+- `@luma/taskmanager-mcp`
 
 ## Landing Page
 
@@ -290,6 +316,7 @@ Security notes:
 agents/          repo-owned scheduled agent prompts
 apps/
   server/        Express API, scheduler, run manager, auth, SSE, terminal bridge
+  taskmanager-mcp/ local MCP server for Luma Tasks reports and task actions
   telegram-mcp/  local MCP server for Telegram messages and file uploads
   web/           React workspace UI
 landing-page/    independent GitHub Pages site
