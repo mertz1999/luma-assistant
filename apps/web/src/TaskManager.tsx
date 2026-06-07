@@ -263,6 +263,25 @@ function formatDate(timestamp: number | null, timeZone: string): string {
   ).format(timestamp);
 }
 
+function calendarDaySerial(timestamp: number, timeZone: string): number {
+  const parts = timeZoneParts(timestamp, timeZone);
+  return Math.floor(Date.UTC(parts.year, parts.month - 1, parts.day) / 86_400_000);
+}
+
+function daysUntilDate(timestamp: number, timeZone: string): number {
+  return calendarDaySerial(timestamp, timeZone) - calendarDaySerial(Date.now(), timeZone);
+}
+
+function formatDaysLeftLabel(daysLeft: number): string {
+  if (daysLeft < 0) {
+    const overdueDays = Math.abs(daysLeft);
+    return `Overdue by ${overdueDays} ${overdueDays === 1 ? "day" : "days"}`;
+  }
+  if (daysLeft === 0) return "0 days left";
+  if (daysLeft === 1) return "1 day left";
+  return `${daysLeft} days left`;
+}
+
 function taskDateBucket(task: Pick<TaskManagerTask, "dueAt">, timeZone: string): TaskDateBucket {
   if (!task.dueAt) return "none";
   if (task.dueAt < startOfToday(timeZone)) return "overdue";
@@ -271,9 +290,10 @@ function taskDateBucket(task: Pick<TaskManagerTask, "dueAt">, timeZone: string):
   return "future";
 }
 
-function formatTaskDueLabel(task: Pick<TaskManagerTask, "dueAt">, timeZone: string): string {
+function formatTaskDueLabel(task: Pick<TaskManagerTask, "dueAt" | "isDeadline">, timeZone: string): string {
   const bucket = taskDateBucket(task, timeZone);
   if (bucket === "none") return "No due date";
+  if (task.isDeadline && task.dueAt) return formatDaysLeftLabel(daysUntilDate(task.dueAt, timeZone));
   if (bucket === "overdue") return "Overdue";
   if (bucket === "today") return "Today";
   if (bucket === "tomorrow") return "Tomorrow";

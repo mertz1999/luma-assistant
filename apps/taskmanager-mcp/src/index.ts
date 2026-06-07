@@ -212,6 +212,15 @@ function dueBucket(task: Pick<TaskManagerTask, "dueAt">, timeZone: string): "ove
   return "future";
 }
 
+function calendarDaySerial(timestamp: number, timeZone: string): number {
+  const parts = timeZoneParts(timestamp, timeZone);
+  return Math.floor(Date.UTC(parts.year, parts.month - 1, parts.day) / 86_400_000);
+}
+
+function daysUntilDate(timestamp: number, timeZone: string): number {
+  return calendarDaySerial(timestamp, timeZone) - calendarDaySerial(Date.now(), timeZone);
+}
+
 function parseDueAt(input: { due_at_ms?: number | null; due_at_iso?: string; due_date?: string; due_time?: string; time_zone?: string }): number | undefined {
   if (typeof input.due_at_ms === "number") return input.due_at_ms;
   if (input.due_at_iso?.trim()) {
@@ -347,6 +356,7 @@ function simplifyTask(task: TaskManagerTask, bootstrap: TaskManagerBootstrap, ti
     dueAt: task.dueAt,
     dueBucket: dueBucket(task, timeZone),
     isDeadline: task.isDeadline,
+    deadlineDaysLeft: task.isDeadline && task.dueAt ? daysUntilDate(task.dueAt, timeZone) : null,
     completedAt: task.completedAt,
     checklist: task.checklist,
   };

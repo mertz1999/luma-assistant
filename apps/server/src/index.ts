@@ -546,6 +546,25 @@ function taskManagerPriorityIcon(priority: TaskManagerPriority): string {
   return "🟢";
 }
 
+function taskManagerCalendarDaySerial(timestamp: number, timeZone: string): number {
+  const parts = taskManagerZonedParts(timestamp, timeZone);
+  return Math.floor(Date.UTC(parts.year, parts.month - 1, parts.day) / 86_400_000);
+}
+
+function taskManagerDaysUntilDate(timestamp: number, timeZone: string): number {
+  return taskManagerCalendarDaySerial(timestamp, timeZone) - taskManagerCalendarDaySerial(Date.now(), timeZone);
+}
+
+function taskManagerFormatDaysLeftLabel(daysLeft: number): string {
+  if (daysLeft < 0) {
+    const overdueDays = Math.abs(daysLeft);
+    return `Overdue by ${overdueDays} ${overdueDays === 1 ? "day" : "days"}`;
+  }
+  if (daysLeft === 0) return "0 days left";
+  if (daysLeft === 1) return "1 day left";
+  return `${daysLeft} days left`;
+}
+
 function publicTaskManagerUser(user: PersistedTaskManagerUser): TaskManagerUser {
   const { passwordHash: _passwordHash, passwordSalt: _passwordSalt, ...safeUser } = user;
   return safeUser;
@@ -1006,6 +1025,7 @@ class TaskManagerStore {
 
   private reportDateLabel(task: TaskManagerTask, timeZone: string, todayEnd: number, tomorrowEnd: number): string {
     if (!task.dueAt) return task.isDeadline ? "No date (deadline)" : "No date";
+    if (task.isDeadline) return `${taskManagerFormatDaysLeftLabel(taskManagerDaysUntilDate(task.dueAt, timeZone))} (deadline)`;
     let label = "";
     if (task.dueAt < taskManagerStartOfToday(timeZone)) {
       label = "Overdue";
@@ -1016,7 +1036,7 @@ class TaskManagerStore {
     } else {
       label = taskManagerFormatShortDate(task.dueAt, timeZone);
     }
-    return task.isDeadline ? `${label} (deadline)` : label;
+    return label;
   }
 
   private recordActivity(taskId: string, userId: string, action: string, detail: string): void {
