@@ -17,6 +17,7 @@ import {
   LogOut,
   Menu,
   MessageSquare,
+  Moon,
   Plus,
   Search,
   Settings,
@@ -56,6 +57,7 @@ import {
   updateTaskManagerUser,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { useUiStore } from "@/store/useUiStore";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 
@@ -389,6 +391,8 @@ function emptyTaskForm(currentUserId: string): {
 }
 
 export function TaskManager(): JSX.Element {
+  const theme = useUiStore((state) => state.theme);
+  const toggleTheme = useUiStore((state) => state.toggleTheme);
   const [token, setToken] = useState(() => localStorage.getItem(tokenStorageKey) || "");
   const [bootstrap, setBootstrap] = useState<TaskManagerBootstrap | null>(null);
   const [loading, setLoading] = useState(Boolean(token));
@@ -417,6 +421,12 @@ export function TaskManager(): JSX.Element {
     startX: 0,
     scrollLeft: 0,
   });
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.setAttribute("data-theme", theme);
+    root.classList.toggle("dark", theme === "dark");
+  }, [theme]);
 
   useEffect(() => {
     registerTaskManagerPwa();
@@ -818,7 +828,7 @@ export function TaskManager(): JSX.Element {
   }
 
   if (!token || (!bootstrap && !loading)) {
-    return <TaskManagerLogin username={loginUsername} password={loginPassword} error={error} saving={saving} onUsername={setLoginUsername} onPassword={setLoginPassword} onSubmit={handleLogin} />;
+    return <TaskManagerLogin username={loginUsername} password={loginPassword} error={error} saving={saving} theme={theme} onToggleTheme={toggleTheme} onUsername={setLoginUsername} onPassword={setLoginPassword} onSubmit={handleLogin} />;
   }
 
   if (loading || !bootstrap || !currentUser) {
@@ -882,6 +892,7 @@ export function TaskManager(): JSX.Element {
               </section>
 
               <div className="mt-auto border-t border-card-border pt-3">
+                <ThemeToggleButton theme={theme} onToggleTheme={toggleTheme} className="mb-2" />
                 <Button type="button" variant="ghost" size="sm" className="tm-control-motion w-full justify-start" onClick={logout}>
                   <LogOut className="mr-2 h-4 w-4" /> Logout
                 </Button>
@@ -936,6 +947,7 @@ export function TaskManager(): JSX.Element {
                 </section>
 
                 <div className="mt-5 border-t border-card-border pt-3">
+                  <ThemeToggleButton theme={theme} onToggleTheme={toggleTheme} className="mb-2" />
                   <Button type="button" variant="ghost" size="sm" className="tm-control-motion w-full justify-start" onClick={logout}>
                     <LogOut className="mr-2 h-4 w-4" /> Logout
                   </Button>
@@ -963,6 +975,7 @@ export function TaskManager(): JSX.Element {
                   <RailButton active={projectManagerOpen} icon={<Tag className="h-4 w-4" />} label="Manage projects" onClick={openProjectManager} />
                 </div>
                 <div className="mt-auto flex w-full flex-col items-center gap-2 border-t border-card-border pt-3">
+                  <ThemeToggleButton theme={theme} onToggleTheme={toggleTheme} compact />
                   <RailButton active={false} icon={<LogOut className="h-4 w-4" />} label="Logout" onClick={logout} />
                 </div>
               </>
@@ -970,7 +983,7 @@ export function TaskManager(): JSX.Element {
           </aside>
 
           <section className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-card p-3 backdrop-blur-xl">
-            {!hasOpenOverlay ? (
+            {!hasOpenOverlay && (view === "settings" || view === "admin") ? (
               <div className="mb-3 shrink-0 lg:hidden">
                 <Button
                   type="button"
@@ -991,6 +1004,7 @@ export function TaskManager(): JSX.Element {
               <AdminPanel users={bootstrap.users} newUser={newUser} onNewUser={setNewUser} onAddUser={addUser} onUpdateUser={async (user, patch) => { await updateTaskManagerUser(user.id, patch); await refresh(); }} />
             ) : (
               <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                <MobileProjectSwitcher tabs={mobileProjectTabs} activeId={mobileProjectId} onSelect={setMobileProjectId} onSort={toggleTaskSortMode} onOpenMenu={() => setMobileMenuOpen(true)} />
                 {taskProjectColumns.length === 0 ? (
                   <div className="tm-list-rise grid min-h-0 flex-1 place-items-center rounded-xl border border-dashed border-card-border text-center text-sm text-[color:var(--text-soft)]">
                     <div>
@@ -1000,7 +1014,6 @@ export function TaskManager(): JSX.Element {
                   </div>
                 ) : (
                   <>
-                    <MobileProjectSwitcher tabs={mobileProjectTabs} activeId={mobileProjectId} onSelect={setMobileProjectId} onSort={toggleTaskSortMode} />
                     <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto lg:hidden">
                       {mobileTasks.length ? (
                         mobileTasks.map((task, index) => (
@@ -1175,11 +1188,43 @@ export function TaskManager(): JSX.Element {
   );
 }
 
+function ThemeToggleButton({
+  theme,
+  onToggleTheme,
+  compact = false,
+  className,
+}: {
+  theme: "light" | "dark";
+  onToggleTheme: () => void;
+  compact?: boolean;
+  className?: string;
+}): JSX.Element {
+  const nextThemeLabel = theme === "light" ? "Switch to dark mode" : "Switch to light mode";
+  const icon = theme === "light" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />;
+
+  if (compact) {
+    return (
+      <Button type="button" variant="ghost" size="sm" className={cn("tm-control-motion h-10 w-10 p-0", className)} onClick={onToggleTheme} aria-label={nextThemeLabel} title={nextThemeLabel}>
+        {icon}
+      </Button>
+    );
+  }
+
+  return (
+    <Button type="button" variant="ghost" size="sm" className={cn("tm-control-motion w-full justify-start", className)} onClick={onToggleTheme}>
+      <span className="mr-2">{icon}</span>
+      {nextThemeLabel}
+    </Button>
+  );
+}
+
 function TaskManagerLogin(props: {
   username: string;
   password: string;
   error: string | null;
   saving: boolean;
+  theme: "light" | "dark";
+  onToggleTheme: () => void;
   onUsername: (value: string) => void;
   onPassword: (value: string) => void;
   onSubmit: (event: FormEvent) => void;
@@ -1187,14 +1232,17 @@ function TaskManagerLogin(props: {
   return (
     <div className="tm-app grid min-h-screen place-items-center bg-background px-4 text-foreground">
       <form onSubmit={props.onSubmit} className="tm-sheet-in w-full max-w-md rounded-2xl border border-card-border bg-card p-5 shadow-soft backdrop-blur-xl">
-        <div className="mb-5 flex items-center gap-3">
-          <div className="grid h-12 w-12 place-items-center rounded-2xl bg-brand text-white">
-            <ClipboardCheck className="h-6 w-6" />
+        <div className="mb-5 flex items-start justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-brand text-white">
+              <ClipboardCheck className="h-6 w-6" />
+            </div>
+            <div className="min-w-0">
+              <h1 className="text-xl font-bold">Luma Tasks</h1>
+              <p className="text-sm text-[color:var(--text-soft)]">Sign in to manage team work</p>
+            </div>
           </div>
-          <div>
-            <h1 className="text-xl font-bold">Luma Tasks</h1>
-            <p className="text-sm text-[color:var(--text-soft)]">Sign in to manage team work</p>
-          </div>
+          <ThemeToggleButton theme={props.theme} onToggleTheme={props.onToggleTheme} compact className="shrink-0" />
         </div>
         {props.error ? <p className="mb-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">{props.error}</p> : null}
         <label className="mb-3 block text-sm font-semibold">
@@ -1268,15 +1316,26 @@ function MobileProjectSwitcher({
   activeId,
   onSelect,
   onSort,
+  onOpenMenu,
 }: {
   tabs: Array<{ id: string; name: string; color: string; count: number; sortMode: TaskSortMode }>;
   activeId: string;
   onSelect: (id: string) => void;
   onSort: (id: string) => void;
+  onOpenMenu: () => void;
 }): JSX.Element {
   return (
     <div className="sticky top-0 z-10 -mx-3 -mt-3 mb-3 border-b border-card-border bg-card/95 px-3 py-2 backdrop-blur-xl lg:hidden">
       <div className="scrollbar-none flex gap-2 overflow-x-auto">
+        <button
+          type="button"
+          className="tm-control-motion grid h-9 w-9 shrink-0 place-items-center rounded-full border border-card-border bg-control text-foreground transition hover:bg-control-hover"
+          onClick={onOpenMenu}
+          aria-label="open task navigation"
+          title="Menu"
+        >
+          <Menu className="h-4 w-4" />
+        </button>
         {tabs.map((tab) => (
           <span
             key={tab.id}

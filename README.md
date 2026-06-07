@@ -80,7 +80,7 @@ PASSWORD=change_me
 JWT_SECRET=change_me_too
 AUTH_TOKEN_TTL_SECONDS=86400
 TASK_MANAGER_ADMIN_USERNAME=admin
-TASK_MANAGER_ADMIN_PASSWORD=change_task_admin_password
+TASK_MANAGER_ADMIN_PASSWORD=
 TASK_MANAGER_JWT_SECRET=change_task_manager_secret
 TASK_MANAGER_TOKEN_TTL_SECONDS=604800
 TASK_MANAGER_DEFAULT_TIME_ZONE=Asia/Tehran
@@ -93,7 +93,7 @@ Important variables:
 
 - `PASSWORD`: browser login password.
 - `JWT_SECRET`: secret used to sign auth tokens.
-- `TASK_MANAGER_ADMIN_USERNAME` / `TASK_MANAGER_ADMIN_PASSWORD`: initial admin login for `/taskmanager`.
+- `TASK_MANAGER_ADMIN_USERNAME` / `TASK_MANAGER_ADMIN_PASSWORD`: initial admin login for `/taskmanager`. If `TASK_MANAGER_ADMIN_PASSWORD` is omitted, it uses `PASSWORD`.
 - `TASK_MANAGER_JWT_SECRET`: secret used to sign task-manager auth tokens. Falls back to `JWT_SECRET` when omitted.
 - `TASK_MANAGER_TOKEN_TTL_SECONDS`: task-manager login lifetime in seconds.
 - `TASK_MANAGER_DEFAULT_TIME_ZONE`: default timezone for new task-manager users. Users can change their own timezone from `/taskmanager/settings`.

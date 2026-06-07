@@ -5334,7 +5334,7 @@ function RightPanel(props: RightPanelProps): JSX.Element {
           Context
         </Button>
         <Button size="sm" variant={props.rightPanelTab === "tools" ? "primary" : "ghost"} onClick={() => props.setRightPanelTab("tools")}>
-          Tools
+          Other Apps
         </Button>
         <Button size="sm" variant={props.rightPanelTab === "agents" ? "primary" : "ghost"} onClick={() => props.setRightPanelTab("agents")}>
           Agents
@@ -5548,6 +5548,24 @@ function RightPanel(props: RightPanelProps): JSX.Element {
 
           <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
             <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-bold">Appearance</h3>
+              <Badge>theme</Badge>
+            </div>
+            <Button variant="ghost" onClick={props.toggleTheme} className="w-full justify-between">
+              <span className="flex items-center gap-2">
+                <Layers className="h-4 w-4" />
+                {props.theme === "light" ? "Light mode" : "Dark mode"}
+              </span>
+              {props.theme === "light" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
+            </Button>
+          </section>
+        </>
+      ) : null}
+
+      {props.rightPanelTab === "tools" ? (
+        <>
+          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+            <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-bold">Other Apps</h3>
               <Badge>apps</Badge>
             </div>
@@ -5567,24 +5585,6 @@ function RightPanel(props: RightPanelProps): JSX.Element {
             </button>
           </section>
 
-          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Appearance</h3>
-              <Badge>theme</Badge>
-            </div>
-            <Button variant="ghost" onClick={props.toggleTheme} className="w-full justify-between">
-              <span className="flex items-center gap-2">
-                <Layers className="h-4 w-4" />
-                {props.theme === "light" ? "Light mode" : "Dark mode"}
-              </span>
-              {props.theme === "light" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
-            </Button>
-          </section>
-        </>
-      ) : null}
-
-      {props.rightPanelTab === "tools" ? (
-        <>
           <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-bold">Session terminal</h3>
