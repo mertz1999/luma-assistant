@@ -1,9 +1,12 @@
 import { useMemo, useState } from "react";
 import {
   Bot,
+  CalendarCheck,
   ChevronRight,
+  ClipboardCheck,
   Github,
   Layers3,
+  ListChecks,
   MessageSquareText,
   Mic,
   Moon,
@@ -15,6 +18,7 @@ import {
   Sparkles,
   Sun,
   TerminalSquare,
+  UserCog,
 } from "lucide-react";
 
 type Mode = "light" | "dark";
@@ -66,6 +70,11 @@ const featureRows = [
     text: "Create scheduled jobs for specific recurring work, then open every result as a normal Codex session with messages and status.",
   },
   {
+    icon: ClipboardCheck,
+    title: "Luma Tasks built in",
+    text: "Run a separate task-manager PWA with projects, priorities, deadlines, timezone-aware Today views, admin users, and Telegram-ready reports.",
+  },
+  {
     icon: Network,
     title: "MCP tools in plain sight",
     text: "Keep MCP calls visible beside shell commands, web searches, file changes, diffs, approvals, and assistant responses.",
@@ -104,6 +113,7 @@ function App() {
     <main className={`min-h-screen overflow-hidden ${shell}`}>
       <Hero mode={mode} setMode={setMode} activeScreenshots={activeScreenshots} />
       <FeatureGrid />
+      <TaskManagerShowcase mode={mode} />
       <WorkflowShowcase mode={mode} />
       <FinalCta />
     </main>
@@ -289,6 +299,103 @@ function FeatureGrid() {
               <p className="mt-2 text-sm leading-6 text-[#14251f]/70">{feature.text}</p>
             </article>
           ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function TaskManagerShowcase({
+  mode,
+}: {
+  mode: Mode;
+}) {
+  const isDark = mode === "dark";
+  const shell = isDark ? "bg-[#101412] text-[#f3f0e7]" : "bg-white text-[#14251f]";
+  const panel = isDark ? "border-white/10 bg-white/[0.08]" : "border-[#14251f]/10 bg-[#f5f4ef]";
+  const muted = isDark ? "text-white/68" : "text-[#14251f]/68";
+  const tasks = [
+    { title: "Review launch checklist", meta: "Today · Website", color: "bg-[#ef2f2f]" },
+    { title: "Prepare Telegram digest", meta: "Tomorrow · Operations", color: "bg-[#f59e0b]" },
+    { title: "Update project access", meta: "Deadline · Admin", color: "bg-[#4f6df5]" },
+  ];
+
+  return (
+    <section className={`${shell}`}>
+      <div className="mx-auto grid max-w-7xl gap-8 px-5 py-16 sm:px-8 lg:grid-cols-[0.92fr_1.08fr] lg:items-center lg:px-10">
+        <div>
+          <p className="inline-flex items-center gap-2 rounded-md bg-[#2f8f7e]/12 px-3 py-2 text-sm font-semibold text-[#2f8f7e]">
+            <ClipboardCheck className="h-4 w-4" aria-hidden="true" />
+            New: Luma Tasks
+          </p>
+          <h2 className="mt-4 text-3xl font-semibold leading-tight sm:text-4xl">
+            A separate task manager for the work your agents create.
+          </h2>
+          <p className={`mt-4 max-w-2xl text-base leading-7 ${muted}`}>
+            Open `/taskmanager` as its own PWA, manage projects and users, sort project chips in the browser,
+            track deadline-heavy work, and let MCP agents send clean Today reports to Telegram.
+          </p>
+          <div className="mt-6 grid gap-3 sm:grid-cols-2">
+            {[
+              { icon: ListChecks, title: "Project columns", text: "Color-coded lists, mobile chips, and saved local ordering." },
+              { icon: CalendarCheck, title: "Deadline views", text: "Timezone-aware Today, Upcoming, Completed, and report output." },
+              { icon: UserCog, title: "Admin controls", text: "Manage users and project access from the task app." },
+              { icon: Send, title: "Telegram reports", text: "Use `luma-tasks` and `luma-tel` to send daily digests." },
+            ].map((item) => (
+              <div className={`rounded-lg border p-4 ${panel}`} key={item.title}>
+                <item.icon className="mb-3 h-5 w-5 text-[#b96f3d]" aria-hidden="true" />
+                <h3 className="text-sm font-semibold">{item.title}</h3>
+                <p className={`mt-1 text-sm leading-6 ${muted}`}>{item.text}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className={`rounded-lg border p-3 shadow-[0_24px_70px_rgba(20,37,31,0.14)] ${panel}`}>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold">Luma Tasks</div>
+              <div className={`text-xs ${muted}`}>Today · Asia/Tehran</div>
+            </div>
+            <div className="flex gap-2">
+              {["All", "Inbox", "Website"].map((chip, index) => (
+                <span
+                  className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                    index === 1 ? "bg-[#2f8f7e] text-white" : isDark ? "bg-white/10 text-white/75" : "bg-white text-[#14251f]/75"
+                  }`}
+                  key={chip}
+                >
+                  {chip}
+                </span>
+              ))}
+            </div>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-3">
+            {["Inbox", "Website", "Operations"].map((column, columnIndex) => (
+              <div className={`min-h-64 rounded-lg border p-3 ${isDark ? "border-white/10 bg-[#191d1a]" : "border-[#14251f]/10 bg-white"}`} key={column}>
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="h-2.5 w-2.5 rounded-full bg-[#2f8f7e]" />
+                    <span className="truncate text-sm font-semibold">{column}</span>
+                  </div>
+                  <span className={`rounded-full px-2 py-0.5 text-xs ${isDark ? "bg-white/10" : "bg-[#f5f4ef]"}`}>{columnIndex + 1}</span>
+                </div>
+                <div className="space-y-2">
+                  {tasks.slice(0, columnIndex + 1).map((task) => (
+                    <div className={`rounded-md border p-3 ${isDark ? "border-white/10 bg-white/[0.07]" : "border-[#14251f]/10 bg-[#f8f7f2]"}`} key={`${column}-${task.title}`}>
+                      <div className="flex items-start gap-2">
+                        <span className={`mt-1 h-2.5 w-2.5 shrink-0 rounded-full ${task.color}`} />
+                        <div className="min-w-0">
+                          <div className="truncate text-sm font-semibold">{task.title}</div>
+                          <div className={`mt-1 text-xs ${muted}`}>{task.meta}</div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
     </section>

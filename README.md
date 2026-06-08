@@ -21,10 +21,12 @@ It keeps the core Codex CLI workflow available in the app: plan mode, MCP tools,
 - `Cron-style jobs`: schedule specific assistant work for specific moments and inspect each run as a normal Codex session.
 - `Sandbox terminal`: open a controlled terminal from the browser when you need direct command access from your phone or another place.
 - `Offline voice-to-text`: dictate prompts into the assistant without relying on a remote transcription service.
+- `Luma Tasks`: use the standalone `/taskmanager` PWA for projects, task lists, priorities, deadlines, timezone-aware Today views, admin-managed users, and Telegram-ready reports.
 - `Agents and instructions`: use Codex workspace instructions such as `AGENTS.md`, plus repo-owned scheduled agents from `agents/<slug>/AGENT.md`.
 - `MCP visibility`: surface MCP calls, web searches, shell commands, file changes, and run status in the normal session timeline.
 - `Repo skill sync`: copy managed repo skills from `skills/**/SKILL.md` into `~/.codex/skills` without overwriting unmanaged global skills.
 - `Telegram MCP`: run a local Telegram MCP server for sending rendered Markdown messages and generated files to Telegram topics.
+- `Luma Tasks MCP`: inspect, search, create, assign, update, and report on Luma Tasks directly from prompts and scheduled agents.
 - `Auth and history`: protect the browser UI with a password and keep local runtime data under `data/`.
 
 ## Stack
@@ -124,6 +126,36 @@ Migrations are idempotent. When a data file needs changes, a backup is written u
 Scheduled jobs let Luma Assistant run specific assistant work at specific moments. Each execution creates a new Codex session, records status, and can be opened in the normal chat viewer.
 
 Schedule creation snapshots the selected workspace, model, sandbox, approval policy, and selected skills. The agent prompt body is read at run time, so updating the agent file changes future executions.
+
+## Luma Tasks
+
+Luma Tasks is a standalone task manager served from:
+
+```text
+/taskmanager
+```
+
+It has separate task-manager authentication from the main assistant. The initial admin account comes from `.env`, and additional users are managed inside the task-manager admin screen.
+
+Task-manager data is persisted as JSON under `data/taskmanager/` and is covered by the migration runner used by `make deploy-start`.
+
+Current task-manager capabilities include:
+
+- Project/list columns with project colors and browser-saved project chip ordering.
+- Mobile-friendly project chips with one-project-at-a-time task browsing.
+- Admin-only user management and per-project user access.
+- Tasks with status, priority, assignee, due date, optional time, deadline flag, checklist, comments, and activity.
+- Views for My Tasks, Today, Upcoming, Completed, Admin, and Settings.
+- Timezone-aware date handling, defaulting to `Asia/Tehran`.
+- Desktop collapsed sidebar icons, mobile drawer navigation, refresh control, and light/dark mode.
+- Separate PWA metadata for installing Luma Tasks apart from the main Luma Assistant app.
+- A Today report endpoint:
+
+```text
+/api/taskmanager/reports/today
+```
+
+The report endpoint returns plain text that is already formatted for Telegram. The `luma-tasks` MCP server exposes this through `get_today_report` so agents can send the report directly with `luma-tel.send_message`.
 
 ## Agents
 
@@ -281,6 +313,7 @@ PM2 process names are:
 - `luma-assistant-server`
 - `luma-assistant-web`
 - `luma-telegram-mcp`
+- `luma-taskmanager-mcp`
 
 ### Nginx
 
