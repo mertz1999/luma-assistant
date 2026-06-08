@@ -19,6 +19,7 @@ import {
   MessageSquare,
   Moon,
   Plus,
+  RefreshCw,
   Search,
   Settings,
   Shield,
@@ -912,6 +913,9 @@ export function TaskManager(): JSX.Element {
               </section>
 
               <div className="mt-auto border-t border-card-border pt-3">
+                <Button type="button" variant="ghost" size="sm" className="tm-control-motion mb-2 w-full justify-start" onClick={() => void refresh({ silent: true })}>
+                  <RefreshCw className="mr-2 h-4 w-4" /> Refresh
+                </Button>
                 <ThemeToggleButton theme={theme} onToggleTheme={toggleTheme} className="mb-2" />
                 <Button type="button" variant="ghost" size="sm" className="tm-control-motion w-full justify-start" onClick={logout}>
                   <LogOut className="mr-2 h-4 w-4" /> Logout
@@ -967,6 +971,9 @@ export function TaskManager(): JSX.Element {
                 </section>
 
                 <div className="mt-5 border-t border-card-border pt-3">
+                  <Button type="button" variant="ghost" size="sm" className="tm-control-motion mb-2 w-full justify-start" onClick={() => void refresh({ silent: true })}>
+                    <RefreshCw className="mr-2 h-4 w-4" /> Refresh
+                  </Button>
                   <ThemeToggleButton theme={theme} onToggleTheme={toggleTheme} className="mb-2" />
                   <Button type="button" variant="ghost" size="sm" className="tm-control-motion w-full justify-start" onClick={logout}>
                     <LogOut className="mr-2 h-4 w-4" /> Logout
@@ -995,6 +1002,7 @@ export function TaskManager(): JSX.Element {
                   <RailButton active={projectManagerOpen} icon={<Tag className="h-4 w-4" />} label="Manage projects" onClick={openProjectManager} />
                 </div>
                 <div className="mt-auto flex w-full flex-col items-center gap-2 border-t border-card-border pt-3">
+                  <RailButton active={false} icon={<RefreshCw className="h-4 w-4" />} label="Refresh" onClick={() => void refresh({ silent: true })} />
                   <ThemeToggleButton theme={theme} onToggleTheme={toggleTheme} compact />
                   <RailButton active={false} icon={<LogOut className="h-4 w-4" />} label="Logout" onClick={logout} />
                 </div>
