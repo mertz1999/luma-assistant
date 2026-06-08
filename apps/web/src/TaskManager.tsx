@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent as ReactMouseEvent } from "react";
 import {
+  ArrowLeft,
+  ArrowRight,
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
@@ -68,6 +70,7 @@ type TaskDateBucket = "overdue" | "today" | "tomorrow" | "future" | "none";
 type TimeZoneRegion = "All" | "Asia" | "Europe" | "America" | "Africa" | "Australia" | "UTC";
 
 const tokenStorageKey = "luma.taskmanager.token";
+const projectChipOrderStorageKey = "luma.taskmanager.projectChipOrder";
 const defaultTaskManagerTimeZone = "Asia/Tehran";
 const statusLabels: Record<TaskManagerStatus, string> = {
   todo: "Todo",
@@ -352,6 +355,41 @@ function sortTasks(tasks: TaskManagerTask[], mode: TaskSortMode): TaskManagerTas
   return sorted.sort((a, b) => taskManualOrder(a) - taskManualOrder(b) || b.updatedAt - a.updatedAt);
 }
 
+function readProjectChipOrder(): string[] {
+  try {
+    const raw = localStorage.getItem(projectChipOrderStorageKey);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return [...new Set(parsed.filter((item): item is string => typeof item === "string" && item.length > 0))];
+  } catch {
+    return [];
+  }
+}
+
+function sameStringList(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((item, index) => item === b[index]);
+}
+
+function reconcileProjectChipOrder(currentOrder: string[], projects: TaskManagerProject[]): string[] {
+  const activeIds = projects.filter((project) => !project.archived).map((project) => project.id);
+  const activeIdSet = new Set(activeIds);
+  const ordered = currentOrder.filter((id) => activeIdSet.has(id));
+  for (const id of activeIds) {
+    if (!ordered.includes(id)) ordered.push(id);
+  }
+  return sameStringList(currentOrder, ordered) ? currentOrder : ordered;
+}
+
+function sortProjectsByChipOrder(projects: TaskManagerProject[], projectOrder: string[]): TaskManagerProject[] {
+  const rank = new Map(projectOrder.map((id, index) => [id, index]));
+  return [...projects].sort((a, b) => {
+    const aRank = rank.get(a.id) ?? Number.MAX_SAFE_INTEGER;
+    const bRank = rank.get(b.id) ?? Number.MAX_SAFE_INTEGER;
+    if (aRank !== bRank) return aRank - bRank;
+    return a.createdAt - b.createdAt || a.name.localeCompare(b.name);
+  });
+}
+
 function taskViewFromPath(): TaskView {
   if (typeof window === "undefined") return "mine";
   const path = window.location.pathname.replace(/\/+$/, "");
@@ -423,6 +461,7 @@ export function TaskManager(): JSX.Element {
   const [view, setView] = useState<TaskView>(() => taskViewFromPath());
   const [projectFilter, setProjectFilter] = useState("all");
   const [mobileProjectId, setMobileProjectId] = useState("all");
+  const [projectChipOrder, setProjectChipOrder] = useState<string[]>(() => readProjectChipOrder());
   const [taskSortModes, setTaskSortModes] = useState<Record<string, TaskSortMode>>({});
   const [adminOwnTasksOnly, setAdminOwnTasksOnly] = useState(false);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
@@ -454,6 +493,10 @@ export function TaskManager(): JSX.Element {
   }, []);
 
   useEffect(() => {
+    localStorage.setItem(projectChipOrderStorageKey, JSON.stringify(projectChipOrder));
+  }, [projectChipOrder]);
+
+  useEffect(() => {
     setTaskManagerAuthToken(token || null);
     if (!token) {
       setBootstrap(null);
@@ -476,6 +519,11 @@ export function TaskManager(): JSX.Element {
   const selectedTask = bootstrap?.tasks.find((task) => task.id === selectedTaskId) || null;
 
   useEffect(() => {
+    if (!bootstrap) return;
+    setProjectChipOrder((current) => reconcileProjectChipOrder(current, bootstrap.projects));
+  }, [bootstrap]);
+
+  useEffect(() => {
     if (currentUser && currentUser.role !== "admin" && view === "admin") {
       setView("mine");
       window.history.replaceState(null, "", taskViewPath("mine"));
@@ -492,9 +540,16 @@ export function TaskManager(): JSX.Element {
       .sort((a, b) => taskManualOrder(a) - taskManualOrder(b) || b.updatedAt - a.updatedAt);
   }, [adminOwnTasksOnly, bootstrap, currentUser, currentTimeZone, projectFilter, view]);
 
+  const orderedAllProjects = useMemo(() => {
+    if (!bootstrap) return [];
+    return sortProjectsByChipOrder(bootstrap.projects, projectChipOrder);
+  }, [bootstrap, projectChipOrder]);
+
+  const orderedProjects = useMemo(() => orderedAllProjects.filter((project) => !project.archived), [orderedAllProjects]);
+
   const taskProjectColumns = useMemo(() => {
     if (!bootstrap) return [];
-    const activeProjects = bootstrap.projects.filter((project) => !project.archived && (projectFilter === "all" || project.id === projectFilter));
+    const activeProjects = orderedProjects.filter((project) => projectFilter === "all" || project.id === projectFilter);
     const projectById = new Map(activeProjects.map((project) => [project.id, project]));
     const grouped = new Map<string, { id: string; name: string; color: string; tasks: TaskManagerTask[] }>();
     const noProjectColumn = { id: "no-project", name: "No project", color: "#94a3b8", tasks: [] as TaskManagerTask[] };
@@ -526,7 +581,7 @@ export function TaskManager(): JSX.Element {
       columns.push({ ...noProjectColumn, tasks: sortTasks(noProjectColumn.tasks, taskSortModes["no-project"] || "manual") });
     }
     return columns;
-  }, [bootstrap, filteredTasks, projectFilter, taskSortModes]);
+  }, [bootstrap, filteredTasks, orderedProjects, projectFilter, taskSortModes]);
 
   const mobileProjectTabs = useMemo(
     () => [
@@ -652,6 +707,20 @@ export function TaskManager(): JSX.Element {
       ...current,
       [listId]: current[listId] === "priority_due" ? "manual" : "priority_due",
     }));
+  }
+
+  function moveProjectChip(projectId: string, direction: "left" | "right"): void {
+    if (!bootstrap || projectId === "all" || projectId === "no-project") return;
+    setProjectChipOrder((current) => {
+      const ordered = reconcileProjectChipOrder(current, bootstrap.projects);
+      const currentIndex = ordered.indexOf(projectId);
+      const nextIndex = direction === "left" ? currentIndex - 1 : currentIndex + 1;
+      if (currentIndex < 0 || nextIndex < 0 || nextIndex >= ordered.length) return ordered;
+      const next = [...ordered];
+      const [movedProjectId] = next.splice(currentIndex, 1);
+      next.splice(nextIndex, 0, movedProjectId);
+      return next;
+    });
   }
 
   async function moveTaskInList(tasks: TaskManagerTask[], taskId: string, direction: "up" | "down", listId: string): Promise<void> {
@@ -906,7 +975,7 @@ export function TaskManager(): JSX.Element {
                 </div>
                 <div className="space-y-1">
                   <ProjectFilterButton active={projectFilter === "all"} name="All projects" color="#94a3b8" onClick={() => selectProject("all")} />
-                  {bootstrap.projects.filter((project) => !project.archived).map((project) => (
+                  {orderedProjects.map((project) => (
                     <ProjectFilterButton key={project.id} active={projectFilter === project.id} name={project.name} color={project.color} onClick={() => selectProject(project.id)} />
                   ))}
                 </div>
@@ -964,7 +1033,7 @@ export function TaskManager(): JSX.Element {
                   </div>
                   <div className="space-y-1">
                     <ProjectFilterButton active={projectFilter === "all"} name="All projects" color="#94a3b8" onClick={() => selectProject("all")} />
-                    {bootstrap.projects.filter((project) => !project.archived).map((project) => (
+                    {orderedProjects.map((project) => (
                       <ProjectFilterButton key={project.id} active={projectFilter === project.id} name={project.name} color={project.color} onClick={() => selectProject(project.id)} />
                     ))}
                   </div>
@@ -996,7 +1065,7 @@ export function TaskManager(): JSX.Element {
                 <div className="my-4 h-px w-9 bg-card-border" />
                 <div className="flex w-full flex-col items-center gap-2">
                   <ProjectRailButton active={projectFilter === "all"} name="All projects" color="#94a3b8" onClick={() => selectProject("all")} />
-                  {bootstrap.projects.filter((project) => !project.archived).slice(0, 8).map((project) => (
+                  {orderedProjects.slice(0, 8).map((project) => (
                     <ProjectRailButton key={project.id} active={projectFilter === project.id} name={project.name} color={project.color} onClick={() => selectProject(project.id)} />
                   ))}
                   <RailButton active={projectManagerOpen} icon={<Tag className="h-4 w-4" />} label="Manage projects" onClick={openProjectManager} />
@@ -1032,7 +1101,7 @@ export function TaskManager(): JSX.Element {
               <AdminPanel users={bootstrap.users} newUser={newUser} onNewUser={setNewUser} onAddUser={addUser} onUpdateUser={async (user, patch) => { await updateTaskManagerUser(user.id, patch); await refresh(); }} />
             ) : (
               <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                <MobileProjectSwitcher tabs={mobileProjectTabs} activeId={mobileProjectId} onSelect={setMobileProjectId} onSort={toggleTaskSortMode} onOpenMenu={() => setMobileMenuOpen(true)} />
+                <MobileProjectSwitcher tabs={mobileProjectTabs} activeId={mobileProjectId} onSelect={setMobileProjectId} onSort={toggleTaskSortMode} onMove={moveProjectChip} onOpenMenu={() => setMobileMenuOpen(true)} />
                 {taskProjectColumns.length === 0 ? (
                   <div className="tm-list-rise grid min-h-0 flex-1 place-items-center rounded-xl border border-dashed border-card-border text-center text-sm text-[color:var(--text-soft)]">
                     <div>
@@ -1155,7 +1224,7 @@ export function TaskManager(): JSX.Element {
 
         {projectManagerOpen ? (
           <ProjectManagerModal
-            projects={bootstrap.projects}
+            projects={orderedAllProjects}
             users={bootstrap.users}
             newProjectName={newProjectName}
             newProjectColor={newProjectColor}
@@ -1344,14 +1413,19 @@ function MobileProjectSwitcher({
   activeId,
   onSelect,
   onSort,
+  onMove,
   onOpenMenu,
 }: {
   tabs: Array<{ id: string; name: string; color: string; count: number; sortMode: TaskSortMode }>;
   activeId: string;
   onSelect: (id: string) => void;
   onSort: (id: string) => void;
+  onMove: (id: string, direction: "left" | "right") => void;
   onOpenMenu: () => void;
 }): JSX.Element {
+  const movableTabs = tabs.filter((tab) => tab.id !== "all" && tab.id !== "no-project");
+  const movableIndexById = new Map(movableTabs.map((tab, index) => [tab.id, index]));
+
   return (
     <div className="sticky top-0 z-10 -mx-3 -mt-3 mb-3 border-b border-card-border bg-card/95 px-3 py-2 backdrop-blur-xl lg:hidden">
       <div className="scrollbar-none flex gap-2 overflow-x-auto">
@@ -1364,34 +1438,65 @@ function MobileProjectSwitcher({
         >
           <Menu className="h-4 w-4" />
         </button>
-        {tabs.map((tab) => (
-          <span
-            key={tab.id}
-            className={cn(
-              "tm-chip-motion inline-flex h-9 shrink-0 items-center overflow-hidden rounded-full border text-sm font-semibold transition",
-              activeId === tab.id ? "border-transparent bg-brand text-white" : "border-card-border bg-control text-foreground hover:bg-control-hover",
-            )}
-          >
-            <button type="button" onClick={() => onSelect(tab.id)} className="inline-flex h-full items-center gap-2 py-0 pl-3 pr-2">
-              <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: activeId === tab.id ? "currentColor" : tab.color }} />
-              <span>{tab.name}</span>
-              <span className={cn("rounded-full px-1.5 text-[11px]", activeId === tab.id ? "bg-white/20" : "bg-surface-2")}>{tab.count}</span>
-            </button>
-            <button
-              type="button"
-              title="Sort by priority and due date"
-              aria-label={`sort ${tab.name} tasks by priority and due date`}
+        {tabs.map((tab) => {
+          const active = activeId === tab.id;
+          const movableIndex = movableIndexById.get(tab.id) ?? -1;
+          const canMove = active && movableIndex >= 0;
+          const canMoveLeft = canMove && movableIndex > 0;
+          const canMoveRight = canMove && movableIndex < movableTabs.length - 1;
+          return (
+            <span
+              key={tab.id}
               className={cn(
-                "tm-control-motion grid h-full w-8 place-items-center border-l transition",
-                activeId === tab.id ? "border-white/20 hover:bg-white/15" : "border-card-border hover:bg-control-hover",
-                tab.sortMode === "priority_due" && (activeId === tab.id ? "bg-white/20" : "bg-brand-soft text-brand-dark"),
+                "tm-chip-motion inline-flex h-9 shrink-0 items-center overflow-hidden rounded-full border text-sm font-semibold transition",
+                active ? "border-transparent bg-brand text-white" : "border-card-border bg-control text-foreground hover:bg-control-hover",
               )}
-              onClick={() => onSort(tab.id)}
             >
-              <ArrowUpDown className="h-3.5 w-3.5" />
-            </button>
-          </span>
-        ))}
+              <button type="button" onClick={() => onSelect(tab.id)} className="inline-flex h-full items-center gap-2 py-0 pl-3 pr-2">
+                <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: active ? "currentColor" : tab.color }} />
+                <span>{tab.name}</span>
+                <span className={cn("rounded-full px-1.5 text-[11px]", active ? "bg-white/20" : "bg-surface-2")}>{tab.count}</span>
+              </button>
+              <button
+                type="button"
+                title="Sort by priority and due date"
+                aria-label={`sort ${tab.name} tasks by priority and due date`}
+                className={cn(
+                  "tm-control-motion grid h-full w-8 place-items-center border-l transition",
+                  active ? "border-white/20 hover:bg-white/15" : "border-card-border hover:bg-control-hover",
+                  tab.sortMode === "priority_due" && (active ? "bg-white/20" : "bg-brand-soft text-brand-dark"),
+                )}
+                onClick={() => onSort(tab.id)}
+              >
+                <ArrowUpDown className="h-3.5 w-3.5" />
+              </button>
+              {canMove ? (
+                <>
+                  <button
+                    type="button"
+                    title={`Move ${tab.name} left`}
+                    aria-label={`move ${tab.name} chip left`}
+                    disabled={!canMoveLeft}
+                    className={cn("tm-control-motion grid h-full w-8 place-items-center border-l border-white/20 transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-35")}
+                    onClick={() => onMove(tab.id, "left")}
+                  >
+                    <ArrowLeft className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    title={`Move ${tab.name} right`}
+                    aria-label={`move ${tab.name} chip right`}
+                    disabled={!canMoveRight}
+                    className={cn("tm-control-motion grid h-full w-8 place-items-center border-l border-white/20 transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-35")}
+                    onClick={() => onMove(tab.id, "right")}
+                  >
+                    <ArrowRight className="h-3.5 w-3.5" />
+                  </button>
+                </>
+              ) : null}
+            </span>
+          );
+        })}
       </div>
     </div>
   );
