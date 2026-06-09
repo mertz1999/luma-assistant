@@ -219,6 +219,13 @@ type QueuedMessage = {
   agents: SelectedAgentRef[];
 };
 
+type ProcessingQueueItem = {
+  item: QueuedMessage;
+  runSessionKey: string | null;
+  startedAt: number;
+  observedActive: boolean;
+};
+
 type SpeechRecognitionAlternativeLike = {
   transcript?: string;
 };
@@ -2014,7 +2021,7 @@ export function App(): JSX.Element {
   const [slashEntriesBySession, setSlashEntriesBySession] = useState<Record<string, TimelineEntry[]>>({});
   const [queuedBySession, setQueuedBySession] = useState<Record<string, QueuedMessage[]>>(() => loadQueuedMessages());
   const [terminalHistoryBySession, setTerminalHistoryBySession] = useState<Record<string, string[]>>(() => loadTerminalCommandHistory());
-  const [processingQueueItemId, setProcessingQueueItemId] = useState<string | null>(null);
+  const [processingQueueItem, setProcessingQueueItem] = useState<ProcessingQueueItem | null>(null);
   const [toolDetailModal, setToolDetailModal] = useState<ToolDetailModalState | null>(null);
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
   const [terminalsBySession, setTerminalsBySession] = useState<Record<string, TerminalSessionSnapshot>>({});
@@ -2525,14 +2532,20 @@ export function App(): JSX.Element {
       })
       .slice(0, 30);
   }, [agents, selectedPromptAgentIds, agentQueryToken]);
-  const runningSessionIds = useMemo(() => {
+  const busySessionIds = useMemo(() => {
     const ids = new Set<string>();
     for (const item of allSessions) {
-      if (!item.historyOnly && item.status === "running") ids.add(item.sessionId);
+      if (!item.historyOnly && (item.status === "queued" || item.status === "running")) ids.add(item.sessionId);
     }
     return ids;
   }, [allSessions]);
-  const queuedMessagesForActiveSession = queuedBySession[sessionTimelineKey] || [];
+  const activeProcessingQueueItem = processingQueueItem?.item.sessionKey === sessionTimelineKey ? processingQueueItem.item : null;
+  const queuedMessagesForActiveSession = useMemo(() => {
+    const queued = queuedBySession[sessionTimelineKey] || [];
+    if (!activeProcessingQueueItem) return queued;
+    if (queued.some((item) => item.id === activeProcessingQueueItem.id)) return queued;
+    return [activeProcessingQueueItem, ...queued];
+  }, [activeProcessingQueueItem, queuedBySession, sessionTimelineKey]);
 
   const mobileHeaderTitle = selectedSession
     ? truncatePreview(selectedSession.summary || `Session ${selectedSession.id}`, 34)
@@ -2646,24 +2659,51 @@ export function App(): JSX.Element {
   }, [isDraftSession, selectedSessionId, selectedSession]);
 
   useEffect(() => {
+    if (!processingQueueItem) return;
+
+    const runSessionKey = processingQueueItem.runSessionKey || processingQueueItem.item.sessionKey;
+    const session = allSessions.find((item) => item.id === runSessionKey || item.sessionId === runSessionKey);
+    if (!session || session.historyOnly) return;
+
+    const isActive = session.status === "queued" || session.status === "running";
+    if (isActive && !processingQueueItem.observedActive) {
+      setProcessingQueueItem((current) => current && current.item.id === processingQueueItem.item.id
+        ? { ...current, observedActive: true }
+        : current);
+      return;
+    }
+
+    const isTerminal = session.status === "completed" || session.status === "failed" || session.status === "stopped";
+    const terminalAfterQueueStart = isTerminal && session.updatedAt >= processingQueueItem.startedAt;
+    if ((processingQueueItem.observedActive && isTerminal) || terminalAfterQueueStart) {
+      setProcessingQueueItem((current) => current?.item.id === processingQueueItem.item.id ? null : current);
+    }
+  }, [allSessions, processingQueueItem]);
+
+  useEffect(() => {
     const node = terminalOutputRef.current;
     if (!node || !selectedSessionId || !selectedTerminal) return;
     node.scrollTop = node.scrollHeight;
   }, [selectedSessionId, selectedTerminal?.output]);
 
   useEffect(() => {
-    if (submitting || processingQueueItemId) return;
+    if (submitting || processingQueueItem) return;
 
     for (const [sessionKey, queued] of Object.entries(queuedBySession)) {
       if (!queued.length) continue;
       if (sessionKey === draftSessionKey) continue;
-      if (runningSessionIds.has(sessionKey)) continue;
+      if (busySessionIds.has(sessionKey)) continue;
 
-      setProcessingQueueItemId(queued[0].id);
+      setProcessingQueueItem({
+        item: queued[0],
+        runSessionKey: null,
+        startedAt: Date.now(),
+        observedActive: false,
+      });
       void runQueuedMessage(queued[0]);
       return;
     }
-  }, [queuedBySession, runningSessionIds, submitting, processingQueueItemId]);
+  }, [queuedBySession, busySessionIds, submitting, processingQueueItem]);
 
   async function onAuthenticate(event?: FormEvent): Promise<void> {
     event?.preventDefault();
@@ -3187,9 +3227,18 @@ export function App(): JSX.Element {
 
   async function runQueuedMessage(queued: QueuedMessage): Promise<void> {
     const focusSession = selectedSessionId === queued.sessionKey;
+    let accepted = false;
     try {
       setSubmitting(true);
-      await startCodexRun(queued, focusSession);
+      const result = await startCodexRun(queued, focusSession);
+      accepted = true;
+      removeQueuedMessage(queued.sessionKey, queued.id);
+      setProcessingQueueItem((current) => current?.item.id === queued.id
+        ? {
+            ...current,
+            runSessionKey: result.sessionId,
+          }
+        : current);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to run queued message";
       pushSlashEntries(queued.sessionKey, [
@@ -3202,9 +3251,11 @@ export function App(): JSX.Element {
           Date.now(),
         ),
       ]);
-    } finally {
       removeQueuedMessage(queued.sessionKey, queued.id);
-      setProcessingQueueItemId((current) => (current === queued.id ? null : current));
+    } finally {
+      if (!accepted) {
+        setProcessingQueueItem((current) => current?.item.id === queued.id ? null : current);
+      }
       setSubmitting(false);
     }
   }
@@ -3618,7 +3669,7 @@ export function App(): JSX.Element {
     }
 
     try {
-      const shouldQueueBehindActiveRun = sessionKey !== draftSessionKey && runningSessionIds.has(sessionKey);
+      const shouldQueueBehindActiveRun = sessionKey !== draftSessionKey && busySessionIds.has(sessionKey);
       if (shouldQueueBehindActiveRun) {
         enqueueMessage(buildQueuedMessage(sessionKey, trimmedPrompt, {
           attachments: pendingAttachments,
@@ -4172,6 +4223,7 @@ export function App(): JSX.Element {
             slashSuggestions={slashSuggestions}
             onSelectSlashCommand={onSelectSlashCommand}
             queueItems={queuedMessagesForActiveSession}
+            processingQueueItemId={processingQueueItem?.item.sessionKey === sessionTimelineKey ? processingQueueItem.item.id : null}
             onRemoveQueueItem={(messageId) => removeQueuedMessage(sessionTimelineKey, messageId)}
             onRetryMessage={onRetryTimelineMessage}
             onSelectAttachments={uploadPendingFiles}
@@ -4565,6 +4617,7 @@ type CenterPanelProps = {
   slashSuggestions: SlashCommandSuggestion[];
   onSelectSlashCommand: (command: SlashCommandKey) => Promise<void>;
   queueItems: QueuedMessage[];
+  processingQueueItemId: string | null;
   onRemoveQueueItem: (messageId: string) => void;
   onRetryMessage: (entry: TimelineEntry) => Promise<void>;
   onSelectAttachments: (files: FileList | null) => Promise<void>;
@@ -4589,7 +4642,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
   const attachmentDragDepthRef = useRef(0);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const timelineBlocks = useMemo(() => buildTimelineRenderBlocks(props.timeline), [props.timeline]);
-  const selectedSessionRunning = Boolean(props.selectedSession && !props.selectedSession.historyOnly && props.selectedSession.status === "running");
+  const selectedSessionBusy = Boolean(props.selectedSession && !props.selectedSession.historyOnly && (props.selectedSession.status === "queued" || props.selectedSession.status === "running"));
   const attachmentDropDisabled = props.submitting || props.isUploadingAttachments;
 
   useEffect(() => {
@@ -4982,16 +5035,26 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             <div className="mb-3 rounded-xl border border-card-border bg-surface-1/85 p-2">
               <div className="mb-1 flex items-center justify-between gap-2">
                 <div className="text-xs font-semibold text-foreground/80">Queued messages ({props.queueItems.length})</div>
-                {selectedSessionRunning ? (
+                {selectedSessionBusy ? (
                   <div className="text-[11px] text-foreground/60">Will send after current run finishes</div>
                 ) : null}
               </div>
               <div className="space-y-1">
-                {props.queueItems.slice(0, 5).map((item) => (
+                {props.queueItems.slice(0, 5).map((item) => {
+                  const isProcessing = item.id === props.processingQueueItemId;
+                  return (
                   <div key={item.id} className="flex items-center gap-2 rounded-lg bg-surface-2/60 px-2 py-1">
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-xs text-foreground/80" title={item.prompt}>
-                        {truncatePreview(item.prompt, 140)}
+                      <div className="flex items-center gap-2">
+                        <div className="min-w-0 flex-1 truncate text-xs text-foreground/80" title={item.prompt}>
+                          {truncatePreview(item.prompt, 140)}
+                        </div>
+                        {isProcessing ? (
+                          <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-brand-soft px-2 py-0.5 text-[10px] font-semibold text-brand-dark">
+                            <LoaderCircle className="h-3 w-3 animate-spin" />
+                            Sending now
+                          </span>
+                        ) : null}
                       </div>
                       {item.attachments.length > 0 ? (
                         <div className="text-[11px] text-foreground/60">{formatAttachmentSummary(item.attachments)}</div>
@@ -5005,15 +5068,17 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                     </div>
                     <button
                       type="button"
-                      className="rounded p-1 text-foreground/70 transition hover:bg-black/5 hover:text-foreground dark:hover:bg-control-hover/70"
+                      className="rounded p-1 text-foreground/70 transition hover:bg-black/5 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-control-hover/70"
                       onClick={() => props.onRemoveQueueItem(item.id)}
+                      disabled={isProcessing}
                       aria-label="Remove queued message"
-                      title="Remove"
+                      title={isProcessing ? "This message is already sending" : "Remove"}
                     >
                       <X className="h-3.5 w-3.5" />
                     </button>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           ) : null}
@@ -5180,8 +5245,8 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             <Button
               type="button"
               disabled={props.submitting || props.isUploadingAttachments}
-              aria-label={selectedSessionRunning ? "Queue message" : "Send message"}
-              title={selectedSessionRunning ? "Queue message" : "Send message"}
+              aria-label={selectedSessionBusy ? "Queue message" : "Send message"}
+              title={selectedSessionBusy ? "Queue message" : "Send message"}
               onClick={props.onSendButtonClick}
               className="h-[44px] w-[44px] shrink-0 rounded-full p-0"
             >
