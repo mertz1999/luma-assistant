@@ -89,6 +89,7 @@ TASK_MANAGER_TOKEN_TTL_SECONDS=604800
 TASK_MANAGER_DEFAULT_TIME_ZONE=Asia/Tehran
 DEFAULT_MODEL=gpt-5.3-codex
 DEFAULT_SANDBOX=danger-full-access
+ATTACHMENT_MAX_BYTES=15728640
 MAX_CONCURRENT_RUNS=8
 ```
 
@@ -103,6 +104,7 @@ Important variables:
 - `CODEX_PATH`: path to the Codex executable if it is not simply `codex`.
 - `DEFAULT_MODEL`: default Codex model for new sessions and new scheduled jobs.
 - `DEFAULT_SANDBOX`: default sandbox mode for new sessions.
+- `ATTACHMENT_MAX_BYTES`: max browser attachment upload size in bytes. Defaults to 15 MB.
 - `MAX_CONCURRENT_RUNS`: server-side cap for active Codex runs.
 - `TERMINAL_DISABLE_PTY=1`: force plain-pipe terminal mode.
 - `TERMINAL_SHELL=/bin/bash`: choose the shell used by session terminals.
@@ -333,6 +335,19 @@ sudo systemctl reload nginx
 ```
 
 Customize `server_name`, TLS certificate paths, and upstream ports before reloading Nginx. The example handles `/api/events` as non-buffered SSE, `/api/*` as API traffic, and `/` as web app traffic.
+
+The example also sets:
+
+```nginx
+client_max_body_size 20m;
+```
+
+This must be higher than `ATTACHMENT_MAX_BYTES`; otherwise Nginx's default 1 MB request limit can reject image uploads before they reach the app. If an already-deployed server rejects a small attachment with `413 Request Entity Too Large`, add or update `client_max_body_size` in `/etc/nginx/sites-available/luma-assistant.conf`, then run:
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
 
 ## Data And Security
 

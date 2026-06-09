@@ -25,6 +25,10 @@ server {
   ssl_certificate /path/to/fullchain.pem;
   ssl_certificate_key /path/to/privkey.pem;
 
+  # Keep this higher than ATTACHMENT_MAX_BYTES so Nginx does not reject
+  # image/text attachments before the Luma Assistant API can validate them.
+  client_max_body_size 20m;
+
   # Recommended TLS settings (optional hardening)
   ssl_session_timeout 1d;
   ssl_session_cache shared:MozSSL:10m;
