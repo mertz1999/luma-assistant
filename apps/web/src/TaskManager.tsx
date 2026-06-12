@@ -1554,7 +1554,11 @@ function TaskCard({ task, users, labels, selected, timeZone, compact = false, ca
               </span>
               <Badge>{statusLabels[task.status]}</Badge>
             </div>
-            {!compact && task.description ? <p className="mt-1 hidden line-clamp-2 text-sm text-[color:var(--text-soft)] lg:block">{task.description}</p> : null}
+            {!compact && task.description ? (
+              <p className="mt-1 hidden line-clamp-1 text-sm text-[color:var(--text-soft)] lg:block" title={task.description}>
+                {task.description}
+              </p>
+            ) : null}
             <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[color:var(--text-soft)]">
               <span
                 className={cn(
@@ -1613,6 +1617,18 @@ function TaskCard({ task, users, labels, selected, timeZone, compact = false, ca
             </button>
             <button type="button" title="Remove date" aria-label="Remove date" className="tm-control-motion grid h-8 w-8 place-items-center rounded-lg border border-card-border bg-control text-foreground hover:bg-control-hover" onClick={() => onDueAt(null)}>
               <CalendarX className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              title={task.status === "in_progress" ? "Move to todo" : "Move to doing"}
+              aria-label={task.status === "in_progress" ? "Move to todo" : "Move to doing"}
+              className={cn(
+                "tm-control-motion grid h-8 w-8 place-items-center rounded-lg border border-card-border bg-control text-foreground hover:bg-control-hover",
+                task.status === "in_progress" && "border-brand/40 bg-brand-soft text-brand-dark",
+              )}
+              onClick={() => onStatus(task.status === "in_progress" ? "todo" : "in_progress")}
+            >
+              {task.status === "in_progress" ? <ListTodo className="h-4 w-4" /> : <ClipboardCheck className="h-4 w-4" />}
             </button>
           </div>
         ) : null}
