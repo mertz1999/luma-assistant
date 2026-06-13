@@ -688,7 +688,7 @@ class TaskManagerStore {
       .filter((task) => this.canAccessTask(session, task))
       .filter((task) => task.status !== "done")
       .filter((task) => task.dueAt !== null && (task.dueAt <= todayEnd || task.isDeadline))
-      .filter((task) => !input.onlyMine || (task.assigneeId ? task.assigneeId === session.userId : task.createdBy === session.userId))
+      .filter((task) => !input.onlyMine || task.assigneeId === session.userId)
       .filter((task) => !input.assigneeId || task.assigneeId === input.assigneeId)
       .filter((task) => !input.projectId || task.projectId === input.projectId)
       .sort((a, b) => {

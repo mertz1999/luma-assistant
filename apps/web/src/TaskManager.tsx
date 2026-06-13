@@ -335,6 +335,10 @@ function isOwnTask(task: TaskManagerTask, currentUserId: string): boolean {
   return task.assigneeId ? task.assigneeId === currentUserId : task.createdBy === currentUserId;
 }
 
+function isAssignedToUser(task: TaskManagerTask, currentUserId: string): boolean {
+  return task.assigneeId === currentUserId;
+}
+
 function taskManualOrder(task: TaskManagerTask): number {
   return task.sortOrder || task.createdAt || task.updatedAt;
 }
@@ -533,9 +537,10 @@ export function TaskManager(): JSX.Element {
   const filteredTasks = useMemo(() => {
     if (!bootstrap || !currentUser) return [];
     const adminSeeingAllTasks = currentUser.role === "admin" && !adminOwnTasksOnly;
+    const adminSeeingOwnTasksOnly = currentUser.role === "admin" && adminOwnTasksOnly;
     return bootstrap.tasks
       .filter((task) => taskMatchesView(task, view === "admin" ? "mine" : view, currentUser.id, currentTimeZone, adminSeeingAllTasks))
-      .filter((task) => adminSeeingAllTasks || isOwnTask(task, currentUser.id))
+      .filter((task) => adminSeeingAllTasks || (adminSeeingOwnTasksOnly ? isAssignedToUser(task, currentUser.id) : isOwnTask(task, currentUser.id)))
       .filter((task) => projectFilter === "all" || task.projectId === projectFilter)
       .sort((a, b) => taskManualOrder(a) - taskManualOrder(b) || b.updatedAt - a.updatedAt);
   }, [adminOwnTasksOnly, bootstrap, currentUser, currentTimeZone, projectFilter, view]);
