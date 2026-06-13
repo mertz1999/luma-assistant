@@ -1792,13 +1792,33 @@ class RunManager extends EventEmitter {
   }
 
   loadPersisted(runs: RunRecord[], approvals: ApprovalQueueItem[]): void {
+    const now = Date.now();
+    const staleRunIds = new Set<string>();
     for (const run of runs) {
+      const staleActiveRun = run.status === "queued" || run.status === "running";
+      if (staleActiveRun) staleRunIds.add(run.id);
+      const restartMessage = "Server restarted before this run completed. Marked as failed because no live Codex process is attached.";
+      const events = staleActiveRun
+        ? [
+            ...run.events,
+            {
+              id: `evt_${now}_${Math.random().toString(36).slice(2, 8)}`,
+              at: now,
+              source: "system" as const,
+              text: restartMessage,
+            },
+          ].slice(-1500)
+        : run.events;
       this.runs.set(run.id, {
         ...run,
+        status: staleActiveRun ? "failed" : run.status,
+        updatedAt: staleActiveRun ? now : run.updatedAt,
         config: {
           ...run.config,
           attachments: normalizeAttachmentRefs(run.config?.attachments),
         },
+        events,
+        lastError: staleActiveRun ? restartMessage : run.lastError,
         sessionId: typeof run.sessionId === "string"
           ? run.sessionId
           : typeof run.threadId === "string"
@@ -1807,7 +1827,11 @@ class RunManager extends EventEmitter {
         archivedAt: typeof run.archivedAt === "number" ? run.archivedAt : null,
       });
     }
-    for (const item of approvals) this.approvals.set(item.id, item);
+    for (const item of approvals) {
+      if (staleRunIds.has(item.runId)) continue;
+      this.approvals.set(item.id, item);
+    }
+    if (staleRunIds.size > 0) this.persistState();
   }
 
   getRuns(includeArchived = true): RunRecord[] {
