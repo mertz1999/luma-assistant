@@ -3944,6 +3944,10 @@ export function App(): JSX.Element {
     }
   }
 
+  function onDisablePlanMode(): void {
+    setPlanState(sessionTimelineKey, "idle");
+  }
+
   async function onRetryTimelineMessage(entry: TimelineEntry): Promise<void> {
     if (entry.role !== "user" || entry.deliveryStatus !== "failed") return;
     try {
@@ -4235,6 +4239,7 @@ export function App(): JSX.Element {
             onToggleVoiceRecording={onToggleVoiceRecording}
             onSendButtonClick={onSendButtonClick}
             planSessionState={planSessionState}
+            onDisablePlanMode={onDisablePlanMode}
             onAnswerPlanQuestions={onAnswerPlanQuestions}
             onApprovePlanImplementation={onApprovePlanImplementation}
             onSubmitPlanFeedback={onSubmitPlanFeedback}
@@ -4629,6 +4634,7 @@ type CenterPanelProps = {
   onToggleVoiceRecording: () => void;
   onSendButtonClick: () => void;
   planSessionState: PlanSessionState;
+  onDisablePlanMode: () => void;
   onAnswerPlanQuestions: (answers: PlanQuestionAnswer[]) => Promise<void>;
   onApprovePlanImplementation: () => Promise<void>;
   onSubmitPlanFeedback: (feedback: string) => Promise<void>;
@@ -4935,10 +4941,21 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           />
 
           {props.planSessionState !== "idle" ? (
-            <div className="mb-3 rounded-2xl border border-brand/30 bg-brand-soft/40 px-3 py-2 text-sm text-foreground/80">
-              {props.planSessionState === "armed"
-                ? "Plan mode is enabled. Your next message will start the planning workflow."
-                : "Planning workflow is active. Messages stay read-only until final approval."}
+            <div className="mb-3 flex items-start justify-between gap-3 rounded-2xl border border-brand/30 bg-brand-soft/40 px-3 py-2 text-sm text-foreground/80">
+              <span className="min-w-0">
+                {props.planSessionState === "armed"
+                  ? "Plan mode is enabled. Your next message will start the planning workflow."
+                  : "Planning workflow is active. Messages stay read-only until final approval."}
+              </span>
+              <button
+                type="button"
+                className="shrink-0 rounded-full p-1 text-foreground/60 transition hover:bg-black/5 hover:text-foreground focus:outline-none focus:ring-2 focus:ring-brand/30 dark:hover:bg-control-hover/70"
+                onClick={props.onDisablePlanMode}
+                aria-label="Disable plan mode"
+                title="Disable plan mode"
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
           ) : null}
 
