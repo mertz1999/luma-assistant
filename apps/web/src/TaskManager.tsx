@@ -952,7 +952,7 @@ export function TaskManager(): JSX.Element {
                 </Button>
               </div>
               <nav className="space-y-1">
-                <ViewButton active={view === "mine"} icon={<ListTodo className="h-4 w-4" />} label="My Tasks" onClick={() => selectView("mine")} />
+                <ViewButton active={view === "mine"} icon={<ListTodo className="h-4 w-4" />} label="All the tasks" onClick={() => selectView("mine")} />
                 <ViewButton active={view === "today"} icon={<Calendar className="h-4 w-4" />} label="Today" onClick={() => selectView("today")} />
                 <ViewButton active={view === "upcoming"} icon={<ChevronRight className="h-4 w-4" />} label="Upcoming" onClick={() => selectView("upcoming")} />
                 <ViewButton active={view === "completed"} icon={<CheckCircle2 className="h-4 w-4" />} label="Completed" onClick={() => selectView("completed")} />
@@ -1010,7 +1010,7 @@ export function TaskManager(): JSX.Element {
                   </div>
                 </div>
                 <nav className="space-y-1">
-                  <ViewButton active={view === "mine"} icon={<ListTodo className="h-4 w-4" />} label="My Tasks" onClick={() => selectView("mine")} />
+                  <ViewButton active={view === "mine"} icon={<ListTodo className="h-4 w-4" />} label="All the tasks" onClick={() => selectView("mine")} />
                   <ViewButton active={view === "today"} icon={<Calendar className="h-4 w-4" />} label="Today" onClick={() => selectView("today")} />
                   <ViewButton active={view === "upcoming"} icon={<ChevronRight className="h-4 w-4" />} label="Upcoming" onClick={() => selectView("upcoming")} />
                   <ViewButton active={view === "completed"} icon={<CheckCircle2 className="h-4 w-4" />} label="Completed" onClick={() => selectView("completed")} />
@@ -1055,7 +1055,7 @@ export function TaskManager(): JSX.Element {
                   <Menu className="h-5 w-5" />
                 </Button>
                 <nav className="flex w-full flex-col items-center gap-1">
-                  <RailButton active={view === "mine"} icon={<ListTodo className="h-4 w-4" />} label="My Tasks" onClick={() => selectView("mine")} />
+                  <RailButton active={view === "mine"} icon={<ListTodo className="h-4 w-4" />} label="All the tasks" onClick={() => selectView("mine")} />
                   <RailButton active={view === "today"} icon={<Calendar className="h-4 w-4" />} label="Today" onClick={() => selectView("today")} />
                   <RailButton active={view === "upcoming"} icon={<ChevronRight className="h-4 w-4" />} label="Upcoming" onClick={() => selectView("upcoming")} />
                   <RailButton active={view === "completed"} icon={<CheckCircle2 className="h-4 w-4" />} label="Completed" onClick={() => selectView("completed")} />
