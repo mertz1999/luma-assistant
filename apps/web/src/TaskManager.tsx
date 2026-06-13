@@ -332,7 +332,7 @@ function parseDueInput(dateValue: string, includeTime: boolean, timeValue: strin
 }
 
 function isOwnTask(task: TaskManagerTask, currentUserId: string): boolean {
-  return task.assigneeId === currentUserId || task.createdBy === currentUserId;
+  return task.assigneeId ? task.assigneeId === currentUserId : task.createdBy === currentUserId;
 }
 
 function taskManualOrder(task: TaskManagerTask): number {
