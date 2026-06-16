@@ -468,6 +468,7 @@ export function TaskManager(): JSX.Element {
   const [projectChipOrder, setProjectChipOrder] = useState<string[]>(() => readProjectChipOrder());
   const [taskSortModes, setTaskSortModes] = useState<Record<string, TaskSortMode>>({});
   const [adminOwnTasksOnly, setAdminOwnTasksOnly] = useState(false);
+  const [adminUserFilter, setAdminUserFilter] = useState("all");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [creatingTask, setCreatingTask] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -485,6 +486,7 @@ export function TaskManager(): JSX.Element {
     startX: 0,
     scrollLeft: 0,
   });
+  const autoRefreshInFlightRef = useRef(false);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -528,6 +530,11 @@ export function TaskManager(): JSX.Element {
   }, [bootstrap]);
 
   useEffect(() => {
+    if (!bootstrap || adminUserFilter === "all") return;
+    if (!bootstrap.users.some((user) => user.id === adminUserFilter)) setAdminUserFilter("all");
+  }, [adminUserFilter, bootstrap]);
+
+  useEffect(() => {
     if (currentUser && currentUser.role !== "admin" && view === "admin") {
       setView("mine");
       window.history.replaceState(null, "", taskViewPath("mine"));
@@ -536,14 +543,23 @@ export function TaskManager(): JSX.Element {
 
   const filteredTasks = useMemo(() => {
     if (!bootstrap || !currentUser) return [];
-    const adminSeeingAllTasks = currentUser.role === "admin" && !adminOwnTasksOnly;
+    const adminSelectedUserId = currentUser.role === "admin" && adminUserFilter !== "all" ? adminUserFilter : null;
+    const adminSeeingAllTasks = currentUser.role === "admin" && !adminOwnTasksOnly && !adminSelectedUserId;
     const adminSeeingOwnTasksOnly = currentUser.role === "admin" && adminOwnTasksOnly;
     return bootstrap.tasks
-      .filter((task) => taskMatchesView(task, view === "admin" ? "mine" : view, currentUser.id, currentTimeZone, adminSeeingAllTasks))
-      .filter((task) => adminSeeingAllTasks || (adminSeeingOwnTasksOnly ? isAssignedToUser(task, currentUser.id) : isOwnTask(task, currentUser.id)))
+      .filter((task) => taskMatchesView(task, view === "admin" ? "mine" : view, currentUser.id, currentTimeZone, currentUser.role === "admin"))
+      .filter((task) => {
+        if (adminSeeingAllTasks) return true;
+        if (currentUser.role === "admin") {
+          const matchesSelectedUser = adminSelectedUserId ? isAssignedToUser(task, adminSelectedUserId) : false;
+          const matchesCurrentUser = adminSeeingOwnTasksOnly ? isAssignedToUser(task, currentUser.id) : false;
+          return matchesSelectedUser || matchesCurrentUser;
+        }
+        return isOwnTask(task, currentUser.id);
+      })
       .filter((task) => projectFilter === "all" || task.projectId === projectFilter)
       .sort((a, b) => taskManualOrder(a) - taskManualOrder(b) || b.updatedAt - a.updatedAt);
-  }, [adminOwnTasksOnly, bootstrap, currentUser, currentTimeZone, projectFilter, view]);
+  }, [adminOwnTasksOnly, adminUserFilter, bootstrap, currentUser, currentTimeZone, projectFilter, view]);
 
   const orderedAllProjects = useMemo(() => {
     if (!bootstrap) return [];
@@ -605,6 +621,20 @@ export function TaskManager(): JSX.Element {
     if (mobileProjectId === "all") return;
     if (!mobileProjectTabs.some((tab) => tab.id === mobileProjectId)) setMobileProjectId("all");
   }, [mobileProjectId, mobileProjectTabs]);
+
+  useEffect(() => {
+    if (!token || !bootstrap) return;
+
+    const timer = window.setInterval(() => {
+      if (autoRefreshInFlightRef.current) return;
+      autoRefreshInFlightRef.current = true;
+      void refresh({ silent: true }).finally(() => {
+        autoRefreshInFlightRef.current = false;
+      });
+    }, 5000);
+
+    return () => window.clearInterval(timer);
+  }, [bootstrap, token]);
 
   async function refresh(options: { silent?: boolean } = {}): Promise<void> {
     try {
@@ -965,10 +995,14 @@ export function TaskManager(): JSX.Element {
                 <ViewButton active={view === "settings"} icon={<Settings className="h-4 w-4" />} label="Settings" onClick={() => selectView("settings")} />
               </nav>
               {currentUser.role === "admin" ? (
-                <label className="mt-3 flex items-center gap-2 rounded-xl border border-card-border bg-control px-3 py-2 text-sm font-semibold">
-                  <input checked={adminOwnTasksOnly} onChange={(event) => setAdminOwnTasksOnly(event.target.checked)} type="checkbox" className="h-4 w-4 accent-brand" />
-                  Only my tasks
-                </label>
+                <AdminTaskFilterControls
+                  users={bootstrap.users}
+                  currentUser={currentUser}
+                  onlyMine={adminOwnTasksOnly}
+                  userFilter={adminUserFilter}
+                  onOnlyMine={setAdminOwnTasksOnly}
+                  onUserFilter={setAdminUserFilter}
+                />
               ) : null}
 
               <section className="mt-5">
@@ -1023,10 +1057,14 @@ export function TaskManager(): JSX.Element {
                   <ViewButton active={view === "settings"} icon={<Settings className="h-4 w-4" />} label="Settings" onClick={() => selectView("settings")} />
                 </nav>
                 {currentUser.role === "admin" ? (
-                  <label className="mt-3 flex items-center gap-2 rounded-xl border border-card-border bg-control px-3 py-2 text-sm font-semibold">
-                    <input checked={adminOwnTasksOnly} onChange={(event) => setAdminOwnTasksOnly(event.target.checked)} type="checkbox" className="h-4 w-4 accent-brand" />
-                    Only my tasks
-                  </label>
+                  <AdminTaskFilterControls
+                    users={bootstrap.users}
+                    currentUser={currentUser}
+                    onlyMine={adminOwnTasksOnly}
+                    userFilter={adminUserFilter}
+                    onOnlyMine={setAdminOwnTasksOnly}
+                    onUserFilter={setAdminUserFilter}
+                  />
                 ) : null}
 
                 <section className="mt-5">
@@ -1367,6 +1405,55 @@ function ViewButton({ active, icon, label, onClick }: { active: boolean; icon: J
       {icon}
       {label}
     </button>
+  );
+}
+
+function AdminTaskFilterControls({
+  users,
+  currentUser,
+  onlyMine,
+  userFilter,
+  onOnlyMine,
+  onUserFilter,
+}: {
+  users: TaskManagerUser[];
+  currentUser: TaskManagerUser;
+  onlyMine: boolean;
+  userFilter: string;
+  onOnlyMine: (value: boolean) => void;
+  onUserFilter: (value: string) => void;
+}): JSX.Element {
+  const orderedUsers = [...users].sort((a, b) => {
+    if (a.id === currentUser.id) return -1;
+    if (b.id === currentUser.id) return 1;
+    return a.displayName.localeCompare(b.displayName);
+  });
+
+  return (
+    <div className="mt-3 space-y-2">
+      <label className="flex items-center gap-2 rounded-xl border border-card-border bg-control px-3 py-2 text-sm font-semibold">
+        <input checked={onlyMine} onChange={(event) => onOnlyMine(event.target.checked)} type="checkbox" className="h-4 w-4 accent-brand" />
+        Only my tasks
+      </label>
+      <label className="block rounded-xl border border-card-border bg-control px-3 py-2">
+        <span className="mb-1.5 flex items-center gap-2 text-xs font-bold uppercase text-[color:var(--text-soft)]">
+          <Users className="h-3.5 w-3.5" />
+          User tasks
+        </span>
+        <select
+          value={userFilter}
+          onChange={(event) => onUserFilter(event.target.value)}
+          className="h-9 w-full rounded-lg border border-card-border bg-surface-1 px-2 text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
+        >
+          <option value="all">All users</option>
+          {orderedUsers.map((user) => (
+            <option key={user.id} value={user.id}>
+              {user.id === currentUser.id ? `${user.displayName} (me)` : `${user.displayName}${user.active ? "" : " (disabled)"}`}
+            </option>
+          ))}
+        </select>
+      </label>
+    </div>
   );
 }
 

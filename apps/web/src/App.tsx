@@ -2055,6 +2055,7 @@ export function App(): JSX.Element {
   const showAllHistoryRef = useRef(showAllHistory);
   const isDraftSessionRef = useRef(isDraftSession);
   const lastEventAtRef = useRef<number>(Date.now());
+  const autoRefreshInFlightRef = useRef(false);
   const previousTimelineStateRef = useRef<{ sessionKey: string; length: number }>({
     sessionKey: draftSessionKey,
     length: 0,
@@ -2434,6 +2435,31 @@ export function App(): JSX.Element {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       es?.close();
     };
+  }, [authReady, isAuthenticated]);
+
+  useEffect(() => {
+    if (!authReady || !isAuthenticated) return;
+
+    const timer = window.setInterval(() => {
+      if (autoRefreshInFlightRef.current) return;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      if (typeof navigator !== "undefined" && "onLine" in navigator && !navigator.onLine) return;
+
+      autoRefreshInFlightRef.current = true;
+      void (async () => {
+        try {
+          await refreshRunList(selectedSessionIdRef.current);
+          const selectedRunId = selectedRunIdRef.current;
+          if (selectedRunId) await loadSelectedRunRecord(selectedRunId);
+        } catch {
+          // Keep polling quiet; SSE/focus refresh paths surface recoverable state later.
+        } finally {
+          autoRefreshInFlightRef.current = false;
+        }
+      })();
+    }, 5000);
+
+    return () => window.clearInterval(timer);
   }, [authReady, isAuthenticated]);
 
   useEffect(() => {
