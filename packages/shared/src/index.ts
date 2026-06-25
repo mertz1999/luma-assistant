@@ -12,6 +12,12 @@ export type ApprovalPolicy = z.infer<typeof approvalPolicySchema>;
 export const runSourceTagSchema = z.enum(["in-app", "vscode", "cli", "exec", "other"]);
 export type RunSourceTag = z.infer<typeof runSourceTagSchema>;
 
+export const runRunnerSchema = z.enum(["codex", "claude"]);
+export type RunRunner = z.infer<typeof runRunnerSchema>;
+
+export const reasoningEffortSchema = z.enum(["low", "medium", "high"]);
+export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
+
 export const attachmentKindSchema = z.enum(["image", "text"]);
 export type AttachmentKind = z.infer<typeof attachmentKindSchema>;
 
@@ -88,8 +94,10 @@ export const agentScheduleSchema = z.object({
   updatedAt: z.number().int().nonnegative(),
   lastRunAt: z.number().int().nonnegative().nullable(),
   runConfig: z.object({
+    runner: runRunnerSchema.default("codex"),
     workspace: z.string().min(1),
     model: z.string().min(1),
+    reasoningEffort: reasoningEffortSchema.default("high"),
     sandbox: sandboxSchema,
     approvalPolicy: approvalPolicySchema,
     skills: z.array(selectedSkillRefSchema).max(20).default([]),
@@ -116,8 +124,10 @@ export const createAgentScheduleSchema = z.object({
   agentId: z.string().min(1),
   hour: z.number().int().min(0).max(23),
   minute: z.number().int().min(0).max(59),
+  runner: runRunnerSchema.default("codex"),
   workspace: z.string().min(1),
   model: z.string().min(1),
+  reasoningEffort: reasoningEffortSchema.default("high"),
   sandbox: sandboxSchema,
   approvalPolicy: approvalPolicySchema,
   skills: z.array(selectedSkillRefSchema).max(20).default([]),
@@ -150,9 +160,11 @@ export type AgentListResponse = {
 };
 
 export const runConfigSchema = z.object({
+  runner: runRunnerSchema.default("codex"),
   workspace: z.string().min(1),
   prompt: z.string().min(1),
   model: z.string().min(1),
+  reasoningEffort: reasoningEffortSchema.default("high"),
   sandbox: sandboxSchema,
   approvalPolicy: approvalPolicySchema,
   planMode: z.boolean().default(false),
@@ -164,9 +176,11 @@ export const runConfigSchema = z.object({
 export type RunConfig = z.infer<typeof runConfigSchema>;
 
 export const startRunSchema = z.object({
+  runner: runRunnerSchema.default("codex"),
   prompt: z.string().min(1),
   workspace: z.string().min(1),
   model: z.string().min(1),
+  reasoningEffort: reasoningEffortSchema.default("high"),
   sandbox: sandboxSchema.default("read-only"),
   approvalPolicy: approvalPolicySchema.default("on-request"),
   planMode: z.boolean().default(false),
@@ -181,8 +195,10 @@ export const sendMessageSchema = z.object({
   clientMessageId: z.string().min(1),
   sessionId: z.string().optional(),
   text: z.string().min(1),
+  runner: runRunnerSchema.default("codex"),
   workspace: z.string().min(1),
   model: z.string().min(1),
+  reasoningEffort: reasoningEffortSchema.default("high"),
   sandbox: sandboxSchema.default("read-only"),
   approvalPolicy: approvalPolicySchema.default("on-request"),
   planMode: z.boolean().default(false),
@@ -247,27 +263,14 @@ export type ApprovalQueueItem = {
   id: string;
   runId: string;
   createdAt: number;
+  kind?: "rerun" | "claude_permission";
   reason: string;
   suggestedSandbox: SandboxMode;
   suggestedApprovalPolicy: ApprovalPolicy;
   command: string | null;
+  toolName?: string;
+  toolUseId?: string;
   status: "pending" | "accepted" | "dismissed";
-};
-
-export type DiffSnapshot = {
-  runId: string;
-  at: number;
-  isGitRepo: boolean;
-  diffText: string;
-  changedFiles: string[];
-  fallbackMessage: string | null;
-};
-
-export type FileTreeNode = {
-  name: string;
-  path: string;
-  type: "file" | "directory";
-  children?: FileTreeNode[];
 };
 
 export type WorkspaceOption = {
@@ -304,6 +307,7 @@ export type RunListItem = {
   name: string;
   status: RunStatus;
   updatedAt: number;
+  runner: RunRunner;
   sourceTag: RunSourceTag;
   sourceRaw: string;
   sessionId: string;
@@ -316,7 +320,6 @@ export type RunListItem = {
 export type RunMessageFileChange = {
   kind: string;
   path: string;
-  diff?: string;
   added: number;
   removed: number;
 };
@@ -363,6 +366,7 @@ export type SessionListItem = {
   title: string;
   status: RunStatus;
   updatedAt: number;
+  runner: RunRunner;
   sourceTag: RunSourceTag;
   sourceRaw: string;
   workspace: string;
@@ -438,7 +442,11 @@ export type TerminalSessionSnapshot = {
 
 export type AppBootstrap = {
   defaults: {
+    runner: RunRunner;
     model: string;
+    codexModel: string;
+    claudeModel: string;
+    reasoningEffort: ReasoningEffort;
     sandbox: SandboxMode;
   };
   activeWorkspace: string;
@@ -449,7 +457,11 @@ export type AppBootstrap = {
 
 export type AppBootstrapLite = {
   defaults: {
+    runner: RunRunner;
     model: string;
+    codexModel: string;
+    claudeModel: string;
+    reasoningEffort: ReasoningEffort;
     sandbox: SandboxMode;
   };
   activeWorkspace: string;
@@ -681,7 +693,6 @@ export const sseEventKinds = [
   "run.stderr",
   "run.item",
   "run.approvalQueued",
-  "run.diffUpdated",
   "run.completed",
   "run.failed",
   "run.stopped",

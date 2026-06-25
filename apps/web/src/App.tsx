@@ -1,7 +1,6 @@
-import { isValidElement, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { isValidElement, useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import Convert from "ansi-to-html";
-import DiffViewer from "react-diff-viewer-continued";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -14,9 +13,9 @@ import {
   Copy,
   ExternalLink,
   FileCode2,
-  FolderTree,
   Lock,
   Layers,
+  LogOut,
   LoaderCircle,
   MessageSquare,
   Mic,
@@ -28,10 +27,11 @@ import {
   Pause,
   Play,
   RefreshCw,
-  Rocket,
   Send,
+  Settings,
   ShieldAlert,
   Sun,
+  Terminal,
   Trash2,
   X,
 } from "lucide-react";
@@ -43,9 +43,9 @@ import type {
   ApprovalQueueItem,
   AttachmentRef,
   ChatMessage,
-  DiffSnapshot,
-  FileTreeNode,
   RunRecord,
+  ReasoningEffort,
+  RunRunner,
   RunSourceTag,
   SandboxMode,
   SelectedAgentRef,
@@ -59,6 +59,7 @@ import type {
   SkillSyncResult,
 } from "@luma/shared";
 import {
+  acceptApproval,
   archiveSession,
   connectEvents,
   createAgentSchedule,
@@ -68,8 +69,6 @@ import {
   getAgentSchedules,
   getAccountStatus,
   getBootstrapLite,
-  getDiff,
-  getFileTree,
   getMcpStatus,
   getSkills,
   getSessionList,
@@ -98,10 +97,14 @@ import { cn } from "@/lib/utils";
 import { useUiStore } from "@/store/useUiStore";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { CardContent } from "@/components/ui/card";
 import { TaskManager } from "@/TaskManager";
 
 type StatusFilter = "all" | "running" | "completed" | "failed" | "stopped";
+type SessionFilterValue = StatusFilter | "all-history";
+type DockTab = "terminal" | "approvals" | "context";
+type SidebarMode = "code" | "agents";
+type BackendConnectionStatus = "connecting" | "connected" | "disconnected";
 
 type DebugLogEntry = {
   key: string;
@@ -148,6 +151,7 @@ type SessionCard = {
   summary: string;
   status: SessionListItem["status"];
   updatedAt: number;
+  runner: RunRunner;
   sourceTag: RunSourceTag;
   sourceRaw: string;
   workspace: string;
@@ -159,10 +163,24 @@ type PlanSessionState = "idle" | "armed" | "active";
 
 const sandboxOptions: SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
 const approvalPolicies: ApprovalPolicy[] = ["untrusted", "on-failure", "on-request", "never"];
-const modelOptions = ["gpt-5.3-codex", "gpt-5.4", "gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o", "o4-mini"];
+const runnerOptions: RunRunner[] = ["codex", "claude"];
+const codexModelOptions = ["gpt-5.3-codex", "gpt-5.4", "gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o", "o4-mini"];
+const claudeModelOptions = ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-4-1"];
+const reasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high"];
+const modelOptions = codexModelOptions;
+function modelOptionsForRunner(runner: RunRunner): string[] {
+  return runner === "claude" ? claudeModelOptions : codexModelOptions;
+}
+function runnerLabel(runner: RunRunner): string {
+  return runner === "claude" ? "Claude Code" : "Codex";
+}
+function compactSelectWidth(label: string): string {
+  return `${Math.max(label.length + 2, 6)}ch`;
+}
 const toolOutputModalLimit = 2500;
 const draftSessionKey = "__draft__";
 const runListPageSize = 60;
+const sidebarListPageSize = 15;
 const messagePageSize = 30;
 const queueStorageKey = "luma_assistant_queue_v1";
 const legacyQueueStorageKey = "agentic_cli_queue_v1";
@@ -211,7 +229,9 @@ type QueuedMessage = {
   attachments: AttachmentRef[];
   createdAt: number;
   workspace: string;
+  runner: RunRunner;
   model: string;
+  reasoningEffort: ReasoningEffort;
   sandbox: SandboxMode;
   approvalPolicy: ApprovalPolicy;
   planMode: boolean;
@@ -371,7 +391,7 @@ function buildSlashHelpText(): string {
 function buildPlanModeEnabledText(): string {
   return [
     "Plan mode is enabled for the next message.",
-    `The next request will ask Codex to read and follow \`${planInstructionPath}\`.`,
+    `The next request will ask the selected runner to read and follow \`${planInstructionPath}\`.`,
     "Planning turns stay read-only until final approval is granted.",
   ].join("\n\n");
 }
@@ -512,7 +532,9 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
         const id = typeof item.id === "string" ? item.id : "";
         const prompt = typeof item.prompt === "string" ? item.prompt : "";
         const workspace = typeof item.workspace === "string" ? item.workspace : "";
+        const runner: RunRunner = item.runner === "claude" ? "claude" : "codex";
         const model = typeof item.model === "string" ? item.model : "";
+        const reasoningEffort: ReasoningEffort = item.reasoningEffort === "low" || item.reasoningEffort === "medium" || item.reasoningEffort === "high" ? item.reasoningEffort : "high";
         const createdAt = typeof item.createdAt === "number" ? item.createdAt : Date.now();
         const planMode = typeof item.planMode === "boolean" ? item.planMode : false;
         const attachments = readAttachmentRefs(item.attachments);
@@ -530,7 +552,9 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
           attachments,
           createdAt,
           workspace,
+          runner,
           model,
+          reasoningEffort,
           sandbox: item.sandbox,
           approvalPolicy: item.approvalPolicy,
           planMode,
@@ -564,10 +588,15 @@ function describeSessionMeta(session: SessionCard): string {
 
 function getSessionSourceBadge(session: SessionCard): { label: string; className: string } {
   if (session.sourceTag === "in-app") {
-    return {
-      label: "in-app",
-      className: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200",
-    };
+    return session.runner === "claude"
+      ? {
+          label: "Claude",
+          className: "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-200",
+        }
+      : {
+          label: "Codex",
+          className: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200",
+        };
   }
   if (session.sourceTag === "vscode") {
     return {
@@ -612,6 +641,7 @@ function buildSessionCards(items: SessionListItem[]): SessionCard[] {
     summary: item.title,
     status: item.status,
     updatedAt: item.updatedAt,
+    runner: item.runner === "claude" ? "claude" : "codex",
     sourceTag: item.sourceTag,
     sourceRaw: item.sourceRaw,
     workspace: item.workspace,
@@ -1111,6 +1141,7 @@ function readSessionListItem(input: unknown): SessionListItem | null {
         title: input.title,
         status: input.status as SessionListItem["status"],
         updatedAt: input.updatedAt,
+        runner: input.runner === "claude" ? "claude" : "codex",
         sourceTag: input.sourceTag as RunSourceTag,
         sourceRaw: input.sourceRaw,
         workspace: input.workspace,
@@ -1196,6 +1227,12 @@ function truncatePreview(input: string, max = 120): string {
   const normalized = input.replace(/\s+/g, " ").trim();
   if (normalized.length <= max) return normalized;
   return `${normalized.slice(0, max - 3)}...`;
+}
+
+function workspaceLabel(workspace: string): string {
+  if (!workspace.trim()) return "workspace";
+  const parts = workspace.split(/[\\/]/).filter(Boolean);
+  return parts.at(-1) || workspace;
 }
 
 function formatAttachmentSize(size: number): string {
@@ -1335,12 +1372,12 @@ function MarkdownMessage({ text }: { text: string }): JSX.Element {
           </a>
         ),
         table: ({ children }) => (
-          <div className="my-2 overflow-x-auto rounded-lg border border-card-border">
+          <div className="claude-table my-2 overflow-x-auto rounded-md">
             <table className="min-w-full border-collapse text-xs">{children}</table>
           </div>
         ),
-        th: ({ children }) => <th className="border-b border-card-border bg-surface-2 px-2 py-1 text-left">{children}</th>,
-        td: ({ children }) => <td className="border-b border-card-border px-2 py-1 align-top">{children}</td>,
+        th: ({ children }) => <th className="px-2 py-1.5 text-left font-semibold text-foreground/80">{children}</th>,
+        td: ({ children }) => <td className="px-2 py-1.5 align-top text-foreground/90">{children}</td>,
         code: ({ className, children }) => {
           const raw = flattenMarkdownText(children).replace(/\n$/, "");
           const isBlock = Boolean(className) || raw.includes("\n");
@@ -1348,8 +1385,8 @@ function MarkdownMessage({ text }: { text: string }): JSX.Element {
             <code
               className={cn(
                 isBlock
-                  ? "block whitespace-pre-wrap break-words bg-transparent font-mono text-[0.95em] leading-relaxed text-[#0f2433] dark:text-[#f1ece6]"
-                  : "rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-[0.92em] text-[#0f2433] dark:bg-[#2a2622] dark:text-[#f1ece6]",
+                  ? "block whitespace-pre-wrap break-words bg-transparent font-mono text-[0.95em] leading-relaxed text-foreground"
+                  : "rounded bg-surface-2 px-1 py-0.5 font-mono text-[0.92em] text-foreground",
                 className,
               )}
             >
@@ -1357,7 +1394,7 @@ function MarkdownMessage({ text }: { text: string }): JSX.Element {
             </code>
           );
         },
-        pre: ({ children }) => <pre className="my-1.5 overflow-x-auto rounded-xl bg-surface-2 px-3 py-2 dark:bg-[#171616]">{children}</pre>,
+        pre: ({ children }) => <pre className="my-1.5 overflow-x-auto rounded-md border border-card-border bg-surface-2 px-3 py-2">{children}</pre>,
       }}
     >
       {text}
@@ -1367,9 +1404,9 @@ function MarkdownMessage({ text }: { text: string }): JSX.Element {
 
 function ThinkingDots({ label = "Thinking" }: { label?: string }): JSX.Element {
   return (
-    <div className="inline-flex items-center gap-2 text-sm text-foreground/80">
-      <Rocket className="h-4 w-4 text-brand" />
-      <span>{label}</span>
+    <div className="inline-flex items-center gap-2 text-sm text-foreground/70">
+      <span className="h-1.5 w-1.5 rounded-full bg-brand shadow-[0_0_0_3px_rgba(234,111,55,0.12)]" />
+      <span className="font-medium">{label}</span>
       <span className="dot-wave" aria-label={`${label} in progress`} role="status">
         <span>.</span>
         <span>.</span>
@@ -1777,9 +1814,6 @@ function ToolEntry({
             <div>
               <span className="font-semibold text-foreground/85">Status:</span> {statusLabel || (entry.pending ? "in progress" : "completed")}
             </div>
-            <div>
-              <span className="font-semibold text-foreground/85">Files:</span> {fileChangeCount || 1}
-            </div>
             {typeof entry.meta?.durationMs === "number" ? (
               <div>
                 <span className="font-semibold text-foreground/85">Duration:</span> {entry.meta.durationMs} ms
@@ -1795,25 +1829,16 @@ function ToolEntry({
           {fileChangeCount ? (
               <div className="space-y-2">
                 {fileChanges.map((change, index) => (
-                <details key={`${change.path}-${index}`} className="rounded-lg border border-card-border bg-surface-2/70 px-1.5 py-1">
-                  <summary className="flex cursor-pointer items-center justify-between gap-2 text-[11px]">
+                <div key={`${change.path}-${index}`} className="rounded-lg border border-card-border bg-surface-2/70 px-1.5 py-1">
+                  <div className="flex items-center justify-between gap-2 text-[11px]">
                     <span className="min-w-0 truncate font-mono" title={change.path}>
                       {change.path}
                     </span>
                     <span className="shrink-0 text-foreground/75">
                       {change.kind} +{change.added} -{change.removed}
                     </span>
-                  </summary>
-                  <div className="mt-1.5">
-                    {change.diff ? (
-                      <pre className="max-h-44 overflow-auto rounded-lg border border-card-border bg-[#0f2433] p-1.5 font-mono text-[10px] text-slate-100">
-                        {change.diff}
-                      </pre>
-                    ) : (
-                      <div className="text-[11px] text-foreground/65">No diff payload returned for this file.</div>
-                    )}
                   </div>
-                </details>
+                </div>
               ))}
             </div>
           ) : (
@@ -1950,15 +1975,16 @@ export function App(): JSX.Element {
   const {
     selectedRunId,
     setSelectedRunId,
-    toolTab,
-    setToolTab,
     rightPanelTab,
     setRightPanelTab,
+    rightDockOpen,
+    setRightDockOpen,
     mobileThreadsOpen,
     setMobileThreadsOpen,
     mobileContextOpen,
     setMobileContextOpen,
     theme,
+    setTheme,
     toggleTheme,
   } = useUiStore();
 
@@ -1981,15 +2007,15 @@ export function App(): JSX.Element {
   const [showAllHistory, setShowAllHistory] = useState(false);
   const [loadingRunList, setLoadingRunList] = useState(false);
   const [approvals, setApprovals] = useState<ApprovalQueueItem[]>([]);
-
-  const [fileNodes, setFileNodes] = useState<FileTreeNode[]>([]);
-  const [diff, setDiff] = useState<DiffSnapshot | null>(null);
+  const [sidebarMode, setSidebarMode] = useState<SidebarMode>("code");
 
   const [prompt, setPrompt] = useState("");
   const [skillCatalog, setSkillCatalog] = useState<SkillListItem[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillsError, setSkillsError] = useState<string | null>(null);
   const [skillPickerOpen, setSkillPickerOpen] = useState(false);
+  const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
+  const [newSessionUseCustomModel, setNewSessionUseCustomModel] = useState(false);
   const [selectedSkills, setSelectedSkills] = useState<SkillListItem[]>([]);
   const [showSystemSkills, setShowSystemSkills] = useState(false);
   const [highlightedSkillIndex, setHighlightedSkillIndex] = useState(0);
@@ -2010,7 +2036,11 @@ export function App(): JSX.Element {
   const [pendingAttachmentWorkspace, setPendingAttachmentWorkspace] = useState<string | null>(null);
   const [uploadingAttachmentNames, setUploadingAttachmentNames] = useState<string[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [runner, setRunnerState] = useState<RunRunner>("codex");
   const [model, setModel] = useState("gpt-5.3-codex");
+  const [defaultCodexModel, setDefaultCodexModel] = useState("gpt-5.3-codex");
+  const [defaultClaudeModel, setDefaultClaudeModel] = useState("sonnet");
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("high");
   const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("on-request");
   const [planFlowBySession, setPlanFlowBySession] = useState<Record<string, PlanSessionState>>({});
@@ -2038,6 +2068,7 @@ export function App(): JSX.Element {
   const [authPasswordInput, setAuthPasswordInput] = useState("");
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [backendConnectionStatus, setBackendConnectionStatus] = useState<BackendConnectionStatus>("connecting");
 
   const ansi = useMemo(() => new Convert({ newline: true, escapeXML: true }), []);
   const composerFileInputRef = useRef<HTMLInputElement>(null);
@@ -2276,7 +2307,11 @@ export function App(): JSX.Element {
   }, [authReady, isAuthenticated, showAllHistory]);
 
   useEffect(() => {
-    if (!authReady || !isAuthenticated) return;
+    if (!authReady || !isAuthenticated) {
+      setBackendConnectionStatus("disconnected");
+      return;
+    }
+    setBackendConnectionStatus("connecting");
     let es: EventSource | null = null;
     let hasOpenedOnce = false;
     let shouldRefreshSelectedSession = false;
@@ -2356,11 +2391,6 @@ export function App(): JSX.Element {
           return;
         }
 
-        if (event.kind === "run.diffUpdated" && event.runId === selectedRunIdRef.current) {
-          setDiff(event.payload as unknown as DiffSnapshot);
-          return;
-        }
-
         if (
           (event.kind === "run.started"
             || event.kind === "run.completed"
@@ -2380,6 +2410,7 @@ export function App(): JSX.Element {
 
       es.onopen = () => {
         lastEventAtRef.current = Date.now();
+        setBackendConnectionStatus("connected");
         if (!hasOpenedOnce) {
           hasOpenedOnce = true;
           shouldRefreshSelectedSession = false;
@@ -2391,6 +2422,7 @@ export function App(): JSX.Element {
       };
 
       es.onerror = () => {
+        setBackendConnectionStatus("disconnected");
         if (!hasOpenedOnce) return;
         shouldRefreshSelectedSession = true;
       };
@@ -2405,6 +2437,7 @@ export function App(): JSX.Element {
       const isStale = Date.now() - lastEventAtRef.current > eventStreamHeartbeatStaleMs;
       if (!es || es.readyState === EventSource.CLOSED || isStale) {
         shouldRefreshSelectedSession = true;
+        setBackendConnectionStatus("connecting");
         openEventStream();
       }
     };
@@ -2420,6 +2453,7 @@ export function App(): JSX.Element {
       if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
       if (Date.now() - lastEventAtRef.current <= eventStreamHeartbeatStaleMs) return;
       shouldRefreshSelectedSession = true;
+      setBackendConnectionStatus("connecting");
       openEventStream();
       refreshRealtimeState();
     }, eventStreamWatchdogIntervalMs);
@@ -2463,27 +2497,13 @@ export function App(): JSX.Element {
   }, [authReady, isAuthenticated]);
 
   useEffect(() => {
-    const selectedIsHistory = runItems.some((item) => item.id === selectedSessionId && item.historyOnly);
-    if (!selectedRunId || isDraftSession || selectedIsHistory) {
-      setDiff(null);
-      return;
-    }
-    void loadDiff(selectedRunId);
-  }, [selectedRunId, selectedSessionId, isDraftSession, runItems]);
-
-  useEffect(() => {
-    if (!activeWorkspace) return;
-    void loadFileTree();
-  }, [activeWorkspace]);
-
-  useEffect(() => {
-    if (!authReady || !isAuthenticated || rightPanelTab !== "agents") return;
+    if (!authReady || !isAuthenticated || sidebarMode !== "agents") return;
     void refreshAgentSchedules();
     const timer = window.setInterval(() => {
       void refreshAgentSchedules();
     }, 30000);
     return () => window.clearInterval(timer);
-  }, [authReady, isAuthenticated, rightPanelTab]);
+  }, [authReady, isAuthenticated, sidebarMode]);
 
   const allSessions = useMemo(() => buildSessionCards(runItems), [runItems]);
   const filteredSessions = useMemo(() => {
@@ -2754,6 +2774,16 @@ export function App(): JSX.Element {
     }
   }
 
+  function onSignOut(): void {
+    setApiAuthToken(null);
+    setAuthTokenState(null);
+    setAuthExpiresAt(0);
+    setAuthPasswordInput("");
+    setAuthError(null);
+    setBackendConnectionStatus("disconnected");
+    removeLocalStorageWithLegacy(authSessionStorageKey, legacyAuthSessionStorageKey);
+  }
+
   function applyAgentScheduleState(payload: {
     agents: AgentListItem[];
     schedules: AgentSchedule[];
@@ -2794,7 +2824,11 @@ export function App(): JSX.Element {
       setRunItems(normalizedItems);
       setRunListNextCursor(listPayload.nextCursor);
       setApprovals(listPayload.approvals.length ? listPayload.approvals : payload.approvals);
+      setRunnerState(payload.defaults.runner);
+      setDefaultCodexModel(payload.defaults.codexModel);
+      setDefaultClaudeModel(payload.defaults.claudeModel);
       setModel(payload.defaults.model);
+      setReasoningEffort(payload.defaults.reasoningEffort);
       setSandbox(payload.defaults.sandbox);
       const sessions = buildSessionCards(normalizedItems);
       if (isDraftSessionRef.current) return;
@@ -2990,20 +3024,6 @@ export function App(): JSX.Element {
     }, 150);
   }
 
-  async function loadDiff(runId: string): Promise<void> {
-    try {
-      const payload = await getDiff(runId);
-      setDiff(payload);
-    } catch {
-      setDiff(null);
-    }
-  }
-
-  async function loadFileTree(): Promise<void> {
-    const payload = await getFileTree(".", 2);
-    setFileNodes(payload.nodes);
-  }
-
   async function loadTerminal(sessionId: string): Promise<void> {
     try {
       const payload = await getTerminal(sessionId);
@@ -3126,6 +3146,18 @@ export function App(): JSX.Element {
     });
   }
 
+  function setRunner(nextRunner: RunRunner): void {
+    setRunnerState(nextRunner);
+    setModel((current) => {
+      if (modelOptionsForRunner(nextRunner).includes(current)) return current;
+      return nextRunner === "claude" ? defaultClaudeModel : defaultCodexModel;
+    });
+  }
+
+  useEffect(() => {
+    setNewSessionUseCustomModel(!modelOptionsForRunner(runner).includes(model));
+  }, [model, runner]);
+
   function buildQueuedMessage(
     sessionKey: string,
     promptValue: string,
@@ -3139,6 +3171,16 @@ export function App(): JSX.Element {
     },
   ): QueuedMessage {
     const planMode = overrides?.planMode ?? shouldUsePlanMode(sessionKey);
+    const existingSession = allSessions.find((session) => session.id === sessionKey);
+    const requestRunner = sessionKey === draftSessionKey ? runner : (existingSession?.runner || runner);
+    const requestModel =
+      selectedRunRecord?.config.runner === requestRunner && selectedRunRecord.config.model
+        ? selectedRunRecord.config.model
+        : requestRunner === runner
+          ? model
+          : requestRunner === "claude"
+            ? defaultClaudeModel
+            : defaultCodexModel;
     return {
       id: `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       sessionKey,
@@ -3146,7 +3188,9 @@ export function App(): JSX.Element {
       attachments: readAttachmentRefs(overrides?.attachments),
       createdAt: Date.now(),
       workspace: activeWorkspace,
-      model,
+      runner: requestRunner,
+      model: requestModel,
+      reasoningEffort,
       sandbox: overrides?.sandbox ?? (planMode ? "read-only" : sandbox),
       approvalPolicy: overrides?.approvalPolicy ?? (planMode ? "never" : approvalPolicy),
       planMode,
@@ -3199,7 +3243,9 @@ export function App(): JSX.Element {
       text: request.prompt,
       attachments: request.attachments,
       workspace: request.workspace,
+      runner: request.runner,
       model: request.model,
+      reasoningEffort: request.reasoningEffort,
       sandbox: request.sandbox,
       approvalPolicy: request.approvalPolicy,
       planMode: request.planMode,
@@ -3229,7 +3275,7 @@ export function App(): JSX.Element {
       if (focusSession) {
         setSelectedSessionId(nextSessionKey);
         setSelectedRunId(payload.latestRunId);
-        setRightPanelTab("tools");
+        setRightPanelTab("terminal");
         setMobileThreadsOpen(false);
       } else if (selectedSessionId && nextSessionKey === selectedSessionId) {
         setSelectedRunId(payload.latestRunId);
@@ -3747,6 +3793,18 @@ export function App(): JSX.Element {
   }
 
   async function onAcceptApproval(item: ApprovalQueueItem): Promise<void> {
+    if (item.kind === "claude_permission") {
+      const payload = await acceptApproval(item.runId, item.id, item.suggestedApprovalPolicy);
+      const nextSessionKey = runSessionId(payload.run);
+      await refreshRunList(nextSessionKey);
+      setSelectedSessionId(nextSessionKey);
+      setSelectedRunId(payload.run.id);
+      void loadSelectedRunRecord(payload.run.id);
+      setRightPanelTab("approvals");
+      setMobileContextOpen(false);
+      return;
+    }
+
     const payload = await rerun(item.runId, {
       sandbox: item.suggestedSandbox,
       approvalPolicy: item.suggestedApprovalPolicy,
@@ -3760,7 +3818,7 @@ export function App(): JSX.Element {
     setSelectedRunId(payload.run.id);
     void loadRunMessagesPage(nextSessionKey, { reset: true });
     void loadSelectedRunRecord(payload.run.id);
-    setRightPanelTab("tools");
+    setRightPanelTab("approvals");
     setMobileContextOpen(false);
   }
 
@@ -3771,7 +3829,6 @@ export function App(): JSX.Element {
     setSelectedPromptAgents([]);
     setSkillPickerOpen(false);
     setAgentPickerOpen(false);
-    await loadFileTree();
     await refreshSkillCatalog(nextWorkspace);
   }
 
@@ -3796,7 +3853,9 @@ export function App(): JSX.Element {
         hour,
         minute,
         workspace: activeWorkspace,
+        runner,
         model,
+        reasoningEffort,
         sandbox,
         approvalPolicy,
         skills: selectedSkills.map(selectedSkillRef),
@@ -3877,12 +3936,12 @@ export function App(): JSX.Element {
     setMobileThreadsOpen(false);
   }
 
-  function onNewSession(): void {
+  function createDraftSession(nextRunner: RunRunner): void {
+    setRunner(nextRunner);
     setIsDraftSession(true);
     setSelectedSessionId(null);
     setSelectedRunId(null);
     setSelectedRunRecord(null);
-    setDiff(null);
     setPrompt("");
     setSelectedSkills([]);
     setSelectedPromptAgents([]);
@@ -3897,6 +3956,11 @@ export function App(): JSX.Element {
       return next;
     });
     setMobileThreadsOpen(false);
+    setNewSessionDialogOpen(false);
+  }
+
+  function onNewSession(): void {
+    setNewSessionDialogOpen(true);
   }
 
   function startVoiceInput(): void {
@@ -3990,7 +4054,8 @@ export function App(): JSX.Element {
       const workspace = selectedSession?.workspace || activeWorkspace;
       const payload = await startTerminal(selectedSessionId, workspace);
       setTerminalsBySession((prev) => ({ ...prev, [selectedSessionId]: payload.terminal }));
-      setRightPanelTab("tools");
+      setRightPanelTab("terminal");
+      window.setTimeout(() => terminalOutputRef.current?.focus(), 0);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "Failed to start terminal");
     } finally {
@@ -4124,12 +4189,38 @@ export function App(): JSX.Element {
     void loadRunMessagesPage(selectedSessionId, { before: nextCursor });
   }
 
+  const agentsSidebarPanel = (
+    <AgentsPanel
+      agents={agents}
+      schedules={agentSchedules}
+      upcoming={upcomingAgentSchedules}
+      executions={agentExecutions}
+      skillSyncResult={skillSyncResult}
+      loading={agentsLoading}
+      error={agentsError}
+      selectedAgentId={selectedAgentId}
+      setSelectedAgentId={setSelectedAgentId}
+      scheduleTime={agentScheduleTime}
+      setScheduleTime={setAgentScheduleTime}
+      selectedSkills={selectedSkills}
+      skillCatalog={skillCatalog}
+      actionId={agentActionId}
+      onReload={onReloadAgentsAndSkills}
+      onCreateSchedule={onCreateAgentSchedule}
+      onToggleSchedule={onToggleAgentSchedule}
+      onDeleteSchedule={onDeleteAgentSchedule}
+      onRunNow={onRunAgentScheduleNow}
+      onSelectExecution={onSelectAgentExecution}
+      compact
+    />
+  );
+
   if (!authReady) {
     return (
       <div className="flex h-[100dvh] items-center justify-center bg-[color:var(--bg)] text-[color:var(--text)]">
-        <div className="flex items-center gap-2 rounded-xl border border-card-border bg-surface-1 px-4 py-3 shadow-sm">
+        <div className="flex items-center gap-2 rounded-md border border-card-border bg-surface-1 px-4 py-3 text-sm">
           <LoaderCircle className="h-4 w-4 animate-spin" />
-          <span className="text-sm">Preparing secure session...</span>
+          <span>Preparing secure session...</span>
         </div>
       </div>
     );
@@ -4138,20 +4229,20 @@ export function App(): JSX.Element {
   if (!isAuthenticated) {
     return (
       <div className="flex h-[100dvh] items-center justify-center bg-[color:var(--bg)] px-4 text-[color:var(--text)]">
-        <Card className="w-full max-w-md">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-lg">
+        <div className="w-full max-w-md rounded-lg border border-card-border bg-surface-1">
+          <div className="border-b border-card-border px-4 py-3">
+            <h1 className="flex items-center gap-2 text-base font-semibold">
               <Lock className="h-5 w-5" />
               Sign in
-            </CardTitle>
-            <p className="text-sm text-foreground/70">
+            </h1>
+            <p className="mt-1 text-sm text-foreground/70">
               Enter password to access this panel. Auth session is saved in browser for 24 hours.
             </p>
-          </CardHeader>
-          <CardContent>
+          </div>
+          <div className="p-4">
             <form className="space-y-3" onSubmit={(event) => void onAuthenticate(event)}>
               <input
-                className="h-11 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
+                className="h-10 w-full rounded-md border border-card-border bg-control px-3 text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
                 type="password"
                 autoComplete="current-password"
                 value={authPasswordInput}
@@ -4165,15 +4256,15 @@ export function App(): JSX.Element {
                 Continue
               </Button>
             </form>
-          </CardContent>
-        </Card>
+          </div>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="h-[100dvh] w-full overflow-hidden text-[color:var(--text)]">
-      <header className="fixed inset-x-0 top-0 z-20 border-b border-card-border bg-surface-1/85 px-3 py-2 backdrop-blur lg:hidden">
+    <div className="h-[100dvh] w-full overflow-hidden bg-background text-[color:var(--text)]">
+      <header className="fixed inset-x-0 top-0 z-20 bg-surface-1/95 px-2 py-2 shadow-[0_14px_30px_-24px_rgba(0,0,0,0.9)] lg:hidden">
         <div className="mx-auto flex max-w-7xl items-center justify-between">
           <Button size="sm" variant="ghost" onClick={() => setMobileThreadsOpen(true)}>
             <PanelLeft className="mr-1.5 h-4 w-4" /> Chats
@@ -4182,13 +4273,18 @@ export function App(): JSX.Element {
             {mobileHeaderTitle}
           </div>
           <Button size="sm" variant="ghost" onClick={() => setMobileContextOpen(true)}>
-            <PanelRight className="mr-1.5 h-4 w-4" /> Context
+            <PanelRight className="mr-1.5 h-4 w-4" /> Tools
           </Button>
         </div>
       </header>
 
-      <div className="mx-auto grid h-full min-h-0 max-w-[1800px] grid-cols-1 gap-3 p-3 pt-14 lg:grid-cols-[320px_minmax(0,1fr)_360px] lg:pt-3">
-        <Card className="hidden min-h-0 flex-col overflow-hidden lg:flex">
+      <div
+        className={cn(
+          "grid h-full min-h-0 grid-cols-1 pt-12 lg:gap-2 lg:p-2 lg:pt-2",
+          rightDockOpen ? "lg:grid-cols-[382px_minmax(0,1fr)_410px]" : "lg:grid-cols-[382px_minmax(0,1fr)]",
+        )}
+      >
+        <aside className="hidden min-h-0 flex-col overflow-hidden rounded-lg bg-surface-1 shadow-[10px_0_26px_-26px_rgba(0,0,0,0.9)] lg:flex">
           <SessionsPanel
             sessions={filteredSessions}
             selectedSessionId={selectedSessionId}
@@ -4202,14 +4298,31 @@ export function App(): JSX.Element {
             onSelectSession={onSelectSession}
             onLoadMoreRuns={loadMoreRunItemsPage}
             onNewSession={onNewSession}
+            mode={sidebarMode}
+            setMode={setSidebarMode}
+            agentsPanel={agentsSidebarPanel}
+            backendConnectionStatus={backendConnectionStatus}
+            theme={theme}
+            setTheme={setTheme}
+            onSignOut={onSignOut}
           />
-        </Card>
+        </aside>
 
-        <Card className="flex min-h-0 flex-col overflow-hidden">
+        <main className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-background lg:rounded-lg">
           <CenterPanel
             loading={loading || Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId] && timeline.length === 0)}
             loadingOlderMessages={Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId] && timeline.length > 0)}
             selectedSession={selectedSession}
+            activeWorkspace={activeWorkspace}
+            runner={runner}
+            setRunner={setRunner}
+            model={model}
+            setModel={setModel}
+            reasoningEffort={reasoningEffort}
+            setReasoningEffort={setReasoningEffort}
+            approvalsCount={pendingApprovals.length}
+            rightPanelTab={rightPanelTab}
+            onOpenRightPanel={(tab) => setRightPanelTab(tab)}
             timeline={visibleTimeline}
             hiddenTimelineCount={hiddenTimelineCount}
             prompt={prompt}
@@ -4270,19 +4383,23 @@ export function App(): JSX.Element {
             onApprovePlanImplementation={onApprovePlanImplementation}
             onSubmitPlanFeedback={onSubmitPlanFeedback}
           />
-        </Card>
+        </main>
 
-        <Card className="hidden min-h-0 flex-col overflow-auto lg:flex">
-          <RightPanel
+        {rightDockOpen ? (
+        <aside className="hidden min-h-0 flex-col overflow-hidden rounded-lg bg-surface-1 shadow-[-10px_0_26px_-26px_rgba(0,0,0,0.9)] lg:flex">
+          <ClaudeRightPanel
             rightPanelTab={rightPanelTab}
             setRightPanelTab={setRightPanelTab}
-            toolTab={toolTab}
-            setToolTab={setToolTab}
+            onClose={() => setRightDockOpen(false)}
             workspaces={workspaces}
             activeWorkspace={activeWorkspace}
             onChangeWorkspace={onChangeWorkspace}
+            runner={runner}
+            setRunner={setRunner}
             model={model}
             setModel={setModel}
+            reasoningEffort={reasoningEffort}
+            setReasoningEffort={setReasoningEffort}
             sandbox={sandbox}
             setSandbox={setSandbox}
             approvalPolicy={approvalPolicy}
@@ -4293,8 +4410,6 @@ export function App(): JSX.Element {
             onAcceptApproval={onAcceptApproval}
             ansi={ansi}
             debugLogs={debugLogs}
-            diff={diff}
-            fileNodes={fileNodes}
             selectedSessionId={selectedSessionId}
             selectedSession={selectedSession}
             selectedSessionTokenUsage={selectedSessionId ? tokenUsageBySession[selectedSessionId] : undefined}
@@ -4314,37 +4429,117 @@ export function App(): JSX.Element {
             sessionAction={sessionAction}
             onArchiveSession={onArchiveSession}
             onDeleteSession={onDeleteSession}
-            agents={agents}
-            agentSchedules={agentSchedules}
-            upcomingAgentSchedules={upcomingAgentSchedules}
-            agentExecutions={agentExecutions}
-            skillSyncResult={skillSyncResult}
-            agentsLoading={agentsLoading}
-            agentsError={agentsError}
-            selectedAgentId={selectedAgentId}
-            setSelectedAgentId={setSelectedAgentId}
-            agentScheduleTime={agentScheduleTime}
-            setAgentScheduleTime={setAgentScheduleTime}
-            selectedSkills={selectedSkills}
-            skillCatalog={skillCatalog}
-            agentActionId={agentActionId}
-            onReloadAgentsAndSkills={onReloadAgentsAndSkills}
-            onCreateAgentSchedule={onCreateAgentSchedule}
-            onToggleAgentSchedule={onToggleAgentSchedule}
-            onDeleteAgentSchedule={onDeleteAgentSchedule}
-            onRunAgentScheduleNow={onRunAgentScheduleNow}
-            onSelectAgentExecution={onSelectAgentExecution}
           />
-        </Card>
+        </aside>
+        ) : null}
       </div>
+
+      <Dialog.Root open={newSessionDialogOpen} onOpenChange={setNewSessionDialogOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-40 bg-black/55" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-[min(460px,calc(100vw-24px))] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-card-border bg-surface-1 p-4 shadow-xl outline-none">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <Dialog.Title className="text-base font-semibold">Create new session</Dialog.Title>
+                <Dialog.Description className="mt-1 text-xs text-foreground/65">
+                  Choose runner, model, and thinking effort.
+                </Dialog.Description>
+              </div>
+              <Button type="button" variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => setNewSessionDialogOpen(false)} aria-label="Close">
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+
+            <div className="grid gap-2 sm:grid-cols-2">
+              <Button
+                type="button"
+                variant={runner === "codex" ? "primary" : "ghost"}
+                className="h-16 justify-start gap-3 rounded-md border border-card-border px-3 text-left"
+                onClick={() => setRunner("codex")}
+              >
+                <FileCode2 className="h-5 w-5 shrink-0" />
+                <span className="min-w-0">
+                  <span className="block text-sm font-semibold">Codex</span>
+                  <span className="block truncate text-xs opacity-70">{runner === "codex" ? model : defaultCodexModel}</span>
+                </span>
+              </Button>
+              <Button
+                type="button"
+                variant={runner === "claude" ? "primary" : "ghost"}
+                className="h-16 justify-start gap-3 rounded-md border border-card-border px-3 text-left"
+                onClick={() => setRunner("claude")}
+              >
+                <Bot className="h-5 w-5 shrink-0" />
+                <span className="min-w-0">
+                  <span className="block text-sm font-semibold">Claude Code</span>
+                  <span className="block truncate text-xs opacity-70">{runner === "claude" ? model : defaultClaudeModel}</span>
+                </span>
+              </Button>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              <div>
+                <label className="mb-1 block text-xs font-semibold text-foreground/75">Model</label>
+                <select
+                  className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                  value={newSessionUseCustomModel ? "__custom__" : model}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    if (next === "__custom__") {
+                      setNewSessionUseCustomModel(true);
+                      return;
+                    }
+                    setNewSessionUseCustomModel(false);
+                    setModel(next);
+                  }}
+                >
+                  {modelOptionsForRunner(runner).map((modelOption) => (
+                    <option key={modelOption} value={modelOption}>
+                      {modelOption}
+                    </option>
+                  ))}
+                  <option value="__custom__">Custom model...</option>
+                </select>
+                {newSessionUseCustomModel ? (
+                  <input
+                    className="mt-2 h-9 w-full rounded-md border border-card-border bg-control px-3 text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
+                    value={model}
+                    onChange={(event) => setModel(event.target.value)}
+                    placeholder={runner === "claude" ? "Enter Claude model id" : "Enter Codex model id"}
+                  />
+                ) : null}
+              </div>
+
+              <div>
+                <label className="mb-1 block text-xs font-semibold text-foreground/75">Thinking effort</label>
+                <select
+                  className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                  value={reasoningEffort}
+                  onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}
+                >
+                  {reasoningEffortOptions.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <Button type="button" className="w-full" onClick={() => createDraftSession(runner)} disabled={!model.trim()}>
+                Create session
+              </Button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
 
       <Dialog.Root open={mobileThreadsOpen} onOpenChange={setMobileThreadsOpen}>
         <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-30 bg-black/45 backdrop-blur-[1px]" />
-          <Dialog.Content className="fixed inset-y-0 left-0 z-40 w-[min(360px,95vw)] border-r border-card-border bg-background p-3 outline-none">
+          <Dialog.Overlay className="fixed inset-0 z-30 bg-black/55" />
+          <Dialog.Content className="fixed inset-y-0 left-0 z-40 w-[min(360px,95vw)] border-r border-card-border bg-surface-1 outline-none">
             <Dialog.Title className="sr-only">Chats Drawer</Dialog.Title>
             <Dialog.Description className="sr-only">Session list and chat selection panel for mobile.</Dialog.Description>
-            <Card className="flex h-full min-h-0 flex-col overflow-hidden animate-slide-in">
+            <div className="flex h-full min-h-0 flex-col overflow-hidden animate-slide-in">
               <SessionsPanel
                 sessions={filteredSessions}
                 selectedSessionId={selectedSessionId}
@@ -4358,29 +4553,39 @@ export function App(): JSX.Element {
                 onSelectSession={onSelectSession}
                 onLoadMoreRuns={loadMoreRunItemsPage}
                 onNewSession={onNewSession}
+                mode={sidebarMode}
+                setMode={setSidebarMode}
+                agentsPanel={agentsSidebarPanel}
+                backendConnectionStatus={backendConnectionStatus}
+                theme={theme}
+                setTheme={setTheme}
+                onSignOut={onSignOut}
               />
-            </Card>
+            </div>
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
 
       <Dialog.Root open={mobileContextOpen} onOpenChange={setMobileContextOpen}>
         <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-30 bg-black/45 backdrop-blur-[1px]" />
-          <Dialog.Content className="fixed inset-y-0 right-0 z-40 w-[min(390px,95vw)] border-l border-card-border bg-background p-3 outline-none">
+          <Dialog.Overlay className="fixed inset-0 z-30 bg-black/55" />
+          <Dialog.Content className="fixed inset-y-0 right-0 z-40 w-[min(410px,95vw)] border-l border-card-border bg-surface-1 outline-none">
             <Dialog.Title className="sr-only">Context Drawer</Dialog.Title>
             <Dialog.Description className="sr-only">Context and tools panel for mobile.</Dialog.Description>
-            <Card className="flex h-full min-h-0 flex-col overflow-auto animate-slide-in">
-              <RightPanel
+            <div className="flex h-full min-h-0 flex-col overflow-hidden animate-slide-in">
+              <ClaudeRightPanel
                 rightPanelTab={rightPanelTab}
                 setRightPanelTab={setRightPanelTab}
-                toolTab={toolTab}
-                setToolTab={setToolTab}
+                onClose={() => setMobileContextOpen(false)}
                 workspaces={workspaces}
                 activeWorkspace={activeWorkspace}
                 onChangeWorkspace={onChangeWorkspace}
+                runner={runner}
+                setRunner={setRunner}
                 model={model}
                 setModel={setModel}
+                reasoningEffort={reasoningEffort}
+                setReasoningEffort={setReasoningEffort}
                 sandbox={sandbox}
                 setSandbox={setSandbox}
                 approvalPolicy={approvalPolicy}
@@ -4391,8 +4596,6 @@ export function App(): JSX.Element {
                 onAcceptApproval={onAcceptApproval}
                 ansi={ansi}
                 debugLogs={debugLogs}
-                diff={diff}
-                fileNodes={fileNodes}
                 selectedSessionId={selectedSessionId}
                 selectedSession={selectedSession}
                 selectedSessionTokenUsage={selectedSessionId ? tokenUsageBySession[selectedSessionId] : undefined}
@@ -4412,29 +4615,9 @@ export function App(): JSX.Element {
                 sessionAction={sessionAction}
                 onArchiveSession={onArchiveSession}
                 onDeleteSession={onDeleteSession}
-                agents={agents}
-                agentSchedules={agentSchedules}
-                upcomingAgentSchedules={upcomingAgentSchedules}
-                agentExecutions={agentExecutions}
-                skillSyncResult={skillSyncResult}
-                agentsLoading={agentsLoading}
-                agentsError={agentsError}
-                selectedAgentId={selectedAgentId}
-                setSelectedAgentId={setSelectedAgentId}
-                agentScheduleTime={agentScheduleTime}
-                setAgentScheduleTime={setAgentScheduleTime}
-                selectedSkills={selectedSkills}
-                skillCatalog={skillCatalog}
-                agentActionId={agentActionId}
-                onReloadAgentsAndSkills={onReloadAgentsAndSkills}
-                onCreateAgentSchedule={onCreateAgentSchedule}
-                onToggleAgentSchedule={onToggleAgentSchedule}
-                onDeleteAgentSchedule={onDeleteAgentSchedule}
-                onRunAgentScheduleNow={onRunAgentScheduleNow}
-                onSelectAgentExecution={onSelectAgentExecution}
                 mobile
               />
-            </Card>
+            </div>
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
@@ -4457,6 +4640,13 @@ type SessionsPanelProps = {
   onSelectSession: (sessionId: string) => void;
   onLoadMoreRuns: () => Promise<void>;
   onNewSession: () => void;
+  mode: SidebarMode;
+  setMode: (mode: SidebarMode) => void;
+  agentsPanel: ReactNode;
+  backendConnectionStatus: BackendConnectionStatus;
+  theme: "light" | "dark";
+  setTheme: (theme: "light" | "dark") => void;
+  onSignOut: () => void;
 };
 
 function SessionsPanel({
@@ -4472,63 +4662,152 @@ function SessionsPanel({
   onSelectSession,
   onLoadMoreRuns,
   onNewSession,
+  mode,
+  setMode,
+  agentsPanel,
+  backendConnectionStatus,
+  theme,
+  setTheme,
+  onSignOut,
 }: SessionsPanelProps): JSX.Element {
-  return (
-    <>
-      <CardHeader className="flex items-center justify-between">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <MessageSquare className="h-4 w-4" /> Chats
-        </CardTitle>
-        <Button size="sm" onClick={onNewSession}>
-          New
-        </Button>
-      </CardHeader>
+  const sessionFilterValue: SessionFilterValue = showAllHistory ? "all-history" : statusFilter;
+  const environmentLabel = deploymentLabel();
+  const [visibleSessionCount, setVisibleSessionCount] = useState(sidebarListPageSize);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const accountMenuRef = useRef<HTMLDivElement>(null);
+  const visibleSessions = sessions.slice(0, visibleSessionCount);
+  const hasHiddenLoadedSessions = visibleSessionCount < sessions.length;
+  const canLoadMoreSessions = hasHiddenLoadedSessions || hasMoreRuns;
 
-      <CardContent className="flex min-h-0 flex-1 flex-col gap-3 p-3">
-        <div>
-          <label className="mb-1 block text-xs font-semibold text-foreground/75">Status filter</label>
-          <select
-            className="h-9 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-xs outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
-            value={statusFilter}
-            onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}
+  useEffect(() => {
+    setVisibleSessionCount(sidebarListPageSize);
+  }, [statusFilter, showAllHistory, mode]);
+
+  useEffect(() => {
+    if (!accountMenuOpen) return;
+
+    function onPointerDown(event: PointerEvent): void {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (accountMenuRef.current?.contains(target)) return;
+      setAccountMenuOpen(false);
+    }
+
+    function onKeyDown(event: globalThis.KeyboardEvent): void {
+      if (event.key === "Escape") setAccountMenuOpen(false);
+    }
+
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [accountMenuOpen]);
+
+  function onSessionFilterChange(next: SessionFilterValue): void {
+    if (next === "all-history") {
+      setStatusFilter("all");
+      onToggleShowAllHistory(true);
+      return;
+    }
+
+    setStatusFilter(next);
+    if (showAllHistory) onToggleShowAllHistory(false);
+  }
+
+  function onLoadMoreVisibleSessions(): void {
+    if (hasHiddenLoadedSessions) {
+      setVisibleSessionCount((current) => Math.min(current + sidebarListPageSize, sessions.length));
+      return;
+    }
+
+    void onLoadMoreRuns();
+  }
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="relative z-10 px-3 pb-3 pt-3 shadow-[0_14px_28px_-28px_rgba(0,0,0,0.9)]">
+        <div className="grid grid-cols-3 gap-1 rounded-md bg-surface-2 p-1 text-xs">
+          <button
+            type="button"
+            className={cn(
+              "flex h-8 items-center justify-center gap-1.5 rounded px-2",
+              mode === "agents" ? "bg-control-hover font-medium text-foreground" : "text-foreground/60 hover:bg-control-hover",
+            )}
+            onClick={() => setMode("agents")}
           >
-            <option value="all">all</option>
-            <option value="running">running</option>
-            <option value="completed">completed</option>
-            <option value="failed">failed</option>
-            <option value="stopped">stopped</option>
-          </select>
+            <Bot className="h-3.5 w-3.5" /> Agents
+          </button>
+          <button type="button" className="flex h-8 items-center justify-center gap-1.5 rounded px-2 text-foreground/60 hover:bg-control-hover">
+            <Bot className="h-3.5 w-3.5" /> Cowork
+          </button>
+          <button
+            type="button"
+            className={cn(
+              "flex h-8 items-center justify-center gap-1.5 rounded px-2",
+              mode === "code" ? "bg-control-hover font-medium text-foreground" : "text-foreground/60 hover:bg-control-hover",
+            )}
+            onClick={() => setMode("code")}
+          >
+            <FileCode2 className="h-3.5 w-3.5" /> Code
+          </button>
         </div>
 
-        <label className="flex items-start gap-2 rounded-xl border border-card-border bg-surface-1 px-3 py-2 text-xs text-foreground/80">
-          <input
-            type="checkbox"
-            className="mt-0.5 h-4 w-4 rounded border-card-border text-brand focus:ring-brand/20"
-            checked={showAllHistory}
-            onChange={(event) => onToggleShowAllHistory(event.target.checked)}
-            disabled={loadingRunList}
-          />
-          <span className="flex items-center gap-2">
-            Show all Codex history
-            {loadingRunList ? <LoaderCircle className="h-3.5 w-3.5 animate-spin text-brand" /> : null}
-          </span>
-        </label>
+        {mode === "code" ? (
+          <nav className="mt-3 space-y-1 text-sm">
+            <button type="button" onClick={onNewSession} className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-foreground/85 hover:bg-control-hover">
+              <span className="text-lg leading-none">+</span> New session
+            </button>
+            <button type="button" className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-foreground/75 hover:bg-control-hover">
+              <Layers className="h-3.5 w-3.5" /> Customize
+            </button>
+            <label className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-foreground/75 hover:bg-control-hover">
+              {loadingRunList ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <PanelRight className="h-3.5 w-3.5" />}
+              <select
+                className="h-7 min-w-0 flex-1 border-0 bg-transparent text-sm outline-none"
+                value={sessionFilterValue}
+                onChange={(event) => onSessionFilterChange(event.target.value as SessionFilterValue)}
+                disabled={loadingRunList}
+              >
+                <option value="all">More: all sessions</option>
+                <option value="all-history">More: All History</option>
+                <option value="running">More: running</option>
+                <option value="completed">More: completed</option>
+                <option value="failed">More: failed</option>
+                <option value="stopped">More: stopped</option>
+              </select>
+            </label>
+          </nav>
+        ) : null}
+      </div>
 
-        <div className="scrollbar-thin flex-1 space-y-2 overflow-auto pr-1">
+      {mode === "agents" ? (
+        <div className="scrollbar-thin min-h-0 flex-1 overflow-auto px-3 py-3">
+          {agentsPanel}
+        </div>
+      ) : (
+      <div className="flex min-h-0 flex-1 flex-col px-3 py-3">
+        <div className="mb-2 flex items-center justify-between gap-2 px-1 text-xs text-foreground/55">
+          <span>Recents</span>
+          <span>{sessions.length}</span>
+        </div>
+
+        <div className="scrollbar-thin flex-1 space-y-1 overflow-auto pr-1">
           {sessions.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-card-border bg-surface-2 px-3 py-2 text-xs text-foreground/70">
+            <div className="rounded-md border border-dashed border-card-border bg-surface-2 px-3 py-2 text-xs text-foreground/70">
               No sessions yet
             </div>
           ) : null}
 
-          {sessions.map((session) => {
+          {visibleSessions.map((session) => {
             const sourceBadge = getSessionSourceBadge(session);
             return (
               <div
                 key={session.id}
                 className={cn(
-                  "w-full rounded-2xl border bg-surface-1 px-3 py-2 text-left shadow-card transition hover:-translate-y-0.5 hover:border-brand/60",
-                  selectedSessionId === session.id ? "border-brand bg-brand-soft/60" : "border-card-border",
+                  "w-full rounded-md border border-transparent px-2.5 py-1.5 text-left transition hover:bg-control-hover",
+                  selectedSessionId === session.id ? "bg-control-hover text-foreground" : "text-foreground/82",
                 )}
               >
                 <button
@@ -4536,32 +4815,44 @@ function SessionsPanel({
                   className="w-full text-left"
                   onClick={() => onSelectSession(session.id)}
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold tracking-wide", sourceBadge.className)}>
-                        {sourceBadge.label}
-                      </span>
-                      <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide", statusClass(session.status))}>
-                        {session.status}
-                      </span>
-                    </div>
-                    <span className="text-[11px] text-foreground/70">{new Date(session.updatedAt).toLocaleTimeString()}</span>
+                  <div className="flex items-center gap-2">
+                    <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", session.status === "running" || session.status === "queued" ? "bg-brand" : "bg-foreground/35")} />
+                    <p className="min-w-0 flex-1 truncate text-sm" title={session.summary}>
+                      {session.summary || "Session"}
+                    </p>
                   </div>
-                  <p className="mt-1 line-clamp-2 text-sm font-semibold" title={session.summary}>
-                    {session.summary || "Session"}
-                  </p>
-                  <p className="mt-1 truncate text-xs text-foreground/70">{describeSessionMeta(session)}</p>
+                  <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1 pl-3.5">
+                    <span className={cn("rounded px-1.5 py-0.5 text-[10px] font-semibold leading-none", sourceBadge.className)}>
+                      {sourceBadge.label}
+                    </span>
+                    <span className={cn("rounded px-1.5 py-0.5 text-[10px] font-semibold leading-none", statusClass(session.status))}>
+                      {session.status}
+                    </span>
+                    {session.historyOnly ? (
+                      <span className="rounded bg-control px-1.5 py-0.5 text-[10px] font-semibold leading-none text-foreground/65">
+                        history
+                      </span>
+                    ) : null}
+                    {session.scheduled ? (
+                      <span className="rounded bg-brand-soft px-1.5 py-0.5 text-[10px] font-semibold leading-none text-brand">
+                        scheduled
+                      </span>
+                    ) : null}
+                    <span className="min-w-0 truncate text-[11px] leading-none text-foreground/45">
+                      {new Date(session.updatedAt).toLocaleTimeString()}
+                    </span>
+                  </div>
                 </button>
               </div>
             );
           })}
 
-          {hasMoreRuns ? (
+          {canLoadMoreSessions ? (
             <Button
               type="button"
               variant="ghost"
               size="sm"
-              onClick={() => void onLoadMoreRuns()}
+              onClick={onLoadMoreVisibleSessions}
               disabled={loadingMoreRuns}
               className="w-full"
             >
@@ -4570,8 +4861,78 @@ function SessionsPanel({
             </Button>
           ) : null}
         </div>
-      </CardContent>
-    </>
+      </div>
+      )}
+
+      <div className="relative z-10 p-3 shadow-[0_-14px_28px_-28px_rgba(0,0,0,0.9)]">
+        <div ref={accountMenuRef} className="relative">
+          {accountMenuOpen ? (
+            <div className="absolute bottom-full left-0 right-0 mb-2 overflow-hidden rounded-md border border-card-border bg-surface-1 p-1 text-sm shadow-[0_16px_42px_-20px_rgba(0,0,0,0.95)]">
+              <button
+                type="button"
+                className="flex h-9 w-full items-center gap-2 rounded px-2 text-left text-foreground/80 transition hover:bg-control-hover"
+                onClick={() => {
+                  setAccountMenuOpen(false);
+                  onSignOut();
+                }}
+              >
+                <LogOut className="h-4 w-4 text-foreground/55" />
+                <span>Sign out</span>
+              </button>
+
+              <div className="my-1 border-t border-card-border" />
+
+              <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-foreground/45">
+                <Settings className="mr-1 inline h-3.5 w-3.5 align-[-2px]" />
+                Settings
+              </div>
+              <button
+                type="button"
+                className="flex h-9 w-full items-center gap-2 rounded px-2 text-left text-foreground/80 transition hover:bg-control-hover"
+                onClick={() => {
+                  setTheme("light");
+                  setAccountMenuOpen(false);
+                }}
+              >
+                <Sun className="h-4 w-4 text-foreground/55" />
+                <span className="flex-1">Light mode</span>
+                {theme === "light" ? <Check className="h-4 w-4 text-brand" /> : null}
+              </button>
+              <button
+                type="button"
+                className="flex h-9 w-full items-center gap-2 rounded px-2 text-left text-foreground/80 transition hover:bg-control-hover"
+                onClick={() => {
+                  setTheme("dark");
+                  setAccountMenuOpen(false);
+                }}
+              >
+                <Moon className="h-4 w-4 text-foreground/55" />
+                <span className="flex-1">Dark mode</span>
+                {theme === "dark" ? <Check className="h-4 w-4 text-brand" /> : null}
+              </button>
+            </div>
+          ) : null}
+
+          <button
+            type="button"
+            className="flex h-9 w-full items-center justify-between gap-3 rounded-md px-1.5 text-left text-xs text-foreground/60 transition hover:bg-control-hover hover:text-foreground"
+            onClick={() => setAccountMenuOpen((current) => !current)}
+            aria-haspopup="menu"
+            aria-expanded={accountMenuOpen}
+          >
+            <span className="flex min-w-0 items-center gap-2">
+              <span
+                className={cn("h-2.5 w-2.5 shrink-0 rounded-full", backendConnectionClass(backendConnectionStatus))}
+                title={`Backend ${backendConnectionStatus}`}
+                aria-label={`Backend ${backendConnectionStatus}`}
+              />
+              <span className="truncate font-medium text-foreground/75">Luma Assistant</span>
+            </span>
+            <span className="shrink-0">{environmentLabel}</span>
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -4605,6 +4966,16 @@ type CenterPanelProps = {
   loading: boolean;
   loadingOlderMessages: boolean;
   selectedSession: SessionCard | null;
+  activeWorkspace: string;
+  runner: RunRunner;
+  setRunner: (value: RunRunner) => void;
+  model: string;
+  setModel: (value: string) => void;
+  reasoningEffort: ReasoningEffort;
+  setReasoningEffort: (value: ReasoningEffort) => void;
+  approvalsCount: number;
+  rightPanelTab: DockTab;
+  onOpenRightPanel: (tab: DockTab) => void;
   timeline: TimelineEntry[];
   hiddenTimelineCount: number;
   prompt: string;
@@ -4676,6 +5047,11 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
   const timelineBlocks = useMemo(() => buildTimelineRenderBlocks(props.timeline), [props.timeline]);
   const selectedSessionBusy = Boolean(props.selectedSession && !props.selectedSession.historyOnly && (props.selectedSession.status === "queued" || props.selectedSession.status === "running"));
   const attachmentDropDisabled = props.submitting || props.isUploadingAttachments;
+  const composerModelOptions = modelOptionsForRunner(props.runner);
+  const composerModelSelectOptions = composerModelOptions.includes(props.model)
+    ? composerModelOptions
+    : [props.model, ...composerModelOptions];
+  const composerRunnerLabel = runnerLabel(props.runner);
 
   useEffect(() => {
     return () => {
@@ -4760,37 +5136,51 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 
   return (
     <>
-      <CardHeader className="hidden items-start justify-between gap-3 lg:flex">
-        <div className="min-w-0">
-          <CardTitle className="truncate text-base" title={props.selectedSession ? props.selectedSession.summary : "No active chat"}>
-            {props.selectedSession ? props.selectedSession.summary : "No active chat"}
-          </CardTitle>
-          <p className="mt-1 font-mono text-[11px] text-foreground/70">
-            {props.selectedSession ? `Session: ${props.selectedSession.id}` : "Create or select a chat to start"}
-          </p>
-          {props.selectedSession ? (
-            <div className="mt-1 flex items-center gap-2">
-              <Badge className={statusClass(props.selectedSession.status)}>{props.selectedSession.status}</Badge>
-              {sourceBadge ? <Badge className={sourceBadge.className}>{sourceBadge.label}</Badge> : null}
+      <div className="relative z-10 hidden h-12 shrink-0 items-center justify-between gap-3 bg-background/95 px-4 shadow-[0_14px_32px_-28px_rgba(0,0,0,0.95)] lg:flex">
+        <div className="flex min-w-0 items-center gap-2">
+          <FileCode2 className="h-4 w-4 shrink-0 text-foreground/70" />
+          <div className="min-w-0">
+            <div className="flex min-w-0 items-center gap-2">
+              <h1 className="truncate text-sm font-semibold" title={props.selectedSession ? props.selectedSession.summary : "No active chat"}>
+                {props.selectedSession ? props.selectedSession.summary : "No active chat"}
+              </h1>
             </div>
-          ) : null}
+            <div className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-foreground/55">
+              {props.selectedSession ? <span className="truncate font-mono">{props.selectedSession.id}</span> : <span>Create or select a session</span>}
+              {props.selectedSession ? <span>{props.selectedSession.status}</span> : null}
+              {sourceBadge ? <span>{sourceBadge.label}</span> : null}
+            </div>
+          </div>
         </div>
 
-        <Button variant="ghost" size="sm" onClick={props.onNewSession}>
-          New session
-        </Button>
-      </CardHeader>
+        <div className="flex shrink-0 items-center gap-1">
+          <Button type="button" variant={props.rightPanelTab === "terminal" ? "primary" : "ghost"} size="sm" className="h-7 w-7 p-0" onClick={() => props.onOpenRightPanel("terminal")} aria-label="Open terminal" title="Terminal">
+            <Terminal className="h-3.5 w-3.5" />
+          </Button>
+          <Button type="button" variant={props.rightPanelTab === "approvals" ? "primary" : "ghost"} size="sm" className="h-7 px-2" onClick={() => props.onOpenRightPanel("approvals")} title="Approvals">
+            <ShieldAlert className="mr-1 h-3.5 w-3.5" />
+            {props.approvalsCount}
+          </Button>
+          <Button type="button" variant={props.rightPanelTab === "context" ? "primary" : "ghost"} size="sm" className="h-7 w-7 p-0" onClick={() => props.onOpenRightPanel("context")} aria-label="Open context" title="Context">
+            <Layers className="h-3.5 w-3.5" />
+          </Button>
+          <Button variant="ghost" size="sm" onClick={props.onNewSession}>
+            New
+          </Button>
+        </div>
+      </div>
 
-      <CardContent className="flex min-h-0 flex-1 flex-col gap-3 p-0">
+      <CardContent className="flex min-h-0 flex-1 flex-col gap-0 p-0">
         <div
           ref={props.timelineScrollRef}
           onScroll={props.onTimelineScroll}
-          className="scrollbar-thin min-h-0 flex-1 space-y-3 overflow-auto px-3 pb-2 pt-3"
+          className="scrollbar-thin min-h-0 flex-1 overflow-auto px-4 pb-4 pt-4 lg:px-8"
         >
+          <div className="mx-auto flex w-full max-w-5xl flex-col gap-5">
           {props.loading ? <p className="text-sm text-foreground/70">Loading...</p> : null}
 
           {!props.loading && !props.selectedSession ? (
-            <div className="rounded-2xl border border-dashed border-card-border bg-surface-2 px-4 py-3 text-sm text-foreground/75">
+            <div className="mx-auto max-w-3xl rounded-md border border-dashed border-card-border bg-surface-2 px-4 py-3 text-sm text-foreground/75">
               Start a new session or pick one from chats.
             </div>
           ) : null}
@@ -4822,23 +5212,27 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 	              const canRetryUserMessage = entry.role === "user" && entry.deliveryStatus === "failed";
               const canCopyMessage = (entry.role === "assistant" || entry.role === "plan" || entry.role === "user")
                 && Boolean(entry.text.trim());
+              const messageAlignment = entry.role === "user"
+                ? "items-end"
+                : entry.role === "system"
+                  ? "items-center"
+                  : "items-start";
 
 	            return (
+                <div key={entry.key} className={cn("flex w-full flex-col animate-fade-up", messageAlignment)}>
 	              <article
-	                key={entry.key}
 	                className={cn(
-	                  "relative animate-fade-up rounded-2xl border px-3 py-2 shadow-card",
-	                  entry.role === "user" && "ml-auto max-w-[90%] border-transparent bg-gradient-to-br from-brand to-brand-dark text-white",
-                    entry.role === "user" && entry.deliveryStatus === "failed" && "border-rose-200/80 from-rose-600 to-rose-700",
-	                  entry.role === "assistant" && "mr-auto max-w-[90%] border-card-border bg-surface-1 pb-8",
-	                  entry.role === "plan" && "mr-auto max-w-full border-brand/35 bg-brand-soft/45 pb-8",
-	                  entry.role === "user" && !showUserDeliveryState && "pb-8",
-	                  entry.role === "tool" && "max-w-full rounded-xl border-dashed border-card-border bg-surface-2 px-2.5 py-1.5 font-mono text-[11px] shadow-none",
-                  entry.role === "system" && "mx-auto max-w-fit rounded-full border-card-border bg-surface-1/90 px-3 py-1 text-xs text-foreground/75",
-                  entry.role === "error" && "mr-auto max-w-[90%] border-rose-300 bg-rose-50 text-rose-900 dark:border-danger-fg/40 dark:bg-danger-bg/90 dark:text-danger-fg",
+	                  "relative shadow-none",
+	                  entry.role === "user" && "ml-auto max-w-[min(760px,82%)] rounded-lg border border-card-border bg-control px-3 py-2 text-foreground",
+                    entry.role === "user" && entry.deliveryStatus === "failed" && "border-rose-500/60 bg-danger-bg text-danger-fg",
+	                  entry.role === "assistant" && "mr-auto w-full bg-transparent px-0 py-0 text-foreground/90",
+	                  entry.role === "plan" && "mr-auto w-full rounded-md border border-card-border bg-surface-1 px-3 py-2",
+	                  entry.role === "tool" && "w-full rounded-md border border-dashed border-card-border bg-surface-2 px-2.5 py-1.5 font-mono text-[11px]",
+                  entry.role === "system" && "mx-auto max-w-fit rounded-md border border-card-border bg-surface-1 px-3 py-1 text-xs text-foreground/75",
+                  entry.role === "error" && "mr-auto max-w-[90%] rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-rose-900 dark:border-danger-fg/40 dark:bg-danger-bg/90 dark:text-danger-fg",
                 )}
               >
-                {entry.role !== "system" && entry.title ? (
+                {entry.role !== "system" && entry.role !== "assistant" && entry.role !== "user" && entry.title ? (
                   <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-foreground/70">{entry.title}</div>
                 ) : null}
 
@@ -4849,7 +5243,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                         key={`${entry.key}_${attachment.id}`}
                         attachment={attachment}
                         className={entry.role === "user"
-                          ? "border-white/20 bg-surface-1/10 text-white"
+                          ? "border-card-border bg-surface-2 text-foreground"
                           : "border-card-border bg-surface-1/80 text-foreground"}
                       />
                     ))}
@@ -4859,7 +5253,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                 {entry.role === "tool" ? (
                   <ToolEntry entry={entry} ansi={props.ansi} onOpenOutput={props.setToolDetailModal} />
                 ) : entry.role === "assistant" || entry.role === "plan" ? (
-                  <div className="break-words text-sm leading-relaxed">
+                  <div className="break-words text-[15px] leading-7">
                     <StructuredMessage
                       entryKey={entry.key}
                       text={entry.text}
@@ -4890,31 +5284,13 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                       </div>
 		                )}
 
-                {canCopyMessage ? (
-                  <button
-                    type="button"
-                    className={cn(
-                      "absolute right-2 rounded-full border px-1.5 py-1 transition",
-                      entry.role === "user"
-                        ? "border-white/20 bg-white/10 text-white/90 hover:bg-white/15"
-                        : "border-card-border bg-surface-1/90 text-foreground/70 hover:bg-surface-2 hover:text-foreground",
-                      showUserDeliveryState ? "bottom-8" : "bottom-2",
-                    )}
-                    onClick={() => void copyMessage(entry)}
-                    aria-label={copiedEntryKey === entry.key ? "Message copied" : "Copy message"}
-                    title={copiedEntryKey === entry.key ? "Copied" : "Copy message"}
-                  >
-                    {copiedEntryKey === entry.key ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-                  </button>
-                ) : null}
-
                 {showUserDeliveryState ? (
-                  <div className="mt-2 flex items-center justify-end gap-2 text-[11px] text-white/85">
+                  <div className="mt-2 flex items-center justify-end gap-2 text-[11px] text-foreground/70">
                     <span>{entry.deliveryStatus === "failed" ? "Failed to send" : "Sending..."}</span>
                     {canRetryUserMessage ? (
                       <button
                         type="button"
-                      className="rounded-full border border-white/30 px-2 py-0.5 font-semibold transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
+                      className="rounded-md border border-card-border px-2 py-0.5 font-semibold transition hover:bg-control-hover disabled:cursor-not-allowed disabled:opacity-70"
                         onClick={() => void props.onRetryMessage(entry)}
                         disabled={props.submitting}
                       >
@@ -4924,22 +5300,39 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                   </div>
                 ) : null}
 	              </article>
+                {canCopyMessage ? (
+                  <div className={cn("mt-1 flex items-center gap-1", entry.role === "user" ? "justify-end" : "justify-start")}>
+                    <button
+                      type="button"
+                      className="inline-flex h-6 w-6 items-center justify-center rounded-md text-foreground/40 transition hover:bg-control-hover hover:text-foreground/75"
+                      onClick={() => void copyMessage(entry)}
+                      aria-label={copiedEntryKey === entry.key ? "Message copied" : "Copy message"}
+                      title={copiedEntryKey === entry.key ? "Copied" : "Copy message"}
+                    >
+                      {copiedEntryKey === entry.key ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                    </button>
+                  </div>
+                ) : null}
+                </div>
 	            );
 	          })}
 
           {props.hasPendingIndicator ? (
-            <article className="mr-auto max-w-full animate-fade-up rounded-2xl border border-brand/35 bg-brand-soft/45 px-3 py-2 shadow-card">
-              <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-foreground/70">Reasoning</div>
-              <ThinkingDots label="Thinking" />
+            <article className="mr-auto max-w-5xl animate-fade-up px-0 py-1.5">
+              <div className="inline-flex items-center gap-2 rounded-md bg-surface-1/45 px-2.5 py-1.5">
+                <span className="font-mono text-[10px] uppercase tracking-wider text-foreground/45">Reasoning</span>
+                <ThinkingDots label="Thinking" />
+              </div>
             </article>
           ) : null}
 
           <div ref={props.timelineBottomRef} />
+          </div>
         </div>
 
         <form
           className={cn(
-            "relative border-t border-card-border bg-surface-1/75 p-3 transition",
+            "relative bg-background px-4 py-3 shadow-[0_-16px_34px_-30px_rgba(0,0,0,0.95)] transition lg:px-8",
             attachmentDropActive && "border-brand bg-brand-soft/25",
           )}
           onDragEnter={onAttachmentDragEnter}
@@ -4953,7 +5346,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           }}
         >
           {attachmentDropActive ? (
-            <div className="pointer-events-none absolute inset-2 z-30 flex items-center justify-center rounded-2xl border-2 border-dashed border-brand bg-surface-1/90 text-sm font-semibold text-brand-dark shadow-soft backdrop-blur dark:text-brand">
+            <div className="pointer-events-none absolute inset-2 z-30 flex items-center justify-center rounded-md border-2 border-dashed border-brand bg-surface-1/95 text-sm font-semibold text-brand">
               Drop files to attach
             </div>
           ) : null}
@@ -4966,8 +5359,54 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             onChange={(event) => void props.onSelectAttachments(event.target.files)}
           />
 
+          <div className="mx-auto w-full max-w-5xl">
+          <div className="mb-2 flex min-h-9 flex-wrap items-center justify-start gap-2 rounded-md bg-surface-2 px-3 py-1.5 text-xs text-foreground/70">
+            <select
+              className="h-6 appearance-none rounded-md border-0 bg-control px-2 text-xs text-foreground outline-none hover:bg-control-hover focus:ring-2 focus:ring-brand/20"
+              style={{ width: compactSelectWidth(composerRunnerLabel) }}
+              value={props.runner}
+              onChange={(event) => props.setRunner(event.target.value as RunRunner)}
+              aria-label="Runner"
+              title="Runner"
+            >
+              {runnerOptions.map((runnerOption) => (
+                <option key={runnerOption} value={runnerOption}>
+                  {runnerLabel(runnerOption)}
+                </option>
+              ))}
+            </select>
+            <select
+              className="h-6 appearance-none rounded-md border-0 bg-control px-2 text-xs text-foreground outline-none hover:bg-control-hover focus:ring-2 focus:ring-brand/20"
+              style={{ width: compactSelectWidth(props.model) }}
+              value={props.model}
+              onChange={(event) => props.setModel(event.target.value)}
+              aria-label="Model"
+              title="Model"
+            >
+              {composerModelSelectOptions.map((modelOption) => (
+                <option key={modelOption} value={modelOption}>
+                  {modelOption}
+                </option>
+              ))}
+            </select>
+            <select
+              className="h-6 appearance-none rounded-md border-0 bg-control px-2 text-xs text-foreground outline-none hover:bg-control-hover focus:ring-2 focus:ring-brand/20"
+              style={{ width: compactSelectWidth(props.reasoningEffort) }}
+              value={props.reasoningEffort}
+              onChange={(event) => props.setReasoningEffort(event.target.value as ReasoningEffort)}
+              aria-label="Thinking effort"
+              title="Thinking effort"
+            >
+              {reasoningEffortOptions.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          </div>
+
           {props.planSessionState !== "idle" ? (
-            <div className="mb-3 flex items-start justify-between gap-3 rounded-2xl border border-brand/30 bg-brand-soft/40 px-3 py-2 text-sm text-foreground/80">
+            <div className="mb-2 flex items-start justify-between gap-3 rounded-md border border-brand/30 bg-brand-soft/40 px-3 py-2 text-sm text-foreground/80">
               <span className="min-w-0">
                 {props.planSessionState === "armed"
                   ? "Plan mode is enabled. Your next message will start the planning workflow."
@@ -4986,11 +5425,11 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           ) : null}
 
           {props.selectedSkills.length > 0 ? (
-            <div className="mb-3 flex flex-wrap gap-2">
+            <div className="mb-2 flex flex-wrap gap-2">
               {props.selectedSkills.map((skill) => (
                 <div
                   key={skill.id}
-                  className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-card-border bg-surface-2/80 px-2 py-1 text-xs text-foreground"
+                  className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-card-border bg-surface-2/80 px-2 py-1 text-xs text-foreground"
                   title={skill.path}
                 >
                   <AtSign className="h-3.5 w-3.5 text-foreground/60" />
@@ -5010,11 +5449,11 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           ) : null}
 
           {props.selectedAgents.length > 0 ? (
-            <div className="mb-3 flex flex-wrap gap-2">
+            <div className="mb-2 flex flex-wrap gap-2">
               {props.selectedAgents.map((agent) => (
                 <div
                   key={agent.id}
-                  className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-card-border bg-surface-2/80 px-2 py-1 text-xs text-foreground"
+                  className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-card-border bg-surface-2/80 px-2 py-1 text-xs text-foreground"
                   title={agent.path}
                 >
                   <Bot className="h-3.5 w-3.5 text-foreground/60" />
@@ -5034,7 +5473,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           ) : null}
 
           {props.pendingAttachments.length > 0 || props.isUploadingAttachments || props.attachmentError ? (
-            <div className="mb-3 rounded-2xl border border-card-border bg-surface-1/90 px-3 py-2">
+            <div className="mb-2 rounded-md border border-card-border bg-surface-1 px-3 py-2">
               <div className="flex items-center justify-between gap-2 text-xs font-semibold text-foreground/80">
                 <span>Attachments</span>
                 <span>
@@ -5075,7 +5514,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           ) : null}
 
           {props.queueItems.length > 0 ? (
-            <div className="mb-3 rounded-xl border border-card-border bg-surface-1/85 p-2">
+            <div className="mb-2 rounded-md border border-card-border bg-surface-1 p-2">
               <div className="mb-1 flex items-center justify-between gap-2">
                 <div className="text-xs font-semibold text-foreground/80">Queued messages ({props.queueItems.length})</div>
                 {selectedSessionBusy ? (
@@ -5086,7 +5525,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                 {props.queueItems.slice(0, 5).map((item) => {
                   const isProcessing = item.id === props.processingQueueItemId;
                   return (
-                  <div key={item.id} className="flex items-center gap-2 rounded-lg bg-surface-2/60 px-2 py-1">
+                  <div key={item.id} className="flex items-center gap-2 rounded-md bg-surface-2/60 px-2 py-1">
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
                         <div className="min-w-0 flex-1 truncate text-xs text-foreground/80" title={item.prompt}>
@@ -5131,7 +5570,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               <Dialog.Content
                 onOpenAutoFocus={(event) => event.preventDefault()}
                 onCloseAutoFocus={(event) => event.preventDefault()}
-                className="absolute bottom-full left-0 right-12 z-20 mb-2 max-h-[360px] overflow-hidden rounded-2xl border border-card-border bg-surface-1/95 p-2 shadow-xl outline-none backdrop-blur"
+                className="absolute bottom-full left-0 right-12 z-20 mb-2 max-h-[360px] overflow-hidden rounded-md border border-card-border bg-surface-1 p-2 shadow-xl outline-none"
               >
                 <Dialog.Title className="flex items-center justify-between gap-2 px-1 pb-2 text-xs font-semibold text-foreground/80">
                   <span className="inline-flex items-center gap-1.5">
@@ -5151,7 +5590,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                         key={agent.id}
                         type="button"
                         className={cn(
-                          "w-full rounded-xl border px-2 py-2 text-left transition",
+                          "w-full rounded-md border px-2 py-2 text-left transition",
                           index === props.highlightedAgentIndex
                             ? "border-brand/45 bg-brand-soft/50"
                             : "border-transparent hover:border-card-border hover:bg-surface-2",
@@ -5169,7 +5608,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                     ))}
                   </div>
                 ) : (
-                  <div className="rounded-xl border border-dashed border-card-border px-2 py-3 text-center text-xs text-foreground/60">
+                  <div className="rounded-md border border-dashed border-card-border px-2 py-3 text-center text-xs text-foreground/60">
                     {props.agentCatalog.length === 0 ? "No agents found." : "No matching agents."}
                   </div>
                 )}
@@ -5180,7 +5619,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               <Dialog.Content
                 onOpenAutoFocus={(event) => event.preventDefault()}
                 onCloseAutoFocus={(event) => event.preventDefault()}
-                className="absolute bottom-full left-0 right-12 z-20 mb-2 max-h-[360px] overflow-hidden rounded-2xl border border-card-border bg-surface-1/95 p-2 shadow-xl outline-none backdrop-blur"
+                className="absolute bottom-full left-0 right-12 z-20 mb-2 max-h-[360px] overflow-hidden rounded-md border border-card-border bg-surface-1 p-2 shadow-xl outline-none"
               >
                 <Dialog.Title className="flex items-center justify-between gap-2 px-1 pb-2 text-xs font-semibold text-foreground/80">
                   <span className="inline-flex items-center gap-1.5">
@@ -5217,7 +5656,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                 </Dialog.Description>
 
                 {props.skillsError ? (
-                  <div className="rounded-xl border border-rose-200 bg-rose-50 px-2 py-2 text-xs text-rose-800 dark:border-danger-fg/40 dark:bg-danger-bg/80 dark:text-danger-fg">
+                  <div className="rounded-md border border-rose-200 bg-rose-50 px-2 py-2 text-xs text-rose-800 dark:border-danger-fg/40 dark:bg-danger-bg/80 dark:text-danger-fg">
                     {props.skillsError}
                   </div>
                 ) : props.filteredSkills.length > 0 ? (
@@ -5227,7 +5666,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                         key={skill.id}
                         type="button"
                         className={cn(
-                          "w-full rounded-xl border px-2 py-2 text-left transition",
+                          "w-full rounded-md border px-2 py-2 text-left transition",
                           index === props.highlightedSkillIndex
                             ? "border-brand/45 bg-brand-soft/50"
                             : "border-transparent hover:border-card-border hover:bg-surface-2",
@@ -5245,7 +5684,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                     ))}
                   </div>
                 ) : (
-                  <div className="rounded-xl border border-dashed border-card-border px-2 py-3 text-center text-xs text-foreground/60">
+                  <div className="rounded-md border border-dashed border-card-border px-2 py-3 text-center text-xs text-foreground/60">
                     {props.skillsLoading
                       ? "Loading skills..."
                       : props.skillCatalog.length === 0
@@ -5259,12 +5698,12 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             </Dialog.Root>
 
             {props.slashSuggestions.length > 0 ? (
-              <div className="absolute bottom-full left-0 right-12 z-10 mb-2 space-y-1 rounded-2xl border border-card-border bg-surface-1/95 p-2 shadow-lg backdrop-blur">
+              <div className="absolute bottom-full left-0 right-12 z-10 mb-2 space-y-1 rounded-md border border-card-border bg-surface-1 p-2 shadow-lg">
                 {props.slashSuggestions.map((item) => (
                   <button
                     key={item.key}
                     type="button"
-                    className="w-full rounded-xl border border-transparent px-2 py-2 text-left transition hover:border-card-border hover:bg-surface-2"
+                    className="w-full rounded-md border border-transparent px-2 py-2 text-left transition hover:border-card-border hover:bg-surface-2"
                     onClick={() => void props.onSelectSlashCommand(item.key)}
                     disabled={props.submitting}
                   >
@@ -5278,8 +5717,8 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             <textarea
               ref={composerTextareaRef}
               rows={1}
-              className="min-h-[44px] w-full resize-none rounded-2xl border border-card-border bg-surface-1 px-3 py-2 text-base md:text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
-              placeholder="Message Codex... (type / for commands, including /plan)"
+              className="min-h-[44px] w-full resize-none rounded-lg border border-card-border bg-surface-1 px-3 py-2 text-base outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
+              placeholder="Type / for commands"
               value={props.prompt}
               onChange={(event) => props.setPrompt(event.target.value)}
               onKeyDown={props.onComposerKeyDown}
@@ -5291,13 +5730,14 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               aria-label={selectedSessionBusy ? "Queue message" : "Send message"}
               title={selectedSessionBusy ? "Queue message" : "Send message"}
               onClick={props.onSendButtonClick}
-              className="h-[44px] w-[44px] shrink-0 rounded-full p-0"
+              className="h-[44px] w-[44px] shrink-0 rounded-lg p-0"
             >
               {props.submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
             </Button>
           </div>
 
-          <div className="mt-2 flex flex-wrap items-center gap-2">
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+            <span className="rounded-md bg-brand-soft px-2 py-1 font-medium text-brand">Auto</span>
             <Button
               type="button"
               variant="ghost"
@@ -5310,7 +5750,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               <Paperclip className="mr-1.5 h-4 w-4" />
               Attachment
             </Button>
-            <span className="hidden rounded-lg border border-dashed border-card-border px-2 py-1 text-xs text-foreground/60 sm:inline-flex">
+            <span className="hidden rounded-md border border-dashed border-card-border px-2 py-1 text-xs text-foreground/60 sm:inline-flex">
               Drop files here
             </span>
             <Button
@@ -5336,6 +5776,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               {props.voiceListening ? `Stop ${formatRecordingDuration(props.voiceRecordingSeconds)}` : "Record"}
             </Button>
           </div>
+          </div>
 
         </form>
       </CardContent>
@@ -5343,16 +5784,19 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
   );
 }
 
-type RightPanelProps = {
-  rightPanelTab: "context" | "tools" | "agents";
-  setRightPanelTab: (tab: "context" | "tools" | "agents") => void;
-  toolTab: "approvals" | "diff" | "files";
-  setToolTab: (tab: "approvals" | "diff" | "files") => void;
+type ClaudeRightPanelProps = {
+  rightPanelTab: DockTab;
+  setRightPanelTab: (tab: DockTab) => void;
+  onClose: () => void;
   workspaces: WorkspaceOption[];
   activeWorkspace: string;
   onChangeWorkspace: (workspace: string) => Promise<void>;
+  runner: RunRunner;
+  setRunner: (value: RunRunner) => void;
   model: string;
   setModel: (value: string) => void;
+  reasoningEffort: ReasoningEffort;
+  setReasoningEffort: (value: ReasoningEffort) => void;
   sandbox: SandboxMode;
   setSandbox: (value: SandboxMode) => void;
   approvalPolicy: ApprovalPolicy;
@@ -5363,8 +5807,6 @@ type RightPanelProps = {
   onAcceptApproval: (item: ApprovalQueueItem) => Promise<void>;
   ansi: Convert;
   debugLogs: DebugLogEntry[];
-  diff: DiffSnapshot | null;
-  fileNodes: FileTreeNode[];
   selectedSessionId: string | null;
   selectedSession: SessionCard | null;
   selectedSessionTokenUsage: TokenUsageSummary | null | undefined;
@@ -5384,192 +5826,318 @@ type RightPanelProps = {
   sessionAction: "archive" | "delete" | null;
   onArchiveSession: () => Promise<void>;
   onDeleteSession: () => Promise<void>;
-  agents: AgentListItem[];
-  agentSchedules: AgentSchedule[];
-  upcomingAgentSchedules: AgentSchedule[];
-  agentExecutions: AgentScheduleExecution[];
-  skillSyncResult: SkillSyncResult | null;
-  agentsLoading: boolean;
-  agentsError: string | null;
-  selectedAgentId: string;
-  setSelectedAgentId: (agentId: string) => void;
-  agentScheduleTime: string;
-  setAgentScheduleTime: (time: string) => void;
-  selectedSkills: SkillListItem[];
-  skillCatalog: SkillListItem[];
-  agentActionId: string | null;
-  onReloadAgentsAndSkills: () => Promise<void>;
-  onCreateAgentSchedule: () => Promise<void>;
-  onToggleAgentSchedule: (schedule: AgentSchedule) => Promise<void>;
-  onDeleteAgentSchedule: (schedule: AgentSchedule) => Promise<void>;
-  onRunAgentScheduleNow: (schedule: AgentSchedule) => Promise<void>;
-  onSelectAgentExecution: (execution: AgentScheduleExecution) => void;
   mobile?: boolean;
 };
 
-function formatDateTime(value: number | null): string {
-  if (!value) return "-";
-  return new Date(value).toLocaleString();
-}
-
-function formatTehranSchedule(schedule: AgentSchedule): string {
-  return `${String(schedule.time.hour).padStart(2, "0")}:${String(schedule.time.minute).padStart(2, "0")} Tehran`;
-}
-
-function executionStatusClass(status: AgentScheduleExecution["status"]): string {
-  if (status === "completed") return "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/30 dark:text-emerald-200";
-  if (status === "running" || status === "queued") return "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900/40 dark:bg-blue-950/30 dark:text-blue-200";
-  if (status === "skipped") return "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-100";
-  return "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/40 dark:bg-rose-950/30 dark:text-rose-200";
-}
-
-function RightPanel(props: RightPanelProps): JSX.Element {
-  const [useCustomModel, setUseCustomModel] = useState(() => !modelOptions.includes(props.model));
+function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
+  const activeModelOptions = modelOptionsForRunner(props.runner);
+  const [useCustomModel, setUseCustomModel] = useState(() => !activeModelOptions.includes(props.model));
+  const [terminalHistoryCursor, setTerminalHistoryCursor] = useState<number | null>(null);
   const terminalRunning = props.selectedTerminal?.status === "running";
   const terminalBusy = props.terminalAction === "starting" || props.terminalAction === "stopping";
   const selectedSessionSourceBadge = props.selectedSession ? getSessionSourceBadge(props.selectedSession) : null;
+  const activeTabLabel = {
+    terminal: "Terminal",
+    approvals: "Approvals",
+    context: "Context",
+  }[props.rightPanelTab];
 
   useEffect(() => {
-    if (!modelOptions.includes(props.model)) {
+    if (!modelOptionsForRunner(props.runner).includes(props.model)) {
       setUseCustomModel(true);
     }
-  }, [props.model]);
+  }, [props.model, props.runner]);
+
+  useEffect(() => {
+    if (props.rightPanelTab !== "terminal") return;
+    const node = props.terminalOutputRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [props.rightPanelTab, props.selectedTerminal?.output, props.terminalInput]);
+
+  function selectTab(tab: DockTab): void {
+    props.setRightPanelTab(tab);
+  }
+
+  function focusTerminalPane(): void {
+    props.terminalOutputRef.current?.focus();
+  }
+
+  function onTerminalKeyDown(event: KeyboardEvent<HTMLDivElement>): void {
+    if (!terminalRunning || props.terminalAction === "sending") return;
+
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+      event.preventDefault();
+      void props.onInterruptTerminal();
+      return;
+    }
+
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const command = props.terminalInput;
+      setTerminalHistoryCursor(null);
+      void props.onSubmitTerminalInput(`${command}\n`);
+      return;
+    }
+
+    if (event.key === "Backspace") {
+      event.preventDefault();
+      setTerminalHistoryCursor(null);
+      props.setTerminalInput(props.terminalInput.slice(0, -1));
+      return;
+    }
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setTerminalHistoryCursor(null);
+      props.setTerminalInput("");
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!props.terminalHistory.length) return;
+      const nextCursor = terminalHistoryCursor === null
+        ? 0
+        : Math.min(terminalHistoryCursor + 1, props.terminalHistory.length - 1);
+      setTerminalHistoryCursor(nextCursor);
+      props.setTerminalInput(props.terminalHistory[nextCursor] || "");
+      return;
+    }
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      if (terminalHistoryCursor === null) return;
+      const nextCursor = terminalHistoryCursor - 1;
+      if (nextCursor < 0) {
+        setTerminalHistoryCursor(null);
+        props.setTerminalInput("");
+        return;
+      }
+      setTerminalHistoryCursor(nextCursor);
+      props.setTerminalInput(props.terminalHistory[nextCursor] || "");
+      return;
+    }
+
+    if (event.key === "Tab") {
+      event.preventDefault();
+      setTerminalHistoryCursor(null);
+      props.setTerminalInput(`${props.terminalInput}  `);
+      return;
+    }
+
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.key.length !== 1) return;
+
+    event.preventDefault();
+    setTerminalHistoryCursor(null);
+    props.setTerminalInput(`${props.terminalInput}${event.key}`);
+  }
+
+  function onTerminalPaste(event: ReactClipboardEvent<HTMLDivElement>): void {
+    if (!terminalRunning || props.terminalAction === "sending") return;
+    const text = event.clipboardData.getData("text");
+    if (!text) return;
+    event.preventDefault();
+    setTerminalHistoryCursor(null);
+    props.setTerminalInput(`${props.terminalInput}${text.replace(/\r\n/g, "\n")}`);
+  }
 
   return (
-    <div className="space-y-4 p-3">
-      <div className="grid grid-cols-3 gap-1 rounded-2xl border border-card-border bg-surface-2 p-1">
-        <Button size="sm" variant={props.rightPanelTab === "context" ? "primary" : "ghost"} onClick={() => props.setRightPanelTab("context")}>
-          Context
-        </Button>
-        <Button size="sm" variant={props.rightPanelTab === "tools" ? "primary" : "ghost"} onClick={() => props.setRightPanelTab("tools")}>
-          Apps
-        </Button>
-        <Button size="sm" variant={props.rightPanelTab === "agents" ? "primary" : "ghost"} onClick={() => props.setRightPanelTab("agents")}>
-          Agents
-        </Button>
+    <div className="flex h-full min-h-0 flex-col bg-surface-1">
+      <div className="relative z-10 flex h-12 shrink-0 items-center justify-between px-3 shadow-[0_14px_30px_-28px_rgba(0,0,0,0.9)]">
+        <div className="flex min-w-0 items-center gap-2">
+          <Terminal className="h-4 w-4 text-brand" />
+          <span className="truncate text-sm font-semibold">{activeTabLabel}</span>
+          {props.rightPanelTab === "approvals" ? <Badge>{props.approvals.length}</Badge> : null}
+        </div>
+        <button type="button" className="rounded-md p-1 text-foreground/55 hover:bg-control-hover hover:text-foreground" onClick={props.onClose} aria-label="Close dock" title="Close">
+          <X className="h-4 w-4" />
+        </button>
       </div>
 
-      {props.rightPanelTab === "context" ? (
-        <>
-          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Workspace</h3>
-              <Badge>active</Badge>
-            </div>
-            <select
-              className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
-              value={props.activeWorkspace}
-              onChange={(event) => void props.onChangeWorkspace(event.target.value)}
+      {props.mobile ? (
+        <div className="relative z-10 grid shrink-0 grid-cols-3 gap-1 bg-background px-2 py-2 shadow-[0_12px_26px_-26px_rgba(0,0,0,0.9)]">
+          {([
+            ["terminal", Terminal, ""],
+            ["approvals", ShieldAlert, props.approvals.length ? String(props.approvals.length) : ""],
+            ["context", Layers, ""],
+          ] as const).map(([tab, Icon, count]) => (
+            <button
+              key={tab}
+              type="button"
+              className={cn(
+                "flex h-8 items-center justify-center gap-1 rounded-md text-xs transition",
+                props.rightPanelTab === tab ? "bg-control-hover text-foreground" : "text-foreground/60 hover:bg-control hover:text-foreground",
+              )}
+              onClick={() => selectTab(tab)}
+              title={tab}
             >
-              {props.workspaces.map((workspace) => (
-                <option key={workspace.path} value={workspace.path}>
-                  {workspace.name} - {workspace.path}
-                </option>
-              ))}
-            </select>
-          </section>
+              <Icon className="h-3.5 w-3.5" />
+              {count ? <span>{count}</span> : null}
+            </button>
+          ))}
+        </div>
+      ) : null}
 
-          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Session</h3>
-              {selectedSessionSourceBadge ? (
-                <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold tracking-wide", selectedSessionSourceBadge.className)}>
-                  {selectedSessionSourceBadge.label}
-                </span>
+      <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3">
+        {props.rightPanelTab === "terminal" ? (
+          <section className="flex min-h-full flex-col">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold">Session terminal</h3>
+                <p className="truncate text-[11px] text-foreground/55" title={props.selectedSessionId || ""}>
+                  {props.selectedSessionId || "Select a session to open a terminal"}
+                </p>
+              </div>
+              <Badge>{terminalRunning ? "running" : "stopped"}</Badge>
+            </div>
+
+            <div className="mb-2 flex flex-wrap gap-2">
+              <Button size="sm" onClick={() => void props.onStartTerminal()} disabled={!props.selectedSessionId || terminalRunning || terminalBusy}>
+                {props.terminalAction === "starting" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                Open
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => void props.onStopTerminal()} disabled={!terminalRunning || terminalBusy}>
+                {props.terminalAction === "stopping" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                Stop
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => void props.onInterruptTerminal()} disabled={!terminalRunning || props.terminalAction === "sending"}>
+                Ctrl+C
+              </Button>
+            </div>
+
+            {props.selectedTerminal ? (
+              <p className="mb-2 truncate text-[11px] text-foreground/60">
+                {props.selectedTerminal.workspace} {props.selectedTerminal.pid ? `| pid ${props.selectedTerminal.pid}` : ""}
+              </p>
+            ) : null}
+
+            <div
+              ref={props.terminalOutputRef}
+              className="min-h-[420px] flex-1 cursor-text overflow-auto rounded-md border border-card-border bg-[#1f1f1e] p-3 font-mono text-[11px] leading-5 text-[#e7e5df] outline-none focus:border-brand/60 focus:ring-2 focus:ring-brand/15"
+              tabIndex={0}
+              role="textbox"
+              aria-label="Session terminal"
+              aria-multiline="true"
+              onClick={focusTerminalPane}
+              onKeyDown={onTerminalKeyDown}
+              onPaste={onTerminalPaste}
+            >
+              <pre className="min-w-max whitespace-pre-wrap">
+                {props.selectedTerminal?.output
+                  || (props.selectedTerminal
+                    ? (props.selectedTerminal.status === "running" ? "$ terminal ready" : "$ terminal stopped")
+                    : "$ terminal not started")}
+              </pre>
+              {terminalRunning ? (
+                <div className="flex min-w-max items-center whitespace-pre-wrap">
+                  <span className="text-brand">$ </span>
+                  <span>{props.terminalInput}</span>
+                  <span className={cn(
+                    "ml-0.5 inline-block h-4 w-1.5 bg-[#e7e5df]",
+                    props.terminalAction === "sending" ? "opacity-40" : "animate-pulse",
+                  )} />
+                </div>
+              ) : null}
+            </div>
+
+          </section>
+        ) : null}
+
+        {props.rightPanelTab === "approvals" ? (
+          <section className="space-y-2">
+            {props.approvals.length === 0 ? <p className="rounded-md border border-dashed border-card-border bg-surface-2 px-3 py-2 text-sm text-foreground/65">Approval queue is empty.</p> : null}
+            {props.approvals.map((item) => (
+              <div key={item.id} className="rounded-md border border-card-border bg-surface-2 p-3">
+                <div className="mb-2 flex items-center gap-2 text-sm font-semibold">
+                  <ShieldAlert className="h-4 w-4 text-[color:var(--warn)]" />
+                  {item.kind === "claude_permission" ? "Claude permission" : "Pending escalation"}
+                </div>
+                <p className="mb-2 line-clamp-6 text-xs text-foreground/75">{item.reason}</p>
+                <div className="mb-2 rounded-md bg-control p-2 font-mono text-[11px]">
+                  {item.kind === "claude_permission"
+                    ? `tool: ${item.command || item.toolName || "Claude tool"}`
+                    : `sandbox: ${item.suggestedSandbox} | approval: ${item.suggestedApprovalPolicy}`}
+                </div>
+                <Button size="sm" onClick={() => void props.onAcceptApproval(item)}>
+                  {item.kind === "claude_permission" ? "Approve" : "Approve and rerun"}
+                </Button>
+              </div>
+            ))}
+          </section>
+        ) : null}
+
+        {props.rightPanelTab === "context" ? (
+          <section className="space-y-3">
+            <div className="rounded-md border border-card-border bg-surface-2 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <h3 className="text-sm font-semibold">Workspace</h3>
+                <Badge>active</Badge>
+              </div>
+              <select
+                className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                value={props.activeWorkspace}
+                onChange={(event) => void props.onChangeWorkspace(event.target.value)}
+              >
+                {props.workspaces.map((workspace) => (
+                  <option key={workspace.path} value={workspace.path}>
+                    {workspace.name} - {workspace.path}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="rounded-md border border-card-border bg-surface-2 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <h3 className="text-sm font-semibold">Session</h3>
+                {selectedSessionSourceBadge ? <span className={cn("rounded px-2 py-0.5 text-[10px] font-semibold", selectedSessionSourceBadge.className)}>{selectedSessionSourceBadge.label}</span> : <Badge>none</Badge>}
+              </div>
+              {props.selectedSession ? (
+                <>
+                  <p className="mb-2 truncate font-mono text-[11px] text-foreground/65" title={props.selectedSession.sessionId}>{props.selectedSession.sessionId}</p>
+                  <p className="mb-2 text-xs text-foreground/70">{describeSessionMeta(props.selectedSession)}</p>
+                  <p className="mb-2 text-xs text-foreground/60">runner: {props.selectedSession.runner === "claude" ? "Claude Code" : "Codex"} | source: {props.selectedSession.sourceRaw || props.selectedSession.sourceTag}</p>
+                  <div className="mb-3 flex flex-wrap gap-2">
+                    <Button size="sm" variant="ghost" disabled={props.tokenUsageLoading} onClick={() => void props.onLoadTokenUsage(props.selectedSession!.sessionId)}>
+                      {props.tokenUsageLoading ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                      Token usage
+                    </Button>
+                    <Button size="sm" variant="ghost" disabled={props.sessionAction !== null || props.selectedSession.historyOnly} onClick={() => void props.onArchiveSession()}>
+                      {props.sessionAction === "archive" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                      Archive
+                    </Button>
+                    <Button size="sm" variant="ghost" className="text-rose-400" disabled={props.sessionAction !== null || props.selectedSession.historyOnly} onClick={() => void props.onDeleteSession()}>
+                      {props.sessionAction === "delete" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                      Delete
+                    </Button>
+                  </div>
+                  {props.tokenUsageError ? <p className="mb-2 rounded-md border border-danger-fg/40 bg-danger-bg px-3 py-2 text-xs text-danger-fg">{props.tokenUsageError}</p> : null}
+                  {props.selectedSessionTokenUsage ? (
+                    <div className="rounded-md border border-card-border bg-control px-3 py-2 text-xs text-foreground/75">
+                      <div className="mb-1 font-semibold text-foreground">Token usage</div>
+                      <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+                        <span>Input</span><span className="text-right tabular-nums">{props.selectedSessionTokenUsage.inputTokens.toLocaleString()}</span>
+                        <span>Output</span><span className="text-right tabular-nums">{props.selectedSessionTokenUsage.outputTokens.toLocaleString()}</span>
+                        <span>Cached input</span><span className="text-right tabular-nums">{props.selectedSessionTokenUsage.cachedInputTokens.toLocaleString()}</span>
+                        <span>Total</span><span className="text-right tabular-nums">{props.selectedSessionTokenUsage.totalTokens.toLocaleString()}</span>
+                      </div>
+                    </div>
+                  ) : null}
+                </>
               ) : (
-                <Badge>none</Badge>
+                <p className="text-xs text-foreground/70">Select a session to manage it.</p>
               )}
             </div>
 
-            {props.selectedSession ? (
-              <>
-                <p className="mb-2 truncate text-xs text-foreground/70" title={props.selectedSession.sessionId}>
-                  {props.selectedSession.sessionId}
-                </p>
-                <p className="mb-2 text-xs text-foreground/70">
-                  {describeSessionMeta(props.selectedSession)}
-                </p>
-                <p className="mb-2 text-xs text-foreground/60">
-                  source: {props.selectedSession.sourceRaw || props.selectedSession.sourceTag}
-                </p>
-                <div className="mb-3">
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    disabled={props.tokenUsageLoading}
-                    onClick={() => void props.onLoadTokenUsage(props.selectedSession!.sessionId)}
-                  >
-                    {props.tokenUsageLoading ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
-                    Get token usage
-                  </Button>
-                </div>
-                {props.tokenUsageError ? (
-                  <p className="mb-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800 dark:border-danger-fg/40 dark:bg-danger-bg/80 dark:text-danger-fg">
-                    {props.tokenUsageError}
-                  </p>
-                ) : null}
-                {props.selectedSessionTokenUsage ? (
-                  <div className="mb-3 rounded-xl border border-card-border bg-surface-2/70 px-3 py-2 text-xs text-foreground/75">
-                    <div className="mb-1 font-semibold text-foreground">Token usage</div>
-                    <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-                      <span>Input</span>
-                      <span className="text-right tabular-nums">{props.selectedSessionTokenUsage.inputTokens.toLocaleString()}</span>
-                      <span>Output</span>
-                      <span className="text-right tabular-nums">{props.selectedSessionTokenUsage.outputTokens.toLocaleString()}</span>
-                      <span>Cached input</span>
-                      <span className="text-right tabular-nums">{props.selectedSessionTokenUsage.cachedInputTokens.toLocaleString()}</span>
-                      <span>Total</span>
-                      <span className="text-right tabular-nums">{props.selectedSessionTokenUsage.totalTokens.toLocaleString()}</span>
-                    </div>
-                  </div>
-                ) : props.selectedSessionTokenUsage === null ? (
-                  <p className="mb-3 rounded-xl border border-card-border bg-surface-2/70 px-3 py-2 text-xs text-foreground/65">
-                    No token usage is available for this session yet.
-                  </p>
-                ) : null}
-                {props.selectedSession.historyOnly ? (
-                  <p className="mb-2 text-xs text-foreground/70">
-                    External Codex session. Archive and delete only apply to sessions with local app runs.
-                  </p>
-                ) : null}
-                <div className="grid grid-cols-2 gap-2">
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    disabled={props.sessionAction !== null || props.selectedSession.historyOnly}
-                    onClick={() => void props.onArchiveSession()}
-                  >
-                    {props.sessionAction === "archive" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
-                    Archive
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="text-rose-700 hover:bg-rose-50 hover:text-rose-800 dark:hover:bg-danger-bg/90"
-                    disabled={props.sessionAction !== null || props.selectedSession.historyOnly}
-                    onClick={() => void props.onDeleteSession()}
-                  >
-                    {props.sessionAction === "delete" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
-                    Delete
-                  </Button>
-                </div>
-              </>
-            ) : (
-              <p className="text-xs text-foreground/70">Select a chat to manage it.</p>
-            )}
-          </section>
-
-          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Run defaults</h3>
-              <Badge>next run</Badge>
-            </div>
-
-            <div className="space-y-2">
-              <div>
-                <label className="mb-1 block text-xs font-semibold text-foreground/75">Model</label>
+            <div className="rounded-md border border-card-border bg-surface-2 p-3">
+              <h3 className="mb-2 text-sm font-semibold">Run defaults</h3>
+              <div className="space-y-2">
+                <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.runner} onChange={(event) => props.setRunner(event.target.value as RunRunner)}>
+                  {runnerOptions.map((runnerOption) => <option key={runnerOption} value={runnerOption}>{runnerOption === "claude" ? "Claude Code" : "Codex"}</option>)}
+                </select>
                 <select
-                  className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                  className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none"
                   value={useCustomModel ? "__custom__" : props.model}
                   onChange={(event) => {
                     const next = event.target.value;
@@ -5581,289 +6149,53 @@ function RightPanel(props: RightPanelProps): JSX.Element {
                     props.setModel(next);
                   }}
                 >
-                  {modelOptions.map((modelOption) => (
-                    <option key={modelOption} value={modelOption}>
-                      {modelOption}
-                    </option>
-                  ))}
+                  {activeModelOptions.map((modelOption) => <option key={modelOption} value={modelOption}>{modelOption}</option>)}
                   <option value="__custom__">Custom model...</option>
                 </select>
-                {useCustomModel ? (
-                  <input
-                    className="mt-2 h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-base md:text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
-                    value={props.model}
-                    onChange={(event) => props.setModel(event.target.value)}
-                    placeholder="Enter model id (e.g. gpt-5.4)"
-                  />
-                ) : null}
-              </div>
-
-              <div>
-                <label className="mb-1 block text-xs font-semibold text-foreground/75">Sandbox</label>
-                <select
-                  className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
-                  value={props.sandbox}
-                  onChange={(event) => props.setSandbox(event.target.value as SandboxMode)}
-                >
-                  {sandboxOptions.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
+                {useCustomModel ? <input className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.model} onChange={(event) => props.setModel(event.target.value)} placeholder="Custom model id" /> : null}
+                <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.reasoningEffort} onChange={(event) => props.setReasoningEffort(event.target.value as ReasoningEffort)}>
+                  {reasoningEffortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
                 </select>
-              </div>
-
-              <div>
-                <label className="mb-1 block text-xs font-semibold text-foreground/75">Approval policy</label>
-                <select
-                  className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
-                  value={props.approvalPolicy}
-                  onChange={(event) => props.setApprovalPolicy(event.target.value as ApprovalPolicy)}
-                >
-                  {approvalPolicies.map((policy) => (
-                    <option key={policy} value={policy}>
-                      {policy}
-                    </option>
-                  ))}
+                <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.sandbox} onChange={(event) => props.setSandbox(event.target.value as SandboxMode)}>
+                  {sandboxOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+                </select>
+                <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.approvalPolicy} onChange={(event) => props.setApprovalPolicy(event.target.value as ApprovalPolicy)}>
+                  {approvalPolicies.map((policy) => <option key={policy} value={policy}>{policy}</option>)}
                 </select>
               </div>
             </div>
-          </section>
 
-          {props.debugLogs.length > 0 ? (
-            <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
-              <details>
-                <summary className="cursor-pointer list-none text-sm font-bold text-foreground">
-                  Debug logs ({props.debugLogs.length})
-                </summary>
+            <div className="rounded-md border border-card-border bg-surface-2 p-3">
+              <button type="button" onClick={() => window.location.assign("/taskmanager")} className="mb-2 flex w-full items-center justify-between rounded-md bg-control px-3 py-2 text-left text-sm hover:bg-control-hover">
+                <span className="flex items-center gap-2"><ClipboardList className="h-4 w-4" /> Luma Tasks</span>
+                <ExternalLink className="h-3.5 w-3.5" />
+              </button>
+              <Button variant="ghost" onClick={props.toggleTheme} className="w-full justify-between">
+                <span className="flex items-center gap-2"><Layers className="h-4 w-4" /> {props.theme === "light" ? "Light mode" : "Dark mode"}</span>
+                {props.theme === "light" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
+              </Button>
+            </div>
+
+            {props.debugLogs.length > 0 ? (
+              <details className="rounded-md border border-card-border bg-surface-2 p-3">
+                <summary className="cursor-pointer text-sm font-semibold">Debug logs ({props.debugLogs.length})</summary>
                 <div className="mt-2 space-y-2">
                   {props.debugLogs.map((entry) => (
-                    <div key={entry.key} className="rounded-xl border border-card-border bg-surface-2/50 px-3 py-2">
+                    <div key={entry.key} className="rounded-md border border-card-border bg-control px-3 py-2">
                       <div className="mb-1 flex items-center justify-between gap-2 text-[11px] text-foreground/65">
                         <span className="font-mono">{entry.runId}</span>
                         <span>{new Date(entry.at).toLocaleString()}</span>
                       </div>
-                      <div
-                        className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs text-foreground/80"
-                        dangerouslySetInnerHTML={{ __html: props.ansi.toHtml(entry.text) }}
-                      />
+                      <div className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs text-foreground/80" dangerouslySetInnerHTML={{ __html: props.ansi.toHtml(entry.text) }} />
                     </div>
                   ))}
                 </div>
               </details>
-            </section>
-          ) : null}
-
-          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Appearance</h3>
-              <Badge>theme</Badge>
-            </div>
-            <Button variant="ghost" onClick={props.toggleTheme} className="w-full justify-between">
-              <span className="flex items-center gap-2">
-                <Layers className="h-4 w-4" />
-                {props.theme === "light" ? "Light mode" : "Dark mode"}
-              </span>
-              {props.theme === "light" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
-            </Button>
+            ) : null}
           </section>
-        </>
-      ) : null}
+        ) : null}
 
-      {props.rightPanelTab === "tools" ? (
-        <>
-          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Apps</h3>
-              <Badge>apps</Badge>
-            </div>
-            <button
-              type="button"
-              onClick={() => window.location.assign("/taskmanager")}
-              className="group flex w-full items-center gap-3 rounded-2xl border border-card-border bg-surface-2/70 p-3 text-left transition hover:border-brand/45 hover:bg-brand-soft/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/25"
-            >
-              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-brand text-white shadow-card">
-                <ClipboardList className="h-5 w-5" />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block text-sm font-bold text-foreground">Luma Tasks</span>
-                <span className="block truncate text-xs text-foreground/65">Open the task manager</span>
-              </span>
-              <ExternalLink className="h-4 w-4 shrink-0 text-foreground/45 transition group-hover:text-brand" />
-            </button>
-          </section>
-
-          <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Session terminal</h3>
-              <Badge>{terminalRunning ? "running" : "stopped"}</Badge>
-            </div>
-
-            {!props.selectedSessionId ? (
-              <p className="text-xs text-foreground/70">Select a chat to open a terminal.</p>
-            ) : (
-              <>
-                <p className="mb-2 truncate font-mono text-[11px] text-foreground/70" title={props.selectedSessionId}>
-                  {props.selectedSessionId}
-                </p>
-
-                <div className="mb-2 flex flex-wrap gap-2">
-                  <Button
-                    size="sm"
-                    onClick={() => void props.onStartTerminal()}
-                    disabled={terminalRunning || terminalBusy}
-                  >
-                    {props.terminalAction === "starting" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
-                    Open terminal
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => void props.onStopTerminal()}
-                    disabled={!terminalRunning || terminalBusy}
-                  >
-                    {props.terminalAction === "stopping" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
-                    Stop
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => void props.onInterruptTerminal()}
-                    disabled={!terminalRunning || props.terminalAction === "sending"}
-                  >
-                    Ctrl+C
-                  </Button>
-                </div>
-
-                {props.selectedTerminal ? (
-                  <p className="mb-2 text-[11px] text-foreground/70">
-                    {props.selectedTerminal.workspace} {props.selectedTerminal.pid ? `| pid ${props.selectedTerminal.pid}` : ""}
-                  </p>
-                ) : (
-                  <p className="mb-2 text-[11px] text-foreground/70">No terminal for this session yet.</p>
-                )}
-
-                <div
-                  ref={props.terminalOutputRef}
-                  className="h-[20rem] overflow-auto rounded-xl border border-card-border bg-slate-950 p-2 font-mono text-[11px] leading-5 text-slate-100 md:h-[24rem]"
-                >
-                  <pre className="min-w-max whitespace-pre">
-                    {props.selectedTerminal?.output
-                      || (props.selectedTerminal
-                        ? (props.selectedTerminal.status === "running" ? "$ terminal ready" : "$ terminal stopped")
-                        : "$ terminal not started")}
-                  </pre>
-                </div>
-
-                <form
-                  className="mt-2 flex items-center gap-2"
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    void props.onSubmitTerminalInput(`${props.terminalInput}\n`);
-                  }}
-                >
-                  <input
-                    className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 font-mono text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
-                    value={props.terminalInput}
-                    onChange={(event) => props.setTerminalInput(event.target.value)}
-                    placeholder={terminalRunning ? "Type command and press Enter" : "Start terminal to run commands"}
-                    disabled={!terminalRunning || props.terminalAction === "sending"}
-                  />
-                  <Button
-                    type="submit"
-                    size="sm"
-                    disabled={!terminalRunning || !props.terminalInput.trim() || props.terminalAction === "sending"}
-                  >
-                    {props.terminalAction === "sending" ? <LoaderCircle className="h-4 w-4 animate-spin" /> : "Run"}
-                  </Button>
-                </form>
-
-                {props.terminalHistory.length ? (
-                  <div className="mt-3 rounded-xl border border-card-border bg-surface-1 p-2">
-                    <div className="mb-2 flex items-center justify-between">
-                      <p className="text-[11px] font-semibold text-foreground/80">Recent commands</p>
-                      <Badge>{props.terminalHistory.length}</Badge>
-                    </div>
-                    <div className="max-h-44 space-y-1 overflow-y-auto pr-1">
-                      {props.terminalHistory.map((command, index) => (
-                        <div key={`${command}_${index}`} className="rounded-lg border border-card-border bg-surface-2 px-2 py-1.5">
-                          <p className="truncate font-mono text-[11px]" title={command}>{command}</p>
-                          <div className="mt-1 flex items-center gap-1">
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-7 px-2 text-[11px]"
-                              onClick={() => props.setTerminalInput(command)}
-                            >
-                              Use
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-7 px-2 text-[11px]"
-                              disabled={!terminalRunning || props.terminalAction === "sending"}
-                              onClick={() => void props.onSubmitTerminalInput(`${command}\n`)}
-                            >
-                              Run
-                            </Button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-              </>
-            )}
-          </section>
-
-          <section className="space-y-2">
-            {props.approvals.length === 0 ? <p className="text-sm text-foreground/70">Approval queue is empty.</p> : null}
-
-            {props.approvals.map((item) => (
-              <div key={item.id} className="rounded-xl border border-card-border bg-surface-1 p-3">
-                <div className="mb-2 flex items-center gap-2 text-sm font-semibold">
-                  <ShieldAlert className="h-4 w-4 text-[color:var(--warn)]" />
-                  Pending escalation
-                </div>
-                <p className="mb-2 line-clamp-5 text-xs text-foreground/75">{item.reason}</p>
-                <div className="mb-2 rounded-lg bg-black/5 p-2 font-mono text-[11px]">
-                  sandbox: {item.suggestedSandbox} | approval: {item.suggestedApprovalPolicy}
-                </div>
-                <Button size="sm" onClick={() => void props.onAcceptApproval(item)}>
-                  Approve and rerun
-                </Button>
-              </div>
-            ))}
-          </section>
-        </>
-      ) : null}
-
-      {props.rightPanelTab === "agents" ? (
-        <AgentsPanel
-          agents={props.agents}
-          schedules={props.agentSchedules}
-          upcoming={props.upcomingAgentSchedules}
-          executions={props.agentExecutions}
-          skillSyncResult={props.skillSyncResult}
-          loading={props.agentsLoading}
-          error={props.agentsError}
-          selectedAgentId={props.selectedAgentId}
-          setSelectedAgentId={props.setSelectedAgentId}
-          scheduleTime={props.agentScheduleTime}
-          setScheduleTime={props.setAgentScheduleTime}
-          selectedSkills={props.selectedSkills}
-          skillCatalog={props.skillCatalog}
-          actionId={props.agentActionId}
-          onReload={props.onReloadAgentsAndSkills}
-          onCreateSchedule={props.onCreateAgentSchedule}
-          onToggleSchedule={props.onToggleAgentSchedule}
-          onDeleteSchedule={props.onDeleteAgentSchedule}
-          onRunNow={props.onRunAgentScheduleNow}
-          onSelectExecution={props.onSelectAgentExecution}
-        />
-      ) : null}
-
-      {props.mobile ? <div className="h-4" /> : null}
+      </div>
     </div>
   );
 }
@@ -5889,17 +6221,58 @@ type AgentsPanelProps = {
   onDeleteSchedule: (schedule: AgentSchedule) => Promise<void>;
   onRunNow: (schedule: AgentSchedule) => Promise<void>;
   onSelectExecution: (execution: AgentScheduleExecution) => void;
+  compact?: boolean;
 };
+
+function formatDateTime(value: number | null): string {
+  if (!value) return "never";
+  return new Date(value).toLocaleString();
+}
+
+function formatTehranSchedule(schedule: AgentSchedule): string {
+  const hour = String(schedule.time.hour).padStart(2, "0");
+  const minute = String(schedule.time.minute).padStart(2, "0");
+  return `${hour}:${minute} ${schedule.time.timezone}`;
+}
+
+function executionStatusClass(status: AgentScheduleExecution["status"]): string {
+  if (status === "completed") return "border-emerald-500/35 bg-emerald-500/10 text-emerald-300";
+  if (status === "running" || status === "queued") return "border-brand/35 bg-brand-soft text-brand";
+  if (status === "failed") return "border-rose-500/35 bg-rose-500/10 text-rose-300";
+  if (status === "stopped" || status === "skipped") return "border-card-border bg-control text-foreground/65";
+  return "border-card-border bg-control text-foreground/65";
+}
+
+function deploymentLabel(): "Local" | "Deployed" {
+  if (typeof window === "undefined") return "Local";
+  const hostname = window.location.hostname.toLowerCase();
+  return hostname === "localhost" || hostname === "0.0.0.0" || hostname === "::1" || hostname.startsWith("127.")
+    ? "Local"
+    : "Deployed";
+}
+
+function backendConnectionClass(status: BackendConnectionStatus): string {
+  if (status === "connected") return "bg-emerald-400 shadow-[0_0_0_3px_rgba(52,211,153,0.16)]";
+  if (status === "connecting") return "bg-amber-400 shadow-[0_0_0_3px_rgba(251,191,36,0.14)]";
+  return "bg-rose-400 shadow-[0_0_0_3px_rgba(251,113,133,0.14)]";
+}
 
 function AgentsPanel(props: AgentsPanelProps): JSX.Element {
   const selectedAgent = props.agents.find((agent) => agent.id === props.selectedAgentId) || null;
   const selectedSkillRefs = props.selectedSkills.map(selectedSkillRef);
   const syncConflictCount = props.skillSyncResult?.conflicts.length || 0;
   const syncErrorCount = props.skillSyncResult?.errors.length || 0;
+  const [visibleExecutionCount, setVisibleExecutionCount] = useState(sidebarListPageSize);
+  const visibleExecutions = props.executions.slice(0, visibleExecutionCount);
+  const hasHiddenExecutions = visibleExecutionCount < props.executions.length;
+
+  useEffect(() => {
+    setVisibleExecutionCount(sidebarListPageSize);
+  }, [props.executions.length]);
 
   return (
-    <div className="space-y-3">
-      <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+    <div className={cn(props.compact ? "space-y-2" : "space-y-3")}>
+      <section className={cn("border border-card-border bg-surface-1 p-3", props.compact ? "rounded-md" : "rounded-2xl")}>
         <div className="mb-2 flex items-center justify-between gap-2">
           <h3 className="flex items-center gap-2 text-sm font-bold">
             <Bot className="h-4 w-4" />
@@ -5950,7 +6323,7 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
             <p className="mt-1 text-xs text-foreground/60">Asia/Tehran</p>
           </div>
 
-          <div className="rounded-xl border border-card-border bg-surface-2 px-3 py-2 text-xs text-foreground/70">
+          <div className={cn("border border-card-border bg-surface-2 px-3 py-2 text-xs text-foreground/70", props.compact ? "rounded-md" : "rounded-xl")}>
             {selectedSkillRefs.length > 0 ? formatSkillSummary(selectedSkillRefs, props.skillCatalog) : "No selected skills"}
           </div>
 
@@ -5966,7 +6339,7 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
       </section>
 
       {props.skillSyncResult ? (
-        <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+        <section className={cn("border border-card-border bg-surface-1 p-3", props.compact ? "rounded-md" : "rounded-2xl")}>
           <div className="mb-1 flex items-center justify-between">
             <h3 className="text-sm font-bold">Skill sync</h3>
             <Badge>{syncConflictCount + syncErrorCount > 0 ? "attention" : "ok"}</Badge>
@@ -5987,7 +6360,7 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
         </section>
       ) : null}
 
-      <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+      <section className={cn("border border-card-border bg-surface-1 p-3", props.compact ? "rounded-md" : "rounded-2xl")}>
         <div className="mb-2 flex items-center justify-between">
           <h3 className="text-sm font-bold">Schedules</h3>
           <Badge>{props.schedules.length}</Badge>
@@ -5995,7 +6368,7 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
         <div className="space-y-2">
           {props.schedules.length === 0 ? <p className="text-xs text-foreground/70">No schedules yet.</p> : null}
           {props.schedules.map((schedule) => (
-            <div key={schedule.id} className="rounded-xl border border-card-border bg-surface-2 px-3 py-2">
+            <div key={schedule.id} className={cn("border border-card-border bg-surface-2 px-3 py-2", props.compact ? "rounded-md" : "rounded-xl")}>
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
                   <p className="truncate text-sm font-semibold">{schedule.agentName}</p>
@@ -6024,7 +6397,7 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
         </div>
       </section>
 
-      <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+      <section className={cn("border border-card-border bg-surface-1 p-3", props.compact ? "rounded-md" : "rounded-2xl")}>
         <div className="mb-2 flex items-center justify-between">
           <h3 className="text-sm font-bold">Upcoming</h3>
           <Badge>{props.upcoming.length}</Badge>
@@ -6040,18 +6413,18 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
         </div>
       </section>
 
-      <section className="rounded-2xl border border-card-border bg-surface-1 p-3">
+      <section className={cn("border border-card-border bg-surface-1 p-3", props.compact ? "rounded-md" : "rounded-2xl")}>
         <div className="mb-2 flex items-center justify-between">
           <h3 className="text-sm font-bold">Latest executions</h3>
           <Badge>{props.executions.length}</Badge>
         </div>
         <div className="space-y-2">
           {props.executions.length === 0 ? <p className="text-xs text-foreground/70">No executions recorded.</p> : null}
-          {props.executions.map((execution) => (
+          {visibleExecutions.map((execution) => (
             <button
               key={execution.id}
               type="button"
-              className="w-full rounded-xl border border-card-border bg-surface-2 px-3 py-2 text-left transition hover:border-brand/50 disabled:cursor-default disabled:hover:border-card-border"
+              className={cn("w-full border border-card-border bg-surface-2 px-3 py-2 text-left transition hover:border-brand/50 disabled:cursor-default disabled:hover:border-card-border", props.compact ? "rounded-md" : "rounded-xl")}
               disabled={!execution.sessionId}
               onClick={() => props.onSelectExecution(execution)}
             >
@@ -6068,44 +6441,19 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
               {execution.error ? <p className="mt-1 line-clamp-2 text-[11px] text-rose-700 dark:text-rose-200">{execution.error}</p> : null}
             </button>
           ))}
+          {hasHiddenExecutions ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="w-full"
+              onClick={() => setVisibleExecutionCount((current) => Math.min(current + sidebarListPageSize, props.executions.length))}
+            >
+              Load more
+            </Button>
+          ) : null}
         </div>
       </section>
-    </div>
-  );
-}
-
-function ToolTabButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }): JSX.Element {
-  return (
-    <Button size="sm" variant={active ? "primary" : "ghost"} className="h-8 px-2 text-[11px]" onClick={onClick}>
-      {label}
-    </Button>
-  );
-}
-
-function FileTree({ nodes }: { nodes: FileTreeNode[] }): JSX.Element {
-  if (!nodes.length) return <p className="text-sm text-foreground/70">No files found.</p>;
-  return (
-    <div className="space-y-1 text-xs">
-      {nodes.map((node) => (
-        <FileTreeRow key={node.path} node={node} level={0} />
-      ))}
-    </div>
-  );
-}
-
-function FileTreeRow({ node, level }: { node: FileTreeNode; level: number }): JSX.Element {
-  const pad = level * 14;
-  return (
-    <div>
-      <div className="flex items-center gap-2 rounded-lg border border-card-border bg-surface-1 p-2" style={{ paddingLeft: 8 + pad }}>
-        {node.type === "directory" ? <FolderTree className="h-3.5 w-3.5" /> : <FileCode2 className="h-3.5 w-3.5" />}
-        <span className="truncate">{node.name}</span>
-      </div>
-      {node.children?.map((child) => (
-        <div key={child.path} className="mt-1">
-          <FileTreeRow node={child} level={level + 1} />
-        </div>
-      ))}
     </div>
   );
 }

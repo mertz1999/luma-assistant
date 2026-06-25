@@ -9,8 +9,6 @@ import type {
   CodexAccountStatusResponse,
   CodexMcpStatusResponse,
   CodexSystemStatusResponse,
-  DiffSnapshot,
-  FileTreeNode,
   RunRecord,
   RunListResponse,
   RunMessagesResponse,
@@ -361,17 +359,15 @@ export function rerun(runId: string, payload: { sandbox?: string; approvalPolicy
   });
 }
 
+export function acceptApproval(runId: string, approvalId: string, approvalPolicy = "on-request"): Promise<{ run: RunRecord; approval: ApprovalQueueItem }> {
+  return request(`/api/runs/${runId}/approval/${approvalId}/accept`, {
+    method: "POST",
+    body: JSON.stringify({ approvalPolicy }),
+  });
+}
+
 export function getRun(runId: string): Promise<{ run: RunRecord; approvals: ApprovalQueueItem[] }> {
   return request(`/api/runs/${runId}`);
-}
-
-export function getDiff(runId: string): Promise<DiffSnapshot> {
-  return request(`/api/runs/${runId}/diff`);
-}
-
-export function getFileTree(relPath = ".", depth = 2): Promise<{ root: string; nodes: FileTreeNode[] }> {
-  const params = new URLSearchParams({ path: relPath, depth: String(depth) });
-  return request(`/api/files/tree?${params.toString()}`);
 }
 
 export function setActiveWorkspace(workspace: string): Promise<{ activeWorkspace: string }> {
@@ -436,7 +432,6 @@ export function connectEvents(onEvent: (evt: SseEvent) => void): EventSource {
     "run.stderr",
     "run.item",
     "run.approvalQueued",
-    "run.diffUpdated",
     "run.completed",
     "run.failed",
     "run.stopped",

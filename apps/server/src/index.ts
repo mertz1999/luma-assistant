@@ -5,6 +5,20 @@ import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypt
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
+import {
+  query as queryClaudeCode,
+  type CanUseTool,
+  type Options as ClaudeOptions,
+  type PermissionResult,
+  type Query as ClaudeQuery,
+  type SDKAssistantMessage,
+  type SDKMessage,
+  type SDKPermissionDenial,
+  type SDKResultMessage,
+  type SDKSystemMessage,
+  type SDKUserMessage,
+  type SDKUserMessageReplay,
+} from "@anthropic-ai/claude-agent-sdk";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -46,14 +60,14 @@ import {
   type CodexMcpStatusResponse,
   type CodexSystemStatusResponse,
   type CodexTokenStatus,
-  type DiffSnapshot,
-  type FileTreeNode,
   type RunConfig,
+  type ReasoningEffort,
   type RunListItem,
   type RunMessageEntry,
   type RunMessageFileChange,
   type RunEventEntry,
   type RunRecord,
+  type RunRunner,
   type RunSourceTag,
   type SelectedAgentRef,
   type SelectedSkillRef,
@@ -104,8 +118,13 @@ const API_PORT = Number(process.env.API_PORT || 9001);
 const WEB_PORT = Number(process.env.WEB_PORT || 5175);
 const HOST = process.env.HOST || "0.0.0.0";
 const CODEX_PATH = process.env.CODEX_PATH || "codex";
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "gpt-5.3-codex";
-const DEFAULT_REASONING_EFFORT = process.env.DEFAULT_REASONING_EFFORT || "high";
+const DEFAULT_RUNNER: RunRunner = process.env.DEFAULT_RUNNER === "claude" ? "claude" : "codex";
+const DEFAULT_CODEX_MODEL = process.env.DEFAULT_MODEL || process.env.CODEX_DEFAULT_MODEL || "gpt-5.3-codex";
+const DEFAULT_CLAUDE_MODEL = process.env.CLAUDE_DEFAULT_MODEL || "sonnet";
+const DEFAULT_MODEL = DEFAULT_RUNNER === "claude" ? DEFAULT_CLAUDE_MODEL : DEFAULT_CODEX_MODEL;
+const CLAUDE_AUTH_MODE = process.env.CLAUDE_AUTH_MODE === "api_key" ? "api_key" : "oauth";
+const CLAUDE_CODE_EXECUTABLE = resolveClaudeCodeExecutable(process.env.CLAUDE_CODE_EXECUTABLE);
+const DEFAULT_REASONING_EFFORT = normalizeReasoningEffort(process.env.DEFAULT_REASONING_EFFORT);
 const DEFAULT_SANDBOX = resolveDefaultSandboxMode();
 const MAX_CONCURRENT_RUNS = Number(process.env.MAX_CONCURRENT_RUNS || 8);
 const AUTH_PASSWORD = process.env.PASSWORD || process.env.APP_PASSWORD || "";
@@ -224,10 +243,28 @@ type PersistedUiState = {
   manualWorkspaces: string[];
 };
 
-type ActiveRun = {
+type CodexActiveRun = {
+  runner: "codex";
   process: ChildProcess;
   stdoutBuffer: string;
   stopRequested: boolean;
+};
+
+type ClaudeActiveRun = {
+  runner: "claude";
+  abortController: AbortController;
+  query: ClaudeQuery | null;
+  stopRequested: boolean;
+};
+
+type ActiveRun = CodexActiveRun | ClaudeActiveRun;
+
+type ClaudePermissionWaiter = {
+  runId: string;
+  toolName: string;
+  toolUseId: string;
+  resolve: (result: PermissionResult) => void;
+  timer: NodeJS.Timeout;
 };
 
 type MessageStoreMeta = {
@@ -253,7 +290,9 @@ type MessageOutboxItem = {
   text: string;
   attachments: AttachmentRef[];
   workspace: string;
+  runner: RunRunner;
   model: string;
+  reasoningEffort: ReasoningEffort;
   sandbox: RunConfig["sandbox"];
   approvalPolicy: RunConfig["approvalPolicy"];
   planMode: boolean;
@@ -344,6 +383,24 @@ const TERMINAL_HISTORY_MAX_CHARS = Number(process.env.TERMINAL_HISTORY_MAX_CHARS
 
 function runSessionId(run: RunRecord): string {
   return run.sessionId || run.threadId || run.id;
+}
+
+function normalizeRunRunner(input: unknown): RunRunner {
+  return input === "claude" ? "claude" : "codex";
+}
+
+function normalizeReasoningEffort(input: unknown): ReasoningEffort {
+  return input === "low" || input === "medium" || input === "high" ? input : "high";
+}
+
+function resolveClaudeThinkingConfig(model: string, effort: ReasoningEffort): ClaudeOptions["thinking"] | undefined {
+  const lowerModel = model.toLowerCase();
+  if (lowerModel.includes("haiku")) return undefined;
+  if (effort === "low") return undefined;
+  return {
+    type: "enabled",
+    budgetTokens: effort === "medium" ? 2048 : 4096,
+  };
 }
 
 function aggregateRunTokenUsage(runs: RunRecord[]): TokenUsageSummary | null {
@@ -1296,8 +1353,10 @@ function parseSkillMetadata(content: string, skillPath: string): { name: string;
 
 function getSkillRoots(workspace: string): Array<{ root: string; source: string; scope: string }> {
   return [
-    { root: path.join(os.homedir(), ".codex", "skills"), source: "global", scope: "user" },
-    { root: path.join(workspace, ".codex", "skills"), source: "workspace", scope: "repo" },
+    { root: path.join(os.homedir(), ".codex", "skills"), source: "codex", scope: "user" },
+    { root: path.join(os.homedir(), ".claude", "skills"), source: "claude", scope: "user" },
+    { root: path.join(workspace, ".codex", "skills"), source: "codex repo", scope: "repo" },
+    { root: path.join(workspace, ".claude", "skills"), source: "claude repo", scope: "repo" },
   ];
 }
 
@@ -1540,6 +1599,45 @@ function writeManagedSkillMarker(targetPath: string, sourcePath: string): void {
   );
 }
 
+function syncRepoSkillTarget(
+  skill: { slug: string; sourcePath: string },
+  targetRoot: string,
+  targetLabel: string,
+  result: SkillSyncResult,
+): void {
+  const targetPath = path.join(targetRoot, skill.slug);
+  const label = `${targetLabel}:${skill.slug}`;
+  try {
+    if (fs.existsSync(targetPath)) {
+      if (!readManagedSkillMarker(targetPath)) {
+        result.conflicts.push({
+          slug: label,
+          sourcePath: skill.sourcePath,
+          targetPath,
+          reason: `Target exists without ${MANAGED_SKILL_MARKER}`,
+        });
+        return;
+      }
+      fs.rmSync(targetPath, { recursive: true, force: true });
+      fs.cpSync(skill.sourcePath, targetPath, { recursive: true });
+      writeManagedSkillMarker(targetPath, skill.sourcePath);
+      result.updated.push(label);
+      return;
+    }
+
+    fs.mkdirSync(targetRoot, { recursive: true });
+    fs.cpSync(skill.sourcePath, targetPath, { recursive: true });
+    writeManagedSkillMarker(targetPath, skill.sourcePath);
+    result.copied.push(label);
+  } catch (error) {
+    result.errors.push({
+      slug: label,
+      sourcePath: skill.sourcePath,
+      message: error instanceof Error ? error.message : "Failed to sync skill",
+    });
+  }
+}
+
 function syncRepoSkills(): SkillSyncResult {
   const result: SkillSyncResult = {
     copied: [],
@@ -1547,37 +1645,14 @@ function syncRepoSkills(): SkillSyncResult {
     conflicts: [],
     errors: [],
   };
-  const globalSkillsRoot = path.join(os.homedir(), ".codex", "skills");
+  const targets = [
+    { root: path.join(os.homedir(), ".codex", "skills"), label: "codex" },
+    { root: path.join(os.homedir(), ".claude", "skills"), label: "claude" },
+  ];
 
   for (const skill of discoverRepoSkillDirectories()) {
-    const targetPath = path.join(globalSkillsRoot, skill.slug);
-    try {
-      if (fs.existsSync(targetPath)) {
-        if (!readManagedSkillMarker(targetPath)) {
-          result.conflicts.push({
-            slug: skill.slug,
-            sourcePath: skill.sourcePath,
-            targetPath,
-            reason: `Target exists without ${MANAGED_SKILL_MARKER}`,
-          });
-          continue;
-        }
-        fs.rmSync(targetPath, { recursive: true, force: true });
-        fs.cpSync(skill.sourcePath, targetPath, { recursive: true });
-        writeManagedSkillMarker(targetPath, skill.sourcePath);
-        result.updated.push(skill.slug);
-      } else {
-        fs.mkdirSync(globalSkillsRoot, { recursive: true });
-        fs.cpSync(skill.sourcePath, targetPath, { recursive: true });
-        writeManagedSkillMarker(targetPath, skill.sourcePath);
-        result.copied.push(skill.slug);
-      }
-    } catch (error) {
-      result.errors.push({
-        slug: skill.slug,
-        sourcePath: skill.sourcePath,
-        message: error instanceof Error ? error.message : "Failed to sync skill",
-      });
+    for (const target of targets) {
+      syncRepoSkillTarget(skill, target.root, target.label, result);
     }
   }
 
@@ -1740,8 +1815,33 @@ function loadNodePty(): NodePtyModule | null {
 }
 
 function commandExists(command: string): boolean {
+  return Boolean(resolveCommandPath(command));
+}
+
+function resolveCommandPath(command: string): string {
   const result = spawnSync("which", [command], { encoding: "utf8" });
-  return result.status === 0 && Boolean(result.stdout.trim());
+  if (result.status !== 0 || !result.stdout.trim()) return "";
+  return result.stdout.trim().split(/\r?\n/)[0]?.trim() || "";
+}
+
+function resolveClaudeCodeExecutable(configured: string | undefined): string {
+  const explicit = (configured || "").trim();
+  if (explicit) return explicit;
+  return resolveCommandPath("claude");
+}
+
+function buildClaudeEnvironment(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env };
+
+  if (CLAUDE_AUTH_MODE === "oauth") {
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    delete env.CLAUDE_AGENT_SDK_CLIENT_APP;
+    return env;
+  }
+
+  env.CLAUDE_AGENT_SDK_CLIENT_APP = process.env.CLAUDE_AGENT_SDK_CLIENT_APP || "luma-assistant";
+  return env;
 }
 
 function getChildPids(pid: number): number[] {
@@ -1781,7 +1881,7 @@ class RunManager extends EventEmitter {
 
   private approvals = new Map<string, ApprovalQueueItem>();
 
-  private diffs = new Map<string, DiffSnapshot>();
+  private claudePermissionWaiters = new Map<string, ClaudePermissionWaiter>();
 
   private activeRuns = new Map<string, ActiveRun>();
 
@@ -1815,7 +1915,11 @@ class RunManager extends EventEmitter {
         updatedAt: staleActiveRun ? now : run.updatedAt,
         config: {
           ...run.config,
+          runner: normalizeRunRunner(run.config?.runner),
+          reasoningEffort: normalizeReasoningEffort(run.config?.reasoningEffort),
           attachments: normalizeAttachmentRefs(run.config?.attachments),
+          skills: normalizeSelectedSkillRefs(run.config?.skills),
+          agents: normalizeSelectedAgentRefs(run.config?.agents),
         },
         events,
         lastError: staleActiveRun ? restartMessage : run.lastError,
@@ -1852,10 +1956,6 @@ class RunManager extends EventEmitter {
     return [...this.approvals.values()].sort((a, b) => b.createdAt - a.createdAt);
   }
 
-  getDiff(runId: string): DiffSnapshot | null {
-    return this.diffs.get(runId) || null;
-  }
-
   archiveSession(sessionId: string): { archivedRuns: number } | null {
     const sessionRuns = this.getSessionRuns(sessionId);
     if (sessionRuns.length === 0) return null;
@@ -1883,7 +1983,6 @@ class RunManager extends EventEmitter {
     const runIds = new Set(sessionRuns.map((run) => run.id));
     for (const runId of runIds) {
       this.runs.delete(runId);
-      this.diffs.delete(runId);
     }
 
     const removedApprovals = this.removeApprovalsForRunIds(runIds);
@@ -1909,7 +2008,10 @@ class RunManager extends EventEmitter {
     const resolvedSkills = resolveSelectedSkills(effectiveConfig.workspace, effectiveConfig.skills);
     const resolvedAgents = resolveSelectedAgents(effectiveConfig.agents);
     const promptBase = buildPromptWithAttachments(effectiveConfig.prompt, resolvedAttachments);
-    const promptWithPlan = effectiveConfig.planMode ? buildPlanModePrompt(promptBase) : promptBase;
+    const planModeInstructions = effectiveConfig.planMode ? readPlanModeInstructions() : "";
+    const promptWithPlan = effectiveConfig.planMode && effectiveConfig.runner !== "claude"
+      ? buildPlanModePrompt(promptBase, planModeInstructions)
+      : promptBase;
     const promptWithAgents = buildAgentBackedPrompt(promptWithPlan, resolvedAgents);
     const prompt = buildSkillBackedPrompt(promptWithAgents, resolvedSkills);
     const imageArgs = resolvedAttachments
@@ -1935,6 +2037,12 @@ class RunManager extends EventEmitter {
 
     this.runs.set(runId, record);
 
+    if (effectiveConfig.runner === "claude") {
+      this.startClaudeExecution(runId, effectiveConfig, prompt, planModeInstructions);
+      this.persistState();
+      return record;
+    }
+
     const args = effectiveConfig.sessionId
       ? [
           "exec",
@@ -1944,12 +2052,13 @@ class RunManager extends EventEmitter {
           "-m",
           effectiveConfig.model,
           "-c",
-          `reasoning_effort=${JSON.stringify(DEFAULT_REASONING_EFFORT)}`,
+          `reasoning_effort=${JSON.stringify(effectiveConfig.reasoningEffort)}`,
           "-c",
           `approval_policy=${JSON.stringify(effectiveConfig.approvalPolicy)}`,
           "-c",
           `sandbox_mode=${JSON.stringify(effectiveConfig.sandbox)}`,
           ...imageArgs,
+          "--",
           effectiveConfig.sessionId,
           prompt,
         ]
@@ -1962,12 +2071,13 @@ class RunManager extends EventEmitter {
           "-m",
           effectiveConfig.model,
           "-c",
-          `reasoning_effort=${JSON.stringify(DEFAULT_REASONING_EFFORT)}`,
+          `reasoning_effort=${JSON.stringify(effectiveConfig.reasoningEffort)}`,
           "-s",
           effectiveConfig.sandbox,
           "-c",
           `approval_policy=${JSON.stringify(effectiveConfig.approvalPolicy)}`,
           ...imageArgs,
+          "--",
           prompt,
         ];
 
@@ -1979,7 +2089,7 @@ class RunManager extends EventEmitter {
       throw new Error("Failed to initialize codex process streams");
     }
 
-    this.activeRuns.set(runId, { process: child, stdoutBuffer: "", stopRequested: false });
+    this.activeRuns.set(runId, { runner: "codex", process: child, stdoutBuffer: "", stopRequested: false });
     this.updateRun(runId, { status: "running" });
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
     const startedRun = this.runs.get(runId);
@@ -1989,7 +2099,7 @@ class RunManager extends EventEmitter {
 
     child.stdout.on("data", (chunk: Buffer) => {
       const active = this.activeRuns.get(runId);
-      if (!active) return;
+      if (!active || active.runner !== "codex") return;
       active.stdoutBuffer += chunk.toString("utf8");
       let idx = active.stdoutBuffer.indexOf("\n");
       while (idx >= 0) {
@@ -2047,7 +2157,6 @@ class RunManager extends EventEmitter {
         }
       }
 
-      this.refreshDiff(runId);
       this.persistState();
     });
 
@@ -2055,20 +2164,398 @@ class RunManager extends EventEmitter {
     return record;
   }
 
+  private startClaudeExecution(runId: string, effectiveConfig: RunConfig, prompt: string, planModeInstructions = ""): void {
+    const abortController = new AbortController();
+    const options: ClaudeOptions = {
+      cwd: effectiveConfig.workspace,
+      model: effectiveConfig.model,
+      abortController,
+      permissionMode: effectiveConfig.planMode ? "plan" : "bypassPermissions",
+      allowDangerouslySkipPermissions: !effectiveConfig.planMode,
+      env: buildClaudeEnvironment(),
+      systemPrompt: { type: "preset", preset: "claude_code" },
+      tools: { type: "preset", preset: "claude_code" },
+    };
+    const thinking = resolveClaudeThinkingConfig(effectiveConfig.model, effectiveConfig.reasoningEffort);
+    if (thinking) options.thinking = thinking;
+    if (effectiveConfig.planMode) {
+      options.planModeInstructions = planModeInstructions;
+      options.canUseTool = this.createClaudeCanUseTool(runId, effectiveConfig);
+    }
+    if (effectiveConfig.sessionId) options.resume = effectiveConfig.sessionId;
+    if (CLAUDE_CODE_EXECUTABLE) options.pathToClaudeCodeExecutable = CLAUDE_CODE_EXECUTABLE;
+
+    const active: ClaudeActiveRun = { runner: "claude", abortController, query: null, stopRequested: false };
+    const claudeQuery = queryClaudeCode({ prompt, options });
+    active.query = claudeQuery;
+    this.activeRuns.set(runId, active);
+    this.updateRun(runId, { status: "running" });
+    this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
+    const startedRun = this.runs.get(runId);
+    if (startedRun) {
+      this.emit("run.lifecycle", { kind: "started", run: startedRun, previous: null } as RunLifecycleEvent);
+    }
+
+    void this.consumeClaudeQuery(runId, claudeQuery).catch((error) => {
+      const stillActive = this.activeRuns.get(runId);
+      const stopRequested = Boolean(stillActive?.stopRequested);
+      if (!stopRequested) {
+        const message = error instanceof Error ? error.message : "Claude Code run failed";
+        this.appendEvent(runId, { source: "stderr", text: message });
+        this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: message } });
+        this.updateRun(runId, { status: "failed", lastError: message });
+      }
+    }).finally(() => {
+      this.finishClaudeExecution(runId);
+    });
+  }
+
+  private async consumeClaudeQuery(runId: string, claudeQuery: ClaudeQuery): Promise<void> {
+    for await (const message of claudeQuery) {
+      this.handleClaudeMessage(runId, message);
+    }
+  }
+
+  private finishClaudeExecution(runId: string): void {
+    const active = this.activeRuns.get(runId);
+    const stopRequested = Boolean(active?.stopRequested);
+    this.activeRuns.delete(runId);
+    this.rejectClaudePermissionWaitersForRun(runId, "Claude run ended before permission was approved.");
+
+    const run = this.runs.get(runId);
+    if (!run) return;
+
+    if (stopRequested) {
+      this.updateRun(runId, { status: "stopped" });
+      this.emitSse({ kind: "run.stopped", runId, at: Date.now() });
+      const stoppedRun = this.runs.get(runId);
+      if (stoppedRun) {
+        this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous: run } as RunLifecycleEvent);
+      }
+    } else if (run.status !== "failed" && run.status !== "stopped") {
+      this.updateRun(runId, { status: "completed" });
+      this.emitSse({ kind: "run.completed", runId, at: Date.now() });
+      const completedRun = this.runs.get(runId);
+      if (completedRun) {
+        this.emit("run.lifecycle", { kind: "completed", run: completedRun, previous: run } as RunLifecycleEvent);
+      }
+    } else if (run.status === "failed") {
+      this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code: 1 } });
+      const failedRun = this.runs.get(runId);
+      if (failedRun) {
+        this.emit("run.lifecycle", { kind: "failed", run: failedRun, previous: run } as RunLifecycleEvent);
+      }
+    }
+
+    this.persistState();
+  }
+
+  private handleClaudeMessage(runId: string, message: SDKMessage): void {
+    const storedLine = truncateText(JSON.stringify(message), STORED_EVENT_TEXT_MAX_CHARS);
+    this.appendEvent(runId, { source: "stdout", text: storedLine });
+    this.emitSse({ kind: "run.stdout", runId, at: Date.now(), payload: { text: storedLine } });
+
+    this.trackClaudeSessionId(runId, message);
+
+    switch (message.type) {
+      case "assistant":
+        this.handleClaudeAssistantMessage(runId, message);
+        return;
+      case "result":
+        this.handleClaudeResultMessage(runId, message);
+        return;
+      case "user":
+        this.handleClaudeUserMessage(runId, message);
+        return;
+      case "system":
+        this.handleClaudeSystemMessage(runId, message);
+        return;
+      case "auth_status":
+        this.handleClaudeAuthStatusMessage(runId, message as unknown as Record<string, unknown>);
+        return;
+      case "prompt_suggestion":
+      case "rate_limit_event":
+      case "stream_event":
+        return;
+      default:
+        return;
+    }
+  }
+
+  private trackClaudeSessionId(runId: string, message: SDKMessage): void {
+    const record = message as unknown as Record<string, unknown>;
+    const sessionId = typeof record.session_id === "string" ? record.session_id : "";
+    if (sessionId) {
+      const run = this.runs.get(runId);
+      if (run) {
+        const patch: Partial<RunRecord> = { threadId: sessionId };
+        if (!run.sessionId) patch.sessionId = sessionId;
+        this.updateRun(runId, patch);
+        this.emitClaudeParsed(runId, { type: "thread.started", thread_id: sessionId });
+      }
+    }
+  }
+
+  private handleClaudeAssistantMessage(runId: string, message: SDKAssistantMessage): void {
+    const text = readClaudeAssistantText(message as unknown as Record<string, unknown>);
+    const toolUses = readClaudeToolUses(message as unknown as Record<string, unknown>);
+    for (const toolUse of toolUses) {
+      this.emitClaudeParsed(runId, {
+        type: "item.completed",
+        item: {
+          id: toolUse.id,
+          type: "mcp_tool_call",
+          status: "completed",
+          server: "claude",
+          tool: toolUse.name,
+          arguments: toolUse.input,
+        },
+      });
+    }
+    if (message.error) {
+      this.emitClaudeParsed(runId, {
+        type: "item.completed",
+        item: {
+          id: message.uuid,
+          type: "error",
+          message: `Claude assistant error: ${message.error}`,
+        },
+      });
+    }
+    if (text.trim()) {
+      this.updateRun(runId, { summary: text.slice(0, 240) });
+      this.emitClaudeParsed(runId, {
+        type: "item.completed",
+        item: {
+          id: message.uuid,
+          type: "agent_message",
+          text,
+        },
+      });
+    }
+  }
+
+  private handleClaudeResultMessage(runId: string, message: SDKResultMessage): void {
+    const record = message as unknown as Record<string, unknown>;
+    const usage = readClaudeResultUsage(record);
+    const resultText = typeof record.result === "string" ? record.result : "";
+    const errors = Array.isArray(record.errors) ? record.errors.filter((item): item is string => typeof item === "string") : [];
+    const permissionDenials = Array.isArray(message.permission_denials) ? message.permission_denials : [];
+    const isError = message.subtype !== "success" || message.is_error === true;
+    if (usage) this.updateRun(runId, { usage });
+    if (resultText.trim()) this.updateRun(runId, { summary: resultText.slice(0, 240) });
+    for (const denial of permissionDenials) {
+      this.emitClaudeParsed(runId, {
+        type: "item.completed",
+        item: {
+          id: denial.tool_use_id || `claude_permission_${Date.now()}`,
+          type: "error",
+          message: readClaudePermissionDenialText(denial),
+        },
+      });
+    }
+    if (isError) {
+      const messageText = errors.join("\n") || resultText || "Claude Code run failed";
+      this.updateRun(runId, { status: "failed", lastError: messageText.slice(0, 600) });
+      this.emitClaudeParsed(runId, {
+        type: "item.completed",
+        item: {
+          id: message.uuid,
+          type: "error",
+          message: messageText,
+        },
+      });
+    }
+    this.emitClaudeParsed(runId, {
+      type: "turn.completed",
+      usage: {
+        input_tokens: usage?.inputTokens,
+        output_tokens: usage?.outputTokens,
+        cached_input_tokens: usage?.cachedInputTokens,
+      },
+    });
+  }
+
+  private handleClaudeUserMessage(runId: string, message: SDKUserMessage | SDKUserMessageReplay): void {
+    if (!("isReplay" in message) || message.isReplay !== true) return;
+    const text = readClaudeUserMessageText(message);
+    if (!text.trim()) return;
+    this.emitClaudeParsed(runId, {
+      type: "item.completed",
+      item: {
+        id: message.uuid || `claude_user_replay_${Date.now()}`,
+        type: "agent_message",
+        text: `Replayed user message:\n${text}`,
+      },
+    });
+  }
+
+  private handleClaudeSystemMessage(runId: string, message: SDKSystemMessage | (SDKMessage & { type: "system" })): void {
+    const record = message as unknown as Record<string, unknown>;
+    const subtype = typeof record.subtype === "string" ? record.subtype : "";
+    if (subtype === "init") return;
+
+    if (subtype === "permission_denied") {
+      const text = readClaudeSystemText(record) || "Claude denied a tool permission request.";
+      this.emitClaudeParsed(runId, {
+        type: "item.completed",
+        item: {
+          id: typeof record.uuid === "string" ? record.uuid : `claude_permission_denied_${Date.now()}`,
+          type: "error",
+          message: text,
+        },
+      });
+      return;
+    }
+
+    const text = readClaudeSystemText(record);
+    if (text) {
+      this.emitClaudeParsed(runId, {
+        type: "item.completed",
+        item: {
+          id: typeof record.uuid === "string" ? record.uuid : `claude_system_${Date.now()}`,
+          type: "agent_message",
+          text,
+        },
+      });
+    }
+  }
+
+  private handleClaudeAuthStatusMessage(runId: string, message: Record<string, unknown>): void {
+    const output = Array.isArray(message.output) ? message.output.filter((item): item is string => typeof item === "string") : [];
+    const error = typeof message.error === "string" ? message.error : "";
+    const text = error || output.join("\n");
+    if (!text.trim()) return;
+    this.emitClaudeParsed(runId, {
+      type: "item.completed",
+      item: {
+        id: typeof message.uuid === "string" ? message.uuid : `claude_auth_${Date.now()}`,
+        type: error ? "error" : "agent_message",
+        ...(error ? { message: text } : { text }),
+      },
+    });
+  }
+
+  private emitClaudeParsed(runId: string, parsed: Record<string, unknown>): void {
+    const type = typeof parsed.type === "string" ? parsed.type : "";
+    if (type.startsWith("item.")) {
+      const item = parsed.item as Record<string, unknown> | undefined;
+      this.emitSse({ kind: "run.item", runId, at: Date.now(), payload: { type, item } });
+    }
+
+    const run = this.runs.get(runId);
+    if (run) {
+      this.emit("run.parsed", { runId, run, parsed } as RunParsedEvent);
+    }
+  }
+
+  private createClaudeCanUseTool(runId: string, effectiveConfig: RunConfig): CanUseTool {
+    return async (toolName, input, options) => {
+      const approvalId = `approval_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const inputPreview = truncateText(JSON.stringify(input, null, 2), 1200);
+      const title = options.title || (toolName === "ExitPlanMode" ? "Claude wants to exit plan mode" : `Claude wants to use ${toolName}`);
+      const description = options.description || options.decisionReason || "";
+      const reason = [title, description, inputPreview ? `Input:\n${inputPreview}` : ""].filter(Boolean).join("\n\n");
+      const approval: ApprovalQueueItem = {
+        id: approvalId,
+        runId,
+        createdAt: Date.now(),
+        kind: "claude_permission",
+        reason,
+        suggestedSandbox: effectiveConfig.sandbox,
+        suggestedApprovalPolicy: effectiveConfig.approvalPolicy,
+        command: options.displayName || toolName,
+        toolName,
+        toolUseId: options.toolUseID,
+        status: "pending",
+      };
+
+      this.approvals.set(approval.id, approval);
+      this.persistState();
+      this.emitSse({ kind: "run.approvalQueued", runId, at: Date.now(), payload: approval as unknown as Record<string, unknown> });
+
+      return await new Promise<PermissionResult>((resolve) => {
+        const deny = (message: string): void => {
+          const waiter = this.claudePermissionWaiters.get(approvalId);
+          if (waiter) {
+            clearTimeout(waiter.timer);
+            this.claudePermissionWaiters.delete(approvalId);
+          }
+          const current = this.approvals.get(approvalId);
+          if (current?.status === "pending") {
+            current.status = "dismissed";
+            this.approvals.set(approvalId, current);
+            this.persistState();
+          }
+          resolve({
+            behavior: "deny",
+            message,
+            toolUseID: options.toolUseID,
+            decisionClassification: "user_reject",
+          });
+        };
+
+        const timer = setTimeout(() => {
+          deny(`${toolName} was not approved before the permission request timed out.`);
+        }, 30 * 60 * 1000);
+        this.claudePermissionWaiters.set(approvalId, {
+          runId,
+          toolName,
+          toolUseId: options.toolUseID,
+          resolve,
+          timer,
+        });
+
+        if (options.signal.aborted) {
+          deny(`${toolName} permission request was aborted.`);
+          return;
+        }
+        options.signal.addEventListener("abort", () => deny(`${toolName} permission request was aborted.`), { once: true });
+      });
+    };
+  }
+
+  private rejectClaudePermissionWaitersForRun(runId: string, message: string): void {
+    for (const [approvalId, waiter] of this.claudePermissionWaiters.entries()) {
+      if (waiter.runId !== runId) continue;
+      clearTimeout(waiter.timer);
+      this.claudePermissionWaiters.delete(approvalId);
+      const approval = this.approvals.get(approvalId);
+      if (approval?.status === "pending") {
+        approval.status = "dismissed";
+        this.approvals.set(approvalId, approval);
+      }
+      waiter.resolve({
+        behavior: "deny",
+        message,
+        toolUseID: waiter.toolUseId,
+        decisionClassification: "user_reject",
+      });
+    }
+    this.persistState();
+  }
+
   stopRun(runId: string): boolean {
     const active = this.activeRuns.get(runId);
     if (!active) return false;
 
     active.stopRequested = true;
+    if (active.runner === "claude") {
+      active.abortController.abort();
+      active.query?.close();
+      this.rejectClaudePermissionWaitersForRun(runId, "Claude run was stopped before permission was approved.");
+      return true;
+    }
+
     active.process.kill("SIGINT");
 
     setTimeout(() => {
       const running = this.activeRuns.get(runId);
-      if (!running) return;
+      if (!running || running.runner !== "codex") return;
       running.process.kill("SIGTERM");
       setTimeout(() => {
         const stillRunning = this.activeRuns.get(runId);
-        if (!stillRunning) return;
+        if (!stillRunning || stillRunning.runner !== "codex") return;
         stillRunning.process.kill("SIGKILL");
       }, 2500);
     }, 2500);
@@ -2081,6 +2568,18 @@ class RunManager extends EventEmitter {
     if (!item) return null;
     item.status = "accepted";
     this.approvals.set(id, item);
+    if (item.kind === "claude_permission") {
+      const waiter = this.claudePermissionWaiters.get(id);
+      if (waiter) {
+        clearTimeout(waiter.timer);
+        this.claudePermissionWaiters.delete(id);
+        waiter.resolve({
+          behavior: "allow",
+          toolUseID: waiter.toolUseId,
+          decisionClassification: "user_temporary",
+        });
+      }
+    }
     this.persistState();
     return item;
   }
@@ -2140,7 +2639,6 @@ class RunManager extends EventEmitter {
           if (typeof row.path === "string") current.add(row.path);
         }
         this.updateRun(runId, { changedFiles: [...current] });
-        this.refreshDiff(runId);
       }
 
       if (itemType === "command_execution") {
@@ -2187,40 +2685,6 @@ class RunManager extends EventEmitter {
     this.approvals.set(approval.id, approval);
     this.persistState();
     this.emitSse({ kind: "run.approvalQueued", runId, at: Date.now(), payload: approval as unknown as Record<string, unknown> });
-  }
-
-  private refreshDiff(runId: string): void {
-    const run = this.runs.get(runId);
-    if (!run) return;
-
-    const isGitRepo = isGitRepository(run.config.workspace);
-    if (isGitRepo) {
-      const result = spawnSync("git", ["-C", run.config.workspace, "diff", "--no-color"], {
-        encoding: "utf8",
-      });
-      const snapshot: DiffSnapshot = {
-        runId,
-        at: Date.now(),
-        isGitRepo: true,
-        diffText: result.stdout || "",
-        changedFiles: run.changedFiles,
-        fallbackMessage: null,
-      };
-      this.diffs.set(runId, snapshot);
-      this.emitSse({ kind: "run.diffUpdated", runId, at: Date.now(), payload: snapshot as unknown as Record<string, unknown> });
-      return;
-    }
-
-    const snapshot: DiffSnapshot = {
-      runId,
-      at: Date.now(),
-      isGitRepo: false,
-      diffText: "",
-      changedFiles: run.changedFiles,
-      fallbackMessage: "No git repository detected. Showing changed file paths only.",
-    };
-    this.diffs.set(runId, snapshot);
-    this.emitSse({ kind: "run.diffUpdated", runId, at: Date.now(), payload: snapshot as unknown as Record<string, unknown> });
   }
 
   private appendEvent(runId: string, partial: Pick<RunEventEntry, "source" | "text">): void {
@@ -2426,10 +2890,12 @@ class AgentScheduleManager {
     agentId: string;
     hour: number;
     minute: number;
+    runner: RunRunner;
     workspace: string;
     model: string;
     sandbox: RunConfig["sandbox"];
     approvalPolicy: RunConfig["approvalPolicy"];
+    reasoningEffort: ReasoningEffort;
     skills: SelectedSkillRef[];
   }): AgentSchedule {
     const agent = discoverAgents().find((item) => item.id === input.agentId);
@@ -2453,8 +2919,10 @@ class AgentScheduleManager {
       updatedAt: now,
       lastRunAt: null,
       runConfig: {
+        runner: normalizeRunRunner(input.runner),
         workspace: input.workspace,
         model: input.model,
+        reasoningEffort: normalizeReasoningEffort(input.reasoningEffort),
         sandbox: input.sandbox,
         approvalPolicy: input.approvalPolicy,
         skills: normalizeSelectedSkillRefs(input.skills),
@@ -2546,6 +3014,8 @@ class AgentScheduleManager {
       nextRunAt: schedule.status === "paused" ? null : nextTehranDailyRun(time, now),
       runConfig: {
         ...schedule.runConfig,
+        runner: normalizeRunRunner(schedule.runConfig.runner),
+        reasoningEffort: normalizeReasoningEffort(schedule.runConfig.reasoningEffort),
         skills: normalizeSelectedSkillRefs(schedule.runConfig.skills),
       },
     };
@@ -3010,13 +3480,19 @@ function ensurePlanModeFile(): void {
   }
 }
 
-function buildPlanModePrompt(prompt: string): string {
+function readPlanModeInstructions(): string {
   ensurePlanModeFile();
+  return fs.readFileSync(PLAN_MODE_FILE_PATH, "utf8").trim();
+}
+
+function buildPlanModePrompt(prompt: string, instructions = readPlanModeInstructions()): string {
   return [
     "Plan mode is enabled for this turn.",
     `Read and follow this file before doing anything else: ${PLAN_MODE_FILE_PATH}`,
     "Act according to that file for the entire response.",
     "If the file cannot be accessed from the current workspace, say so explicitly instead of guessing.",
+    "",
+    instructions,
     "",
     "User request:",
     prompt,
@@ -3030,6 +3506,8 @@ function resolveEffectiveRunConfig(config: RunConfig): RunConfig {
   if (!config.planMode) {
     return {
       ...config,
+      runner: normalizeRunRunner(config.runner),
+      reasoningEffort: normalizeReasoningEffort(config.reasoningEffort),
       attachments,
       skills,
       agents,
@@ -3037,6 +3515,8 @@ function resolveEffectiveRunConfig(config: RunConfig): RunConfig {
   }
   return {
     ...config,
+    runner: normalizeRunRunner(config.runner),
+    reasoningEffort: normalizeReasoningEffort(config.reasoningEffort),
     attachments,
     skills,
     agents,
@@ -3089,11 +3569,122 @@ function toOptionalNumber(input: unknown): number | undefined {
   return typeof input === "number" ? input : undefined;
 }
 
-function isGitRepository(workspace: string): boolean {
-  const res = spawnSync("git", ["-C", workspace, "rev-parse", "--is-inside-work-tree"], {
-    encoding: "utf8",
-  });
-  return res.status === 0 && res.stdout.trim() === "true";
+function readClaudeAssistantText(message: Record<string, unknown>): string {
+  const payload = isRecord(message.message) ? message.message : {};
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  return content
+    .map((item) => {
+      if (!isRecord(item)) return "";
+      if (item.type === "text" && typeof item.text === "string") return item.text;
+      if (item.type === "thinking" && typeof item.thinking === "string") return item.thinking;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+function readClaudeToolUses(message: Record<string, unknown>): Array<{ id: string; name: string; input: unknown }> {
+  const payload = isRecord(message.message) ? message.message : {};
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  return content
+    .map((item) => {
+      if (!isRecord(item) || item.type !== "tool_use") return null;
+      return {
+        id: typeof item.id === "string" ? item.id : `claude_tool_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        name: typeof item.name === "string" ? item.name : "tool",
+        input: item.input,
+      };
+    })
+    .filter((item): item is { id: string; name: string; input: unknown } => item !== null);
+}
+
+function readClaudeUserMessageText(message: SDKUserMessage | SDKUserMessageReplay): string {
+  const payload = message.message as unknown;
+  if (!isRecord(payload)) return "";
+  const content = payload.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((item) => {
+      if (!isRecord(item)) return "";
+      if (item.type === "text" && typeof item.text === "string") return item.text;
+      if (item.type === "tool_result" && typeof item.content === "string") return item.content;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+function readClaudeResultUsage(message: Record<string, unknown>): RunRecord["usage"] {
+  const usage = isRecord(message.usage) ? message.usage : null;
+  const modelUsage = isRecord(message.modelUsage) ? message.modelUsage : null;
+  if (!usage && !modelUsage) return null;
+
+  if (usage) {
+    return {
+      inputTokens: toOptionalNumber(usage.input_tokens),
+      outputTokens: toOptionalNumber(usage.output_tokens),
+      cachedInputTokens: toOptionalNumber(usage.cache_read_input_tokens ?? usage.cached_input_tokens),
+    };
+  }
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedInputTokens = 0;
+  for (const value of Object.values(modelUsage || {})) {
+    if (!isRecord(value)) continue;
+    inputTokens += typeof value.inputTokens === "number" ? value.inputTokens : 0;
+    outputTokens += typeof value.outputTokens === "number" ? value.outputTokens : 0;
+    cachedInputTokens += typeof value.cacheReadInputTokens === "number" ? value.cacheReadInputTokens : 0;
+  }
+  return { inputTokens, outputTokens, cachedInputTokens };
+}
+
+function readClaudeSystemText(message: Record<string, unknown>): string {
+  if (typeof message.content === "string") return message.content;
+  if (typeof message.message === "string") return message.message;
+  if (message.subtype === "permission_denied") {
+    const toolName = typeof message.tool_name === "string" ? message.tool_name : "tool";
+    const denial = typeof message.message === "string" ? message.message : "Permission denied";
+    return `${toolName}: ${denial}`;
+  }
+  if (message.subtype === "compact_boundary" && isRecord(message.compact_metadata)) {
+    const trigger = typeof message.compact_metadata.trigger === "string" ? message.compact_metadata.trigger : "context";
+    const preTokens = typeof message.compact_metadata.pre_tokens === "number" ? message.compact_metadata.pre_tokens : null;
+    const postTokens = typeof message.compact_metadata.post_tokens === "number" ? message.compact_metadata.post_tokens : null;
+    const tokenText = preTokens !== null ? ` (${preTokens}${postTokens !== null ? ` -> ${postTokens}` : ""} tokens)` : "";
+    return `Claude compacted context via ${trigger}${tokenText}.`;
+  }
+  if (message.subtype === "plugin_install") {
+    const status = typeof message.status === "string" ? message.status : "updated";
+    const name = typeof message.name === "string" ? ` ${message.name}` : "";
+    const error = typeof message.error === "string" ? `: ${message.error}` : "";
+    return `Claude plugin install${name} ${status}${error}`;
+  }
+  if (message.subtype === "worker_shutting_down") {
+    const reason = typeof message.reason === "string" ? message.reason : "unknown";
+    return `Claude worker is shutting down: ${reason}`;
+  }
+  if (message.subtype === "api_retry") {
+    const attempt = typeof message.attempt === "number" ? message.attempt : null;
+    const maxRetries = typeof message.max_retries === "number" ? message.max_retries : null;
+    const error = typeof message.error === "string" ? message.error : "API request failed";
+    const retry = attempt !== null && maxRetries !== null ? ` (${attempt}/${maxRetries})` : "";
+    return `Claude retrying API request${retry}: ${error}`;
+  }
+  if (message.subtype === "local_command_output" && typeof message.content === "string") return message.content;
+  if (message.subtype === "informational" && typeof message.content === "string") return message.content;
+  if (message.subtype === "task_started" && typeof message.description === "string") return `Claude started task: ${message.description}`;
+  if (message.subtype === "task_progress" && typeof message.description === "string") return `Claude task progress: ${message.description}`;
+  if (message.subtype === "task_notification" && typeof message.summary === "string") return `Claude task ${message.status || "updated"}: ${message.summary}`;
+  return "";
+}
+
+function readClaudePermissionDenialText(denial: SDKPermissionDenial): string {
+  const input = truncateText(JSON.stringify(denial.tool_input, null, 2), 800);
+  return [`Claude permission denied for ${denial.tool_name}.`, input ? `Input:\n${input}` : ""].filter(Boolean).join("\n\n");
 }
 
 function safeJsonParse<T>(text: string, fallback: T): T {
@@ -3224,39 +3815,6 @@ function resolveConfigWorkspaces(): { defaultWorkspace: string; options: Workspa
 function expandHome(value: string): string {
   if (!value.startsWith("~")) return value;
   return path.join(os.homedir(), value.slice(1));
-}
-
-function listTree(root: string, relativePath: string, depth: number): FileTreeNode[] {
-  const resolved = path.resolve(root, relativePath || ".");
-  if (!resolved.startsWith(path.resolve(root))) return [];
-  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return [];
-
-  const ignored = new Set([".git", "node_modules", "dist", ".next", "coverage", ".turbo"]);
-  const entries = fs.readdirSync(resolved, { withFileTypes: true })
-    .filter((entry) => !ignored.has(entry.name))
-    .sort((a, b) => {
-      if (a.isDirectory() && !b.isDirectory()) return -1;
-      if (!a.isDirectory() && b.isDirectory()) return 1;
-      return a.name.localeCompare(b.name);
-    });
-
-  return entries.map((entry) => {
-    const childPath = path.join(resolved, entry.name);
-    const rel = path.relative(root, childPath) || ".";
-    if (entry.isDirectory()) {
-      return {
-        name: entry.name,
-        path: rel,
-        type: "directory" as const,
-        children: depth > 0 ? listTree(root, rel, depth - 1) : [],
-      };
-    }
-    return {
-      name: entry.name,
-      path: rel,
-      type: "file" as const,
-    };
-  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -3516,6 +4074,7 @@ function readRunListItems(includeHistory: boolean): RunListItem[] {
       name: normalizeRunListName(firstPrompt || fallback, fallback),
       status: latestRun?.status || "completed",
       updatedAt: latestRun ? (latestRun.updatedAt || latestRun.createdAt) : 0,
+      runner: normalizeRunRunner(latestRun?.config.runner),
       sourceTag: "in-app" as const,
       sourceRaw: "in-app",
       sessionId,
@@ -3536,6 +4095,7 @@ function readRunListItems(includeHistory: boolean): RunListItem[] {
       name: normalizeRunListName(entry.summary, entry.id),
       status: "completed" as const,
       updatedAt: Date.parse(entry.timestamp) || 0,
+      runner: "codex" as const,
       sourceTag: normalizeRunSourceTag(entry.source, true),
       sourceRaw: entry.source,
       sessionId: entry.id,
@@ -3620,7 +4180,6 @@ function parseRunFileChanges(item: Record<string, unknown>): RunMessageFileChang
     result.push({
       kind: typeof change.kind === "string" ? change.kind : "modify",
       path: filePath,
-      diff: typeof change.diff === "string" ? change.diff : undefined,
       added: typeof change.added === "number" ? change.added : 0,
       removed: typeof change.removed === "number" ? change.removed : 0,
     });
@@ -3881,6 +4440,7 @@ function buildRunMessageEntries(run: RunRecord): RunMessageEntry[] {
 
     if (itemType === "error") {
       const message = typeof item?.message === "string" ? item.message : raw;
+      if (isMissingLocalImageReadErrorText(message)) continue;
       entries.push({
         key: `${run.id}_${itemId}_error`,
         role: "error",
@@ -3987,8 +4547,15 @@ function buildRunMessageEntries(run: RunRecord): RunMessageEntry[] {
   return entries.sort((a, b) => a.at - b.at);
 }
 
+function isMissingLocalImageReadErrorText(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  return normalized.startsWith("codex could not read the local image at ")
+    && normalized.includes("no such file or directory")
+    && normalized.includes("os error 2");
+}
+
 function buildTranscriptMessageEntries(transcript: SessionTranscriptResponse): RunMessageEntry[] {
-  return transcript.entries.map((entry) => ({
+  return transcript.entries.filter((entry) => !isMissingLocalImageReadErrorText(entry.text)).map((entry) => ({
     key: `history_${entry.key}`,
     role: entry.role,
     title: entry.role === "user" ? "You" : "Assistant",
@@ -4222,7 +4789,9 @@ function normalizeSessionMessages(messages: ChatMessage[]): ChatMessage[] {
 }
 
 function transcriptToChatMessages(sessionId: string, transcript: SessionTranscriptResponse): ChatMessage[] {
-  return transcript.entries.map((entry, index) => transcriptEntryToChatMessage(sessionId, entry, index + 1));
+  return transcript.entries
+    .filter((entry) => !isMissingLocalImageReadErrorText(entry.text))
+    .map((entry, index) => transcriptEntryToChatMessage(sessionId, entry, index + 1));
 }
 
 function buildHistorySessionListItem(entry: SessionHistoryEntry): SessionListItem {
@@ -4231,6 +4800,7 @@ function buildHistorySessionListItem(entry: SessionHistoryEntry): SessionListIte
     title: normalizeRunListName(entry.summary, entry.id),
     status: "completed",
     updatedAt: Date.parse(entry.timestamp) || 0,
+    runner: "codex",
     sourceTag: normalizeRunSourceTag(entry.source, true),
     sourceRaw: entry.source,
     workspace: entry.cwd,
@@ -4385,6 +4955,7 @@ class MessageStore {
       title: titleFallback,
       workspace: latestRun?.config.workspace || "",
       status: latestRun?.status || "completed",
+      runner: normalizeRunRunner(latestRun?.config.runner),
       sourceTag: "in-app",
       sourceRaw: "in-app",
     });
@@ -4502,6 +5073,7 @@ class MessageStore {
       title: titleFallback,
       workspace: input.workspace,
       status: "queued",
+      runner: input.runner,
       sourceTag: "in-app",
       sourceRaw: "in-app",
     });
@@ -4579,12 +5151,14 @@ class MessageStore {
       title: titleFallback,
       workspace: run.config.workspace,
       status: run.status,
+      runner: normalizeRunRunner(run.config.runner),
       sourceTag: "in-app",
       sourceRaw: "in-app",
     });
 
     this.markSessionInApp(state);
     state.item.status = run.status;
+    state.item.runner = normalizeRunRunner(run.config.runner);
     state.item.updatedAt = run.updatedAt || run.createdAt;
     state.item.workspace = run.config.workspace;
     state.item.latestRunId = run.id;
@@ -4600,6 +5174,7 @@ class MessageStore {
       title: "Session",
       workspace: "",
       status: "running",
+      runner: "codex",
       sourceTag: "in-app",
       sourceRaw: "in-app",
     });
@@ -4710,6 +5285,7 @@ class MessageStore {
       const state: SessionState = {
         item: {
           ...item,
+          runner: normalizeRunRunner(item.runner),
           lastMessagePreview: item.lastMessagePreview || previewText(messages[messages.length - 1]?.text || ""),
           messageCount: messages.length,
         },
@@ -4747,6 +5323,7 @@ class MessageStore {
         title: normalizeRunListName(firstPrompt || latestRun?.summary || "Session", latestRun?.summary || "Session"),
         status: latestRun?.status || "completed",
         updatedAt: latestRun ? (latestRun.updatedAt || latestRun.createdAt) : 0,
+        runner: normalizeRunRunner(latestRun?.config.runner),
         sourceTag: "in-app",
         sourceRaw: "in-app",
         workspace: latestRun?.config.workspace || "",
@@ -4772,7 +5349,7 @@ class MessageStore {
 
   private ensureSession(
     sessionId: string,
-    seed: Pick<SessionListItem, "title" | "workspace" | "status" | "sourceTag" | "sourceRaw">,
+    seed: Pick<SessionListItem, "title" | "workspace" | "status" | "runner" | "sourceTag" | "sourceRaw">,
   ): SessionState {
     const existing = this.sessions.get(sessionId);
     if (existing) return existing;
@@ -4782,6 +5359,7 @@ class MessageStore {
         id: sessionId,
         title: seed.title,
         status: seed.status,
+        runner: seed.runner,
         updatedAt: Date.now(),
         sourceTag: seed.sourceTag,
         sourceRaw: seed.sourceRaw,
@@ -4827,6 +5405,7 @@ class MessageStore {
       title: "Session",
       workspace: "",
       status: "running",
+      runner: "codex",
       sourceTag: "in-app",
       sourceRaw: "in-app",
     });
@@ -4909,6 +5488,7 @@ class MessageStore {
       id: sessionId,
       title: existing?.item.title?.trim() || historyItem.title,
       status: existing?.item.status || "completed",
+      runner: normalizeRunRunner(existing?.item.runner || historyItem.runner),
       updatedAt: Math.max(
         existing?.item.updatedAt || 0,
         historyItem.updatedAt,
@@ -5083,6 +5663,8 @@ class OutboxProcessor {
     const payload = safeJsonParse<{ items: MessageOutboxItem[] }>(fs.readFileSync(MESSAGE_OUTBOX_PATH, "utf8"), { items: [] });
     this.items = (payload.items || []).map((item) => ({
       ...item,
+      runner: normalizeRunRunner(item.runner),
+      reasoningEffort: normalizeReasoningEffort(item.reasoningEffort),
       attachments: normalizeAttachmentRefs(item.attachments),
       skills: normalizeSelectedSkillRefs(item.skills),
       agents: normalizeSelectedAgentRefs(item.agents),
@@ -5158,9 +5740,11 @@ class OutboxProcessor {
 
       try {
         const run = this.runManager.startRun({
+          runner: item.runner,
           workspace: item.workspace,
           prompt: item.text,
           model: item.model,
+          reasoningEffort: item.reasoningEffort,
           sandbox: item.sandbox,
           approvalPolicy: item.approvalPolicy,
           planMode: item.planMode,
@@ -5769,10 +6353,12 @@ const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, pro
     clientMessageId: execution.id,
     sessionId,
     text: prompt,
+    runner: schedule.runConfig.runner,
     workspace: schedule.runConfig.workspace,
     model: schedule.runConfig.model,
     sandbox: schedule.runConfig.sandbox,
     approvalPolicy: schedule.runConfig.approvalPolicy,
+    reasoningEffort: schedule.runConfig.reasoningEffort,
     planMode: false,
     attachments: [],
     skills: schedule.runConfig.skills,
@@ -5781,9 +6367,11 @@ const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, pro
 
   try {
     const run = runManager.startRun({
+      runner: schedule.runConfig.runner,
       workspace: schedule.runConfig.workspace,
       prompt,
       model: schedule.runConfig.model,
+      reasoningEffort: schedule.runConfig.reasoningEffort,
       sandbox: schedule.runConfig.sandbox,
       approvalPolicy: schedule.runConfig.approvalPolicy,
       planMode: false,
@@ -5960,7 +6548,11 @@ function getWorkspaces(): WorkspaceOption[] {
 app.get("/api/bootstrap", (_req, res) => {
   const payload: AppBootstrap = {
     defaults: {
+      runner: DEFAULT_RUNNER,
       model: DEFAULT_MODEL,
+      codexModel: DEFAULT_CODEX_MODEL,
+      claudeModel: DEFAULT_CLAUDE_MODEL,
+      reasoningEffort: DEFAULT_REASONING_EFFORT,
       sandbox: DEFAULT_SANDBOX as "read-only" | "workspace-write" | "danger-full-access",
     },
     activeWorkspace: uiState.activeWorkspace,
@@ -5974,7 +6566,11 @@ app.get("/api/bootstrap", (_req, res) => {
 app.get("/api/bootstrap-lite", (_req, res) => {
   const payload: AppBootstrapLite = {
     defaults: {
+      runner: DEFAULT_RUNNER,
       model: DEFAULT_MODEL,
+      codexModel: DEFAULT_CODEX_MODEL,
+      claudeModel: DEFAULT_CLAUDE_MODEL,
+      reasoningEffort: DEFAULT_REASONING_EFFORT,
       sandbox: DEFAULT_SANDBOX as "read-only" | "workspace-write" | "danger-full-access",
     },
     activeWorkspace: uiState.activeWorkspace,
@@ -6068,8 +6664,10 @@ app.post("/api/agent-schedules", (req, res) => {
       agentId: parsed.data.agentId,
       hour: parsed.data.hour,
       minute: parsed.data.minute,
+      runner: parsed.data.runner,
       workspace,
       model: parsed.data.model,
+      reasoningEffort: parsed.data.reasoningEffort,
       sandbox: parsed.data.sandbox,
       approvalPolicy: parsed.data.approvalPolicy,
       skills: selectedSkills,
@@ -6295,6 +6893,7 @@ app.post("/api/messages/send", (req, res) => {
   const acceptedMessage = messageStore.acceptOutgoingMessage(sessionId, {
     ...parsed.data,
     workspace,
+    runner: parsed.data.runner,
     skills: selectedSkills,
     agents: selectedAgents,
   });
@@ -6307,7 +6906,9 @@ app.post("/api/messages/send", (req, res) => {
     text: parsed.data.text,
     attachments: normalizeAttachmentRefs(parsed.data.attachments),
     workspace,
+    runner: parsed.data.runner,
     model: parsed.data.model,
+    reasoningEffort: parsed.data.reasoningEffort,
     sandbox: parsed.data.sandbox,
     approvalPolicy: parsed.data.approvalPolicy,
     planMode: parsed.data.planMode,
@@ -6366,9 +6967,11 @@ app.post("/api/runs/start", (req, res) => {
 
   try {
     const run = runManager.startRun({
+      runner: parsed.data.runner,
       workspace,
       prompt: parsed.data.prompt,
       model: parsed.data.model,
+      reasoningEffort: parsed.data.reasoningEffort,
       sandbox: parsed.data.sandbox,
       approvalPolicy: parsed.data.approvalPolicy,
       planMode: parsed.data.planMode,
@@ -6444,6 +7047,11 @@ app.post("/api/runs/:runId/approval/:approvalId/accept", (req, res) => {
     return;
   }
 
+  if (approval.kind === "claude_permission") {
+    res.json(apiOk({ run: baseRun, approval }));
+    return;
+  }
+
   try {
     const run = runManager.startRun({
       ...baseRun.config,
@@ -6505,7 +7113,7 @@ app.get("/api/sessions/:sessionId/messages", (req, res) => {
     return;
   }
 
-  const historyMessages = transcript.entries.map((entry, index) => transcriptEntryToChatMessage(req.params.sessionId, entry, index + 1));
+  const historyMessages = transcriptToChatMessages(req.params.sessionId, transcript);
   const { start, end: safeEnd } = resolveCountedPageWindow(
     historyMessages,
     before,
@@ -6523,15 +7131,6 @@ app.get("/api/sessions/:sessionId/messages", (req, res) => {
     console.log(`[luma-assistant/message-perf] sessions.messages durationMs=${Date.now() - startedAt} payloadBytes=${Buffer.byteLength(JSON.stringify(response))}`);
   }
   res.json(apiOk(response));
-});
-
-app.get("/api/runs/:runId/diff", (req, res) => {
-  const diff = runManager.getDiff(req.params.runId);
-  if (!diff) {
-    res.status(404).json(apiErr("Diff not available yet for this run"));
-    return;
-  }
-  res.json(apiOk(diff));
 });
 
 app.post("/api/sessions/:sessionId/archive", (req, res) => {
@@ -6621,15 +7220,6 @@ app.post("/api/terminals/:sessionId/input", (req, res) => {
   }
 
   res.json(apiOk({ accepted: true }));
-});
-
-app.get("/api/files/tree", (req, res) => {
-  const relativePath = typeof req.query.path === "string" ? req.query.path : ".";
-  const depth = Number(req.query.depth ?? 2);
-
-  const workspace = uiState.activeWorkspace;
-  const nodes = listTree(workspace, relativePath, Number.isFinite(depth) ? Math.min(Math.max(depth, 0), 5) : 2);
-  res.json(apiOk({ root: relativePath, nodes }));
 });
 
 app.get("/api/sessions/history", (_req, res) => {

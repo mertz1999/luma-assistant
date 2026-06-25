@@ -5,18 +5,18 @@
 <h1 align="center">Luma Assistant</h1>
 
 <p align="center">
-  Self-hosted web application for your Codex CLI with remote URL access, cron-style jobs, sandbox terminals, offline voice-to-text, MCP, plan mode, agents, skills, and persistent session history.
+  Self-hosted web application for Codex and Claude Code with remote URL access, cron-style jobs, sandbox terminals, offline voice-to-text, MCP, plan mode, agents, skills, and persistent session history.
 </p>
 
 ## What It Is
 
-Luma Assistant connects to the Codex CLI on your machine or server and gives it a browser UI. You can install it on a server, protect it with authentication and HTTPS, and use your Codex workspace from anywhere with a URL.
+Luma Assistant connects to Codex and Claude Code on your machine or server and gives them a browser UI. You can install it on a server, protect it with authentication and HTTPS, and use your coding workspace from anywhere with a URL.
 
-It keeps the core Codex CLI workflow available in the app: plan mode, MCP tools, workspace instructions such as `AGENTS.md`, agents, skills, approvals, terminal access, voice input, live tool output, diffs, and session history.
+It keeps the core coding-agent workflow available in the app: runner selection, plan mode, MCP tools, workspace instructions such as `AGENTS.md`, agents, skills, approvals, terminal access, voice input, live tool output, diffs, and session history.
 
 ## Capabilities
 
-- `Connect to your Codex CLI`: run Codex from a web app while keeping live output, approvals, diffs, plan mode, MCP, and session history visible.
+- `Choose Codex or Claude Code`: create each new session with the runner you want, while keeping live output, diffs, plan mode, MCP, and session history visible.
 - `Use it anywhere by URL`: deploy Luma Assistant on a server and access your workspace from desktop, phone, or another machine.
 - `Cron-style jobs`: schedule specific assistant work for specific moments and inspect each run as a normal Codex session.
 - `Sandbox terminal`: open a controlled terminal from the browser when you need direct command access from your phone or another place.
@@ -24,7 +24,7 @@ It keeps the core Codex CLI workflow available in the app: plan mode, MCP tools,
 - `Luma Tasks`: use the standalone `/taskmanager` PWA for projects, task lists, priorities, deadlines, timezone-aware Today views, admin-managed users, and Telegram-ready reports.
 - `Agents and instructions`: use Codex workspace instructions such as `AGENTS.md`, plus repo-owned scheduled agents from `agents/<slug>/AGENT.md`.
 - `MCP visibility`: surface MCP calls, web searches, shell commands, file changes, and run status in the normal session timeline.
-- `Repo skill sync`: copy managed repo skills from `skills/**/SKILL.md` into `~/.codex/skills` without overwriting unmanaged global skills.
+- `Repo skill sync`: copy managed repo skills from `skills/**/SKILL.md` into `~/.codex/skills` and `~/.claude/skills` without overwriting unmanaged global skills.
 - `Telegram MCP`: run a local Telegram MCP server for sending rendered Markdown messages and generated files to Telegram topics.
 - `Luma Tasks MCP`: inspect, search, create, assign, update, and report on Luma Tasks directly from prompts and scheduled agents.
 - `Auth and history`: protect the browser UI with a password and keep local runtime data under `data/`.
@@ -46,6 +46,7 @@ It keeps the core Codex CLI workflow available in the app: plan mode, MCP tools,
 - Node.js `>= 22`
 - npm
 - Codex CLI available in `PATH`, or set through `CODEX_PATH`
+- Claude Code authentication or Anthropic credentials when using the Claude Code runner
 - A Unix-like host for the best terminal experience
 
 Authenticate Codex before using the app:
@@ -88,6 +89,11 @@ TASK_MANAGER_JWT_SECRET=change_task_manager_secret
 TASK_MANAGER_TOKEN_TTL_SECONDS=604800
 TASK_MANAGER_DEFAULT_TIME_ZONE=Asia/Tehran
 DEFAULT_MODEL=gpt-5.3-codex
+DEFAULT_RUNNER=codex
+CLAUDE_DEFAULT_MODEL=sonnet
+DEFAULT_REASONING_EFFORT=high
+CLAUDE_CODE_EXECUTABLE=
+CLAUDE_AUTH_MODE=oauth
 DEFAULT_SANDBOX=danger-full-access
 ATTACHMENT_MAX_BYTES=15728640
 MAX_CONCURRENT_RUNS=8
@@ -102,7 +108,12 @@ Important variables:
 - `TASK_MANAGER_TOKEN_TTL_SECONDS`: task-manager login lifetime in seconds.
 - `TASK_MANAGER_DEFAULT_TIME_ZONE`: default timezone for new task-manager users. Users can change their own timezone from `/taskmanager/settings`.
 - `CODEX_PATH`: path to the Codex executable if it is not simply `codex`.
+- `DEFAULT_RUNNER`: default runner for new sessions. Use `codex` or `claude`.
 - `DEFAULT_MODEL`: default Codex model for new sessions and new scheduled jobs.
+- `CLAUDE_DEFAULT_MODEL`: default Claude model when the Claude Code runner is selected.
+- `DEFAULT_REASONING_EFFORT`: default thinking effort for new sessions. Use `low`, `medium`, or `high`; it can also be changed in the new-session dialog.
+- `CLAUDE_CODE_EXECUTABLE`: optional path to a separately installed `claude` binary. If omitted, Luma uses `claude` from `PATH` when available, then falls back to the SDK binary.
+- `CLAUDE_AUTH_MODE`: Claude auth mode. Defaults to `oauth`, which uses your logged-in Claude Code account and strips inherited Anthropic API-key variables from the Claude subprocess. Set `api_key` to intentionally use `ANTHROPIC_API_KEY`.
 - `DEFAULT_SANDBOX`: default sandbox mode for new sessions.
 - `ATTACHMENT_MAX_BYTES`: max browser attachment upload size in bytes. Defaults to 15 MB.
 - `MAX_CONCURRENT_RUNS`: server-side cap for active Codex runs.
@@ -110,6 +121,20 @@ Important variables:
 - `TERMINAL_SHELL=/bin/bash`: choose the shell used by session terminals.
 
 Legacy browser storage keys and local session sources are tolerated so existing sessions, auth, theme, and queued prompts are not dropped during upgrades.
+
+## Claude Code Runner
+
+Luma Assistant includes Claude Code as a second runner through `@anthropic-ai/claude-agent-sdk`. Select `Codex` or `Claude Code` in Run defaults before creating a new session. Existing sessions keep their original runner.
+
+By default, Claude runs use your normal Claude Code OAuth login. If the server shell has `ANTHROPIC_API_KEY` set, Luma removes it from the Claude subprocess so a paid Claude Code plan is not accidentally bypassed. To intentionally use API-key billing instead, set `CLAUDE_AUTH_MODE=api_key`.
+
+Normal Claude Code runs use full autonomous permissions. Plan mode still forces Claude `plan` permissions so planning remains read-only.
+
+More implementation notes are in:
+
+```text
+docs/claude-sdk.md
+```
 
 ## Deployment Migrations
 
@@ -196,9 +221,10 @@ On server startup and manual skill reload, Luma Assistant copies each skill fold
 
 ```text
 ~/.codex/skills/<slug>
+~/.claude/skills/<slug>
 ```
 
-Managed copies include a marker file and can be updated safely. If a destination folder already exists without the managed marker, it is reported as a conflict and is not overwritten.
+Managed copies include a marker file and can be updated safely. If a destination folder already exists without the managed marker, it is reported as a conflict and is not overwritten. Claude Code reads `~/.claude/skills`, so Claude runner sessions can discover the same repo-managed skills natively; selected skills are also injected into the prompt for the active turn.
 
 ## Telegram MCP
 
@@ -376,7 +402,7 @@ packages/
 scripts/
   nginx/         reverse proxy example
   pm2/           production process definitions
-skills/          repo-managed Codex skills
+skills/          repo-managed Codex and Claude skills
 data/            private runtime data and logs
 ```
 
@@ -384,5 +410,5 @@ data/            private runtime data and logs
 
 - `Connection refused` on HTTPS usually means no process is listening on port `443`, the reverse proxy is stopped, or the firewall is rejecting the port.
 - `Codex not found` means `CODEX_PATH` does not point at an executable Codex CLI.
-- `Skill conflict` means a global `~/.codex/skills/<slug>` exists without Luma Assistant's managed marker and was intentionally left untouched.
+- `Skill conflict` means a global `~/.codex/skills/<slug>` or `~/.claude/skills/<slug>` exists without Luma Assistant's managed marker and was intentionally left untouched.
 - `Scheduled job skipped` can happen when the global run capacity is full.

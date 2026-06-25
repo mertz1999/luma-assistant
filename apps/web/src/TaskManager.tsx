@@ -959,7 +959,7 @@ export function TaskManager(): JSX.Element {
   if (loading || !bootstrap || !currentUser) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background px-4 text-foreground">
-        <div className="rounded-2xl border border-card-border bg-card px-5 py-4 shadow-soft">Loading task manager...</div>
+        <div className="rounded-lg border border-card-border bg-surface-1 px-5 py-4">Loading task manager...</div>
       </div>
     );
   }
@@ -971,12 +971,12 @@ export function TaskManager(): JSX.Element {
   return (
     <div className="tm-app h-screen min-h-screen overflow-hidden bg-background text-foreground">
       <div className="flex h-full min-w-0 flex-col overflow-hidden">
-        {error ? <div className="tm-list-rise mx-3 mt-3 rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">{error}</div> : null}
+        {error ? <div className="tm-list-rise mx-3 mt-3 rounded-md border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">{error}</div> : null}
 
         {mobileMenuOpen ? (
           <div className="tm-fade-in fixed inset-0 z-40 lg:hidden" role="dialog" aria-modal="true">
-            <button className="absolute inset-0 bg-black/45" type="button" aria-label="dismiss task navigation" onClick={() => setMobileMenuOpen(false)} />
-            <aside className="tm-drawer-in relative flex h-full w-[min(84vw,320px)] flex-col overflow-y-auto border-r border-card-border bg-surface-1 p-3 shadow-soft">
+            <button className="absolute inset-0 bg-black/55" type="button" aria-label="dismiss task navigation" onClick={() => setMobileMenuOpen(false)} />
+            <aside className="tm-drawer-in relative flex h-full w-[min(84vw,320px)] flex-col overflow-y-auto border-r border-card-border bg-surface-1 p-3 ">
               <div className="mb-3 flex items-center justify-between">
                 <div>
                   <div className="text-sm font-bold">Luma Tasks</div>
@@ -1034,10 +1034,10 @@ export function TaskManager(): JSX.Element {
         ) : null}
 
         <main className={cn("grid min-h-0 min-w-0 flex-1 overflow-hidden", desktopSidebarOpen ? "lg:grid-cols-[250px_minmax(0,1fr)]" : "lg:grid-cols-[72px_minmax(0,1fr)]")}>
-          <aside className={cn("hidden border-r border-card-border bg-card p-3 backdrop-blur-xl lg:flex lg:flex-col", !desktopSidebarOpen && "items-center px-2")}>
+          <aside className={cn("hidden border-r border-card-border bg-surface-1 p-3 lg:flex lg:flex-col", !desktopSidebarOpen && "items-center px-2")}>
             {desktopSidebarOpen ? (
               <>
-                <div className="mb-4 rounded-xl border border-card-border bg-control px-3 py-2">
+                <div className="mb-4 rounded-md border border-card-border bg-control px-3 py-2">
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       <div className="text-sm font-bold">Luma Tasks</div>
@@ -1122,7 +1122,7 @@ export function TaskManager(): JSX.Element {
             )}
           </aside>
 
-          <section className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-card p-3 backdrop-blur-xl">
+          <section className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-background p-3">
             {!hasOpenOverlay && (view === "settings" || view === "admin") ? (
               <div className="mb-3 shrink-0 lg:hidden">
                 <Button
@@ -1146,7 +1146,7 @@ export function TaskManager(): JSX.Element {
               <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
                 <MobileProjectSwitcher tabs={mobileProjectTabs} activeId={mobileProjectId} onSelect={setMobileProjectId} onSort={toggleTaskSortMode} onMove={moveProjectChip} onOpenMenu={() => setMobileMenuOpen(true)} />
                 {taskProjectColumns.length === 0 ? (
-                  <div className="tm-list-rise grid min-h-0 flex-1 place-items-center rounded-xl border border-dashed border-card-border text-center text-sm text-[color:var(--text-soft)]">
+                  <div className="tm-list-rise grid min-h-0 flex-1 place-items-center rounded-md border border-dashed border-card-border text-center text-sm text-[color:var(--text-soft)]">
                     <div>
                       <ClipboardCheck className="mx-auto mb-3 h-8 w-8" />
                       No tasks match this view.
@@ -1174,7 +1174,7 @@ export function TaskManager(): JSX.Element {
                           />
                         ))
                       ) : (
-                        <div className="tm-list-rise grid min-h-[260px] place-items-center rounded-xl border border-dashed border-card-border text-center text-sm text-[color:var(--text-soft)]">
+                        <div className="tm-list-rise grid min-h-[260px] place-items-center rounded-md border border-dashed border-card-border text-center text-sm text-[color:var(--text-soft)]">
                           <div>
                             <ClipboardCheck className="mx-auto mb-3 h-8 w-8" />
                             No tasks in this project.
@@ -1201,8 +1201,8 @@ export function TaskManager(): JSX.Element {
                       onMouseLeave={stopColumnDrag}
                     >
                       {taskProjectColumns.map((column) => (
-                        <section key={column.id} className="tm-column-motion flex h-full min-h-0 w-[min(88vw,390px)] shrink-0 flex-col rounded-xl border border-card-border bg-surface-2/55">
-                          <div className="shrink-0 flex items-center justify-between border-b border-card-border bg-card/95 px-3 py-2 backdrop-blur-xl">
+                        <section key={column.id} className="tm-column-motion flex h-full min-h-0 w-[min(88vw,390px)] shrink-0 flex-col rounded-md border border-card-border bg-surface-2/55">
+                          <div className="shrink-0 flex items-center justify-between border-b border-card-border bg-surface-1 px-3 py-2">
                             <div className="flex min-w-0 items-center gap-2">
                               <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: column.color }} />
                               <h2 className="truncate text-sm font-bold">{column.name}</h2>
@@ -1242,7 +1242,7 @@ export function TaskManager(): JSX.Element {
                               />
                             ))}
                           </div>
-                          <div className="shrink-0 border-t border-card-border bg-card/80 p-2 backdrop-blur-xl">
+                          <div className="shrink-0 border-t border-card-border bg-surface-1 p-2">
                             <Button
                               type="button"
                               variant="ghost"
@@ -1281,9 +1281,9 @@ export function TaskManager(): JSX.Element {
         ) : null}
 
         {(creatingTask || selectedTask) ? (
-          <div className="tm-fade-in fixed inset-0 z-50 flex items-end justify-center bg-black/45 p-0 backdrop-blur-sm sm:items-center sm:px-3 sm:py-4" role="dialog" aria-modal="true">
+          <div className="tm-fade-in fixed inset-0 z-50 flex items-end justify-center bg-black/55 p-0 sm:items-center sm:px-3 sm:py-4" role="dialog" aria-modal="true">
             <button className="absolute inset-0 cursor-default" type="button" aria-label="dismiss task editor" onClick={closeTaskModal} />
-            <section className="tm-sheet-in relative flex h-[100dvh] w-full flex-col overflow-hidden rounded-t-2xl border border-card-border bg-card shadow-soft backdrop-blur-xl sm:h-auto sm:max-h-[92vh] sm:max-w-3xl sm:rounded-2xl">
+            <section className="tm-sheet-in relative flex h-[100dvh] w-full flex-col overflow-hidden rounded-t-lg border border-card-border bg-surface-1 sm:h-auto sm:max-h-[92vh] sm:max-w-3xl sm:rounded-lg">
               <div className="shrink-0 border-b border-card-border px-4 py-3">
                 <div className="flex items-center justify-between gap-3">
                   <div>
@@ -1314,7 +1314,7 @@ export function TaskManager(): JSX.Element {
                   onAddComment={addComment}
                 />
               </div>
-              <div className="shrink-0 border-t border-card-border bg-card/95 px-4 py-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] backdrop-blur-xl">
+              <div className="shrink-0 border-t border-card-border bg-surface-1 px-4 py-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
                 <div className="flex items-center justify-between gap-2">
                   {selectedTask ? <Button type="button" variant="danger" size="sm" className="tm-control-motion" onClick={() => removeTask(selectedTask)}><Trash2 className="h-4 w-4" /> Delete</Button> : <span />}
                   <Button type="submit" form="task-editor-form" className="tm-control-motion" disabled={saving}>{saving ? "Saving..." : "Save task"}</Button>
@@ -1371,27 +1371,27 @@ function TaskManagerLogin(props: {
 }): JSX.Element {
   return (
     <div className="tm-app grid min-h-screen place-items-center bg-background px-4 text-foreground">
-      <form onSubmit={props.onSubmit} className="tm-sheet-in w-full max-w-md rounded-2xl border border-card-border bg-card p-5 shadow-soft backdrop-blur-xl">
+      <form onSubmit={props.onSubmit} className="tm-sheet-in w-full max-w-md rounded-lg border border-card-border bg-surface-1 p-5">
         <div className="mb-5 flex items-start justify-between gap-3">
           <div className="flex min-w-0 items-center gap-3">
-            <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-brand text-white">
+            <div className="grid h-12 w-12 shrink-0 place-items-center rounded-lg bg-control-hover text-foreground">
               <ClipboardCheck className="h-6 w-6" />
             </div>
             <div className="min-w-0">
-              <h1 className="text-xl font-bold">Luma Tasks</h1>
+              <h1 className="text-lg font-semibold">Luma Tasks</h1>
               <p className="text-sm text-[color:var(--text-soft)]">Sign in to manage team work</p>
             </div>
           </div>
           <ThemeToggleButton theme={props.theme} onToggleTheme={props.onToggleTheme} compact className="shrink-0" />
         </div>
-        {props.error ? <p className="mb-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">{props.error}</p> : null}
+        {props.error ? <p className="mb-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">{props.error}</p> : null}
         <label className="mb-3 block text-sm font-semibold">
           Username
-          <input value={props.username} onChange={(event) => props.onUsername(event.target.value)} className="mt-1 h-11 w-full rounded-xl border border-card-border bg-control px-3 outline-none focus-ring" autoComplete="username" />
+          <input value={props.username} onChange={(event) => props.onUsername(event.target.value)} className="mt-1 h-10 w-full rounded-md border border-card-border bg-control px-3 outline-none focus-ring" autoComplete="username" />
         </label>
         <label className="mb-4 block text-sm font-semibold">
           Password
-          <input value={props.password} onChange={(event) => props.onPassword(event.target.value)} className="mt-1 h-11 w-full rounded-xl border border-card-border bg-control px-3 outline-none focus-ring" type="password" autoComplete="current-password" />
+          <input value={props.password} onChange={(event) => props.onPassword(event.target.value)} className="mt-1 h-10 w-full rounded-md border border-card-border bg-control px-3 outline-none focus-ring" type="password" autoComplete="current-password" />
         </label>
         <Button className="tm-control-motion w-full" type="submit" disabled={props.saving}>{props.saving ? "Signing in..." : "Sign in"}</Button>
       </form>
@@ -1401,7 +1401,7 @@ function TaskManagerLogin(props: {
 
 function ViewButton({ active, icon, label, onClick }: { active: boolean; icon: JSX.Element; label: string; onClick: () => void }): JSX.Element {
   return (
-    <button type="button" onClick={onClick} className={cn("tm-control-motion flex h-10 w-full items-center gap-2 rounded-xl px-3 text-left text-sm font-semibold transition hover:bg-control-hover", active ? "bg-brand text-white hover:bg-brand-dark" : "text-foreground")}>
+    <button type="button" onClick={onClick} className={cn("tm-control-motion flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-sm font-medium transition hover:bg-control-hover", active ? "bg-control-hover text-foreground" : "text-foreground/78")}>
       {icon}
       {label}
     </button>
@@ -1431,11 +1431,11 @@ function AdminTaskFilterControls({
 
   return (
     <div className="mt-3 space-y-2">
-      <label className="flex items-center gap-2 rounded-xl border border-card-border bg-control px-3 py-2 text-sm font-semibold">
+      <label className="flex items-center gap-2 rounded-md border border-card-border bg-control px-3 py-2 text-sm font-semibold">
         <input checked={onlyMine} onChange={(event) => onOnlyMine(event.target.checked)} type="checkbox" className="h-4 w-4 accent-brand" />
         Only my tasks
       </label>
-      <label className="block rounded-xl border border-card-border bg-control px-3 py-2">
+      <label className="block rounded-md border border-card-border bg-control px-3 py-2">
         <span className="mb-1.5 flex items-center gap-2 text-xs font-bold uppercase text-[color:var(--text-soft)]">
           <Users className="h-3.5 w-3.5" />
           User tasks
@@ -1465,8 +1465,8 @@ function RailButton({ active, icon, label, onClick }: { active: boolean; icon: J
       aria-label={label}
       onClick={onClick}
       className={cn(
-        "tm-control-motion grid h-10 w-10 place-items-center rounded-xl transition hover:bg-control-hover",
-        active ? "bg-brand text-white hover:bg-brand-dark" : "text-foreground",
+        "tm-control-motion grid h-10 w-10 place-items-center rounded-md transition hover:bg-control-hover",
+        active ? "bg-control-hover text-foreground" : "text-foreground/75",
       )}
     >
       {icon}
@@ -1476,7 +1476,7 @@ function RailButton({ active, icon, label, onClick }: { active: boolean; icon: J
 
 function ProjectFilterButton({ active, name, color, onClick }: { active: boolean; name: string; color: string; onClick: () => void }): JSX.Element {
   return (
-    <button type="button" onClick={onClick} className={cn("tm-control-motion flex h-9 w-full items-center gap-2 rounded-xl px-2 text-left text-sm transition hover:bg-control-hover", active && "bg-control")}>
+    <button type="button" onClick={onClick} className={cn("tm-control-motion flex h-9 w-full items-center gap-2 rounded-md px-2 text-left text-sm transition hover:bg-control-hover", active && "bg-control")}>
       <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: color }} />
       <span className="truncate">{name}</span>
     </button>
@@ -1491,7 +1491,7 @@ function ProjectRailButton({ active, name, color, onClick }: { active: boolean; 
       aria-label={name}
       onClick={onClick}
       className={cn(
-        "tm-control-motion grid h-9 w-10 place-items-center rounded-xl transition hover:bg-control-hover",
+        "tm-control-motion grid h-9 w-10 place-items-center rounded-md transition hover:bg-control-hover",
         active && "bg-control",
       )}
     >
@@ -1519,7 +1519,7 @@ function MobileProjectSwitcher({
   const movableIndexById = new Map(movableTabs.map((tab, index) => [tab.id, index]));
 
   return (
-    <div className="sticky top-0 z-10 -mx-3 -mt-3 mb-3 border-b border-card-border bg-card/95 px-3 py-2 backdrop-blur-xl lg:hidden">
+    <div className="sticky top-0 z-10 -mx-3 -mt-3 mb-3 border-b border-card-border bg-surface-1 px-3 py-2 lg:hidden">
       <div className="scrollbar-none flex gap-2 overflow-x-auto">
         <button
           type="button"
@@ -1541,7 +1541,7 @@ function MobileProjectSwitcher({
               key={tab.id}
               className={cn(
                 "tm-chip-motion inline-flex h-9 shrink-0 items-center overflow-hidden rounded-full border text-sm font-semibold transition",
-                active ? "border-transparent bg-brand text-white" : "border-card-border bg-control text-foreground hover:bg-control-hover",
+                active ? "border-card-border bg-control-hover text-foreground" : "border-card-border bg-control text-foreground hover:bg-control-hover",
               )}
             >
               <button type="button" onClick={() => onSelect(tab.id)} className="inline-flex h-full items-center gap-2 py-0 pl-3 pr-2">
@@ -1630,7 +1630,7 @@ function TaskCard({ task, users, labels, selected, timeZone, compact = false, ca
 
   return (
     <article
-      className={cn("tm-card-motion group relative rounded-xl border border-card-border bg-control p-3 transition hover:border-foreground/30", selected && "border-brand ring-2 ring-brand/20")}
+      className={cn("tm-card-motion group relative rounded-md border border-card-border bg-control p-3 transition hover:border-foreground/30", selected && "border-brand ring-2 ring-brand/20")}
     >
       <div className="flex flex-col gap-3">
         <div className="flex gap-3">
@@ -1765,17 +1765,17 @@ function TaskEditor(props: {
   return (
     <div className="space-y-4">
       <form id="task-editor-form" onSubmit={props.onSave} className="space-y-4">
-        <section className="rounded-xl border border-card-border bg-surface-2/55 p-3">
+        <section className="rounded-md border border-card-border bg-surface-2/55 p-3">
           <div className="mb-3 text-xs font-bold uppercase text-[color:var(--text-soft)]">Core info</div>
           <div className="space-y-3">
-            <input value={props.form.title} onChange={(event) => updateForm({ title: event.target.value })} className="h-11 w-full rounded-xl border border-card-border bg-control px-3 text-sm font-semibold outline-none focus-ring" placeholder="Task title" />
-            <textarea value={props.form.description} onChange={(event) => updateForm({ description: event.target.value })} className="min-h-24 w-full resize-y rounded-xl border border-card-border bg-control px-3 py-2 text-sm outline-none focus-ring" placeholder="Description" />
+            <input value={props.form.title} onChange={(event) => updateForm({ title: event.target.value })} className="h-11 w-full rounded-md border border-card-border bg-control px-3 text-sm font-semibold outline-none focus-ring" placeholder="Task title" />
+            <textarea value={props.form.description} onChange={(event) => updateForm({ description: event.target.value })} className="min-h-24 w-full resize-y rounded-md border border-card-border bg-control px-3 py-2 text-sm outline-none focus-ring" placeholder="Description" />
             <label className="block text-xs font-bold uppercase text-[color:var(--text-soft)]">
               Project
               <select
                 value={props.form.projectId}
                 onChange={(event) => updateForm({ projectId: event.target.value })}
-                className="mt-1 h-11 w-full rounded-xl border bg-control px-3 text-sm font-semibold normal-case text-foreground"
+                className="mt-1 h-11 w-full rounded-md border bg-control px-3 text-sm font-semibold normal-case text-foreground"
                 style={{ borderColor: props.projects.find((project) => project.id === props.form.projectId)?.color || undefined }}
               >
                 <option value="">No project</option>
@@ -1785,48 +1785,48 @@ function TaskEditor(props: {
           </div>
         </section>
 
-        <section className="rounded-xl border border-card-border bg-surface-2/55 p-3">
+        <section className="rounded-md border border-card-border bg-surface-2/55 p-3">
           <div className="mb-3 text-xs font-bold uppercase text-[color:var(--text-soft)]">Status and ownership</div>
           <div className="grid gap-2 sm:grid-cols-3">
-            <select value={props.form.status} onChange={(event) => updateForm({ status: event.target.value as TaskManagerStatus })} className="h-10 rounded-xl border border-card-border bg-control px-3 text-sm">
+            <select value={props.form.status} onChange={(event) => updateForm({ status: event.target.value as TaskManagerStatus })} className="h-10 rounded-md border border-card-border bg-control px-3 text-sm">
               {Object.entries(statusLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
             </select>
             <select
               value={props.form.priority}
               onChange={(event) => updateForm({ priority: event.target.value as TaskManagerPriority })}
-              className="h-10 rounded-xl border bg-control px-3 text-sm font-semibold"
+              className="h-10 rounded-md border bg-control px-3 text-sm font-semibold"
               style={{ borderColor: priorityColors[props.form.priority], color: priorityColors[props.form.priority] }}
             >
               {Object.entries(priorityLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
             </select>
-            <select value={props.form.assigneeId} onChange={(event) => updateForm({ assigneeId: event.target.value })} className="h-10 rounded-xl border border-card-border bg-control px-3 text-sm">
+            <select value={props.form.assigneeId} onChange={(event) => updateForm({ assigneeId: event.target.value })} className="h-10 rounded-md border border-card-border bg-control px-3 text-sm">
               <option value="">Unassigned</option>
               {props.users.filter((user) => user.active).map((user) => <option key={user.id} value={user.id}>{user.displayName}</option>)}
             </select>
           </div>
         </section>
 
-        <section className="rounded-xl border border-card-border bg-surface-2/55 p-3">
+        <section className="rounded-md border border-card-border bg-surface-2/55 p-3">
           <div className="mb-3 text-xs font-bold uppercase text-[color:var(--text-soft)]">Date</div>
           <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
-            <input value={props.form.dueDate} onChange={(event) => updateForm({ dueDate: event.target.value, isDeadline: event.target.value ? props.form.isDeadline : false })} type="date" className="h-10 w-full rounded-xl border border-card-border bg-control px-3 text-sm" />
-            <label className="flex h-10 items-center gap-2 rounded-xl border border-card-border bg-control px-3 text-sm font-semibold">
+            <input value={props.form.dueDate} onChange={(event) => updateForm({ dueDate: event.target.value, isDeadline: event.target.value ? props.form.isDeadline : false })} type="date" className="h-10 w-full rounded-md border border-card-border bg-control px-3 text-sm" />
+            <label className="flex h-10 items-center gap-2 rounded-md border border-card-border bg-control px-3 text-sm font-semibold">
               <input checked={props.form.isDeadline} onChange={(event) => updateForm({ isDeadline: event.target.checked })} type="checkbox" className="h-4 w-4 accent-brand" disabled={!props.form.dueDate} />
               Deadline
             </label>
-            <label className="flex h-10 items-center gap-2 rounded-xl border border-card-border bg-control px-3 text-sm font-semibold">
+            <label className="flex h-10 items-center gap-2 rounded-md border border-card-border bg-control px-3 text-sm font-semibold">
               <input checked={props.form.includeDueTime} onChange={(event) => updateForm({ includeDueTime: event.target.checked })} type="checkbox" className="h-4 w-4 accent-brand" />
               Set time
             </label>
           </div>
           {props.form.includeDueTime ? (
-            <input value={props.form.dueTime} onChange={(event) => updateForm({ dueTime: event.target.value })} type="time" className="mt-2 h-10 w-full rounded-xl border border-card-border bg-control px-3 text-sm" />
+            <input value={props.form.dueTime} onChange={(event) => updateForm({ dueTime: event.target.value })} type="time" className="mt-2 h-10 w-full rounded-md border border-card-border bg-control px-3 text-sm" />
           ) : null}
         </section>
 
-        <section className="rounded-xl border border-card-border bg-surface-2/55 p-3">
+        <section className="rounded-md border border-card-border bg-surface-2/55 p-3">
           <div className="mb-3 text-xs font-bold uppercase text-[color:var(--text-soft)]">Checklist</div>
-          <textarea value={props.form.checklistText} onChange={(event) => updateForm({ checklistText: event.target.value })} className="min-h-20 w-full resize-y rounded-xl border border-card-border bg-control px-3 py-2 text-sm outline-none focus-ring" placeholder="Checklist, one item per line" />
+          <textarea value={props.form.checklistText} onChange={(event) => updateForm({ checklistText: event.target.value })} className="min-h-20 w-full resize-y rounded-md border border-card-border bg-control px-3 py-2 text-sm outline-none focus-ring" placeholder="Checklist, one item per line" />
         </section>
       </form>
 
@@ -1834,13 +1834,13 @@ function TaskEditor(props: {
         <>
           <form onSubmit={props.onAddComment} className="space-y-2">
             <div className="flex items-center gap-2 text-sm font-bold"><MessageSquare className="h-4 w-4" /> Comments</div>
-            <textarea value={props.commentText} onChange={(event) => props.onComment(event.target.value)} className="min-h-16 w-full resize-y rounded-xl border border-card-border bg-control px-3 py-2 text-sm outline-none focus-ring" placeholder="Add a comment" />
+            <textarea value={props.commentText} onChange={(event) => props.onComment(event.target.value)} className="min-h-16 w-full resize-y rounded-md border border-card-border bg-control px-3 py-2 text-sm outline-none focus-ring" placeholder="Add a comment" />
             <Button size="sm" type="submit">Add comment</Button>
           </form>
           <div className="space-y-2">
             {props.comments.map((comment) => {
               const user = props.users.find((item) => item.id === comment.userId);
-              return <div key={comment.id} className="rounded-xl border border-card-border bg-control p-2 text-sm"><strong>{user?.displayName || "User"}</strong><p className="text-[color:var(--text-soft)]">{comment.body}</p></div>;
+              return <div key={comment.id} className="rounded-md border border-card-border bg-control p-2 text-sm"><strong>{user?.displayName || "User"}</strong><p className="text-[color:var(--text-soft)]">{comment.body}</p></div>;
             })}
           </div>
           <div>
@@ -1902,9 +1902,9 @@ function ProjectManagerModal(props: {
   }
 
   return (
-    <div className="tm-fade-in fixed inset-0 z-50 flex items-end justify-center bg-black/45 p-0 backdrop-blur-sm sm:items-center sm:px-3 sm:py-4" role="dialog" aria-modal="true">
+    <div className="tm-fade-in fixed inset-0 z-50 flex items-end justify-center bg-black/55 p-0 sm:items-center sm:px-3 sm:py-4" role="dialog" aria-modal="true">
       <button className="absolute inset-0 cursor-default" type="button" aria-label="dismiss project manager" onClick={props.onClose} />
-      <section className="tm-sheet-in relative flex h-[100dvh] w-full flex-col overflow-hidden rounded-t-2xl border border-card-border bg-card shadow-soft backdrop-blur-xl sm:h-auto sm:max-h-[92vh] sm:max-w-3xl sm:rounded-2xl">
+      <section className="tm-sheet-in relative flex h-[100dvh] w-full flex-col overflow-hidden rounded-t-lg border border-card-border bg-surface-1 sm:h-auto sm:max-h-[92vh] sm:max-w-3xl sm:rounded-lg">
         <div className="shrink-0 border-b border-card-border px-4 py-3">
           <div className="flex items-center justify-between gap-3">
             <div>
@@ -1918,7 +1918,7 @@ function ProjectManagerModal(props: {
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4 pb-[calc(1rem+env(safe-area-inset-bottom))] scrollbar-thin">
-          <form onSubmit={props.onAddProject} className="mb-4 rounded-xl border border-card-border bg-surface-2/60 p-3">
+          <form onSubmit={props.onAddProject} className="mb-4 rounded-md border border-card-border bg-surface-2/60 p-3">
             <div className="mb-2 text-xs font-bold uppercase text-[color:var(--text-soft)]">Add project</div>
             <div className="mb-2 flex gap-2">
               <input value={props.newProjectName} onChange={(event) => props.onNewProject(event.target.value)} className="min-w-0 flex-1 rounded-lg border border-card-border bg-control px-3 py-2 text-sm outline-none" placeholder="Project name" />
@@ -1932,7 +1932,7 @@ function ProjectManagerModal(props: {
               const draft = drafts[project.id] || { name: project.name, color: project.color, userIds: project.userIds || [] };
               const expanded = expandedProjectIds.has(project.id);
               return (
-                <div key={project.id} className="tm-card-motion overflow-hidden rounded-xl border border-card-border bg-control">
+                <div key={project.id} className="tm-card-motion overflow-hidden rounded-md border border-card-border bg-control">
                   <button type="button" className="tm-control-motion flex w-full items-center justify-between gap-3 px-3 py-3 text-left" onClick={() => toggleProject(project.id)}>
                     <span className="flex min-w-0 items-center gap-2">
                       <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: draft.color || project.color }} />
@@ -1946,9 +1946,9 @@ function ProjectManagerModal(props: {
                     <div className="tm-list-rise border-t border-card-border p-3">
                       <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
                         <div className="min-w-0 space-y-3">
-                          <input value={draft.name} onChange={(event) => updateDraft(project, { name: event.target.value })} className="h-10 w-full rounded-lg border border-card-border bg-card px-3 text-sm font-semibold outline-none" />
+                          <input value={draft.name} onChange={(event) => updateDraft(project, { name: event.target.value })} className="h-10 w-full rounded-lg border border-card-border bg-control px-3 text-sm font-semibold outline-none" />
                           <ColorSwatches value={draft.color} onChange={(color) => updateDraft(project, { color })} />
-                          <div className="rounded-xl border border-card-border bg-card p-2">
+                          <div className="rounded-md border border-card-border bg-control p-2">
                             <div className="mb-2 text-xs font-bold uppercase text-[color:var(--text-soft)]">Access</div>
                             {assignableUsers.length ? (
                               <div className="flex flex-wrap gap-2">
@@ -2060,10 +2060,10 @@ function TaskManagerSettingsPanel({ currentUser, timeZone, saving, onSave }: {
 
   return (
     <div className="tm-list-rise mx-auto flex min-h-0 w-full max-w-4xl flex-1 flex-col overflow-y-auto">
-      <form onSubmit={submit} className="flex min-h-0 flex-1 flex-col rounded-xl border border-card-border bg-surface-2/60 p-3 sm:p-4">
+      <form onSubmit={submit} className="flex min-h-0 flex-1 flex-col rounded-md border border-card-border bg-surface-2/60 p-3 sm:p-4">
         <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-brand-soft text-brand-dark">
+            <div className="grid h-10 w-10 shrink-0 place-items-center rounded-md bg-brand-soft text-brand-dark">
               <Settings className="h-4 w-4" />
             </div>
             <div className="min-w-0">
@@ -2077,7 +2077,7 @@ function TaskManagerSettingsPanel({ currentUser, timeZone, saving, onSave }: {
         </div>
 
         <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_240px]">
-          <section className="min-w-0 rounded-xl border border-card-border bg-card/75 p-3">
+          <section className="min-w-0 rounded-md border border-card-border bg-card/75 p-3">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <div>
                 <div className="text-xs font-bold uppercase text-[color:var(--text-soft)]">App timezone</div>
@@ -2116,7 +2116,7 @@ function TaskManagerSettingsPanel({ currentUser, timeZone, saving, onSave }: {
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 placeholder="Search city or timezone"
-                className="h-11 w-full rounded-xl border border-card-border bg-control pl-9 pr-3 text-sm outline-none focus-ring"
+                className="h-11 w-full rounded-md border border-card-border bg-control pl-9 pr-3 text-sm outline-none focus-ring"
               />
             </div>
 
@@ -2127,7 +2127,7 @@ function TaskManagerSettingsPanel({ currentUser, timeZone, saving, onSave }: {
                   type="button"
                   className={cn(
                     "tm-control-motion shrink-0 rounded-full border px-3 py-1.5 text-xs font-semibold",
-                    region === option ? "border-brand bg-brand text-white" : "border-card-border bg-control text-foreground hover:bg-control-hover",
+                    region === option ? "border-card-border bg-control-hover text-foreground" : "border-card-border bg-control text-foreground hover:bg-control-hover",
                   )}
                   onClick={() => setRegion(option)}
                 >
@@ -2146,7 +2146,7 @@ function TaskManagerSettingsPanel({ currentUser, timeZone, saving, onSave }: {
                         key={zone}
                         type="button"
                         className={cn(
-                          "tm-control-motion min-w-0 rounded-xl border p-3 text-left hover:bg-control-hover",
+                          "tm-control-motion min-w-0 rounded-md border p-3 text-left hover:bg-control-hover",
                           active ? "border-brand bg-brand-soft text-brand-dark" : "border-card-border bg-control text-foreground",
                         )}
                         onClick={() => {
@@ -2167,7 +2167,7 @@ function TaskManagerSettingsPanel({ currentUser, timeZone, saving, onSave }: {
                   })}
                 </div>
               ) : (
-                <div className="grid min-h-[160px] place-items-center rounded-xl border border-dashed border-card-border text-center text-sm text-[color:var(--text-soft)]">
+                <div className="grid min-h-[160px] place-items-center rounded-md border border-dashed border-card-border text-center text-sm text-[color:var(--text-soft)]">
                   No timezone matches this search.
                 </div>
               )}
@@ -2175,7 +2175,7 @@ function TaskManagerSettingsPanel({ currentUser, timeZone, saving, onSave }: {
           </section>
 
           <aside className="grid gap-3">
-            <div className="rounded-xl border border-card-border bg-control p-3">
+            <div className="rounded-md border border-card-border bg-control p-3">
               <div className="mb-2 flex items-center gap-2 text-xs font-bold uppercase text-[color:var(--text-soft)]">
                 <Clock className="h-3.5 w-3.5" />
                 Selected time
@@ -2186,12 +2186,12 @@ function TaskManagerSettingsPanel({ currentUser, timeZone, saving, onSave }: {
                 {selectedRegion} · {timeZoneOffsetLabel(draftTimeZone)}
               </div>
             </div>
-            <div className="rounded-xl border border-card-border bg-control p-3">
+            <div className="rounded-md border border-card-border bg-control p-3">
               <div className="text-xs font-bold uppercase text-[color:var(--text-soft)]">Browser timezone</div>
               <div className="mt-1 text-sm font-semibold">{browserZone}</div>
               <div className="mt-1 text-xs text-[color:var(--text-soft)]">{timeZoneLocalTimeLabel(browserZone)} · {timeZoneOffsetLabel(browserZone)}</div>
             </div>
-            <div className="rounded-xl border border-card-border bg-control p-3 text-xs text-[color:var(--text-soft)]">
+            <div className="rounded-md border border-card-border bg-control p-3 text-xs text-[color:var(--text-soft)]">
               Signed in as {currentUser.displayName}. Stored timestamps stay unchanged.
             </div>
           </aside>
@@ -2210,14 +2210,14 @@ function AdminPanel({ users, newUser, onNewUser, onAddUser, onUpdateUser }: {
 }): JSX.Element {
   return (
     <div className="space-y-4">
-      <form onSubmit={onAddUser} className="tm-list-rise rounded-xl border border-card-border bg-surface-2/60 p-3">
+      <form onSubmit={onAddUser} className="tm-list-rise rounded-md border border-card-border bg-surface-2/60 p-3">
         <div className="mb-3 flex items-center gap-2 font-bold"><UserPlus className="h-4 w-4" /> Create user</div>
         <div className="grid gap-2 md:grid-cols-4">
-          <input value={newUser.username} onChange={(event) => onNewUser({ ...newUser, username: event.target.value })} className="h-10 rounded-xl border border-card-border bg-control px-3 text-sm" placeholder="username" />
-          <input value={newUser.displayName} onChange={(event) => onNewUser({ ...newUser, displayName: event.target.value })} className="h-10 rounded-xl border border-card-border bg-control px-3 text-sm" placeholder="display name" />
-          <input value={newUser.password} onChange={(event) => onNewUser({ ...newUser, password: event.target.value })} className="h-10 rounded-xl border border-card-border bg-control px-3 text-sm" placeholder="password" type="password" />
+          <input value={newUser.username} onChange={(event) => onNewUser({ ...newUser, username: event.target.value })} className="h-10 rounded-md border border-card-border bg-control px-3 text-sm" placeholder="username" />
+          <input value={newUser.displayName} onChange={(event) => onNewUser({ ...newUser, displayName: event.target.value })} className="h-10 rounded-md border border-card-border bg-control px-3 text-sm" placeholder="display name" />
+          <input value={newUser.password} onChange={(event) => onNewUser({ ...newUser, password: event.target.value })} className="h-10 rounded-md border border-card-border bg-control px-3 text-sm" placeholder="password" type="password" />
           <div className="flex gap-2">
-            <select value={newUser.role} onChange={(event) => onNewUser({ ...newUser, role: event.target.value as "admin" | "user" })} className="h-10 min-w-0 flex-1 rounded-xl border border-card-border bg-control px-3 text-sm">
+            <select value={newUser.role} onChange={(event) => onNewUser({ ...newUser, role: event.target.value as "admin" | "user" })} className="h-10 min-w-0 flex-1 rounded-md border border-card-border bg-control px-3 text-sm">
               <option value="user">User</option>
               <option value="admin">Admin</option>
             </select>
@@ -2227,9 +2227,9 @@ function AdminPanel({ users, newUser, onNewUser, onAddUser, onUpdateUser }: {
       </form>
       <div className="grid gap-2">
         {users.map((user) => (
-          <div key={user.id} className="tm-card-motion flex flex-col gap-2 rounded-xl border border-card-border bg-control p-3 md:flex-row md:items-center md:justify-between">
+          <div key={user.id} className="tm-card-motion flex flex-col gap-2 rounded-md border border-card-border bg-control p-3 md:flex-row md:items-center md:justify-between">
             <div className="flex items-center gap-3">
-              <div className="grid h-10 w-10 place-items-center rounded-xl bg-brand-soft text-brand-dark"><Users className="h-4 w-4" /></div>
+              <div className="grid h-10 w-10 place-items-center rounded-md bg-brand-soft text-brand-dark"><Users className="h-4 w-4" /></div>
               <div>
                 <div className="font-semibold">{user.displayName}</div>
                 <div className="text-xs text-[color:var(--text-soft)]">@{user.username} · {user.role} · {user.active ? "active" : "disabled"}</div>
