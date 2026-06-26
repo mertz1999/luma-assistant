@@ -4324,7 +4324,10 @@ export function App(): JSX.Element {
             approvalsCount={pendingApprovals.length}
             rightPanelTab={rightPanelTab}
             rightDockOpen={rightDockOpen}
-            onOpenRightPanel={(tab) => setRightPanelTab(tab)}
+            onOpenRightPanel={(tab) => {
+              setRightPanelTab(tab);
+              setRightDockOpen(true);
+            }}
             leftSidebarOpen={leftSidebarOpen}
             onOpenLeftSidebar={() => setLeftSidebarOpen(true)}
             timeline={visibleTimeline}

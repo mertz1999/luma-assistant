@@ -38,7 +38,7 @@ export const useUiStore = create<UiStore>((set, get) => ({
   mobileContextOpen: false,
   theme: getInitialTheme(),
   setSelectedRunId: (selectedRunId) => set({ selectedRunId }),
-  setRightPanelTab: (rightPanelTab) => set({ rightPanelTab, rightDockOpen: true }),
+  setRightPanelTab: (rightPanelTab) => set({ rightPanelTab }),
   setRightDockOpen: (rightDockOpen) => set({ rightDockOpen }),
   setLeftSidebarOpen: (leftSidebarOpen) => set({ leftSidebarOpen }),
   setMobileThreadsOpen: (mobileThreadsOpen) => set({ mobileThreadsOpen }),
