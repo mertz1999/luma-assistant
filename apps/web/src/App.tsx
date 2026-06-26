@@ -2629,7 +2629,9 @@ export function App(): JSX.Element {
     const node = timelineScrollRef.current;
     if (!node) return;
 
+    suppressTimelineScrollTracking(100);
     node.scrollTop = pending.scrollTop + (node.scrollHeight - pending.scrollHeight);
+    timelineShouldAutoScrollRef.current = false;
     pendingTimelineExpansionRef.current = null;
   }, [visibleTimeline.length, sessionTimelineKey]);
 
@@ -2674,12 +2676,15 @@ export function App(): JSX.Element {
       return;
     }
     void loadRunMessagesPage(selectedSessionId, { reset: true });
-    if (!selectedSession.historyOnly && selectedSession.latestRunId) {
-      void loadSelectedRunRecord(selectedSession.latestRunId);
-    } else {
+  }, [isDraftSession, selectedSessionId, selectedSession?.id]);
+
+  useEffect(() => {
+    if (isDraftSession || !selectedSessionId || !selectedSession || selectedSession.historyOnly || !selectedSession.latestRunId) {
       setSelectedRunRecord(null);
+      return;
     }
-  }, [isDraftSession, selectedSessionId, selectedSession]);
+    void loadSelectedRunRecord(selectedSession.latestRunId);
+  }, [isDraftSession, selectedSessionId, selectedSession?.historyOnly, selectedSession?.latestRunId]);
 
   useEffect(() => {
     if (!processingQueueItem) return;
@@ -4156,6 +4161,7 @@ export function App(): JSX.Element {
 
     const node = timelineScrollRef.current;
     if (node) {
+      timelineShouldAutoScrollRef.current = false;
       pendingTimelineExpansionRef.current = {
         sessionKey: selectedSessionId,
         scrollHeight: node.scrollHeight,
