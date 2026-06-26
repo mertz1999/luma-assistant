@@ -177,7 +177,6 @@ function runnerLabel(runner: RunRunner): string {
 function compactSelectWidth(label: string): string {
   return `${Math.max(label.length + 2, 6)}ch`;
 }
-const toolOutputModalLimit = 2500;
 const draftSessionKey = "__draft__";
 const runListPageSize = 60;
 const sidebarListPageSize = 15;
@@ -924,6 +923,73 @@ function toolEntryTypeLabel(entry: TimelineEntry): string {
   return "tool update";
 }
 
+function countChangedFiles(entries: TimelineEntry[]): number {
+  let count = 0;
+  for (const entry of entries) {
+    const changes = Array.isArray(entry.meta?.fileChanges) ? entry.meta.fileChanges : [];
+    if (changes.length > 0) {
+      count += changes.length;
+    } else if (String(entry.meta?.type || "").toLowerCase() === "filechange") {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function summarizeToolEntriesInline(entries: TimelineEntry[]): string {
+  const total = entries.length;
+  const running = entries.some((entry) => entry.pending);
+  const typeCounts = entries.reduce<Record<string, number>>((acc, entry) => {
+    const type = String(entry.meta?.type || "").toLowerCase() || "tool";
+    acc[type] = (acc[type] || 0) + 1;
+    return acc;
+  }, {});
+
+  const action = running ? "Running" : "Ran";
+  const onlyType = Object.keys(typeCounts).length === 1 ? Object.keys(typeCounts)[0] : "";
+  const count = onlyType ? typeCounts[onlyType] || total : total;
+
+  if (onlyType === "commandexecution") return `${action} ${count} command${count === 1 ? "" : "s"}`;
+  if (onlyType === "mcptoolcall") return `${action} ${count} MCP tool${count === 1 ? "" : "s"}`;
+  if (onlyType === "websearch") return `${running ? "Searching" : "Searched"} ${count === 1 ? "the web" : `${count} times`}`;
+  if (onlyType === "filechange") {
+    const fileCount = countChangedFiles(entries);
+    return `${running ? "Editing" : "Edited"} ${fileCount} file${fileCount === 1 ? "" : "s"}`;
+  }
+
+  return `${action} ${total} tool${total === 1 ? "" : "s"}`;
+}
+
+function toolEntryDetailTitle(entry: TimelineEntry): string {
+  const type = String(entry.meta?.type || "").toLowerCase();
+  if (type === "commandexecution") return "Command output";
+  if (type === "mcptoolcall") return "MCP tool output";
+  if (type === "websearch") return "Web search output";
+  if (type === "filechange") return "File changes";
+  return "Tool output";
+}
+
+function toolEntryCommandText(entry: TimelineEntry): string {
+  const type = String(entry.meta?.type || "").toLowerCase();
+  if (type === "filechange") return "File changes";
+  return String(entry.meta?.command || entry.text || toolEntryTypeLabel(entry)).trim();
+}
+
+function toolEntryOutputText(entry: TimelineEntry): string {
+  const type = String(entry.meta?.type || "").toLowerCase();
+  if (type === "filechange") {
+    const changes = Array.isArray(entry.meta?.fileChanges) ? entry.meta.fileChanges : [];
+    if (changes.length > 0) {
+      return changes
+        .map((change) => `${change.kind} ${change.path} +${change.added} -${change.removed}`)
+        .join("\n");
+    }
+    return String(entry.meta?.path || entry.text || "File change");
+  }
+
+  return String(entry.meta?.output || entry.meta?.errorMessage || entry.text || "").trim();
+}
+
 function summarizeToolGroup(entries: TimelineEntry[]): { summary: string; detail: string; preview: string } {
   const typeCounts = new Map<string, number>();
   let runningCount = 0;
@@ -941,7 +1007,7 @@ function summarizeToolGroup(entries: TimelineEntry[]): { summary: string; detail
   const previewSource = firstEntry && String(firstEntry.meta?.command || firstEntry.text || "").trim();
 
   return {
-    summary: `${entries.length} tool ${entries.length === 1 ? "message" : "messages"}`,
+    summary: summarizeToolEntriesInline(entries),
     detail: detailParts.join(" | "),
     preview: previewSource ? truncatePreview(previewSource, 120) : "",
   };
@@ -1699,271 +1765,181 @@ function FinalApprovalCard({
   );
 }
 
-type ToolDetailModalState = {
-  title: string;
-  command: string;
-  output: string;
-  status?: string;
-  exitCode?: number | null;
-  at: number;
-};
-
 function ToolEntry({
   entry,
   ansi,
-  onOpenOutput,
 }: {
   entry: TimelineEntry;
   ansi: Convert;
-  onOpenOutput: (state: ToolDetailModalState) => void;
 }): JSX.Element {
+  const [expanded, setExpanded] = useState(false);
   const type = (entry.meta?.type || "").toLowerCase();
   const status = entry.meta?.status || null;
   const statusLabel = status ? String(status).replace(/[-_]/g, " ") : null;
+  const command = toolEntryCommandText(entry);
+  const output = type === "filechange"
+    ? toolEntryOutputText(entry) || "No file changes captured."
+    : toolEntryOutputText(entry) || entry.text || "No output captured.";
+  const title = toolEntryDetailTitle(entry);
+  const exitCode = entry.meta?.exitCode;
 
   if (type === "commandexecution" || type === "mcptoolcall" || type === "websearch") {
-    const command = entry.meta?.command || entry.text;
-    const output = entry.meta?.output || entry.meta?.errorMessage || "";
-    const shouldTruncate = output.length > toolOutputModalLimit;
-    const visibleOutput = shouldTruncate ? output.slice(0, toolOutputModalLimit) : output;
-    const toolLabel = type === "mcptoolcall"
-      ? "MCP tool"
-      : type === "websearch"
-        ? "Web search"
-        : "Command";
-    const runningLabel = type === "mcptoolcall"
-      ? "Running MCP tool"
-      : type === "websearch"
-        ? "Running web search"
-        : "Running command";
-    const previewSource = type === "mcptoolcall"
-      ? `MCP ${entry.meta?.server || "mcp"}.${entry.meta?.tool || "tool"}`
-      : type === "websearch"
-        ? (entry.meta?.query || command)
-        : command;
-    const preview = `${entry.pending ? runningLabel : toolLabel}: ${previewSource}`;
-
     return (
-      <details className="rounded-lg border border-card-border bg-surface-1/75 p-1.5" open={entry.pending}>
-        <summary className="cursor-pointer list-none text-xs font-medium text-foreground/90">
-          <span className="block truncate">{truncatePreview(preview, 132)}</span>
-        </summary>
-        <div className="mt-1.5 space-y-1.5">
-          <pre className="max-h-28 overflow-auto rounded-lg border border-card-border bg-[#102b3b] p-1.5 text-[11px] text-slate-100">{command}</pre>
-
-          {visibleOutput.trim() ? (
-            <div>
-              <div
-                className="max-h-44 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-card-border bg-black/5 p-1.5 font-mono text-[11px]"
-                dangerouslySetInnerHTML={{ __html: ansi.toHtml(visibleOutput) }}
-              />
-              {shouldTruncate ? (
-                <button
-                  type="button"
-                  className="mt-1.5 text-[11px] font-medium text-brand underline"
-                  onClick={() =>
-                    onOpenOutput({
-                      title: `${toolLabel} output`,
-                      command,
-                      output,
-                      status: status || undefined,
-                      exitCode: entry.meta?.exitCode,
-                      at: entry.at,
-                    })
-                  }
-                >
-                  View full output
-                </button>
-              ) : null}
-            </div>
-          ) : (
-            <div className="rounded-lg border border-card-border bg-black/5 px-1.5 py-1 text-[11px] text-foreground/70">No output captured.</div>
-          )}
-
-          <div className="flex items-center justify-between gap-2 text-[11px] text-foreground/75">
-            <span>
-              {statusLabel ? `Status: ${statusLabel}` : entry.pending ? runningLabel : `${toolLabel} update`}
-              {entry.meta?.exitCode !== null && entry.meta?.exitCode !== undefined ? ` | Exit: ${entry.meta.exitCode}` : ""}
-            </span>
-            {entry.pending ? <ThinkingDots label="Running" /> : null}
-          </div>
-        </div>
-      </details>
+      <div className="w-full">
+        <button
+          type="button"
+          className="group inline-flex max-w-full items-center gap-1 text-left text-sm leading-6 text-foreground/55 transition hover:text-foreground/85"
+          onClick={() => setExpanded((current) => !current)}
+        >
+          <span className="truncate">{summarizeToolEntriesInline([entry])}</span>
+          <span className={cn("text-foreground/35 transition group-hover:text-foreground/70", expanded && "rotate-90")}>›</span>
+        </button>
+        {expanded ? (
+          <InlineToolDetails
+            title={title}
+            command={command}
+            output={output}
+            status={status || undefined}
+            statusLabel={statusLabel || undefined}
+            exitCode={exitCode}
+            at={entry.at}
+            ansi={ansi}
+          />
+        ) : null}
+      </div>
     );
   }
 
   if (type === "filechange") {
-    const fileChanges = entry.meta?.fileChanges || [];
-    const fileChangeCount = fileChanges.length;
-    const preview = fileChangeCount
-      ? `${entry.pending ? "Applying" : "Applied"} file changes (${fileChangeCount} file${fileChangeCount > 1 ? "s" : ""})`
-      : entry.meta?.path
-        ? `${entry.pending ? "Updating" : "File change"}: ${entry.meta.path}`
-        : entry.pending
-          ? "Applying file changes"
-          : "File change update";
-
     return (
-      <details className="rounded-lg border border-card-border bg-surface-1/75 p-1.5" open={entry.pending}>
-        <summary className="cursor-pointer list-none text-xs font-medium text-foreground/90">
-          <span className="block truncate">{preview}</span>
-        </summary>
-
-        <div className="mt-1.5 space-y-1.5 text-[11px]">
-          <div className="grid grid-cols-2 gap-2 text-foreground/75 sm:grid-cols-3">
-            <div>
-              <span className="font-semibold text-foreground/85">Status:</span> {statusLabel || (entry.pending ? "in progress" : "completed")}
-            </div>
-            {typeof entry.meta?.durationMs === "number" ? (
-              <div>
-                <span className="font-semibold text-foreground/85">Duration:</span> {entry.meta.durationMs} ms
-              </div>
-            ) : null}
-            {entry.meta?.errorMessage ? (
-              <div className="col-span-2 sm:col-span-3 rounded-lg border border-red-200 bg-red-50 px-2 py-1 text-red-700">
-                <span className="font-semibold">Error:</span> {entry.meta.errorMessage}
-              </div>
-            ) : null}
-          </div>
-
-          {fileChangeCount ? (
-              <div className="space-y-2">
-                {fileChanges.map((change, index) => (
-                <div key={`${change.path}-${index}`} className="rounded-lg border border-card-border bg-surface-2/70 px-1.5 py-1">
-                  <div className="flex items-center justify-between gap-2 text-[11px]">
-                    <span className="min-w-0 truncate font-mono" title={change.path}>
-                      {change.path}
-                    </span>
-                    <span className="shrink-0 text-foreground/75">
-                      {change.kind} +{change.added} -{change.removed}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="text-xs text-foreground/70">
-              <span className="font-semibold text-foreground/80">Path:</span>{" "}
-              <span className="font-mono break-all">{entry.meta?.path || "-"}</span>
-            </div>
-          )}
-
-          {entry.pending ? (
-            <div className="pt-1">
-              <ThinkingDots label="Applying changes" />
-            </div>
-          ) : null}
-        </div>
-      </details>
+      <div className="w-full">
+        <button
+          type="button"
+          className="group inline-flex max-w-full items-center gap-1 text-left text-sm leading-6 text-foreground/55 transition hover:text-foreground/85"
+          onClick={() => setExpanded((current) => !current)}
+        >
+          <span className="truncate">{summarizeToolEntriesInline([entry])}</span>
+          <span className={cn("text-foreground/35 transition group-hover:text-foreground/70", expanded && "rotate-90")}>›</span>
+        </button>
+        {expanded ? (
+          <InlineToolDetails
+            title={title}
+            command={command}
+            output={output}
+            status={status || undefined}
+            statusLabel={statusLabel || undefined}
+            exitCode={exitCode}
+            at={entry.at}
+            ansi={ansi}
+          />
+        ) : null}
+      </div>
     );
   }
 
   return (
-    <details className="rounded-lg border border-card-border bg-surface-1/75 p-1.5" open={entry.pending}>
-      <summary className="cursor-pointer list-none text-xs font-medium text-foreground/90">
-        <span className="block truncate">{truncatePreview(entry.text, 132)}</span>
-      </summary>
-      {entry.text ? <pre className="mt-1.5 whitespace-pre-wrap break-words text-[11px] leading-relaxed">{entry.text}</pre> : null}
-      {entry.pending ? <ThinkingDots label="Working" /> : null}
-    </details>
+    <div className="w-full">
+      <button
+        type="button"
+        className="group inline-flex max-w-full items-center gap-1 text-left text-sm leading-6 text-foreground/55 transition hover:text-foreground/85"
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="truncate">{summarizeToolEntriesInline([entry])}</span>
+        <span className={cn("text-foreground/35 transition group-hover:text-foreground/70", expanded && "rotate-90")}>›</span>
+      </button>
+      {expanded ? (
+        <InlineToolDetails
+          title={title}
+          command={command}
+          output={output}
+          status={status || undefined}
+          statusLabel={statusLabel || undefined}
+          exitCode={exitCode}
+          at={entry.at}
+          ansi={ansi}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function InlineToolDetails({
+  title,
+  command,
+  output,
+  status,
+  statusLabel,
+  exitCode,
+  at,
+  ansi,
+}: {
+  title: string;
+  command: string;
+  output: string;
+  status?: string;
+  statusLabel?: string;
+  exitCode?: number | null;
+  at: number;
+  ansi: Convert;
+}): JSX.Element {
+  return (
+    <div className="mt-1.5 w-full max-w-4xl rounded-md border border-card-border bg-surface-1/70 p-2 text-xs text-foreground/75">
+      <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+        <span className="font-medium text-foreground/80">{title}</span>
+        <span className="text-foreground/35">·</span>
+        <span>{new Date(at).toLocaleTimeString()}</span>
+        {status || statusLabel ? (
+          <>
+            <span className="text-foreground/35">·</span>
+            <span>{statusLabel || status}</span>
+          </>
+        ) : null}
+        {exitCode !== null && exitCode !== undefined ? (
+          <>
+            <span className="text-foreground/35">·</span>
+            <span>exit {exitCode}</span>
+          </>
+        ) : null}
+      </div>
+      <pre className="max-h-28 overflow-auto whitespace-pre-wrap break-words rounded bg-background px-2 py-1.5 font-mono text-[11px] leading-relaxed text-foreground/80">{command}</pre>
+      <div
+        className="mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-background px-2 py-1.5 font-mono text-[11px] leading-relaxed text-foreground/80"
+        dangerouslySetInnerHTML={{ __html: ansi.toHtml(output) }}
+      />
+    </div>
   );
 }
 
 function ToolEntryGroup({
   entries,
   ansi,
-  onOpenOutput,
 }: {
   entries: TimelineEntry[];
   ansi: Convert;
-  onOpenOutput: (state: ToolDetailModalState) => void;
 }): JSX.Element {
   const [loaded, setLoaded] = useState(false);
   const groupSummary = useMemo(() => summarizeToolGroup(entries), [entries]);
 
   return (
-    <article className="max-w-full animate-fade-up rounded-xl border border-dashed border-card-border bg-surface-2 px-2.5 py-2 shadow-none">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="mb-1 flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-foreground/70">
-            <Layers className="h-3.5 w-3.5" />
-            Tool batch
-          </div>
-          <p className="text-[11px] font-semibold text-foreground/90">{groupSummary.summary}</p>
-          {groupSummary.detail ? <p className="mt-0.5 text-[11px] text-foreground/70">{groupSummary.detail}</p> : null}
-          {!loaded && groupSummary.preview ? (
-            <p className="mt-1 truncate text-[11px] text-foreground/60">{groupSummary.preview}</p>
-          ) : null}
-        </div>
-
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="h-7 shrink-0 px-2.5 text-[11px]"
-          onClick={() => setLoaded((current) => !current)}
-        >
-          {loaded ? "Hide tools" : `Load ${entries.length}`}
-        </Button>
-      </div>
+    <article className="w-full animate-fade-up">
+      <button
+        type="button"
+        className="group inline-flex max-w-full items-center gap-1 text-left text-sm leading-6 text-foreground/55 transition hover:text-foreground/85"
+        onClick={() => setLoaded((current) => !current)}
+        title={groupSummary.detail || groupSummary.preview || groupSummary.summary}
+      >
+        <span className="truncate">{groupSummary.summary}</span>
+        <span className={cn("text-foreground/35 transition group-hover:text-foreground/70", loaded && "rotate-90")}>›</span>
+      </button>
 
       {loaded ? (
-        <div className="mt-2 space-y-1.5">
+        <div className="mt-1 flex flex-col items-start gap-0.5 pl-4">
           {entries.map((entry) => (
-            <ToolEntry key={entry.key} entry={entry} ansi={ansi} onOpenOutput={onOpenOutput} />
+            <ToolEntry key={entry.key} entry={entry} ansi={ansi} />
           ))}
         </div>
       ) : null}
     </article>
-  );
-}
-
-function ToolDetailModal({
-  state,
-  ansi,
-  onClose,
-}: {
-  state: ToolDetailModalState;
-  ansi: Convert;
-  onClose: () => void;
-}): JSX.Element {
-  return (
-    <div className="fixed inset-0 z-[80] bg-black/45 p-3 sm:p-6">
-      <div className="mx-auto mt-4 max-w-3xl rounded-2xl border border-[color:var(--panel-border)] bg-[color:var(--bg)] shadow-2xl">
-        <div className="flex items-center justify-between border-b border-[color:var(--panel-border)] px-4 py-3">
-          <div>
-            <p className="text-sm font-semibold">{state.title}</p>
-            <p className="text-xs text-[color:var(--text-soft)]">{new Date(state.at).toLocaleString()}</p>
-          </div>
-          <button className="focus-ring glass h-11 w-11 rounded-xl" type="button" onClick={onClose}>
-            <X className="mx-auto h-4 w-4" />
-          </button>
-        </div>
-
-        <div className="max-h-[75vh] space-y-3 overflow-auto p-4">
-          <section>
-            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-[color:var(--text-soft)]">Command</p>
-            <pre className="overflow-x-auto rounded-xl border border-[color:var(--panel-border)] bg-black/5 p-3 font-mono text-xs">{state.command}</pre>
-          </section>
-
-          <section>
-            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-[color:var(--text-soft)]">Output</p>
-            <div
-              className="overflow-x-auto whitespace-pre-wrap break-words rounded-xl border border-[color:var(--panel-border)] bg-black/5 p-3 font-mono text-xs"
-              dangerouslySetInnerHTML={{ __html: ansi.toHtml(state.output || "") }}
-            />
-          </section>
-
-          {(state.status || state.exitCode !== null && state.exitCode !== undefined) ? (
-            <p className="text-xs text-[color:var(--text-soft)]">
-              {state.status ? `status: ${state.status}` : ""}{" "}
-              {state.exitCode !== null && state.exitCode !== undefined ? `| exit: ${state.exitCode}` : ""}
-            </p>
-          ) : null}
-        </div>
-      </div>
-      <button className="absolute inset-0 -z-10" type="button" onClick={onClose} aria-label="close output modal" />
-    </div>
   );
 }
 
@@ -1979,6 +1955,8 @@ export function App(): JSX.Element {
     setRightPanelTab,
     rightDockOpen,
     setRightDockOpen,
+    leftSidebarOpen,
+    setLeftSidebarOpen,
     mobileThreadsOpen,
     setMobileThreadsOpen,
     mobileContextOpen,
@@ -2052,7 +2030,6 @@ export function App(): JSX.Element {
   const [queuedBySession, setQueuedBySession] = useState<Record<string, QueuedMessage[]>>(() => loadQueuedMessages());
   const [terminalHistoryBySession, setTerminalHistoryBySession] = useState<Record<string, string[]>>(() => loadTerminalCommandHistory());
   const [processingQueueItem, setProcessingQueueItem] = useState<ProcessingQueueItem | null>(null);
-  const [toolDetailModal, setToolDetailModal] = useState<ToolDetailModalState | null>(null);
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
   const [terminalsBySession, setTerminalsBySession] = useState<Record<string, TerminalSessionSnapshot>>({});
   const [terminalInput, setTerminalInput] = useState("");
@@ -4262,6 +4239,14 @@ export function App(): JSX.Element {
     );
   }
 
+  const desktopGridColumns = leftSidebarOpen
+    ? rightDockOpen
+      ? "lg:grid-cols-[382px_minmax(0,1fr)_410px]"
+      : "lg:grid-cols-[382px_minmax(0,1fr)]"
+    : rightDockOpen
+      ? "lg:grid-cols-[minmax(0,1fr)_410px]"
+      : "lg:grid-cols-1";
+
   return (
     <div className="h-[100dvh] w-full overflow-hidden bg-background text-[color:var(--text)]">
       <header className="fixed inset-x-0 top-0 z-20 bg-surface-1/95 px-2 py-2 shadow-[0_14px_30px_-24px_rgba(0,0,0,0.9)] lg:hidden">
@@ -4281,9 +4266,10 @@ export function App(): JSX.Element {
       <div
         className={cn(
           "grid h-full min-h-0 grid-cols-1 pt-12 lg:gap-2 lg:p-2 lg:pt-2",
-          rightDockOpen ? "lg:grid-cols-[382px_minmax(0,1fr)_410px]" : "lg:grid-cols-[382px_minmax(0,1fr)]",
+          desktopGridColumns,
         )}
       >
+        {leftSidebarOpen ? (
         <aside className="hidden min-h-0 flex-col overflow-hidden rounded-lg bg-surface-1 shadow-[10px_0_26px_-26px_rgba(0,0,0,0.9)] lg:flex">
           <SessionsPanel
             sessions={filteredSessions}
@@ -4305,8 +4291,10 @@ export function App(): JSX.Element {
             theme={theme}
             setTheme={setTheme}
             onSignOut={onSignOut}
+            onCloseSidebar={() => setLeftSidebarOpen(false)}
           />
         </aside>
+        ) : null}
 
         <main className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-background lg:rounded-lg">
           <CenterPanel
@@ -4322,7 +4310,10 @@ export function App(): JSX.Element {
             setReasoningEffort={setReasoningEffort}
             approvalsCount={pendingApprovals.length}
             rightPanelTab={rightPanelTab}
+            rightDockOpen={rightDockOpen}
             onOpenRightPanel={(tab) => setRightPanelTab(tab)}
+            leftSidebarOpen={leftSidebarOpen}
+            onOpenLeftSidebar={() => setLeftSidebarOpen(true)}
             timeline={visibleTimeline}
             hiddenTimelineCount={hiddenTimelineCount}
             prompt={prompt}
@@ -4362,7 +4353,6 @@ export function App(): JSX.Element {
             timelineBottomRef={timelineBottomRef}
             onTimelineScroll={onTimelineScroll}
             onLoadOlderTimelineMessages={onLoadOlderTimelineMessages}
-            setToolDetailModal={setToolDetailModal}
             slashSuggestions={slashSuggestions}
             onSelectSlashCommand={onSelectSlashCommand}
             queueItems={queuedMessagesForActiveSession}
@@ -4560,6 +4550,7 @@ export function App(): JSX.Element {
                 theme={theme}
                 setTheme={setTheme}
                 onSignOut={onSignOut}
+                onCloseSidebar={() => setMobileThreadsOpen(false)}
               />
             </div>
           </Dialog.Content>
@@ -4621,8 +4612,6 @@ export function App(): JSX.Element {
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
-
-      {toolDetailModal ? <ToolDetailModal state={toolDetailModal} ansi={ansi} onClose={() => setToolDetailModal(null)} /> : null}
     </div>
   );
 }
@@ -4647,6 +4636,7 @@ type SessionsPanelProps = {
   theme: "light" | "dark";
   setTheme: (theme: "light" | "dark") => void;
   onSignOut: () => void;
+  onCloseSidebar: () => void;
 };
 
 function SessionsPanel({
@@ -4669,6 +4659,7 @@ function SessionsPanel({
   theme,
   setTheme,
   onSignOut,
+  onCloseSidebar,
 }: SessionsPanelProps): JSX.Element {
   const sessionFilterValue: SessionFilterValue = showAllHistory ? "all-history" : statusFilter;
   const environmentLabel = deploymentLabel();
@@ -4728,30 +4719,43 @@ function SessionsPanel({
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="relative z-10 px-3 pb-3 pt-3 shadow-[0_14px_28px_-28px_rgba(0,0,0,0.9)]">
-        <div className="grid grid-cols-3 gap-1 rounded-md bg-surface-2 p-1 text-xs">
-          <button
+        <div className="flex items-center gap-1">
+          <div className="grid min-w-0 flex-1 grid-cols-3 gap-1 rounded-md bg-surface-2 p-1 text-xs">
+            <button
+              type="button"
+              className={cn(
+                "flex h-8 items-center justify-center gap-1.5 rounded px-2",
+                mode === "agents" ? "bg-control-hover font-medium text-foreground" : "text-foreground/60 hover:bg-control-hover",
+              )}
+              onClick={() => setMode("agents")}
+            >
+              <Bot className="h-3.5 w-3.5" /> Agents
+            </button>
+            <button type="button" className="flex h-8 items-center justify-center gap-1.5 rounded px-2 text-foreground/60 hover:bg-control-hover">
+              <Bot className="h-3.5 w-3.5" /> Cowork
+            </button>
+            <button
+              type="button"
+              className={cn(
+                "flex h-8 items-center justify-center gap-1.5 rounded px-2",
+                mode === "code" ? "bg-control-hover font-medium text-foreground" : "text-foreground/60 hover:bg-control-hover",
+              )}
+              onClick={() => setMode("code")}
+            >
+              <FileCode2 className="h-3.5 w-3.5" /> Code
+            </button>
+          </div>
+          <Button
             type="button"
-            className={cn(
-              "flex h-8 items-center justify-center gap-1.5 rounded px-2",
-              mode === "agents" ? "bg-control-hover font-medium text-foreground" : "text-foreground/60 hover:bg-control-hover",
-            )}
-            onClick={() => setMode("agents")}
+            variant="ghost"
+            size="sm"
+            className="hidden h-8 w-8 shrink-0 p-0 lg:inline-flex"
+            onClick={onCloseSidebar}
+            aria-label="Close left sidebar"
+            title="Close sidebar"
           >
-            <Bot className="h-3.5 w-3.5" /> Agents
-          </button>
-          <button type="button" className="flex h-8 items-center justify-center gap-1.5 rounded px-2 text-foreground/60 hover:bg-control-hover">
-            <Bot className="h-3.5 w-3.5" /> Cowork
-          </button>
-          <button
-            type="button"
-            className={cn(
-              "flex h-8 items-center justify-center gap-1.5 rounded px-2",
-              mode === "code" ? "bg-control-hover font-medium text-foreground" : "text-foreground/60 hover:bg-control-hover",
-            )}
-            onClick={() => setMode("code")}
-          >
-            <FileCode2 className="h-3.5 w-3.5" /> Code
-          </button>
+            <PanelLeft className="h-3.5 w-3.5" />
+          </Button>
         </div>
 
         {mode === "code" ? (
@@ -4975,7 +4979,10 @@ type CenterPanelProps = {
   setReasoningEffort: (value: ReasoningEffort) => void;
   approvalsCount: number;
   rightPanelTab: DockTab;
+  rightDockOpen: boolean;
   onOpenRightPanel: (tab: DockTab) => void;
+  leftSidebarOpen: boolean;
+  onOpenLeftSidebar: () => void;
   timeline: TimelineEntry[];
   hiddenTimelineCount: number;
   prompt: string;
@@ -5015,7 +5022,6 @@ type CenterPanelProps = {
   timelineBottomRef: React.RefObject<HTMLDivElement>;
   onTimelineScroll: () => void;
   onLoadOlderTimelineMessages: () => void;
-  setToolDetailModal: (state: ToolDetailModalState | null) => void;
   slashSuggestions: SlashCommandSuggestion[];
   onSelectSlashCommand: (command: SlashCommandKey) => Promise<void>;
   queueItems: QueuedMessage[];
@@ -5138,6 +5144,19 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
     <>
       <div className="relative z-10 hidden h-12 shrink-0 items-center justify-between gap-3 bg-background/95 px-4 shadow-[0_14px_32px_-28px_rgba(0,0,0,0.95)] lg:flex">
         <div className="flex min-w-0 items-center gap-2">
+          {!props.leftSidebarOpen ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 shrink-0 p-0"
+              onClick={props.onOpenLeftSidebar}
+              aria-label="Open left sidebar"
+              title="Open sidebar"
+            >
+              <PanelLeft className="h-3.5 w-3.5" />
+            </Button>
+          ) : null}
           <FileCode2 className="h-4 w-4 shrink-0 text-foreground/70" />
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-2">
@@ -5154,14 +5173,14 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
-          <Button type="button" variant={props.rightPanelTab === "terminal" ? "primary" : "ghost"} size="sm" className="h-7 w-7 p-0" onClick={() => props.onOpenRightPanel("terminal")} aria-label="Open terminal" title="Terminal">
+          <Button type="button" variant={props.rightDockOpen && props.rightPanelTab === "terminal" ? "primary" : "ghost"} size="sm" className="h-7 w-7 p-0" onClick={() => props.onOpenRightPanel("terminal")} aria-label="Open terminal" title="Terminal">
             <Terminal className="h-3.5 w-3.5" />
           </Button>
-          <Button type="button" variant={props.rightPanelTab === "approvals" ? "primary" : "ghost"} size="sm" className="h-7 px-2" onClick={() => props.onOpenRightPanel("approvals")} title="Approvals">
+          <Button type="button" variant={props.rightDockOpen && props.rightPanelTab === "approvals" ? "primary" : "ghost"} size="sm" className="h-7 px-2" onClick={() => props.onOpenRightPanel("approvals")} title="Approvals">
             <ShieldAlert className="mr-1 h-3.5 w-3.5" />
             {props.approvalsCount}
           </Button>
-          <Button type="button" variant={props.rightPanelTab === "context" ? "primary" : "ghost"} size="sm" className="h-7 w-7 p-0" onClick={() => props.onOpenRightPanel("context")} aria-label="Open context" title="Context">
+          <Button type="button" variant={props.rightDockOpen && props.rightPanelTab === "context" ? "primary" : "ghost"} size="sm" className="h-7 w-7 p-0" onClick={() => props.onOpenRightPanel("context")} aria-label="Open context" title="Context">
             <Layers className="h-3.5 w-3.5" />
           </Button>
           <Button variant="ghost" size="sm" onClick={props.onNewSession}>
@@ -5202,7 +5221,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 
 		          {timelineBlocks.map((block) => {
                 if (block.kind === "tool-group") {
-                  return <ToolEntryGroup key={block.key} entries={block.entries} ansi={props.ansi} onOpenOutput={props.setToolDetailModal} />;
+                  return <ToolEntryGroup key={block.key} entries={block.entries} ansi={props.ansi} />;
                 }
 
                 const entry = block.entry;
@@ -5227,7 +5246,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                     entry.role === "user" && entry.deliveryStatus === "failed" && "border-rose-500/60 bg-danger-bg text-danger-fg",
 	                  entry.role === "assistant" && "mr-auto w-full bg-transparent px-0 py-0 text-foreground/90",
 	                  entry.role === "plan" && "mr-auto w-full rounded-md border border-card-border bg-surface-1 px-3 py-2",
-	                  entry.role === "tool" && "w-full rounded-md border border-dashed border-card-border bg-surface-2 px-2.5 py-1.5 font-mono text-[11px]",
+	                  entry.role === "tool" && "w-full bg-transparent px-0 py-0",
                   entry.role === "system" && "mx-auto max-w-fit rounded-md border border-card-border bg-surface-1 px-3 py-1 text-xs text-foreground/75",
                   entry.role === "error" && "mr-auto max-w-[90%] rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-rose-900 dark:border-danger-fg/40 dark:bg-danger-bg/90 dark:text-danger-fg",
                 )}
@@ -5251,7 +5270,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                 ) : null}
 
                 {entry.role === "tool" ? (
-                  <ToolEntry entry={entry} ansi={props.ansi} onOpenOutput={props.setToolDetailModal} />
+                  <ToolEntry entry={entry} ansi={props.ansi} />
                 ) : entry.role === "assistant" || entry.role === "plan" ? (
                   <div className="break-words text-[15px] leading-7">
                     <StructuredMessage

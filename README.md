@@ -12,18 +12,20 @@
 
 Luma Assistant connects to Codex and Claude Code on your machine or server and gives them a browser UI. You can install it on a server, protect it with authentication and HTTPS, and use your coding workspace from anywhere with a URL.
 
-It keeps the core coding-agent workflow available in the app: runner selection, plan mode, MCP tools, workspace instructions such as `AGENTS.md`, agents, skills, approvals, terminal access, voice input, live tool output, diffs, and session history.
+It keeps the core coding-agent workflow available in the app: runner selection, model and thinking controls, plan mode, MCP tools, workspace instructions such as `AGENTS.md`, agents, skills, approvals, terminal access, voice input, inline tool output, and session history.
 
 ## Capabilities
 
-- `Choose Codex or Claude Code`: create each new session with the runner you want, while keeping live output, diffs, plan mode, MCP, and session history visible.
+- `Choose Codex or Claude Code`: create each new session with the runner you want, while keeping live output, plan mode, MCP, and session history visible.
+- `Claude-like workspace`: use a compact dark coding UI with centered messages, right-aligned user bubbles, collapsible left navigation, and a right dock that opens only when Terminal, Approvals, or Context is selected.
+- `Runner controls`: change runner, model, and thinking effort from the new-session flow and composer strip. Codex and Claude use their own defaults.
 - `Use it anywhere by URL`: deploy Luma Assistant on a server and access your workspace from desktop, phone, or another machine.
 - `Cron-style jobs`: schedule specific assistant work for specific moments and inspect each run as a normal Codex session.
-- `Sandbox terminal`: open a controlled terminal from the browser when you need direct command access from your phone or another place.
+- `Browser terminal`: open a controlled terminal from the browser, type directly in the terminal surface, interrupt commands, and close the dock when you are done.
 - `Offline voice-to-text`: dictate prompts into the assistant without relying on a remote transcription service.
 - `Luma Tasks`: use the standalone `/taskmanager` PWA for projects, task lists, priorities, deadlines, timezone-aware Today views, admin-managed users, and Telegram-ready reports.
-- `Agents and instructions`: use Codex workspace instructions such as `AGENTS.md`, plus repo-owned scheduled agents from `agents/<slug>/AGENT.md`.
-- `MCP visibility`: surface MCP calls, web searches, shell commands, file changes, and run status in the normal session timeline.
+- `Agents and instructions`: use Codex workspace instructions such as `AGENTS.md`, plus repo-owned scheduled agents from `agents/<slug>/AGENT.md`; the Agents area is available from the left navigation.
+- `Inline tool transcript`: surface MCP calls, web searches, shell commands, file changes, and run status as compact rows like `Ran 5 commands`, expandable inline instead of opening a modal.
 - `Repo skill sync`: copy managed repo skills from `skills/**/SKILL.md` into `~/.codex/skills` and `~/.claude/skills` without overwriting unmanaged global skills.
 - `Telegram MCP`: run a local Telegram MCP server for sending rendered Markdown messages and generated files to Telegram topics.
 - `Luma Tasks MCP`: inspect, search, create, assign, update, and report on Luma Tasks directly from prompts and scheduled agents.
@@ -135,6 +137,20 @@ More implementation notes are in:
 ```text
 docs/claude-sdk.md
 ```
+
+## Web Interface
+
+The main web app now uses a Claude Code-inspired layout while keeping Luma-specific functionality:
+
+- Dark mode is the default on every load.
+- The left sidebar can be collapsed and reopened.
+- The right dock starts closed and opens from the top Terminal, Approvals, and Context buttons.
+- Session lists show the first 15 items and can load more history from the session-type selector.
+- The bottom-left app status shows backend connection state and whether the app is running locally or deployed.
+- The composer strip shows the active runner, model, and thinking effort with compact controls sized to their text.
+- Commands, MCP calls, web searches, file edits, and tool batches appear inline in the chat transcript.
+- Copy buttons sit outside message boxes so assistant and user messages stay visually clean.
+- The account menu under `Luma Assistant` includes sign out and theme settings.
 
 ## Deployment Migrations
 
@@ -303,7 +319,7 @@ The root npm workspaces are:
 
 ## Landing Page
 
-The standalone landing page lives in `landing-page/`.
+The standalone GitHub Pages landing site lives in `landing-page/`. It presents the current Claude-like workspace, Codex and Claude runner support, plan mode, inline tools, terminal dock, skills, agents, and Luma Tasks without exposing private session screenshots.
 
 ```bash
 npm ci --prefix landing-page

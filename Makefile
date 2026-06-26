@@ -31,6 +31,9 @@ install-if-needed:
 		elif ! node -e "try{require.resolve('node-pty/package.json');process.exit(0)}catch{process.exit(1)}"; then \
 			echo "node-pty missing; reinstalling dependencies..."; \
 			npm install --include=optional --no-audit --no-fund; \
+		elif ! node -e "try{require.resolve('@anthropic-ai/claude-agent-sdk/package.json');process.exit(0)}catch{process.exit(1)}"; then \
+			echo "Claude Agent SDK missing; reinstalling dependencies..."; \
+			npm install --include=optional --no-audit --no-fund; \
 		elif ! node -e "try{require.resolve('@modelcontextprotocol/sdk/package.json');process.exit(0)}catch{process.exit(1)}"; then \
 			echo "MCP dependencies missing; reinstalling dependencies..."; \
 			npm install --include=optional --no-audit --no-fund; \

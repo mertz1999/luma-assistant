@@ -6,12 +6,14 @@ type UiStore = {
   selectedRunId: string | null;
   rightPanelTab: RightPanelTab;
   rightDockOpen: boolean;
+  leftSidebarOpen: boolean;
   mobileThreadsOpen: boolean;
   mobileContextOpen: boolean;
   theme: "light" | "dark";
   setSelectedRunId: (runId: string | null) => void;
   setRightPanelTab: (tab: RightPanelTab) => void;
   setRightDockOpen: (open: boolean) => void;
+  setLeftSidebarOpen: (open: boolean) => void;
   setMobileThreadsOpen: (open: boolean) => void;
   setMobileContextOpen: (open: boolean) => void;
   setTheme: (theme: "light" | "dark") => void;
@@ -30,13 +32,15 @@ function getInitialTheme(): "light" | "dark" {
 export const useUiStore = create<UiStore>((set, get) => ({
   selectedRunId: null,
   rightPanelTab: "terminal",
-  rightDockOpen: true,
+  rightDockOpen: false,
+  leftSidebarOpen: true,
   mobileThreadsOpen: false,
   mobileContextOpen: false,
   theme: getInitialTheme(),
   setSelectedRunId: (selectedRunId) => set({ selectedRunId }),
   setRightPanelTab: (rightPanelTab) => set({ rightPanelTab, rightDockOpen: true }),
   setRightDockOpen: (rightDockOpen) => set({ rightDockOpen }),
+  setLeftSidebarOpen: (leftSidebarOpen) => set({ leftSidebarOpen }),
   setMobileThreadsOpen: (mobileThreadsOpen) => set({ mobileThreadsOpen }),
   setMobileContextOpen: (mobileContextOpen) => set({ mobileContextOpen }),
   setTheme: (theme) => {
