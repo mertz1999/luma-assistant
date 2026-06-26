@@ -7153,7 +7153,16 @@ app.delete("/api/sessions/:sessionId", (req, res) => {
   try {
     const result = runManager.deleteSession(req.params.sessionId);
     if (!result) {
-      res.status(404).json(apiErr("Session not found"));
+      const localSession = messageStore.getLocalSession(req.params.sessionId);
+      if (!localSession || localSession.historyOnly) {
+        res.status(404).json(apiErr("Session not found"));
+        return;
+      }
+
+      messageStore.removeSession(req.params.sessionId);
+      outboxProcessor?.removeSession(req.params.sessionId);
+      terminalManager.removeSession(req.params.sessionId);
+      res.json(apiOk({ sessionId: req.params.sessionId, removedRuns: 0, removedApprovals: 0 }));
       return;
     }
     messageStore.removeSession(req.params.sessionId);
