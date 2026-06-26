@@ -3604,8 +3604,10 @@ function buildImageRenderContextPrompt(prompt: string, sessionId: string): strin
   return [
     "Luma image render context:",
     `- Current Luma session_id: ${sessionId}`,
-    "- When the user asks to see an image, or when you create an image file that should be shown in chat, call the MCP tool luma-images.show_image with this session_id.",
+    "- When the user asks to see an image, asks to resend/show a generated image, or when you create an image file that should be shown in chat, call the MCP tool luma-images.show_image with this session_id.",
     "- The image tool accepts a local image path or HTTP(S) image URL, plus optional caption and alt text.",
+    "- Do not say an image was sent, shown, displayed, or resent until luma-images.show_image succeeds.",
+    "- If luma-images.show_image is unavailable or fails, say that the image display tool is unavailable and include the local file path if you found one.",
     "- The tool will reject images over 3 MB or taller than 1200 px; do not inline base64 images in your text response.",
     "",
     "User request:",
@@ -3941,6 +3943,7 @@ function looksLikeEnvelopeMessage(text: string): boolean {
     || normalized.startsWith("<environment_context>")
     || normalized.startsWith("<ide_context>")
     || normalized.startsWith("<turn_aborted>")
+    || normalized.startsWith("luma image render context:")
     || normalized.startsWith("# agents.md instructions for")
     || normalized.startsWith("plan mode is enabled in the codex exec fallback path.");
 }
@@ -4836,6 +4839,7 @@ function normalizeSessionMessages(messages: ChatMessage[]): ChatMessage[] {
   const byId = new Map<string, ChatMessage>();
   const order: string[] = [];
   for (const message of messages) {
+    if (message.role === "user" && looksLikeEnvelopeMessage(message.text)) continue;
     if (!byId.has(message.id)) order.push(message.id);
     byId.set(message.id, message);
   }
@@ -5856,7 +5860,7 @@ class OutboxProcessor {
         const run = this.runManager.startRun({
           runner: item.runner,
           workspace: item.workspace,
-          prompt: item.provisionalSession ? buildImageRenderContextPrompt(item.text, item.sessionId) : item.text,
+          prompt: item.text,
           model: item.model,
           reasoningEffort: item.reasoningEffort,
           sandbox: item.sandbox,
