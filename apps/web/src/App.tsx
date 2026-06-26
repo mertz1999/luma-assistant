@@ -5589,7 +5589,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               <Dialog.Content
                 onOpenAutoFocus={(event) => event.preventDefault()}
                 onCloseAutoFocus={(event) => event.preventDefault()}
-                className="absolute bottom-full left-0 right-12 z-20 mb-2 max-h-[360px] overflow-hidden rounded-md border border-card-border bg-surface-1 p-2 shadow-xl outline-none"
+                className="absolute bottom-full left-0 right-12 z-20 mb-2 max-h-[360px] overflow-hidden rounded-md border border-card-border bg-surface-1 p-2 shadow-xl outline-none max-sm:right-0 max-sm:max-h-[300px] max-sm:p-1.5"
               >
                 <Dialog.Title className="flex items-center justify-between gap-2 px-1 pb-2 text-xs font-semibold text-foreground/80">
                   <span className="inline-flex items-center gap-1.5">
@@ -5603,13 +5603,13 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                 </Dialog.Description>
 
                 {props.filteredAgents.length > 0 ? (
-                  <div className="max-h-[292px] space-y-1 overflow-auto pr-1">
+                  <div className="max-h-[292px] space-y-1 overflow-auto pr-1 max-sm:max-h-[240px] max-sm:space-y-0.5">
                     {props.filteredAgents.map((agent, index) => (
                       <button
                         key={agent.id}
                         type="button"
                         className={cn(
-                          "w-full rounded-md border px-2 py-2 text-left transition",
+                          "w-full rounded-md border px-2 py-2 text-left transition max-sm:py-1.5",
                           index === props.highlightedAgentIndex
                             ? "border-brand/45 bg-brand-soft/50"
                             : "border-transparent hover:border-card-border hover:bg-surface-2",
@@ -5621,7 +5621,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                           <Badge className="shrink-0 bg-surface-2 text-[10px] text-foreground/70">{agent.slug}</Badge>
                         </div>
                         {agent.description ? (
-                          <div className="mt-0.5 max-h-8 overflow-hidden text-[11px] leading-snug text-foreground/65">{agent.description}</div>
+                          <div className="mt-0.5 max-h-8 overflow-hidden text-[11px] leading-snug text-foreground/65 max-sm:hidden">{agent.description}</div>
                         ) : null}
                       </button>
                     ))}
@@ -5638,7 +5638,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               <Dialog.Content
                 onOpenAutoFocus={(event) => event.preventDefault()}
                 onCloseAutoFocus={(event) => event.preventDefault()}
-                className="absolute bottom-full left-0 right-12 z-20 mb-2 max-h-[360px] overflow-hidden rounded-md border border-card-border bg-surface-1 p-2 shadow-xl outline-none"
+                className="absolute bottom-full left-0 right-12 z-20 mb-2 max-h-[360px] overflow-hidden rounded-md border border-card-border bg-surface-1 p-2 shadow-xl outline-none max-sm:right-0 max-sm:max-h-[300px] max-sm:p-1.5"
               >
                 <Dialog.Title className="flex items-center justify-between gap-2 px-1 pb-2 text-xs font-semibold text-foreground/80">
                   <span className="inline-flex items-center gap-1.5">
@@ -5679,13 +5679,13 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                     {props.skillsError}
                   </div>
                 ) : props.filteredSkills.length > 0 ? (
-                  <div className="max-h-[292px] space-y-1 overflow-auto pr-1">
+                  <div className="max-h-[292px] space-y-1 overflow-auto pr-1 max-sm:max-h-[240px] max-sm:space-y-0.5">
                     {props.filteredSkills.map((skill, index) => (
                       <button
                         key={skill.id}
                         type="button"
                         className={cn(
-                          "w-full rounded-md border px-2 py-2 text-left transition",
+                          "w-full rounded-md border px-2 py-2 text-left transition max-sm:py-1.5",
                           index === props.highlightedSkillIndex
                             ? "border-brand/45 bg-brand-soft/50"
                             : "border-transparent hover:border-card-border hover:bg-surface-2",
@@ -5697,7 +5697,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                           <Badge className="shrink-0 bg-surface-2 text-[10px] text-foreground/70">{skill.source}</Badge>
                         </div>
                         {skill.description ? (
-                          <div className="mt-0.5 max-h-8 overflow-hidden text-[11px] leading-snug text-foreground/65">{skill.description}</div>
+                          <div className="mt-0.5 max-h-8 overflow-hidden text-[11px] leading-snug text-foreground/65 max-sm:hidden">{skill.description}</div>
                         ) : null}
                       </button>
                     ))}
