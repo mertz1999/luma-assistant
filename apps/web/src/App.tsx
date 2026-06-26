@@ -14,6 +14,7 @@ import {
   Download,
   ExternalLink,
   FileCode2,
+  Image as ImageIcon,
   Lock,
   Layers,
   LogOut,
@@ -4990,44 +4991,71 @@ type ImageAttachmentPreviewProps = {
 function ImageAttachmentPreview({ attachment, workspace }: ImageAttachmentPreviewProps): JSX.Element {
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const [lightboxOpen, setLightboxOpen] = useState(false);
 
   useEffect(() => {
-    let cancelled = false;
-    let nextUrl: string | null = null;
-    setObjectUrl(null);
+    setObjectUrl((current) => {
+      if (current) URL.revokeObjectURL(current);
+      return null;
+    });
     setError(null);
-    void fetchAttachmentBlob(attachment, workspace)
-      .then((blob) => {
-        if (cancelled) return;
-        nextUrl = URL.createObjectURL(blob);
-        setObjectUrl(nextUrl);
-      })
-      .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : "Unable to load image.");
-      });
-    return () => {
-      cancelled = true;
-      if (nextUrl) URL.revokeObjectURL(nextUrl);
-    };
+    setLoading(false);
+    setLightboxOpen(false);
   }, [attachment.id, attachment.relativePath, workspace]);
 
-  if (error || !objectUrl) {
-    return (
-      <AttachmentChip
-        attachment={attachment}
-        className={cn(
-          "border-card-border bg-surface-1/80 text-foreground",
-          error && "border-rose-400/40 text-rose-300",
-        )}
-      />
-    );
-  }
+  useEffect(() => () => {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+  }, [objectUrl]);
 
   const description = [
     attachment.width && attachment.height ? `${attachment.width}x${attachment.height}` : null,
     formatAttachmentSize(attachment.size),
   ].filter(Boolean).join(" | ");
+
+  async function loadImage(): Promise<void> {
+    if (loading || objectUrl) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const blob = await fetchAttachmentBlob(attachment, workspace);
+      const nextUrl = URL.createObjectURL(blob);
+      setObjectUrl((current) => {
+        if (current) URL.revokeObjectURL(current);
+        return nextUrl;
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to load image.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (!objectUrl) {
+    return (
+      <figure className="mt-2 max-w-full rounded-md border border-card-border bg-surface-1 px-3 py-2">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-control text-foreground/65">
+            <ImageIcon className="h-4 w-4" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm font-medium text-foreground/85">{attachment.name}</div>
+            <div className="mt-0.5 text-xs text-foreground/55">{description || "Image attachment"}</div>
+            {error ? <div className="mt-1 text-xs text-rose-300">{error}</div> : null}
+          </div>
+          <button
+            type="button"
+            className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-card-border px-2 text-xs font-medium transition hover:bg-control-hover disabled:cursor-not-allowed disabled:opacity-60"
+            onClick={() => void loadImage()}
+            disabled={loading}
+          >
+            {loading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <ImageIcon className="h-3.5 w-3.5" />}
+            {loading ? "Loading" : "Load image"}
+          </button>
+        </div>
+      </figure>
+    );
+  }
 
   return (
     <>
