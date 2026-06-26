@@ -26,7 +26,7 @@ It keeps the core coding-agent workflow available in the app: runner selection, 
 - `Luma Tasks`: use the standalone `/taskmanager` PWA for projects, task lists, priorities, deadlines, timezone-aware Today views, admin-managed users, and Telegram-ready reports.
 - `Agents and instructions`: use Codex workspace instructions such as `AGENTS.md`, plus repo-owned scheduled agents from `agents/<slug>/AGENT.md`; the Agents area is available from the left navigation.
 - `Inline tool transcript`: surface MCP calls, web searches, shell commands, file changes, and run status as compact rows like `Ran 5 commands`, expandable inline instead of opening a modal.
-- `Image render MCP`: let agents call `luma-images.show_image` to render validated local or HTTP(S) images directly inside the current chat.
+- `Image render MCP`: let agents call `luma-images.show_image` to attach validated local or HTTP(S) images to the current chat; the web UI lazy-loads image bytes only after the user clicks `Load image`.
 - `Repo skill sync`: copy managed repo skills from `skills/**/SKILL.md` into `~/.codex/skills` and `~/.claude/skills` without overwriting unmanaged global skills.
 - `Telegram MCP`: run a local Telegram MCP server for sending rendered Markdown messages and generated files to Telegram topics.
 - `Luma Tasks MCP`: inspect, search, create, assign, update, and report on Luma Tasks directly from prompts and scheduled agents.
@@ -323,7 +323,7 @@ Guardrails are enforced by both the MCP server and the Luma API:
 - Maximum height: `IMAGE_MCP_MAX_HEIGHT`, default 1200 px.
 - HTTP(S) URLs must return an image content type and private/localhost network targets are blocked.
 
-Accepted images are copied into `data/session-images/`, shown inline in chat, can be opened larger, and can be downloaded from the preview. `make run` and `make deploy-start` register this MCP for Codex and, when the Claude CLI is available, Claude Code.
+Accepted images are copied into `data/session-images/` and attached to the session. In the web chat, image attachments render first as compact placeholders with filename, dimensions, and size; the browser fetches the actual image bytes only when the user clicks `Load image`. After loading, the preview can be opened larger in the in-app lightbox and downloaded. `make run` and `make deploy-start` register this MCP for Codex and, when the Claude CLI is available, Claude Code.
 
 ## Development
 
