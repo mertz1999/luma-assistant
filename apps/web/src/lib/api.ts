@@ -83,6 +83,33 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return payload.data;
 }
 
+export async function fetchAttachmentBlob(attachment: AttachmentRef, workspace: string, download = false): Promise<Blob> {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (authToken) {
+    headers.set("Authorization", `Bearer ${authToken}`);
+  }
+  const response = await fetch("/api/attachments/content", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ attachment, workspace, download }),
+  });
+  if (response.status === 401) {
+    emitUnauthorized();
+    throw new Error("Unauthorized");
+  }
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`;
+    try {
+      const payload = (await response.json()) as ApiResponse<unknown>;
+      if (!payload.ok) message = payload.error.message || message;
+    } catch {
+      // Non-JSON errors are reported with their HTTP status.
+    }
+    throw new Error(message);
+  }
+  return response.blob();
+}
+
 async function taskManagerRequest<T>(url: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (!headers.has("Content-Type")) {

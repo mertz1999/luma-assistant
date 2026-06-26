@@ -12,11 +12,14 @@ TELEGRAM_MCP_PORT := $(if $(TELEGRAM_MCP_PORT),$(TELEGRAM_MCP_PORT),9013)
 TASK_MANAGER_MCP_PORT ?= $(shell awk -F= '/^TASK_MANAGER_MCP_PORT=/{print $$2}' .env 2>/dev/null | tail -n 1)
 TASK_MANAGER_MCP_PORT := $(if $(TASK_MANAGER_MCP_PORT),$(TASK_MANAGER_MCP_PORT),9014)
 
-PROJECT_PORTS := $(API_PORT) $(WEB_PORT) $(TELEGRAM_MCP_PORT) $(TASK_MANAGER_MCP_PORT)
+IMAGE_MCP_PORT ?= $(shell awk -F= '/^IMAGE_MCP_PORT=/{print $$2}' .env 2>/dev/null | tail -n 1)
+IMAGE_MCP_PORT := $(if $(IMAGE_MCP_PORT),$(IMAGE_MCP_PORT),9015)
+
+PROJECT_PORTS := $(API_PORT) $(WEB_PORT) $(TELEGRAM_MCP_PORT) $(TASK_MANAGER_MCP_PORT) $(IMAGE_MCP_PORT)
 PM2_BIN := npx pm2
 PM2_ECOSYSTEM := scripts/pm2/ecosystem.config.cjs
 
-.PHONY: install install-if-needed install-pm2 stop-dev-processes kill-ports stop-pm2-apps ensure-telegram-mcp ensure-taskmanager-mcp ensure-mcps migrate run deploy-start deploy-stop deploy-status deploy-logs
+.PHONY: install install-if-needed install-pm2 stop-dev-processes kill-ports stop-pm2-apps ensure-telegram-mcp ensure-taskmanager-mcp ensure-image-mcp ensure-mcps migrate run deploy-start deploy-stop deploy-status deploy-logs
 
 install:
 	npm install --include=optional --no-audit --no-fund
@@ -25,7 +28,7 @@ install-if-needed:
 	@if [ ! -d node_modules ]; then \
 		echo "node_modules missing; installing dependencies..."; \
 		npm install --include=optional --no-audit --no-fund; \
-		elif ! node -e "for (const pkg of ['@luma/shared/package.json','@luma/server/package.json','@luma/web/package.json','@luma/telegram-mcp/package.json','@luma/taskmanager-mcp/package.json']) { try { require.resolve(pkg); } catch { process.exit(1); } }"; then \
+		elif ! node -e "for (const pkg of ['@luma/shared/package.json','@luma/server/package.json','@luma/web/package.json','@luma/telegram-mcp/package.json','@luma/taskmanager-mcp/package.json','@luma/image-mcp/package.json']) { try { require.resolve(pkg); } catch { process.exit(1); } }"; then \
 			echo "Luma workspace links missing; reinstalling dependencies..."; \
 			npm install --include=optional --no-audit --no-fund; \
 		elif ! node -e "try{require.resolve('node-pty/package.json');process.exit(0)}catch{process.exit(1)}"; then \
@@ -62,11 +65,13 @@ stop-pm2-apps: install-pm2
 	-$(PM2_BIN) delete luma-assistant-web
 	-$(PM2_BIN) delete luma-telegram-mcp
 	-$(PM2_BIN) delete luma-taskmanager-mcp
+	-$(PM2_BIN) delete luma-image-mcp
 	@if [ -d "$(CURDIR)/data/pm2" ]; then \
 		PM2_HOME="$(CURDIR)/data/pm2" $(PM2_BIN) delete luma-assistant-server || true; \
 		PM2_HOME="$(CURDIR)/data/pm2" $(PM2_BIN) delete luma-assistant-web || true; \
 		PM2_HOME="$(CURDIR)/data/pm2" $(PM2_BIN) delete luma-telegram-mcp || true; \
 		PM2_HOME="$(CURDIR)/data/pm2" $(PM2_BIN) delete luma-taskmanager-mcp || true; \
+		PM2_HOME="$(CURDIR)/data/pm2" $(PM2_BIN) delete luma-image-mcp || true; \
 	fi
 
 stop-dev-processes:
@@ -97,7 +102,10 @@ ensure-telegram-mcp:
 ensure-taskmanager-mcp:
 	node scripts/ensure-taskmanager-mcp.cjs
 
-ensure-mcps: ensure-telegram-mcp ensure-taskmanager-mcp
+ensure-image-mcp:
+	node scripts/ensure-image-mcp.cjs
+
+ensure-mcps: ensure-telegram-mcp ensure-taskmanager-mcp ensure-image-mcp
 
 migrate:
 	npm run migrate
@@ -109,7 +117,7 @@ deploy-start: install-if-needed install-pm2 ensure-mcps stop-pm2-apps stop-dev-p
 	@mkdir -p data/logs
 	npm run build
 	npm run migrate
-	API_PORT=$(API_PORT) WEB_PORT=$(WEB_PORT) TELEGRAM_MCP_PORT=$(TELEGRAM_MCP_PORT) TASK_MANAGER_MCP_PORT=$(TASK_MANAGER_MCP_PORT) HOST=$(HOST) NODE_ENV=production $(PM2_BIN) startOrReload $(PM2_ECOSYSTEM) --update-env
+	API_PORT=$(API_PORT) WEB_PORT=$(WEB_PORT) TELEGRAM_MCP_PORT=$(TELEGRAM_MCP_PORT) TASK_MANAGER_MCP_PORT=$(TASK_MANAGER_MCP_PORT) IMAGE_MCP_PORT=$(IMAGE_MCP_PORT) HOST=$(HOST) NODE_ENV=production $(PM2_BIN) startOrReload $(PM2_ECOSYSTEM) --update-env
 	$(PM2_BIN) save
 	$(PM2_BIN) status
 

@@ -8,6 +8,7 @@ const apiPort = String(process.env.API_PORT || '9001');
 const webPort = String(process.env.WEB_PORT || '5175');
 const telegramMcpPort = String(process.env.TELEGRAM_MCP_PORT || '9013');
 const taskManagerMcpPort = String(process.env.TASK_MANAGER_MCP_PORT || '9014');
+const imageMcpPort = String(process.env.IMAGE_MCP_PORT || '9015');
 const host = process.env.HOST || '0.0.0.0';
 
 module.exports = {
@@ -80,6 +81,23 @@ module.exports = {
       time: true,
       out_file: path.join(root, 'data', 'logs', 'taskmanager-mcp.out.log'),
       error_file: path.join(root, 'data', 'logs', 'taskmanager-mcp.err.log'),
+    },
+    {
+      name: 'luma-image-mcp',
+      cwd: root,
+      script: 'npm',
+      args: 'run start -w @luma/image-mcp',
+      env: {
+        ...process.env,
+        NODE_ENV: 'production',
+        IMAGE_MCP_PORT: imageMcpPort,
+      },
+      autorestart: true,
+      max_restarts: 10,
+      restart_delay: 1500,
+      time: true,
+      out_file: path.join(root, 'data', 'logs', 'image-mcp.out.log'),
+      error_file: path.join(root, 'data', 'logs', 'image-mcp.err.log'),
     },
   ],
 };

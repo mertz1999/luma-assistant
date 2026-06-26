@@ -113,6 +113,7 @@ const MESSAGE_STORE_META_PATH = path.resolve(rootDir, "data/message-store-meta.j
 const MESSAGE_OUTBOX_PATH = path.resolve(rootDir, "data/message-outbox.json");
 const MESSAGE_LOG_DIR = path.resolve(rootDir, "data/messages");
 const TASK_MANAGER_DATA_PATH = path.resolve(rootDir, "data/taskmanager/state.json");
+const SESSION_IMAGE_DIR = path.resolve(rootDir, "data/session-images");
 
 const API_PORT = Number(process.env.API_PORT || 9001);
 const WEB_PORT = Number(process.env.WEB_PORT || 5175);
@@ -139,6 +140,8 @@ const TASK_MANAGER_DEFAULT_TIME_ZONE = process.env.TASK_MANAGER_DEFAULT_TIME_ZON
 const PLAN_MODE_FILE_PATH = path.resolve(rootDir, "plan.md");
 const ATTACHMENT_STAGING_DIR = path.join(".agentic", "attachments");
 const ATTACHMENT_MAX_BYTES = Number(process.env.ATTACHMENT_MAX_BYTES || 15 * 1024 * 1024);
+const IMAGE_MCP_MAX_BYTES = Number(process.env.IMAGE_MCP_MAX_BYTES || 3 * 1024 * 1024);
+const IMAGE_MCP_MAX_HEIGHT = Number(process.env.IMAGE_MCP_MAX_HEIGHT || 1200);
 const ATTACHMENT_MAX_FILES = 10;
 const RUN_LIST_PAGE_DEFAULT = Number(process.env.RUN_LIST_PAGE_DEFAULT || 60);
 const RUN_LIST_PAGE_MAX = Number(process.env.RUN_LIST_PAGE_MAX || 200);
@@ -1259,6 +1262,99 @@ function resolveStoredAttachmentPath(workspace: string, relativePath: string): s
   return absolutePath;
 }
 
+function createStoredSessionImageRelativePath(attachmentId: string, name: string): string {
+  const date = new Date();
+  const dayStamp = [
+    date.getUTCFullYear(),
+    String(date.getUTCMonth() + 1).padStart(2, "0"),
+    String(date.getUTCDate()).padStart(2, "0"),
+  ].join("-");
+  const safeName = sanitizeAttachmentName(name);
+  return path.join("session-images", dayStamp, `${attachmentId}_${safeName}`).split(path.sep).join(path.posix.sep);
+}
+
+function resolveStoredSessionImagePath(relativePath: string): string {
+  const absolutePath = path.resolve(rootDir, "data", relativePath);
+  const relative = path.relative(SESSION_IMAGE_DIR, absolutePath);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("Image path is outside Luma image storage.");
+  }
+  return absolutePath;
+}
+
+function imageMimeFromBuffer(buffer: Buffer): string | null {
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+  if (buffer.length >= 6 && (buffer.subarray(0, 6).toString("ascii") === "GIF87a" || buffer.subarray(0, 6).toString("ascii") === "GIF89a")) return "image/gif";
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  return null;
+}
+
+function imageDimensionsFromBuffer(buffer: Buffer): { width: number; height: number } | null {
+  const mime = imageMimeFromBuffer(buffer);
+  if (mime === "image/png" && buffer.length >= 24) {
+    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  }
+  if (mime === "image/gif" && buffer.length >= 10) {
+    return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+  }
+  if (mime === "image/jpeg") {
+    let offset = 2;
+    while (offset + 9 < buffer.length) {
+      if (buffer[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      const marker = buffer[offset + 1];
+      const length = buffer.readUInt16BE(offset + 2);
+      if (length < 2) return null;
+      if (
+        (marker >= 0xc0 && marker <= 0xc3)
+        || (marker >= 0xc5 && marker <= 0xc7)
+        || (marker >= 0xc9 && marker <= 0xcb)
+        || (marker >= 0xcd && marker <= 0xcf)
+      ) {
+        return { width: buffer.readUInt16BE(offset + 7), height: buffer.readUInt16BE(offset + 5) };
+      }
+      offset += 2 + length;
+    }
+  }
+  if (mime === "image/webp" && buffer.length >= 30) {
+    const chunk = buffer.subarray(12, 16).toString("ascii");
+    if (chunk === "VP8X" && buffer.length >= 30) {
+      const width = 1 + buffer.readUIntLE(24, 3);
+      const height = 1 + buffer.readUIntLE(27, 3);
+      return { width, height };
+    }
+    if (chunk === "VP8 " && buffer.length >= 30) {
+      return { width: buffer.readUInt16LE(26) & 0x3fff, height: buffer.readUInt16LE(28) & 0x3fff };
+    }
+    if (chunk === "VP8L" && buffer.length >= 25 && buffer[20] === 0x2f) {
+      const bits = buffer.readUInt32LE(21);
+      return { width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
+    }
+  }
+  return null;
+}
+
+function validateImageGuardrails(buffer: Buffer): { mimeType: string; width: number; height: number } {
+  if (buffer.byteLength > IMAGE_MCP_MAX_BYTES) {
+    throw new Error(`Image is too large. Maximum size is ${IMAGE_MCP_MAX_BYTES} bytes.`);
+  }
+  const mimeType = imageMimeFromBuffer(buffer);
+  if (!mimeType) {
+    throw new Error("Unsupported image type. Use PNG, JPEG, WebP, or GIF.");
+  }
+  const dimensions = imageDimensionsFromBuffer(buffer);
+  if (!dimensions || dimensions.width <= 0 || dimensions.height <= 0) {
+    throw new Error("Could not read image dimensions.");
+  }
+  if (dimensions.height > IMAGE_MCP_MAX_HEIGHT) {
+    throw new Error(`Image is too tall. Maximum height is ${IMAGE_MCP_MAX_HEIGHT}px.`);
+  }
+  return { mimeType, ...dimensions };
+}
+
 function buildPromptWithAttachments(prompt: string, attachments: ResolvedAttachment[]): string {
   if (attachments.length === 0) return prompt;
 
@@ -2007,7 +2103,11 @@ class RunManager extends EventEmitter {
     const resolvedAttachments = resolveRunAttachments(effectiveConfig);
     const resolvedSkills = resolveSelectedSkills(effectiveConfig.workspace, effectiveConfig.skills);
     const resolvedAgents = resolveSelectedAgents(effectiveConfig.agents);
-    const promptBase = buildPromptWithAttachments(effectiveConfig.prompt, resolvedAttachments);
+    const imageSessionId = effectiveConfig.sessionId || "";
+    const promptWithImageContext = imageSessionId
+      ? buildImageRenderContextPrompt(effectiveConfig.prompt, imageSessionId)
+      : effectiveConfig.prompt;
+    const promptBase = buildPromptWithAttachments(promptWithImageContext, resolvedAttachments);
     const planModeInstructions = effectiveConfig.planMode ? readPlanModeInstructions() : "";
     const promptWithPlan = effectiveConfig.planMode && effectiveConfig.runner !== "claude"
       ? buildPlanModePrompt(promptBase, planModeInstructions)
@@ -3493,6 +3593,20 @@ function buildPlanModePrompt(prompt: string, instructions = readPlanModeInstruct
     "If the file cannot be accessed from the current workspace, say so explicitly instead of guessing.",
     "",
     instructions,
+    "",
+    "User request:",
+    prompt,
+  ].join("\n");
+}
+
+function buildImageRenderContextPrompt(prompt: string, sessionId: string): string {
+  if (!sessionId || prompt.includes("Luma image render context:")) return prompt;
+  return [
+    "Luma image render context:",
+    `- Current Luma session_id: ${sessionId}`,
+    "- When the user asks to see an image, or when you create an image file that should be shown in chat, call the MCP tool luma-images.show_image with this session_id.",
+    "- The image tool accepts a local image path or HTTP(S) image URL, plus optional caption and alt text.",
+    "- The tool will reject images over 3 MB or taller than 1200 px; do not inline base64 images in your text response.",
     "",
     "User request:",
     prompt,
@@ -5742,7 +5856,7 @@ class OutboxProcessor {
         const run = this.runManager.startRun({
           runner: item.runner,
           workspace: item.workspace,
-          prompt: item.text,
+          prompt: item.provisionalSession ? buildImageRenderContextPrompt(item.text, item.sessionId) : item.text,
           model: item.model,
           reasoningEffort: item.reasoningEffort,
           sandbox: item.sandbox,
@@ -6055,7 +6169,7 @@ const { defaultWorkspace, options: configWorkspaceOptions } = resolveConfigWorks
 let uiState = loadPersistedUiState(defaultWorkspace);
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "5mb" }));
 app.use(
   cors({
     origin: [
@@ -6848,6 +6962,115 @@ app.post("/api/attachments", express.raw({ limit: ATTACHMENT_MAX_BYTES, type: ()
   };
 
   res.json(apiOk({ attachment }));
+});
+
+app.post("/api/attachments/content", (req, res) => {
+  const parsed = attachmentRefSchema.safeParse(req.body?.attachment);
+  if (!parsed.success || parsed.data.kind !== "image") {
+    res.status(400).json(apiErr("A valid image attachment is required."));
+    return;
+  }
+
+  const attachment = parsed.data;
+  const storage = attachment.storage || "workspace";
+  try {
+    const absolutePath = storage === "luma"
+      ? resolveStoredSessionImagePath(attachment.relativePath)
+      : resolveStoredAttachmentPath(path.resolve(String(req.body?.workspace || uiState.activeWorkspace)), attachment.relativePath);
+    if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+      res.status(404).json(apiErr("Image attachment not found."));
+      return;
+    }
+    const buffer = fs.readFileSync(absolutePath);
+    const mimeType = storage === "luma"
+      ? validateImageGuardrails(buffer).mimeType
+      : imageMimeFromBuffer(buffer);
+    if (!mimeType) {
+      res.status(400).json(apiErr("Unsupported image type. Use PNG, JPEG, WebP, or GIF."));
+      return;
+    }
+    res.setHeader("Content-Type", mimeType);
+    res.setHeader("Content-Length", String(buffer.byteLength));
+    res.setHeader("Cache-Control", "private, max-age=300");
+    if (req.body?.download === true) {
+      res.setHeader("Content-Disposition", `attachment; filename="${sanitizeAttachmentName(attachment.name)}"`);
+    }
+    res.end(buffer);
+  } catch (error) {
+    res.status(400).json(apiErr(error instanceof Error ? error.message : "Unable to read image attachment."));
+  }
+});
+
+app.post("/api/session-images", (req, res) => {
+  const body = isRecord(req.body) ? req.body : {};
+  const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+  const dataBase64 = typeof body.dataBase64 === "string" ? body.dataBase64.trim() : "";
+  const requestedName = typeof body.name === "string" ? body.name.trim() : "image";
+  const caption = typeof body.caption === "string" ? body.caption.trim().slice(0, 4000) : "";
+  const alt = typeof body.alt === "string" ? body.alt.trim().slice(0, 500) : "";
+  if (!sessionId) {
+    res.status(400).json(apiErr("sessionId is required."));
+    return;
+  }
+  const localSession = messageStore.getLocalSession(sessionId);
+  if (!localSession) {
+    res.status(404).json(apiErr("Session not found."));
+    return;
+  }
+  if (!dataBase64) {
+    res.status(400).json(apiErr("dataBase64 is required."));
+    return;
+  }
+
+  let buffer: Buffer;
+  try {
+    buffer = Buffer.from(dataBase64, "base64");
+  } catch {
+    res.status(400).json(apiErr("Invalid base64 image data."));
+    return;
+  }
+
+  try {
+    const metadata = validateImageGuardrails(buffer);
+    const extension = metadata.mimeType === "image/jpeg" ? ".jpg" : `.${metadata.mimeType.split("/")[1] || "png"}`;
+    const displayName = sanitizeAttachmentName(requestedName || `image${extension}`);
+    const nameWithExtension = path.extname(displayName) ? displayName : `${displayName}${extension}`;
+    const attachmentId = `image_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const relativePath = createStoredSessionImageRelativePath(attachmentId, nameWithExtension);
+    const absolutePath = resolveStoredSessionImagePath(relativePath);
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+    fs.writeFileSync(absolutePath, buffer);
+
+    const attachment: AttachmentRef = {
+      id: attachmentId,
+      name: nameWithExtension,
+      mimeType: metadata.mimeType,
+      size: buffer.byteLength,
+      kind: "image",
+      relativePath,
+      uploadedAt: Date.now(),
+      storage: "luma",
+      width: metadata.width,
+      height: metadata.height,
+      alt: alt || caption || nameWithExtension,
+    };
+    const createdAt = Date.now();
+    const message = messageStore.upsertGeneratedMessage(sessionId, {
+      id: `image_msg_${createdAt}_${Math.random().toString(36).slice(2, 8)}`,
+      clientMessageId: null,
+      runId: null,
+      role: "assistant",
+      kind: "message",
+      title: "Assistant",
+      text: caption || `Image: ${nameWithExtension}`,
+      createdAt,
+      deliveryStatus: "sent",
+      attachments: [attachment],
+    });
+    res.json(apiOk({ sessionId, attachment, message }));
+  } catch (error) {
+    res.status(400).json(apiErr(error instanceof Error ? error.message : "Unable to publish image."));
+  }
 });
 
 app.post("/api/messages/send", (req, res) => {

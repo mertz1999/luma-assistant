@@ -29,6 +29,10 @@ export const attachmentRefSchema = z.object({
   kind: attachmentKindSchema,
   relativePath: z.string().min(1),
   uploadedAt: z.number().int().nonnegative(),
+  storage: z.enum(["workspace", "luma"]).optional(),
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+  alt: z.string().optional(),
 });
 export type AttachmentRef = z.infer<typeof attachmentRefSchema>;
 

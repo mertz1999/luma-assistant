@@ -26,6 +26,7 @@ It keeps the core coding-agent workflow available in the app: runner selection, 
 - `Luma Tasks`: use the standalone `/taskmanager` PWA for projects, task lists, priorities, deadlines, timezone-aware Today views, admin-managed users, and Telegram-ready reports.
 - `Agents and instructions`: use Codex workspace instructions such as `AGENTS.md`, plus repo-owned scheduled agents from `agents/<slug>/AGENT.md`; the Agents area is available from the left navigation.
 - `Inline tool transcript`: surface MCP calls, web searches, shell commands, file changes, and run status as compact rows like `Ran 5 commands`, expandable inline instead of opening a modal.
+- `Image render MCP`: let agents call `luma-images.show_image` to render validated local or HTTP(S) images directly inside the current chat.
 - `Repo skill sync`: copy managed repo skills from `skills/**/SKILL.md` into `~/.codex/skills` and `~/.claude/skills` without overwriting unmanaged global skills.
 - `Telegram MCP`: run a local Telegram MCP server for sending rendered Markdown messages and generated files to Telegram topics.
 - `Luma Tasks MCP`: inspect, search, create, assign, update, and report on Luma Tasks directly from prompts and scheduled agents.
@@ -98,6 +99,10 @@ CLAUDE_CODE_EXECUTABLE=
 CLAUDE_AUTH_MODE=oauth
 DEFAULT_SANDBOX=danger-full-access
 ATTACHMENT_MAX_BYTES=15728640
+IMAGE_MCP_PORT=9015
+IMAGE_MCP_NAME=luma-images
+IMAGE_MCP_MAX_BYTES=3145728
+IMAGE_MCP_MAX_HEIGHT=1200
 MAX_CONCURRENT_RUNS=8
 ```
 
@@ -118,6 +123,9 @@ Important variables:
 - `CLAUDE_AUTH_MODE`: Claude auth mode. Defaults to `oauth`, which uses your logged-in Claude Code account and strips inherited Anthropic API-key variables from the Claude subprocess. Set `api_key` to intentionally use `ANTHROPIC_API_KEY`.
 - `DEFAULT_SANDBOX`: default sandbox mode for new sessions.
 - `ATTACHMENT_MAX_BYTES`: max browser attachment upload size in bytes. Defaults to 15 MB.
+- `IMAGE_MCP_PORT` / `IMAGE_MCP_NAME`: local MCP server used by agents to render images in chat.
+- `IMAGE_MCP_MAX_BYTES`: max image size accepted by the image MCP and server-side image renderer. Defaults to 3 MB.
+- `IMAGE_MCP_MAX_HEIGHT`: max image height accepted by the image MCP and server-side image renderer. Defaults to 1200 px.
 - `MAX_CONCURRENT_RUNS`: server-side cap for active Codex runs.
 - `TERMINAL_DISABLE_PTY=1`: force plain-pipe terminal mode.
 - `TERMINAL_SHELL=/bin/bash`: choose the shell used by session terminals.
@@ -295,7 +303,27 @@ LUMA_TASKS_AUTH_TOKEN=
 
 If `LUMA_TASKS_PASSWORD` is omitted, the MCP server falls back to `TASK_MANAGER_ADMIN_PASSWORD`, then `PASSWORD`. `LUMA_TASKS_AUTH_TOKEN` is optional and can be used instead of username/password, but normal username/password login is preferred because task-manager tokens expire.
 
-`make run` and `make deploy-start` ensure the local Codex MCP entry points at both `luma-tel` and `luma-tasks`.
+`make run` and `make deploy-start` ensure the local MCP entries point at `luma-tel`, `luma-tasks`, and `luma-images` where supported.
+
+## Luma Images MCP
+
+The repo includes an image-render MCP server registered as `luma-images` by default. Agents should call `show_image` when the user asks to see an image or when a generated image file should appear in the active Luma chat.
+
+`show_image` accepts:
+
+- `session_id`: the current Luma session id injected into the run prompt.
+- `source`: a local image path or HTTP(S) image URL.
+- `caption`: optional message text shown with the image.
+- `alt`: optional accessibility text.
+
+Guardrails are enforced by both the MCP server and the Luma API:
+
+- PNG, JPEG, WebP, and GIF only.
+- Maximum size: `IMAGE_MCP_MAX_BYTES`, default 3 MB.
+- Maximum height: `IMAGE_MCP_MAX_HEIGHT`, default 1200 px.
+- HTTP(S) URLs must return an image content type and private/localhost network targets are blocked.
+
+Accepted images are copied into `data/session-images/`, shown inline in chat, can be opened larger, and can be downloaded from the preview. `make run` and `make deploy-start` register this MCP for Codex and, when the Claude CLI is available, Claude Code.
 
 ## Development
 
@@ -316,6 +344,7 @@ The root npm workspaces are:
 - `@luma/web`
 - `@luma/telegram-mcp`
 - `@luma/taskmanager-mcp`
+- `@luma/image-mcp`
 
 ## Landing Page
 
@@ -358,6 +387,7 @@ PM2 process names are:
 - `luma-assistant-web`
 - `luma-telegram-mcp`
 - `luma-taskmanager-mcp`
+- `luma-image-mcp`
 
 ### Nginx
 
@@ -411,6 +441,7 @@ apps/
   server/        Express API, scheduler, run manager, auth, SSE, terminal bridge
   taskmanager-mcp/ local MCP server for Luma Tasks reports and task actions
   telegram-mcp/  local MCP server for Telegram messages and file uploads
+  image-mcp/     local MCP server for rendering images in Luma chat
   web/           React workspace UI
 landing-page/    independent GitHub Pages site
 packages/

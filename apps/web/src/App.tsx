@@ -11,6 +11,7 @@ import {
   ClipboardList,
   CircleStop,
   Copy,
+  Download,
   ExternalLink,
   FileCode2,
   Lock,
@@ -21,6 +22,7 @@ import {
   Mic,
   MicOff,
   Moon,
+  Maximize2,
   PanelLeft,
   PanelRight,
   Paperclip,
@@ -65,6 +67,7 @@ import {
   createAgentSchedule,
   deleteSession,
   deleteAgentSchedule,
+  fetchAttachmentBlob,
   sendMessage,
   getAgentSchedules,
   getAccountStatus,
@@ -1034,6 +1037,10 @@ function readAttachmentRef(input: unknown): AttachmentRef | null {
         kind: input.kind,
         relativePath: input.relativePath,
         uploadedAt: input.uploadedAt,
+        storage: input.storage === "luma" ? "luma" : input.storage === "workspace" ? "workspace" : undefined,
+        width: typeof input.width === "number" && input.width > 0 ? input.width : undefined,
+        height: typeof input.height === "number" && input.height > 0 ? input.height : undefined,
+        alt: typeof input.alt === "string" ? input.alt : undefined,
       }
     : null;
 }
@@ -4972,6 +4979,117 @@ function AttachmentChip({ attachment, className, onRemove }: AttachmentChipProps
   );
 }
 
+type ImageAttachmentPreviewProps = {
+  attachment: AttachmentRef;
+  workspace: string;
+};
+
+function ImageAttachmentPreview({ attachment, workspace }: ImageAttachmentPreviewProps): JSX.Element {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    let nextUrl: string | null = null;
+    setObjectUrl(null);
+    setError(null);
+    void fetchAttachmentBlob(attachment, workspace)
+      .then((blob) => {
+        if (cancelled) return;
+        nextUrl = URL.createObjectURL(blob);
+        setObjectUrl(nextUrl);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Unable to load image.");
+      });
+    return () => {
+      cancelled = true;
+      if (nextUrl) URL.revokeObjectURL(nextUrl);
+    };
+  }, [attachment.id, attachment.relativePath, workspace]);
+
+  if (error || !objectUrl) {
+    return (
+      <AttachmentChip
+        attachment={attachment}
+        className={cn(
+          "border-card-border bg-surface-1/80 text-foreground",
+          error && "border-rose-400/40 text-rose-300",
+        )}
+      />
+    );
+  }
+
+  const description = [
+    attachment.width && attachment.height ? `${attachment.width}x${attachment.height}` : null,
+    formatAttachmentSize(attachment.size),
+  ].filter(Boolean).join(" | ");
+
+  return (
+    <>
+      <figure className="mt-2 max-w-full overflow-hidden rounded-md border border-card-border bg-surface-1">
+        <button
+          type="button"
+          className="group block w-full bg-black/10 text-left"
+          onClick={() => setLightboxOpen(true)}
+          aria-label={`Open ${attachment.name}`}
+        >
+          <img
+            src={objectUrl}
+            alt={attachment.alt || attachment.name}
+            className="max-h-[460px] w-full object-contain transition group-hover:brightness-110 max-sm:max-h-[320px]"
+          />
+        </button>
+        <figcaption className="flex items-center justify-between gap-3 border-t border-card-border px-3 py-2 text-xs text-foreground/70">
+          <span className="min-w-0">
+            <span className="block truncate font-medium text-foreground/85">{attachment.name}</span>
+            <span>{description}</span>
+          </span>
+          <span className="inline-flex shrink-0 items-center gap-1 text-foreground/55">
+            <Maximize2 className="h-3.5 w-3.5" />
+            Open
+          </span>
+        </figcaption>
+      </figure>
+
+      {lightboxOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4" role="dialog" aria-modal="true">
+          <div className="flex max-h-full w-full max-w-6xl flex-col overflow-hidden rounded-md border border-card-border bg-surface-1 shadow-2xl">
+            <div className="flex items-center justify-between gap-3 border-b border-card-border px-3 py-2">
+              <div className="min-w-0">
+                <div className="truncate text-sm font-semibold">{attachment.name}</div>
+                <div className="text-xs text-foreground/60">{description}</div>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <a
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md border border-card-border px-2 text-xs font-medium transition hover:bg-control-hover"
+                  href={objectUrl}
+                  download={attachment.name}
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  Download
+                </a>
+                <button
+                  type="button"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-card-border transition hover:bg-control-hover"
+                  onClick={() => setLightboxOpen(false)}
+                  aria-label="Close image preview"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto bg-black p-3">
+              <img src={objectUrl} alt={attachment.alt || attachment.name} className="mx-auto max-h-[calc(100vh-130px)] max-w-full object-contain" />
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 type CenterPanelProps = {
   loading: boolean;
   loadingOlderMessages: boolean;
@@ -5262,15 +5380,23 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                 ) : null}
 
                 {entry.attachments && entry.attachments.length > 0 ? (
-                  <div className="mb-2 flex flex-wrap gap-1.5">
+                  <div className="mb-2 flex flex-col gap-2">
                     {entry.attachments.map((attachment) => (
-                      <AttachmentChip
-                        key={`${entry.key}_${attachment.id}`}
-                        attachment={attachment}
-                        className={entry.role === "user"
-                          ? "border-card-border bg-surface-2 text-foreground"
-                          : "border-card-border bg-surface-1/80 text-foreground"}
-                      />
+                      attachment.kind === "image" ? (
+                        <ImageAttachmentPreview
+                          key={`${entry.key}_${attachment.id}`}
+                          attachment={attachment}
+                          workspace={props.selectedSession?.workspace || props.activeWorkspace}
+                        />
+                      ) : (
+                        <AttachmentChip
+                          key={`${entry.key}_${attachment.id}`}
+                          attachment={attachment}
+                          className={entry.role === "user"
+                            ? "border-card-border bg-surface-2 text-foreground"
+                            : "border-card-border bg-surface-1/80 text-foreground"}
+                        />
+                      )
                     ))}
                   </div>
                 ) : null}
