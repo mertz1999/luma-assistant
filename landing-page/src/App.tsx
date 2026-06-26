@@ -38,7 +38,7 @@ const remoteFeatureScreenshots = [
   },
   {
     src: `${baseUrl}screenshots/remote-chats-blurred.png`,
-    alt: "Luma Assistant mobile chat list with private session names blurred",
+    alt: "Luma Assistant mobile session history list",
   },
 ];
 
