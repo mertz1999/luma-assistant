@@ -216,6 +216,23 @@ const TEXT_ATTACHMENT_MIME_TYPES = new Set([
   "application/x-sh",
   "image/svg+xml",
 ]);
+const CLAUDE_PLAN_ALLOWED_TOOLS = ["Read", "Glob", "Grep"];
+const CLAUDE_PLAN_DISALLOWED_TOOLS = [
+  "Bash",
+  "Edit",
+  "Write",
+  "NotebookEdit",
+  "ExitPlanMode",
+  "EnterPlanMode",
+  "Task",
+  "TaskOutput",
+  "TodoWrite",
+  "WebFetch",
+  "WebSearch",
+  "KillShell",
+  "Skill",
+  "SlashCommand",
+];
 
 type ResolvedAttachment = {
   ref: AttachmentRef;
@@ -2109,7 +2126,7 @@ class RunManager extends EventEmitter {
       : effectiveConfig.prompt;
     const promptBase = buildPromptWithAttachments(promptWithImageContext, resolvedAttachments);
     const planModeInstructions = effectiveConfig.planMode ? readPlanModeInstructions() : "";
-    const promptWithPlan = effectiveConfig.planMode && effectiveConfig.runner !== "claude"
+    const promptWithPlan = effectiveConfig.planMode
       ? buildPlanModePrompt(promptBase, planModeInstructions)
       : promptBase;
     const promptWithAgents = buildAgentBackedPrompt(promptWithPlan, resolvedAgents);
@@ -2138,7 +2155,7 @@ class RunManager extends EventEmitter {
     this.runs.set(runId, record);
 
     if (effectiveConfig.runner === "claude") {
-      this.startClaudeExecution(runId, effectiveConfig, prompt, planModeInstructions);
+      this.startClaudeExecution(runId, effectiveConfig, prompt);
       this.persistState();
       return record;
     }
@@ -2264,13 +2281,13 @@ class RunManager extends EventEmitter {
     return record;
   }
 
-  private startClaudeExecution(runId: string, effectiveConfig: RunConfig, prompt: string, planModeInstructions = ""): void {
+  private startClaudeExecution(runId: string, effectiveConfig: RunConfig, prompt: string): void {
     const abortController = new AbortController();
     const options: ClaudeOptions = {
       cwd: effectiveConfig.workspace,
       model: effectiveConfig.model,
       abortController,
-      permissionMode: effectiveConfig.planMode ? "plan" : "bypassPermissions",
+      permissionMode: effectiveConfig.planMode ? "dontAsk" : "bypassPermissions",
       allowDangerouslySkipPermissions: !effectiveConfig.planMode,
       env: buildClaudeEnvironment(),
       systemPrompt: { type: "preset", preset: "claude_code" },
@@ -2279,8 +2296,8 @@ class RunManager extends EventEmitter {
     const thinking = resolveClaudeThinkingConfig(effectiveConfig.model, effectiveConfig.reasoningEffort);
     if (thinking) options.thinking = thinking;
     if (effectiveConfig.planMode) {
-      options.planModeInstructions = planModeInstructions;
-      options.canUseTool = this.createClaudeCanUseTool(runId, effectiveConfig);
+      options.allowedTools = CLAUDE_PLAN_ALLOWED_TOOLS;
+      options.disallowedTools = CLAUDE_PLAN_DISALLOWED_TOOLS;
     }
     if (effectiveConfig.sessionId) options.resume = effectiveConfig.sessionId;
     if (CLAUDE_CODE_EXECUTABLE) options.pathToClaudeCodeExecutable = CLAUDE_CODE_EXECUTABLE;

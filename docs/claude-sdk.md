@@ -51,13 +51,31 @@ permissionMode: "bypassPermissions"
 allowDangerouslySkipPermissions: true
 ```
 
-Plan-mode runs use:
+Plan-mode runs use Luma's shared `plan.md` prompt wrapper, matching the Codex runner. Luma normalizes the run config to read-only planning semantics and sends Claude the same plan instructions from the repository root:
 
 ```ts
-permissionMode: "plan"
+permissionMode: "dontAsk"
+allowDangerouslySkipPermissions: false
+allowedTools: ["Read", "Glob", "Grep"]
+disallowedTools: [
+  "Bash",
+  "Edit",
+  "Write",
+  "NotebookEdit",
+  "ExitPlanMode",
+  "EnterPlanMode",
+  "Task",
+  "TaskOutput",
+  "TodoWrite",
+  "WebFetch",
+  "WebSearch",
+  "KillShell",
+  "Skill",
+  "SlashCommand",
+]
 ```
 
-This preserves Luma's read-only planning workflow while allowing full autonomous execution for normal Claude Code sessions.
+This avoids Claude Code's native plan file / `ExitPlanMode` workflow and keeps planning output controlled by `plan.md`. Normal Claude runs still use `bypassPermissions` for autonomous execution.
 
 ## Environment Variables
 
