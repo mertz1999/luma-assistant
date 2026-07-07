@@ -1151,6 +1151,43 @@ function isSystemSkill(skill: SkillListItem): boolean {
   return skill.path.split(/[\\/]/).includes(".system");
 }
 
+function skillIdentityKey(skill: SkillListItem): string {
+  const parts = skill.path.split(/[\\/]/).filter(Boolean);
+  const runtimeIndex = parts.findIndex((part) => part === ".codex" || part === ".claude");
+  const skillsIndex = runtimeIndex >= 0 ? parts.indexOf("skills", runtimeIndex) : -1;
+  if (skillsIndex >= 0 && skillsIndex < parts.length - 1) {
+    const relative = parts.slice(skillsIndex + 1, -1).join("/");
+    if (relative) return relative.toLowerCase();
+  }
+
+  return skill.name.trim().toLowerCase();
+}
+
+function skillCanonicalRank(skill: SkillListItem): number {
+  if (skill.scope === "repo") return skill.source.includes("codex") ? 0 : 1;
+  if (skill.source === "codex") return 2;
+  if (skill.source === "claude") return 3;
+  return 4;
+}
+
+function chooseCanonicalSkill(current: SkillListItem, candidate: SkillListItem): SkillListItem {
+  const currentRank = skillCanonicalRank(current);
+  const candidateRank = skillCanonicalRank(candidate);
+  if (currentRank !== candidateRank) return candidateRank < currentRank ? candidate : current;
+  return candidate.path.localeCompare(current.path) < 0 ? candidate : current;
+}
+
+function dedupeSkillCatalog(skills: SkillListItem[]): SkillListItem[] {
+  const byIdentity = new Map<string, SkillListItem>();
+  for (const skill of skills) {
+    const key = skillIdentityKey(skill);
+    const existing = byIdentity.get(key);
+    byIdentity.set(key, existing ? chooseCanonicalSkill(existing, skill) : skill);
+  }
+
+  return [...byIdentity.values()].sort((a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path));
+}
+
 type SkillQueryToken = {
   start: number;
   end: number;
@@ -2550,13 +2587,21 @@ export function App(): JSX.Element {
   }, [prompt]);
   const agentQueryToken = useMemo(() => findAgentQueryToken(prompt), [prompt]);
   const skillQueryToken = useMemo(() => findSkillQueryToken(prompt), [prompt]);
-  const selectedSkillIds = useMemo(() => new Set(selectedSkills.map((skill) => skill.id)), [selectedSkills]);
+  const visibleSkillCatalog = useMemo(() => dedupeSkillCatalog(skillCatalog), [skillCatalog]);
+  const selectedSkillKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const selected of selectedSkills) {
+      const match = skillCatalog.find((skill) => skill.id === selected.id || skill.path === selected.path);
+      keys.add(match ? skillIdentityKey(match) : selected.id);
+    }
+    return keys;
+  }, [selectedSkills, skillCatalog]);
   const selectedPromptAgentIds = useMemo(() => new Set(selectedPromptAgents.map((agent) => agent.id)), [selectedPromptAgents]);
   const filteredSkills = useMemo(() => {
     const query = (skillQueryToken?.query || "").toLowerCase();
-    return skillCatalog
+    return visibleSkillCatalog
       .filter((skill) => showSystemSkills || !isSystemSkill(skill))
-      .filter((skill) => !selectedSkillIds.has(skill.id))
+      .filter((skill) => !selectedSkillKeys.has(skillIdentityKey(skill)))
       .filter((skill) => {
         if (!query) return true;
         return skill.name.toLowerCase().includes(query)
@@ -2565,7 +2610,7 @@ export function App(): JSX.Element {
           || skill.source.toLowerCase().includes(query);
       })
       .slice(0, 30);
-  }, [skillCatalog, selectedSkillIds, showSystemSkills, skillQueryToken]);
+  }, [visibleSkillCatalog, selectedSkillKeys, showSystemSkills, skillQueryToken]);
   const filteredPromptAgents = useMemo(() => {
     const query = (agentQueryToken?.query || "").toLowerCase();
     return agents
