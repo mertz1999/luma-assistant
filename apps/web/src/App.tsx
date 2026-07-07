@@ -156,6 +156,8 @@ type SessionCard = {
   status: SessionListItem["status"];
   updatedAt: number;
   runner: RunRunner;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
   sourceTag: RunSourceTag;
   sourceRaw: string;
   workspace: string;
@@ -168,15 +170,24 @@ type PlanSessionState = "idle" | "armed" | "active";
 const sandboxOptions: SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
 const approvalPolicies: ApprovalPolicy[] = ["untrusted", "on-failure", "on-request", "never"];
 const runnerOptions: RunRunner[] = ["codex", "claude"];
-const codexModelOptions = ["gpt-5.3-codex", "gpt-5.4", "gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o", "o4-mini"];
+const codexModelOptions = ["gpt-5.5", "gpt-5.4"];
 const claudeModelOptions = ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-4-1"];
-const reasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high"];
-const modelOptions = codexModelOptions;
+const codexReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
+const claudeReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high"];
 function modelOptionsForRunner(runner: RunRunner): string[] {
   return runner === "claude" ? claudeModelOptions : codexModelOptions;
 }
+function reasoningEffortOptionsForRunner(runner: RunRunner): ReasoningEffort[] {
+  return runner === "claude" ? claudeReasoningEffortOptions : codexReasoningEffortOptions;
+}
 function runnerLabel(runner: RunRunner): string {
   return runner === "claude" ? "Claude Code" : "Codex";
+}
+function reasoningEffortLabel(effort: ReasoningEffort): string {
+  return effort === "xhigh" ? "extra high" : effort;
+}
+function isReasoningEffort(input: unknown): input is ReasoningEffort {
+  return input === "low" || input === "medium" || input === "high" || input === "xhigh";
 }
 function compactSelectWidth(label: string): string {
   return `${Math.max(label.length + 2, 6)}ch`;
@@ -537,7 +548,7 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
         const workspace = typeof item.workspace === "string" ? item.workspace : "";
         const runner: RunRunner = item.runner === "claude" ? "claude" : "codex";
         const model = typeof item.model === "string" ? item.model : "";
-        const reasoningEffort: ReasoningEffort = item.reasoningEffort === "low" || item.reasoningEffort === "medium" || item.reasoningEffort === "high" ? item.reasoningEffort : "high";
+        const reasoningEffort: ReasoningEffort = isReasoningEffort(item.reasoningEffort) ? item.reasoningEffort : "high";
         const createdAt = typeof item.createdAt === "number" ? item.createdAt : Date.now();
         const planMode = typeof item.planMode === "boolean" ? item.planMode : false;
         const attachments = readAttachmentRefs(item.attachments);
@@ -645,6 +656,8 @@ function buildSessionCards(items: SessionListItem[]): SessionCard[] {
     status: item.status,
     updatedAt: item.updatedAt,
     runner: item.runner === "claude" ? "claude" : "codex",
+    model: item.model,
+    reasoningEffort: item.reasoningEffort,
     sourceTag: item.sourceTag,
     sourceRaw: item.sourceRaw,
     workspace: item.workspace,
@@ -1216,6 +1229,8 @@ function readSessionListItem(input: unknown): SessionListItem | null {
         status: input.status as SessionListItem["status"],
         updatedAt: input.updatedAt,
         runner: input.runner === "claude" ? "claude" : "codex",
+        model: typeof input.model === "string" ? input.model : undefined,
+        reasoningEffort: isReasoningEffort(input.reasoningEffort) ? input.reasoningEffort : undefined,
         sourceTag: input.sourceTag as RunSourceTag,
         sourceRaw: input.sourceRaw,
         workspace: input.workspace,
@@ -2023,9 +2038,10 @@ export function App(): JSX.Element {
   const [uploadingAttachmentNames, setUploadingAttachmentNames] = useState<string[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [runner, setRunnerState] = useState<RunRunner>("codex");
-  const [model, setModel] = useState("gpt-5.3-codex");
-  const [defaultCodexModel, setDefaultCodexModel] = useState("gpt-5.3-codex");
+  const [model, setModel] = useState("gpt-5.5");
+  const [defaultCodexModel, setDefaultCodexModel] = useState("gpt-5.5");
   const [defaultClaudeModel, setDefaultClaudeModel] = useState("sonnet");
+  const [claudeEffortFlagSupported, setClaudeEffortFlagSupported] = useState(true);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("high");
   const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("on-request");
@@ -2817,6 +2833,7 @@ export function App(): JSX.Element {
       setRunnerState(payload.defaults.runner);
       setDefaultCodexModel(payload.defaults.codexModel);
       setDefaultClaudeModel(payload.defaults.claudeModel);
+      setClaudeEffortFlagSupported(payload.defaults.claudeEffortFlagSupported);
       setModel(payload.defaults.model);
       setReasoningEffort(payload.defaults.reasoningEffort);
       setSandbox(payload.defaults.sandbox);
@@ -3092,6 +3109,7 @@ export function App(): JSX.Element {
 
     if (selectedSessionIdRef.current === session.id) {
       setSelectedRunId(session.latestRunId);
+      applyRunConfigToControls(session.runner === "claude" ? "claude" : "codex", session.model, session.reasoningEffort);
     }
   }
 
@@ -3142,11 +3160,40 @@ export function App(): JSX.Element {
       if (modelOptionsForRunner(nextRunner).includes(current)) return current;
       return nextRunner === "claude" ? defaultClaudeModel : defaultCodexModel;
     });
+    setReasoningEffort((current) => {
+      if (reasoningEffortOptionsForRunner(nextRunner).includes(current)) return current;
+      return "high";
+    });
+  }
+
+  function applyRunConfigToControls(nextRunner: RunRunner, nextModel?: string, nextReasoningEffort?: ReasoningEffort): void {
+    setRunnerState(nextRunner);
+    if (nextModel?.trim()) {
+      setModel(nextModel);
+    } else {
+      setModel(nextRunner === "claude" ? defaultClaudeModel : defaultCodexModel);
+    }
+    setReasoningEffort((current) => {
+      const nextEffort = nextReasoningEffort && reasoningEffortOptionsForRunner(nextRunner).includes(nextReasoningEffort)
+        ? nextReasoningEffort
+        : current;
+      return reasoningEffortOptionsForRunner(nextRunner).includes(nextEffort) ? nextEffort : "high";
+    });
   }
 
   useEffect(() => {
     setNewSessionUseCustomModel(!modelOptionsForRunner(runner).includes(model));
   }, [model, runner]);
+
+  useEffect(() => {
+    if (isDraftSession || !selectedRunRecord) return;
+    if (selectedSession?.latestRunId && selectedRunRecord.id !== selectedSession.latestRunId) return;
+    applyRunConfigToControls(
+      selectedRunRecord.config.runner,
+      selectedRunRecord.config.model,
+      selectedRunRecord.config.reasoningEffort,
+    );
+  }, [isDraftSession, selectedRunRecord?.id, selectedSession?.latestRunId]);
 
   function buildQueuedMessage(
     sessionKey: string,
@@ -3166,11 +3213,21 @@ export function App(): JSX.Element {
     const requestModel =
       selectedRunRecord?.config.runner === requestRunner && selectedRunRecord.config.model
         ? selectedRunRecord.config.model
+        : existingSession?.runner === requestRunner && existingSession.model
+          ? existingSession.model
         : requestRunner === runner
           ? model
           : requestRunner === "claude"
             ? defaultClaudeModel
             : defaultCodexModel;
+    const requestReasoningEffort =
+      selectedRunRecord?.config.runner === requestRunner
+        ? selectedRunRecord.config.reasoningEffort
+        : existingSession?.runner === requestRunner && existingSession.reasoningEffort
+          ? existingSession.reasoningEffort
+          : requestRunner === runner && reasoningEffortOptionsForRunner(requestRunner).includes(reasoningEffort)
+            ? reasoningEffort
+            : "high";
     return {
       id: `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       sessionKey,
@@ -3180,7 +3237,7 @@ export function App(): JSX.Element {
       workspace: activeWorkspace,
       runner: requestRunner,
       model: requestModel,
-      reasoningEffort,
+      reasoningEffort: requestReasoningEffort,
       sandbox: overrides?.sandbox ?? (planMode ? "read-only" : sandbox),
       approvalPolicy: overrides?.approvalPolicy ?? (planMode ? "never" : approvalPolicy),
       planMode,
@@ -3922,6 +3979,7 @@ export function App(): JSX.Element {
     if (target) {
       setSelectedSessionId(target.id);
       setSelectedRunId(target.latestRunId);
+      applyRunConfigToControls(target.runner, target.model, target.reasoningEffort);
     }
     setMobileThreadsOpen(false);
   }
@@ -4322,6 +4380,7 @@ export function App(): JSX.Element {
             setModel={setModel}
             reasoningEffort={reasoningEffort}
             setReasoningEffort={setReasoningEffort}
+            claudeEffortFlagSupported={claudeEffortFlagSupported}
             approvalsCount={pendingApprovals.length}
             rightPanelTab={rightPanelTab}
             rightDockOpen={rightDockOpen}
@@ -4518,15 +4577,22 @@ export function App(): JSX.Element {
               </div>
 
               <div>
-                <label className="mb-1 block text-xs font-semibold text-foreground/75">Thinking effort</label>
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <label className="block text-xs font-semibold text-foreground/75">Thinking effort</label>
+                  {runner === "claude" && !claudeEffortFlagSupported ? (
+                    <span className="text-[11px] text-amber-600 dark:text-amber-300" title="This Claude CLI rejected --effort; Luma uses CLAUDE_CODE_EFFORT_LEVEL instead.">
+                      env fallback
+                    </span>
+                  ) : null}
+                </div>
                 <select
                   className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
                   value={reasoningEffort}
                   onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}
                 >
-                  {reasoningEffortOptions.map((option) => (
+                  {reasoningEffortOptionsForRunner(runner).map((option) => (
                     <option key={option} value={option}>
-                      {option}
+                      {reasoningEffortLabel(option)}
                     </option>
                   ))}
                 </select>
@@ -5132,6 +5198,7 @@ type CenterPanelProps = {
   setModel: (value: string) => void;
   reasoningEffort: ReasoningEffort;
   setReasoningEffort: (value: ReasoningEffort) => void;
+  claudeEffortFlagSupported: boolean;
   approvalsCount: number;
   rightPanelTab: DockTab;
   rightDockOpen: boolean;
@@ -5573,18 +5640,23 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             </select>
             <select
               className="h-6 appearance-none rounded-md border-0 bg-control px-2 text-xs text-foreground outline-none hover:bg-control-hover focus:ring-2 focus:ring-brand/20"
-              style={{ width: compactSelectWidth(props.reasoningEffort) }}
+              style={{ width: compactSelectWidth(reasoningEffortLabel(props.reasoningEffort)) }}
               value={props.reasoningEffort}
               onChange={(event) => props.setReasoningEffort(event.target.value as ReasoningEffort)}
               aria-label="Thinking effort"
               title="Thinking effort"
             >
-              {reasoningEffortOptions.map((option) => (
+              {reasoningEffortOptionsForRunner(props.runner).map((option) => (
                 <option key={option} value={option}>
-                  {option}
+                  {reasoningEffortLabel(option)}
                 </option>
               ))}
             </select>
+            {props.runner === "claude" && !props.claudeEffortFlagSupported ? (
+              <span className="rounded-md bg-amber-500/12 px-2 py-1 text-[11px] text-amber-700 dark:text-amber-300" title="This Claude CLI rejected --effort; Luma uses CLAUDE_CODE_EFFORT_LEVEL instead.">
+                env fallback
+              </span>
+            ) : null}
           </div>
 
           {props.planSessionState !== "idle" ? (
@@ -6336,7 +6408,7 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
                 </select>
                 {useCustomModel ? <input className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.model} onChange={(event) => props.setModel(event.target.value)} placeholder="Custom model id" /> : null}
                 <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.reasoningEffort} onChange={(event) => props.setReasoningEffort(event.target.value as ReasoningEffort)}>
-                  {reasoningEffortOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+                  {reasoningEffortOptionsForRunner(props.runner).map((option) => <option key={option} value={option}>{reasoningEffortLabel(option)}</option>)}
                 </select>
                 <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.sandbox} onChange={(event) => props.setSandbox(event.target.value as SandboxMode)}>
                   {sandboxOptions.map((option) => <option key={option} value={option}>{option}</option>)}

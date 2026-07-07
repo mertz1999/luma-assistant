@@ -91,7 +91,7 @@ TASK_MANAGER_ADMIN_PASSWORD=
 TASK_MANAGER_JWT_SECRET=change_task_manager_secret
 TASK_MANAGER_TOKEN_TTL_SECONDS=604800
 TASK_MANAGER_DEFAULT_TIME_ZONE=Asia/Tehran
-DEFAULT_MODEL=gpt-5.3-codex
+DEFAULT_MODEL=gpt-5.5
 DEFAULT_RUNNER=codex
 CLAUDE_DEFAULT_MODEL=sonnet
 DEFAULT_REASONING_EFFORT=high
@@ -118,8 +118,8 @@ Important variables:
 - `DEFAULT_RUNNER`: default runner for new sessions. Use `codex` or `claude`.
 - `DEFAULT_MODEL`: default Codex model for new sessions and new scheduled jobs.
 - `CLAUDE_DEFAULT_MODEL`: default Claude model when the Claude Code runner is selected.
-- `DEFAULT_REASONING_EFFORT`: default thinking effort for new sessions. Use `low`, `medium`, or `high`; it can also be changed in the new-session dialog.
-- `CLAUDE_CODE_EXECUTABLE`: optional path to a separately installed `claude` binary. If omitted, Luma uses `claude` from `PATH` when available, then falls back to the SDK binary.
+- `DEFAULT_REASONING_EFFORT`: default thinking effort for new sessions. Use `low`, `medium`, `high`, or `xhigh` for Codex extra high; it can also be changed in the new-session dialog.
+- `CLAUDE_CODE_EXECUTABLE`: optional path to the Claude Code CLI. If omitted, Luma uses `claude` from `PATH`.
 - `CLAUDE_AUTH_MODE`: Claude auth mode. Defaults to `oauth`, which uses your logged-in Claude Code account and strips inherited Anthropic API-key variables from the Claude subprocess. Set `api_key` to intentionally use `ANTHROPIC_API_KEY`.
 - `DEFAULT_SANDBOX`: default sandbox mode for new sessions.
 - `ATTACHMENT_MAX_BYTES`: max browser attachment upload size in bytes. Defaults to 15 MB.
@@ -134,16 +134,18 @@ Legacy browser storage keys and local session sources are tolerated so existing 
 
 ## Claude Code Runner
 
-Luma Assistant includes Claude Code as a second runner through `@anthropic-ai/claude-agent-sdk`. Select `Codex` or `Claude Code` in Run defaults before creating a new session. Existing sessions keep their original runner.
+Luma Assistant includes Claude Code as a second runner by spawning the `claude` CLI directly. Select `Codex` or `Claude Code` in Run defaults before creating a new session. Existing sessions keep their original runner.
 
 By default, Claude runs use your normal Claude Code OAuth login. If the server shell has `ANTHROPIC_API_KEY` set, Luma removes it from the Claude subprocess so a paid Claude Code plan is not accidentally bypassed. To intentionally use API-key billing instead, set `CLAUDE_AUTH_MODE=api_key`.
 
-Normal Claude Code runs use full autonomous permissions. Plan mode still forces Claude `plan` permissions so planning remains read-only.
+Normal Claude Code runs use autonomous `bypassPermissions` CLI mode. Plan mode wraps the prompt with `plan.md`, uses `dontAsk`, and limits Claude to read/search tools. Luma captures raw Claude stream JSON/stderr plus normalized chat, tool, status, session, and usage events.
+
+Claude effort is passed with `--effort` when the installed CLI supports it. Older CLI builds that reject the flag receive `CLAUDE_CODE_EFFORT_LEVEL=<effort>` and Luma emits a warning in the run log because enforcement depends on the installed Claude Code version.
 
 More implementation notes are in:
 
 ```text
-docs/claude-sdk.md
+docs/claude-cli.md
 ```
 
 ## Web Interface

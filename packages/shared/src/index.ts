@@ -15,7 +15,7 @@ export type RunSourceTag = z.infer<typeof runSourceTagSchema>;
 export const runRunnerSchema = z.enum(["codex", "claude"]);
 export type RunRunner = z.infer<typeof runRunnerSchema>;
 
-export const reasoningEffortSchema = z.enum(["low", "medium", "high"]);
+export const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh"]);
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
 
 export const attachmentKindSchema = z.enum(["image", "text"]);
@@ -312,6 +312,8 @@ export type RunListItem = {
   status: RunStatus;
   updatedAt: number;
   runner: RunRunner;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
   sourceTag: RunSourceTag;
   sourceRaw: string;
   sessionId: string;
@@ -371,6 +373,8 @@ export type SessionListItem = {
   status: RunStatus;
   updatedAt: number;
   runner: RunRunner;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
   sourceTag: RunSourceTag;
   sourceRaw: string;
   workspace: string;
@@ -450,6 +454,7 @@ export type AppBootstrap = {
     model: string;
     codexModel: string;
     claudeModel: string;
+    claudeEffortFlagSupported: boolean;
     reasoningEffort: ReasoningEffort;
     sandbox: SandboxMode;
   };
@@ -465,6 +470,7 @@ export type AppBootstrapLite = {
     model: string;
     codexModel: string;
     claudeModel: string;
+    claudeEffortFlagSupported: boolean;
     reasoningEffort: ReasoningEffort;
     sandbox: SandboxMode;
   };
