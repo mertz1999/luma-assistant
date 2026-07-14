@@ -3256,22 +3256,22 @@ export function App(): JSX.Element {
     const existingSession = allSessions.find((session) => session.id === sessionKey);
     const requestRunner = sessionKey === draftSessionKey ? runner : (existingSession?.runner || runner);
     const requestModel =
-      selectedRunRecord?.config.runner === requestRunner && selectedRunRecord.config.model
-        ? selectedRunRecord.config.model
+      requestRunner === runner
+        ? model
         : existingSession?.runner === requestRunner && existingSession.model
           ? existingSession.model
-        : requestRunner === runner
-          ? model
-          : requestRunner === "claude"
-            ? defaultClaudeModel
-            : defaultCodexModel;
+          : selectedRunRecord?.config.runner === requestRunner && selectedRunRecord.config.model
+            ? selectedRunRecord.config.model
+            : requestRunner === "claude"
+              ? defaultClaudeModel
+              : defaultCodexModel;
     const requestReasoningEffort =
-      selectedRunRecord?.config.runner === requestRunner
-        ? selectedRunRecord.config.reasoningEffort
+      requestRunner === runner && reasoningEffortOptionsForRunner(requestRunner).includes(reasoningEffort)
+        ? reasoningEffort
         : existingSession?.runner === requestRunner && existingSession.reasoningEffort
           ? existingSession.reasoningEffort
-          : requestRunner === runner && reasoningEffortOptionsForRunner(requestRunner).includes(reasoningEffort)
-            ? reasoningEffort
+          : selectedRunRecord?.config.runner === requestRunner
+            ? selectedRunRecord.config.reasoningEffort
             : "high";
     return {
       id: `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
