@@ -3154,7 +3154,6 @@ export function App(): JSX.Element {
 
     if (selectedSessionIdRef.current === session.id) {
       setSelectedRunId(session.latestRunId);
-      applyRunConfigToControls(session.runner === "claude" ? "claude" : "codex", session.model, session.reasoningEffort);
     }
   }
 
@@ -3233,11 +3232,8 @@ export function App(): JSX.Element {
   useEffect(() => {
     if (isDraftSession || !selectedRunRecord) return;
     if (selectedSession?.latestRunId && selectedRunRecord.id !== selectedSession.latestRunId) return;
-    applyRunConfigToControls(
-      selectedRunRecord.config.runner,
-      selectedRunRecord.config.model,
-      selectedRunRecord.config.reasoningEffort,
-    );
+    if (selectedSessionIdRef.current !== runSessionId(selectedRunRecord)) return;
+    applyRunConfigToControls(selectedRunRecord.config.runner, selectedRunRecord.config.model, selectedRunRecord.config.reasoningEffort);
   }, [isDraftSession, selectedRunRecord?.id, selectedSession?.latestRunId]);
 
   function buildQueuedMessage(
