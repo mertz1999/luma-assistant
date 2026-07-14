@@ -106,7 +106,7 @@ const WEB_PORT = Number(process.env.WEB_PORT || 5175);
 const HOST = process.env.HOST || "0.0.0.0";
 const CODEX_PATH = process.env.CODEX_PATH || "codex";
 const DEFAULT_RUNNER: RunRunner = process.env.DEFAULT_RUNNER === "claude" ? "claude" : "codex";
-const DEFAULT_CODEX_MODEL = process.env.DEFAULT_MODEL || process.env.CODEX_DEFAULT_MODEL || "gpt-5.5";
+const DEFAULT_CODEX_MODEL = process.env.DEFAULT_MODEL || process.env.CODEX_DEFAULT_MODEL || "gpt-5.6-sol";
 const DEFAULT_CLAUDE_MODEL = process.env.CLAUDE_DEFAULT_MODEL || "sonnet";
 const DEFAULT_MODEL = DEFAULT_RUNNER === "claude" ? DEFAULT_CLAUDE_MODEL : DEFAULT_CODEX_MODEL;
 const CLAUDE_AUTH_MODE = process.env.CLAUDE_AUTH_MODE === "api_key" ? "api_key" : "oauth";

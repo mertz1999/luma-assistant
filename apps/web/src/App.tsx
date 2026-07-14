@@ -2075,8 +2075,8 @@ export function App(): JSX.Element {
   const [uploadingAttachmentNames, setUploadingAttachmentNames] = useState<string[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [runner, setRunnerState] = useState<RunRunner>("codex");
-  const [model, setModel] = useState("gpt-5.5");
-  const [defaultCodexModel, setDefaultCodexModel] = useState("gpt-5.5");
+  const [model, setModel] = useState("gpt-5.6-sol");
+  const [defaultCodexModel, setDefaultCodexModel] = useState("gpt-5.6-sol");
   const [defaultClaudeModel, setDefaultClaudeModel] = useState("sonnet");
   const [claudeEffortFlagSupported, setClaudeEffortFlagSupported] = useState(true);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("high");
