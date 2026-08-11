@@ -1937,20 +1937,9 @@ function claudeCliSupportsEffort(executable: string): boolean {
   const cached = claudeEffortSupportCache.get(command);
   if (cached !== undefined) return cached;
 
-  const result = spawnSync(command, [
-    "-p",
-    "--effort",
-    "low",
-    "--output-format",
-    "json",
-    "--no-session-persistence",
-    "--max-turns",
-    "0",
-    "--",
-    "noop",
-  ], { encoding: "utf8", timeout: 5000 });
+  const result = spawnSync(command, ["-p", "--help"], { encoding: "utf8", timeout: 5000 });
   const output = `${result.stdout || ""}\n${result.stderr || ""}`;
-  const supported = !result.error && !output.includes("unknown option '--effort'");
+  const supported = !result.error && output.includes("--effort");
   claudeEffortSupportCache.set(command, supported);
   return supported;
 }
