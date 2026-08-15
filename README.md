@@ -254,7 +254,7 @@ Managed copies include a marker file and can be updated safely. If a destination
 
 ## Telegram MCP
 
-The repo includes a Telegram MCP server registered as `luma-tel` by default. It can send Markdown messages and upload generated files to Telegram group topics.
+The repo includes a Telegram MCP server registered as `luma-tel` by default. It can send Markdown messages, upload generated files to Telegram group topics, and save/read the latest document uploaded by a user.
 
 1. Create a bot with `@BotFather`.
 2. Add the bot to your group and grant send permissions.
@@ -276,7 +276,13 @@ TELEGRAM_MCP_PORT=9013
 TELEGRAM_MCP_NAME=luma-tel
 TELEGRAM_ALLOWED_ROOTS=/Users/applestation/Project
 TELEGRAM_MAX_FILE_BYTES=52428800
+TELEGRAM_DOWNLOAD_DIR=/Users/applestation/Project/.luma/telegram-uploads
+TELEGRAM_MAX_TEXT_READ_BYTES=262144
 ```
+
+The MCP exposes `get_last_uploaded_file` for inbound documents. It reads Telegram's bot update stream, finds the latest user-uploaded document in the configured chat/topic, and saves it under `TELEGRAM_DOWNLOAD_DIR` (or `.luma/telegram-uploads` beneath the first allowed root). Recognized text and code files also return their leading UTF-8 content; binary files return the saved local path. The last downloaded file is cached, so asking for it again returns the saved copy until a newer document arrives.
+
+For group uploads, disable the bot's privacy mode with `@BotFather` or make the bot an administrator so it can receive ordinary document messages. `getUpdates` cannot be used while a webhook is configured, and this MCP should be the only consumer of the bot's update stream.
 
 `make run` and `make deploy-start` ensure the local Codex MCP entry points at the Telegram MCP server.
 

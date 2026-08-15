@@ -20,6 +20,8 @@ const MCP_PORT = Number(process.env.TELEGRAM_MCP_PORT || 9013);
 const MCP_HOST = process.env.TELEGRAM_MCP_HOST || "127.0.0.1";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const TELEGRAM_MAX_FILE_BYTES = Number(process.env.TELEGRAM_MAX_FILE_BYTES || 50 * 1024 * 1024);
+const TELEGRAM_MAX_TEXT_READ_BYTES = Number(process.env.TELEGRAM_MAX_TEXT_READ_BYTES || 256 * 1024);
+const TELEGRAM_RECEIVE_MAX_PAGES = Number(process.env.TELEGRAM_RECEIVE_MAX_PAGES || 100);
 const FILE_THREAD_ENV = "TELEGRAM_MESSAGE_FILE_THREAD_ID";
 const TEXT_THREAD_ENV = "TELEGRAM_MESSAGE_TEXT_THREAD_ID";
 const LEGACY_THREAD_ENV = "TELEGRAM_MESSAGE_THREAD_ID";
@@ -36,6 +38,41 @@ type TelegramUser = {
   is_bot: boolean;
   first_name?: string;
   username?: string;
+};
+
+type TelegramDocument = {
+  file_id: string;
+  file_unique_id?: string;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+};
+
+type TelegramInboundMessage = {
+  message_id: number;
+  date: number;
+  message_thread_id?: number;
+  chat: {
+    id: number | string;
+    title?: string;
+    type?: string;
+  };
+  from?: TelegramUser;
+  caption?: string;
+  document?: TelegramDocument;
+};
+
+type TelegramUpdate = {
+  update_id: number;
+  message?: TelegramInboundMessage;
+  channel_post?: TelegramInboundMessage;
+};
+
+type TelegramFile = {
+  file_id: string;
+  file_unique_id?: string;
+  file_size?: number;
+  file_path?: string;
 };
 
 type TelegramSendDocumentResult = {
@@ -89,6 +126,43 @@ type TestConnectionResult = {
   bot_username: string | null;
   chat_id: string;
   message_thread_id: string | null;
+};
+
+type InboundFileCandidate = {
+  update_id: number;
+  message_id: number;
+  chat_id: string;
+  message_thread_id: string | null;
+  sent_at: string;
+  sender_id: string | null;
+  sender_username: string | null;
+  caption: string | null;
+  file_id: string;
+  file_unique_id: string | null;
+  file_name: string;
+  mime_type: string | null;
+  file_size: number | null;
+};
+
+type SavedInboundFile = InboundFileCandidate & {
+  saved_path: string;
+  saved_at: string;
+};
+
+type TelegramReceiveState = {
+  version: 1;
+  next_update_offset?: number;
+  last_candidates: Record<string, InboundFileCandidate>;
+  last_saved_files: Record<string, SavedInboundFile>;
+};
+
+type GetLastUploadedFileResult = SavedInboundFile & {
+  ok: true;
+  from_cache: boolean;
+  is_text: boolean;
+  text_content: string | null;
+  text_content_bytes: number;
+  text_content_truncated: boolean;
 };
 
 function findWorkspaceRoot(startDir: string): string | null {
@@ -152,6 +226,13 @@ function parseAllowedRoots(): string[] {
 }
 
 const allowedRoots = parseAllowedRoots();
+const telegramDownloadDir = path.resolve(expandHome(
+  process.env.TELEGRAM_DOWNLOAD_DIR || path.join(allowedRoots[0] || rootDir, ".luma", "telegram-uploads"),
+));
+const telegramReceiveStatePath = path.resolve(expandHome(
+  process.env.TELEGRAM_RECEIVE_STATE_PATH || path.join(rootDir, "data", "telegram-mcp", "receive-state.json"),
+));
+let receiveFileLock: Promise<void> = Promise.resolve();
 
 function ensureInsideAllowedRoots(candidate: string): void {
   const resolved = path.resolve(candidate);
@@ -161,6 +242,57 @@ function ensureInsideAllowedRoots(candidate: string): void {
   });
   if (!inside) {
     throw new Error(`File is outside TELEGRAM_ALLOWED_ROOTS. Allowed roots: ${allowedRoots.join(", ")}`);
+  }
+}
+
+async function withReceiveFileLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = receiveFileLock;
+  let release = () => {};
+  receiveFileLock = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+function emptyReceiveState(): TelegramReceiveState {
+  return {
+    version: 1,
+    last_candidates: {},
+    last_saved_files: {},
+  };
+}
+
+async function readReceiveState(): Promise<TelegramReceiveState> {
+  try {
+    const parsed = JSON.parse(await fs.promises.readFile(telegramReceiveStatePath, "utf8")) as Partial<TelegramReceiveState>;
+    if (parsed.version !== 1) return emptyReceiveState();
+    return {
+      version: 1,
+      next_update_offset: Number.isSafeInteger(parsed.next_update_offset) ? parsed.next_update_offset : undefined,
+      last_candidates: parsed.last_candidates && typeof parsed.last_candidates === "object" ? parsed.last_candidates : {},
+      last_saved_files: parsed.last_saved_files && typeof parsed.last_saved_files === "object" ? parsed.last_saved_files : {},
+    };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || error instanceof SyntaxError) return emptyReceiveState();
+    throw error;
+  }
+}
+
+async function writeReceiveState(state: TelegramReceiveState): Promise<void> {
+  const stateDir = path.dirname(telegramReceiveStatePath);
+  await fs.promises.mkdir(stateDir, { recursive: true });
+  const temporaryPath = `${telegramReceiveStatePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.promises.writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+    await fs.promises.rename(temporaryPath, telegramReceiveStatePath);
+  } finally {
+    await fs.promises.rm(temporaryPath, { force: true });
   }
 }
 
@@ -186,6 +318,115 @@ async function resolveSafeFile(filePath: string, cwd?: string): Promise<{ absolu
     throw new Error(`File is too large for Telegram upload policy: ${stat.size} bytes > ${TELEGRAM_MAX_FILE_BYTES} bytes`);
   }
   return { absolutePath, stat };
+}
+
+async function resolveSafeDownloadDirectory(directory?: string, cwd?: string): Promise<string> {
+  const base = cwd ? path.resolve(expandHome(cwd)) : rootDir;
+  const requested = directory?.trim() || telegramDownloadDir;
+  const absolutePath = path.isAbsolute(requested)
+    ? path.resolve(expandHome(requested))
+    : path.resolve(base, expandHome(requested));
+
+  ensureInsideAllowedRoots(absolutePath);
+  await fs.promises.mkdir(absolutePath, { recursive: true });
+  const realPath = await fs.promises.realpath(absolutePath);
+  ensureInsideAllowedRoots(realPath);
+  return realPath;
+}
+
+function sanitizeDownloadedFileName(name: string): string {
+  const baseName = path.basename(name).normalize("NFKC");
+  const safeName = baseName
+    .replace(/[\u0000-\u001f\u007f]/g, "_")
+    .replace(/[^\p{L}\p{N}._()\[\] -]+/gu, "_")
+    .replace(/^\.+/, "")
+    .trim()
+    .slice(0, 180);
+  return safeName || "telegram-file";
+}
+
+function receiveStateKey(chatId: string, threadId: string | null): string {
+  return JSON.stringify([chatId, threadId ?? "*"]);
+}
+
+function resolveReceiveThreadId(input?: string | number | null): string | null {
+  if (input === null) return null;
+  return resolveThreadId(input);
+}
+
+function inboundMessageFromUpdate(update: TelegramUpdate): TelegramInboundMessage | undefined {
+  return update.message || update.channel_post;
+}
+
+function candidateFromUpdate(update: TelegramUpdate): InboundFileCandidate | null {
+  const message = inboundMessageFromUpdate(update);
+  const document = message?.document;
+  if (!message || !document?.file_id || message.from?.is_bot) return null;
+
+  return {
+    update_id: update.update_id,
+    message_id: message.message_id,
+    chat_id: String(message.chat.id),
+    message_thread_id: message.message_thread_id === undefined ? null : String(message.message_thread_id),
+    sent_at: new Date(message.date * 1000).toISOString(),
+    sender_id: message.from ? String(message.from.id) : null,
+    sender_username: message.from?.username || null,
+    caption: message.caption?.trim() || null,
+    file_id: document.file_id,
+    file_unique_id: document.file_unique_id || null,
+    file_name: sanitizeDownloadedFileName(document.file_name || `telegram-file-${message.message_id}`),
+    mime_type: document.mime_type || null,
+    file_size: Number.isSafeInteger(document.file_size) ? document.file_size ?? null : null,
+  };
+}
+
+function rememberCandidate(state: TelegramReceiveState, candidate: InboundFileCandidate): void {
+  const keys = [
+    receiveStateKey(candidate.chat_id, candidate.message_thread_id),
+    receiveStateKey(candidate.chat_id, null),
+  ];
+  for (const key of keys) {
+    const existing = state.last_candidates[key];
+    if (!existing || candidate.update_id > existing.update_id) {
+      state.last_candidates[key] = candidate;
+    }
+  }
+}
+
+async function pollTelegramFileUpdates(state: TelegramReceiveState): Promise<void> {
+  let offset = state.next_update_offset ?? -100;
+  const maxPages = Number.isSafeInteger(TELEGRAM_RECEIVE_MAX_PAGES) && TELEGRAM_RECEIVE_MAX_PAGES > 0
+    ? TELEGRAM_RECEIVE_MAX_PAGES
+    : 100;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const body = new URLSearchParams({
+      offset: String(offset),
+      limit: "100",
+      timeout: "0",
+    });
+    const updates = await callTelegram<TelegramUpdate[]>("getUpdates", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+
+    if (updates.length === 0) return;
+    for (const update of updates) {
+      const candidate = candidateFromUpdate(update);
+      if (candidate) rememberCandidate(state, candidate);
+    }
+
+    const highestUpdateId = Math.max(...updates.map((update) => update.update_id));
+    state.next_update_offset = highestUpdateId + 1;
+    await writeReceiveState(state);
+    offset = state.next_update_offset;
+    if (updates.length < 100) return;
+  }
+
+  throw new Error(
+    `Telegram has more than ${maxPages * 100} pending updates. Run get_last_uploaded_file again to continue scanning safely.`,
+  );
 }
 
 function requireTelegramToken(): string {
@@ -270,6 +511,206 @@ async function callTelegramWithCurl<T>(
   } catch {
     return { ok: false };
   }
+}
+
+async function downloadTelegramFile(candidate: InboundFileCandidate, destinationDirectory: string): Promise<SavedInboundFile> {
+  if (candidate.file_size !== null && candidate.file_size > TELEGRAM_MAX_FILE_BYTES) {
+    throw new Error(
+      `Telegram file is too large for the configured download policy: ${candidate.file_size} bytes > ${TELEGRAM_MAX_FILE_BYTES} bytes`,
+    );
+  }
+
+  const body = new URLSearchParams({ file_id: candidate.file_id });
+  const telegramFile = await callTelegram<TelegramFile>("getFile", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!telegramFile.file_path) throw new Error("Telegram getFile did not return a downloadable file path.");
+  if (telegramFile.file_size !== undefined && telegramFile.file_size > TELEGRAM_MAX_FILE_BYTES) {
+    throw new Error(
+      `Telegram file is too large for the configured download policy: ${telegramFile.file_size} bytes > ${TELEGRAM_MAX_FILE_BYTES} bytes`,
+    );
+  }
+
+  const stableName = `${candidate.update_id}_${candidate.message_id}_${candidate.file_name}`;
+  const destinationPath = path.join(destinationDirectory, stableName);
+  ensureInsideAllowedRoots(destinationPath);
+
+  const existingStat = await fs.promises.stat(destinationPath).catch(() => null);
+  const expectedSize = telegramFile.file_size ?? candidate.file_size;
+  if (existingStat?.isFile() && (expectedSize === null || existingStat.size === expectedSize)) {
+    return {
+      ...candidate,
+      file_size: existingStat.size,
+      saved_path: destinationPath,
+      saved_at: existingStat.mtime.toISOString(),
+    };
+  }
+
+  const token = requireTelegramToken();
+  const sourceUrl = `${TELEGRAM_API_BASE}/file/bot${token}/${telegramFile.file_path}`;
+  const temporaryPath = `${destinationPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    let response: Response | null = null;
+    try {
+      response = await fetch(sourceUrl);
+    } catch (error) {
+      try {
+        await execFileAsync("curl", [
+          "-fLsS",
+          "--connect-timeout", "10",
+          "--max-time", "120",
+          "--max-filesize", String(TELEGRAM_MAX_FILE_BYTES),
+          "--output", temporaryPath,
+          sourceUrl,
+        ], { timeout: 125_000, maxBuffer: 1024 * 1024 });
+      } catch (curlError) {
+        throw new Error(
+          `Telegram file download failed: ${formatErrorMessage(error)}; curl fallback: ${formatErrorMessage(curlError)}`,
+        );
+      }
+    }
+
+    if (response) {
+      if (!response.ok) throw new Error(`Telegram file download failed with HTTP ${response.status}.`);
+      const contentLength = Number(response.headers.get("content-length") || "0");
+      if (contentLength > TELEGRAM_MAX_FILE_BYTES) {
+        throw new Error(
+          `Telegram file is too large for the configured download policy: ${contentLength} bytes > ${TELEGRAM_MAX_FILE_BYTES} bytes`,
+        );
+      }
+      const bytes = Buffer.from(await response.arrayBuffer());
+      if (bytes.length > TELEGRAM_MAX_FILE_BYTES) {
+        throw new Error(
+          `Telegram file is too large for the configured download policy: ${bytes.length} bytes > ${TELEGRAM_MAX_FILE_BYTES} bytes`,
+        );
+      }
+      await fs.promises.writeFile(temporaryPath, bytes, { flag: "wx", mode: 0o600 });
+    }
+
+    const stat = await fs.promises.stat(temporaryPath);
+    if (!stat.isFile() || stat.size > TELEGRAM_MAX_FILE_BYTES) {
+      throw new Error(`Downloaded Telegram file failed the local file-size policy (${stat.size} bytes).`);
+    }
+    await fs.promises.rename(temporaryPath, destinationPath);
+    return {
+      ...candidate,
+      file_size: stat.size,
+      saved_path: destinationPath,
+      saved_at: new Date().toISOString(),
+    };
+  } finally {
+    await fs.promises.rm(temporaryPath, { force: true });
+  }
+}
+
+const readableTextExtensions = new Set([
+  ".txt", ".md", ".mdx", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml", ".xml",
+  ".html", ".htm", ".css", ".scss", ".less", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
+  ".py", ".rb", ".php", ".java", ".kt", ".kts", ".go", ".rs", ".c", ".h", ".cpp", ".hpp",
+  ".cs", ".swift", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".sql", ".graphql", ".gql", ".toml",
+  ".ini", ".conf", ".cfg", ".env", ".log", ".tex", ".rst",
+]);
+
+function isReadableTextFile(fileName: string, mimeType: string | null): boolean {
+  const normalizedMime = mimeType?.toLowerCase().split(";", 1)[0]?.trim() || "";
+  if (normalizedMime.startsWith("text/")) return true;
+  if ([
+    "application/json",
+    "application/ld+json",
+    "application/xml",
+    "application/javascript",
+    "application/x-javascript",
+    "application/x-yaml",
+    "application/yaml",
+    "application/sql",
+  ].includes(normalizedMime)) return true;
+  return readableTextExtensions.has(path.extname(fileName).toLowerCase());
+}
+
+async function readDownloadedText(
+  savedFile: SavedInboundFile,
+  includeText: boolean,
+  requestedMaxBytes?: number,
+): Promise<Pick<GetLastUploadedFileResult, "is_text" | "text_content" | "text_content_bytes" | "text_content_truncated">> {
+  const isText = isReadableTextFile(savedFile.file_name, savedFile.mime_type);
+  if (!includeText || !isText) {
+    return {
+      is_text: isText,
+      text_content: null,
+      text_content_bytes: 0,
+      text_content_truncated: false,
+    };
+  }
+
+  const configuredLimit = Number.isSafeInteger(TELEGRAM_MAX_TEXT_READ_BYTES) && TELEGRAM_MAX_TEXT_READ_BYTES > 0
+    ? TELEGRAM_MAX_TEXT_READ_BYTES
+    : 256 * 1024;
+  const limit = requestedMaxBytes === undefined ? configuredLimit : Math.min(requestedMaxBytes, configuredLimit);
+  const stat = await fs.promises.stat(savedFile.saved_path);
+  const bytesToRead = Math.min(stat.size, limit);
+  const handle = await fs.promises.open(savedFile.saved_path, "r");
+  try {
+    const buffer = Buffer.alloc(bytesToRead);
+    const { bytesRead } = await handle.read(buffer, 0, bytesToRead, 0);
+    const content = buffer.subarray(0, bytesRead).toString("utf8").replace(/^\uFEFF/, "");
+    return {
+      is_text: true,
+      text_content: content,
+      text_content_bytes: bytesRead,
+      text_content_truncated: stat.size > bytesRead,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function getLastUploadedFile(args: {
+  chat_id?: string | number;
+  message_thread_id?: string | number | null;
+  save_dir?: string;
+  cwd?: string;
+  include_text?: boolean;
+  max_text_bytes?: number;
+}): Promise<GetLastUploadedFileResult> {
+  return withReceiveFileLock(async () => {
+    const chatId = resolveChatId(args.chat_id);
+    const threadId = resolveReceiveThreadId(args.message_thread_id);
+    const stateKey = receiveStateKey(chatId, threadId);
+    const state = await readReceiveState();
+    await pollTelegramFileUpdates(state);
+
+    const candidate = state.last_candidates[stateKey];
+    if (!candidate) {
+      const location = threadId ? `chat ${chatId}, topic ${threadId}` : `chat ${chatId}`;
+      throw new Error(
+        `No uploaded Telegram document was found for ${location}. Upload a document, then try again.`,
+      );
+    }
+
+    const destinationDirectory = await resolveSafeDownloadDirectory(args.save_dir, args.cwd);
+    const cached = state.last_saved_files[stateKey];
+    const cachedStat = cached && cached.update_id === candidate.update_id
+      ? await fs.promises.stat(cached.saved_path).catch(() => null)
+      : null;
+    const requestedDestination = path.join(
+      destinationDirectory,
+      `${candidate.update_id}_${candidate.message_id}_${candidate.file_name}`,
+    );
+    const useCached = Boolean(cachedStat?.isFile() && cached?.saved_path === requestedDestination);
+    const savedFile = useCached && cached ? cached : await downloadTelegramFile(candidate, destinationDirectory);
+
+    state.last_saved_files[stateKey] = savedFile;
+    await writeReceiveState(state);
+    const textResult = await readDownloadedText(savedFile, args.include_text !== false, args.max_text_bytes);
+    return {
+      ok: true,
+      ...savedFile,
+      from_cache: useCached,
+      ...textResult,
+    };
+  });
 }
 
 async function testTelegramConnection(chatIdInput?: string | number, threadIdInput?: string | number | null): Promise<TestConnectionResult> {
@@ -406,7 +847,7 @@ function createServer(): McpServer {
     { name: MCP_NAME, version: "0.1.0" },
     {
       instructions:
-        "Use send_file to upload a local generated file to the configured Telegram group topic, and send_message to post text. Never ask for or expose TELEGRAM_BOT_TOKEN.",
+        "Use send_file to upload a local generated file, send_message to post text, and get_last_uploaded_file when the user asks for the latest document uploaded to the configured Telegram chat/topic. The receive tool saves the document locally and includes supported text-file content. Never ask for or expose TELEGRAM_BOT_TOKEN.",
     },
   );
 
@@ -468,6 +909,40 @@ function createServer(): McpServer {
     async (args) => {
       try {
         return toolSuccess({ ...(await sendTelegramFile(args)) });
+      } catch (error) {
+        return toolFailure(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_last_uploaded_file",
+    {
+      title: "Get Last Uploaded Telegram File",
+      description:
+        "Find the latest document uploaded by a user in the configured Telegram chat/topic, save it locally, and optionally return readable text content. Reuses the saved copy when there is no newer upload.",
+      inputSchema: {
+        chat_id: z.union([z.string(), z.number()]).optional().describe("Telegram chat id. Defaults to TELEGRAM_CHAT_ID."),
+        message_thread_id: z.union([z.string(), z.number()]).nullable().optional().describe(
+          "Telegram topic/thread id. Defaults to TELEGRAM_MESSAGE_FILE_THREAD_ID. Pass null to search all topics in the chat.",
+        ),
+        save_dir: z.string().optional().describe(
+          "Directory where the document should be saved. Defaults to TELEGRAM_DOWNLOAD_DIR or .luma/telegram-uploads under the first allowed root.",
+        ),
+        cwd: z.string().optional().describe(
+          "Base directory for a relative save_dir. The resolved directory must remain under TELEGRAM_ALLOWED_ROOTS.",
+        ),
+        include_text: z.boolean().optional().describe(
+          "Include UTF-8 content for recognized text/code files. Defaults to true; binary files are still saved and return a path.",
+        ),
+        max_text_bytes: z.number().int().positive().optional().describe(
+          "Maximum leading text bytes to return, capped by TELEGRAM_MAX_TEXT_READ_BYTES (default 262144).",
+        ),
+      },
+    },
+    async (args) => {
+      try {
+        return toolSuccess({ ...(await getLastUploadedFile(args)) });
       } catch (error) {
         return toolFailure(error);
       }
