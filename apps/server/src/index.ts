@@ -2285,6 +2285,7 @@ class RunManager extends EventEmitter {
     const effort = resolveClaudeCliEffort(effectiveConfig.reasoningEffort);
     const supportsEffort = claudeCliSupportsEffort(executable);
     const env = buildClaudeEnvironment();
+    const runningAsRoot = typeof process.getuid === "function" && process.getuid() === 0;
     const args = [
       "-p",
       "--output-format",
@@ -2295,7 +2296,7 @@ class RunManager extends EventEmitter {
       "--tools",
       "default",
       "--permission-mode",
-      effectiveConfig.planMode ? "dontAsk" : "bypassPermissions",
+      effectiveConfig.planMode ? "dontAsk" : runningAsRoot ? "default" : "bypassPermissions",
     ];
 
     if (supportsEffort) {
@@ -2304,7 +2305,7 @@ class RunManager extends EventEmitter {
       env.CLAUDE_CODE_EFFORT_LEVEL = effort;
     }
 
-    if (!effectiveConfig.planMode) {
+    if (!effectiveConfig.planMode && !runningAsRoot) {
       args.push("--allow-dangerously-skip-permissions");
     }
 
@@ -2346,6 +2347,12 @@ class RunManager extends EventEmitter {
       const warning = `Claude CLI did not accept --effort during capability detection; using CLAUDE_CODE_EFFORT_LEVEL=${effort}. Upgrade Claude Code if effort is not applied.`;
       this.appendEvent(runId, { source: "stderr", text: `${warning}\n` });
       this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${warning}\n` } });
+    }
+
+    if (runningAsRoot && !effectiveConfig.planMode) {
+      const warning = "Claude Code does not allow bypass-permissions mode when running as root; using default Claude permissions for this run.\n";
+      this.appendEvent(runId, { source: "stderr", text: warning });
+      this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: warning } });
     }
 
     child.stdout.on("data", (chunk: Buffer) => {
