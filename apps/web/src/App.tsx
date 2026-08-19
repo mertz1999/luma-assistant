@@ -32,7 +32,6 @@ import {
   RefreshCw,
   Send,
   Settings,
-  ShieldAlert,
   Sun,
   Terminal,
   Trash2,
@@ -43,7 +42,6 @@ import type {
   AgentSchedule,
   AgentScheduleExecution,
   ApprovalPolicy,
-  ApprovalQueueItem,
   AttachmentRef,
   ChatMessage,
   RunRecord,
@@ -62,7 +60,6 @@ import type {
   SkillSyncResult,
 } from "@luma/shared";
 import {
-  acceptApproval,
   archiveSession,
   connectEvents,
   createAgentSchedule,
@@ -106,7 +103,7 @@ import { TaskManager } from "@/TaskManager";
 
 type StatusFilter = "all" | "running" | "completed" | "failed" | "stopped";
 type SessionFilterValue = StatusFilter | "all-history";
-type DockTab = "terminal" | "approvals" | "context";
+type DockTab = "terminal" | "context";
 type SidebarMode = "code" | "agents";
 type BackendConnectionStatus = "connecting" | "connected" | "disconnected";
 
@@ -168,7 +165,6 @@ type SessionCard = {
 type PlanSessionState = "idle" | "armed" | "active";
 
 const sandboxOptions: SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
-const approvalPolicies: ApprovalPolicy[] = ["untrusted", "on-failure", "on-request", "never"];
 const runnerOptions: RunRunner[] = ["codex", "claude"];
 const codexModelOptions = ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4"];
 const claudeModelOptions = ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-4-1"];
@@ -2044,7 +2040,6 @@ export function App(): JSX.Element {
   const [tokenUsageError, setTokenUsageError] = useState<string | null>(null);
   const [showAllHistory, setShowAllHistory] = useState(false);
   const [loadingRunList, setLoadingRunList] = useState(false);
-  const [approvals, setApprovals] = useState<ApprovalQueueItem[]>([]);
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>("code");
 
   const [prompt, setPrompt] = useState("");
@@ -2081,7 +2076,7 @@ export function App(): JSX.Element {
   const [claudeEffortFlagSupported, setClaudeEffortFlagSupported] = useState(true);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("high");
   const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
-  const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("on-request");
+  const approvalPolicy: ApprovalPolicy = "never";
   const [planFlowBySession, setPlanFlowBySession] = useState<Record<string, PlanSessionState>>({});
 
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
@@ -2441,9 +2436,6 @@ export function App(): JSX.Element {
           return;
         }
 
-        if (event.kind === "run.approvalQueued") {
-          void refreshRunList(selectedSessionIdRef.current);
-        }
       });
 
       es.onopen = () => {
@@ -2578,7 +2570,6 @@ export function App(): JSX.Element {
   );
   const visibleTimeline = timeline;
   const hiddenTimelineCount = selectedSessionId && messageNextCursorByRunId[selectedSessionId] ? messagePageSize : 0;
-  const pendingApprovals = useMemo(() => approvals.filter((item) => item.status === "pending"), [approvals]);
   const slashSuggestions = useMemo(() => {
     const trimmed = prompt.trimStart();
     if (!trimmed.startsWith("/")) return [] as SlashCommandSuggestion[];
@@ -2874,7 +2865,6 @@ export function App(): JSX.Element {
       const normalizedItems = normalizeSessionItems(listPayload.items);
       setRunItems(normalizedItems);
       setRunListNextCursor(listPayload.nextCursor);
-      setApprovals(listPayload.approvals.length ? listPayload.approvals : payload.approvals);
       setRunnerState(payload.defaults.runner);
       setDefaultCodexModel(payload.defaults.codexModel);
       setDefaultClaudeModel(payload.defaults.claudeModel);
@@ -2961,7 +2951,6 @@ export function App(): JSX.Element {
     const normalizedItems = normalizeSessionItems(payload.items);
     setRunItems(normalizedItems);
     setRunListNextCursor(payload.nextCursor);
-    setApprovals(payload.approvals);
 
     if (isDraftSessionRef.current) return;
 
@@ -3007,7 +2996,6 @@ export function App(): JSX.Element {
         return normalizeSessionItems([...next.values()]);
       });
       setRunListNextCursor(payload.nextCursor);
-      setApprovals(payload.approvals);
     } finally {
       setLoadingMoreRunItems(false);
     }
@@ -3880,35 +3868,6 @@ export function App(): JSX.Element {
     }
   }
 
-  async function onAcceptApproval(item: ApprovalQueueItem): Promise<void> {
-    if (item.kind === "claude_permission") {
-      const payload = await acceptApproval(item.runId, item.id, item.suggestedApprovalPolicy);
-      const nextSessionKey = runSessionId(payload.run);
-      await refreshRunList(nextSessionKey);
-      setSelectedSessionId(nextSessionKey);
-      setSelectedRunId(payload.run.id);
-      void loadSelectedRunRecord(payload.run.id);
-      setRightPanelTab("approvals");
-      setMobileContextOpen(false);
-      return;
-    }
-
-    const payload = await rerun(item.runId, {
-      sandbox: item.suggestedSandbox,
-      approvalPolicy: item.suggestedApprovalPolicy,
-      approvalId: item.id,
-    });
-
-    const nextSessionKey = runSessionId(payload.run);
-    await refreshRunList(nextSessionKey);
-    setIsDraftSession(false);
-    setSelectedSessionId(nextSessionKey);
-    setSelectedRunId(payload.run.id);
-    void loadRunMessagesPage(nextSessionKey, { reset: true });
-    void loadSelectedRunRecord(payload.run.id);
-    setRightPanelTab("approvals");
-    setMobileContextOpen(false);
-  }
 
   async function onChangeWorkspace(nextWorkspace: string): Promise<void> {
     await setActiveWorkspace(nextWorkspace);
@@ -4422,7 +4381,6 @@ export function App(): JSX.Element {
             reasoningEffort={reasoningEffort}
             setReasoningEffort={setReasoningEffort}
             claudeEffortFlagSupported={claudeEffortFlagSupported}
-            approvalsCount={pendingApprovals.length}
             rightPanelTab={rightPanelTab}
             rightDockOpen={rightDockOpen}
             onOpenRightPanel={(tab) => {
@@ -4509,12 +4467,8 @@ export function App(): JSX.Element {
             setReasoningEffort={setReasoningEffort}
             sandbox={sandbox}
             setSandbox={setSandbox}
-            approvalPolicy={approvalPolicy}
-            setApprovalPolicy={setApprovalPolicy}
             theme={theme}
             toggleTheme={toggleTheme}
-            approvals={pendingApprovals}
-            onAcceptApproval={onAcceptApproval}
             ansi={ansi}
             debugLogs={debugLogs}
             selectedSessionId={selectedSessionId}
@@ -4703,12 +4657,8 @@ export function App(): JSX.Element {
                 setReasoningEffort={setReasoningEffort}
                 sandbox={sandbox}
                 setSandbox={setSandbox}
-                approvalPolicy={approvalPolicy}
-                setApprovalPolicy={setApprovalPolicy}
                 theme={theme}
                 toggleTheme={toggleTheme}
-                approvals={pendingApprovals}
-                onAcceptApproval={onAcceptApproval}
                 ansi={ansi}
                 debugLogs={debugLogs}
                 selectedSessionId={selectedSessionId}
@@ -5240,7 +5190,6 @@ type CenterPanelProps = {
   reasoningEffort: ReasoningEffort;
   setReasoningEffort: (value: ReasoningEffort) => void;
   claudeEffortFlagSupported: boolean;
-  approvalsCount: number;
   rightPanelTab: DockTab;
   rightDockOpen: boolean;
   onOpenRightPanel: (tab: DockTab) => void;
@@ -5438,10 +5387,6 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
         <div className="flex shrink-0 items-center gap-1">
           <Button type="button" variant={props.rightDockOpen && props.rightPanelTab === "terminal" ? "primary" : "ghost"} size="sm" className="h-7 w-7 p-0" onClick={() => props.onOpenRightPanel("terminal")} aria-label="Open terminal" title="Terminal">
             <Terminal className="h-3.5 w-3.5" />
-          </Button>
-          <Button type="button" variant={props.rightDockOpen && props.rightPanelTab === "approvals" ? "primary" : "ghost"} size="sm" className="h-7 px-2" onClick={() => props.onOpenRightPanel("approvals")} title="Approvals">
-            <ShieldAlert className="mr-1 h-3.5 w-3.5" />
-            {props.approvalsCount}
           </Button>
           <Button type="button" variant={props.rightDockOpen && props.rightPanelTab === "context" ? "primary" : "ghost"} size="sm" className="h-7 w-7 p-0" onClick={() => props.onOpenRightPanel("context")} aria-label="Open context" title="Context">
             <Layers className="h-3.5 w-3.5" />
@@ -6094,12 +6039,8 @@ type ClaudeRightPanelProps = {
   setReasoningEffort: (value: ReasoningEffort) => void;
   sandbox: SandboxMode;
   setSandbox: (value: SandboxMode) => void;
-  approvalPolicy: ApprovalPolicy;
-  setApprovalPolicy: (value: ApprovalPolicy) => void;
   theme: "light" | "dark";
   toggleTheme: () => void;
-  approvals: ApprovalQueueItem[];
-  onAcceptApproval: (item: ApprovalQueueItem) => Promise<void>;
   ansi: Convert;
   debugLogs: DebugLogEntry[];
   selectedSessionId: string | null;
@@ -6133,7 +6074,6 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
   const selectedSessionSourceBadge = props.selectedSession ? getSessionSourceBadge(props.selectedSession) : null;
   const activeTabLabel = {
     terminal: "Terminal",
-    approvals: "Approvals",
     context: "Context",
   }[props.rightPanelTab];
 
@@ -6244,7 +6184,6 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
         <div className="flex min-w-0 items-center gap-2">
           <Terminal className="h-4 w-4 text-brand" />
           <span className="truncate text-sm font-semibold">{activeTabLabel}</span>
-          {props.rightPanelTab === "approvals" ? <Badge>{props.approvals.length}</Badge> : null}
         </div>
         <button type="button" className="rounded-md p-1 text-foreground/55 hover:bg-control-hover hover:text-foreground" onClick={props.onClose} aria-label="Close dock" title="Close">
           <X className="h-4 w-4" />
@@ -6252,10 +6191,9 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
       </div>
 
       {props.mobile ? (
-        <div className="relative z-10 grid shrink-0 grid-cols-3 gap-1 bg-background px-2 py-2 shadow-[0_12px_26px_-26px_rgba(0,0,0,0.9)]">
+        <div className="relative z-10 grid shrink-0 grid-cols-2 gap-1 bg-background px-2 py-2 shadow-[0_12px_26px_-26px_rgba(0,0,0,0.9)]">
           {([
             ["terminal", Terminal, ""],
-            ["approvals", ShieldAlert, props.approvals.length ? String(props.approvals.length) : ""],
             ["context", Layers, ""],
           ] as const).map(([tab, Icon, count]) => (
             <button
@@ -6340,28 +6278,6 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
           </section>
         ) : null}
 
-        {props.rightPanelTab === "approvals" ? (
-          <section className="space-y-2">
-            {props.approvals.length === 0 ? <p className="rounded-md border border-dashed border-card-border bg-surface-2 px-3 py-2 text-sm text-foreground/65">Approval queue is empty.</p> : null}
-            {props.approvals.map((item) => (
-              <div key={item.id} className="rounded-md border border-card-border bg-surface-2 p-3">
-                <div className="mb-2 flex items-center gap-2 text-sm font-semibold">
-                  <ShieldAlert className="h-4 w-4 text-[color:var(--warn)]" />
-                  {item.kind === "claude_permission" ? "Claude permission" : "Pending escalation"}
-                </div>
-                <p className="mb-2 line-clamp-6 text-xs text-foreground/75">{item.reason}</p>
-                <div className="mb-2 rounded-md bg-control p-2 font-mono text-[11px]">
-                  {item.kind === "claude_permission"
-                    ? `tool: ${item.command || item.toolName || "Claude tool"}`
-                    : `sandbox: ${item.suggestedSandbox} | approval: ${item.suggestedApprovalPolicy}`}
-                </div>
-                <Button size="sm" onClick={() => void props.onAcceptApproval(item)}>
-                  {item.kind === "claude_permission" ? "Approve" : "Approve and rerun"}
-                </Button>
-              </div>
-            ))}
-          </section>
-        ) : null}
 
         {props.rightPanelTab === "context" ? (
           <section className="space-y-3">
@@ -6453,9 +6369,6 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
                 </select>
                 <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.sandbox} onChange={(event) => props.setSandbox(event.target.value as SandboxMode)}>
                   {sandboxOptions.map((option) => <option key={option} value={option}>{option}</option>)}
-                </select>
-                <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.approvalPolicy} onChange={(event) => props.setApprovalPolicy(event.target.value as ApprovalPolicy)}>
-                  {approvalPolicies.map((policy) => <option key={policy} value={policy}>{policy}</option>)}
                 </select>
               </div>
             </div>

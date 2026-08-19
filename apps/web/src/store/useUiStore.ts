@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-type RightPanelTab = "terminal" | "approvals" | "context";
+type RightPanelTab = "terminal" | "context";
 
 type UiStore = {
   selectedRunId: string | null;

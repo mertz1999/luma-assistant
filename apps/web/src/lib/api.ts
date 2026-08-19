@@ -386,13 +386,6 @@ export function rerun(runId: string, payload: { sandbox?: string; approvalPolicy
   });
 }
 
-export function acceptApproval(runId: string, approvalId: string, approvalPolicy = "on-request"): Promise<{ run: RunRecord; approval: ApprovalQueueItem }> {
-  return request(`/api/runs/${runId}/approval/${approvalId}/accept`, {
-    method: "POST",
-    body: JSON.stringify({ approvalPolicy }),
-  });
-}
-
 export function getRun(runId: string): Promise<{ run: RunRecord; approvals: ApprovalQueueItem[] }> {
   return request(`/api/runs/${runId}`);
 }

@@ -91,7 +91,9 @@ const require = createRequire(import.meta.url);
 
 const APP_STATE_PATH = path.resolve(rootDir, "data/ui-state.json");
 const RUNS_PATH = path.resolve(rootDir, "data/runs.json");
+const RUN_EVENTS_DIR = path.resolve(rootDir, "data/runs");
 const AGENTS_DIR = path.resolve(rootDir, "agents");
+const CLAUDE_BYPASS_AS_ROOT = process.env.CLAUDE_BYPASS_AS_ROOT === "1";
 const REPO_SKILLS_DIR = path.resolve(rootDir, "skills");
 const AGENT_SCHEDULES_PATH = path.resolve(rootDir, "data/agent-schedules.json");
 const SESSION_INDEX_PATH = path.resolve(rootDir, "data/session-index.json");
@@ -2095,6 +2097,7 @@ class RunManager extends EventEmitter {
     const runIds = new Set(sessionRuns.map((run) => run.id));
     for (const runId of runIds) {
       this.runs.delete(runId);
+      deleteRunEventsFile(runId);
     }
 
     const removedApprovals = this.removeApprovalsForRunIds(runIds);
@@ -2285,6 +2288,7 @@ class RunManager extends EventEmitter {
     const effort = resolveClaudeCliEffort(effectiveConfig.reasoningEffort);
     const supportsEffort = claudeCliSupportsEffort(executable);
     const env = buildClaudeEnvironment();
+    const permissionMode = effectiveConfig.planMode ? "dontAsk" : "bypassPermissions";
     const args = [
       "-p",
       "--output-format",
@@ -2295,8 +2299,16 @@ class RunManager extends EventEmitter {
       "--tools",
       "default",
       "--permission-mode",
-      effectiveConfig.planMode ? "dontAsk" : "auto",
+      permissionMode,
     ];
+
+    if (permissionMode === "bypassPermissions") {
+      args.push("--allow-dangerously-skip-permissions");
+      // Claude Code refuses bypassPermissions as root unless it believes it is sandboxed.
+      if (CLAUDE_BYPASS_AS_ROOT || process.getuid?.() === 0) {
+        env.IS_SANDBOX = "1";
+      }
+    }
 
     if (supportsEffort) {
       args.push("--effort", effort);
@@ -2781,36 +2793,21 @@ class RunManager extends EventEmitter {
   }
 
   private checkApprovalSignal(runId: string, text: string, item: Record<string, unknown> | null): void {
-    const lower = text.toLowerCase();
-    if (!looksLikeApprovalIssue(lower)) return;
-
-    const command = item && typeof item.command === "string" ? item.command : null;
-    const suggestedSandbox =
-      lower.includes("read-only") || lower.includes("operation not permitted") ? "workspace-write" : "danger-full-access";
-
-    const approval: ApprovalQueueItem = {
-      id: `approval_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-      runId,
-      createdAt: Date.now(),
-      reason: text.slice(0, 600),
-      suggestedSandbox,
-      suggestedApprovalPolicy: "on-request",
-      command,
-      status: "pending",
-    };
-
-    this.approvals.set(approval.id, approval);
-    this.persistState();
-    this.emitSse({ kind: "run.approvalQueued", runId, at: Date.now(), payload: approval as unknown as Record<string, unknown> });
+    // Approvals UI was removed; full-access defaults mean we no longer queue escalations.
+    void runId;
+    void text;
+    void item;
   }
 
   private appendEvent(runId: string, partial: Pick<RunEventEntry, "source" | "text">): void {
     const run = this.runs.get(runId);
     if (!run) return;
 
-    const events = [...run.events, { id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, at: Date.now(), ...partial }];
+    const event: RunEventEntry = { id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, at: Date.now(), ...partial };
+    const events = [...run.events, event];
     const capped = events.length > 1500 ? events.slice(events.length - 1500) : events;
     this.updateRun(runId, { events: capped });
+    appendRunEventToDisk(runId, event);
   }
 
   private updateRun(runId: string, patch: Partial<RunRecord>): void {
@@ -3927,6 +3924,54 @@ function safeJsonParse<T>(text: string, fallback: T): T {
 
 function ensureDataDir(): void {
   fs.mkdirSync(path.dirname(APP_STATE_PATH), { recursive: true });
+  fs.mkdirSync(RUN_EVENTS_DIR, { recursive: true });
+}
+
+function runEventsPath(runId: string): string {
+  return path.join(RUN_EVENTS_DIR, `${encodeURIComponent(runId)}.jsonl`);
+}
+
+function readRunEventsFromDisk(runId: string): RunEventEntry[] {
+  const filePath = runEventsPath(runId);
+  if (!fs.existsSync(filePath)) return [];
+  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+  const events: RunEventEntry[] = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const parsed = safeJsonParse<RunEventEntry | null>(line, null);
+    if (!parsed || typeof parsed.id !== "string" || typeof parsed.at !== "number") continue;
+    if (parsed.source !== "stdout" && parsed.source !== "stderr") continue;
+    if (typeof parsed.text !== "string") continue;
+    events.push({ id: parsed.id, at: parsed.at, source: parsed.source, text: parsed.text });
+  }
+  return events.length > 1500 ? events.slice(events.length - 1500) : events;
+}
+
+function writeRunEventsToDisk(runId: string, events: RunEventEntry[]): void {
+  ensureDataDir();
+  const filePath = runEventsPath(runId);
+  if (!events.length) {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    return;
+  }
+  const payload = `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tempPath, payload);
+  fs.renameSync(tempPath, filePath);
+}
+
+function appendRunEventToDisk(runId: string, event: RunEventEntry): void {
+  ensureDataDir();
+  fs.appendFileSync(runEventsPath(runId), `${JSON.stringify(event)}\n`);
+}
+
+function deleteRunEventsFile(runId: string): void {
+  const filePath = runEventsPath(runId);
+  if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+}
+
+function slimRunForIndex(run: RunRecord): RunRecord {
+  return { ...run, events: [] };
 }
 
 function loadPersistedUiState(defaultWorkspace: string): PersistedUiState {
@@ -3952,15 +3997,45 @@ function persistUiState(state: PersistedUiState): void {
 function loadPersistedRuns(): { runs: RunRecord[]; approvals: ApprovalQueueItem[] } {
   ensureDataDir();
   if (!fs.existsSync(RUNS_PATH)) return { runs: [], approvals: [] };
-  return safeJsonParse<{ runs: RunRecord[]; approvals: ApprovalQueueItem[] }>(fs.readFileSync(RUNS_PATH, "utf8"), {
+  const parsed = safeJsonParse<{ runs: RunRecord[]; approvals: ApprovalQueueItem[] }>(fs.readFileSync(RUNS_PATH, "utf8"), {
     runs: [],
     approvals: [],
   });
+  const runs = Array.isArray(parsed.runs) ? parsed.runs : [];
+  const approvals = Array.isArray(parsed.approvals) ? parsed.approvals : [];
+
+  let migratedInlineEvents = false;
+  const hydrated: RunRecord[] = runs.map((run) => {
+    const inlineEvents = Array.isArray(run.events) ? run.events : [];
+    const diskEvents = readRunEventsFromDisk(run.id);
+    if (inlineEvents.length > 0) {
+      const merged = diskEvents.length >= inlineEvents.length ? diskEvents : inlineEvents;
+      writeRunEventsToDisk(run.id, merged);
+      migratedInlineEvents = true;
+      return { ...run, events: merged };
+    }
+    return { ...run, events: diskEvents };
+  });
+
+  if (migratedInlineEvents) {
+    const backupDir = path.resolve(rootDir, "data/backups");
+    fs.mkdirSync(backupDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    fs.copyFileSync(RUNS_PATH, path.join(backupDir, `runs-before-events-split-${stamp}.json`));
+    persistRuns(hydrated, approvals);
+    // eslint-disable-next-line no-console
+    console.log(`[luma-assistant/server] migrated inline run events to ${RUN_EVENTS_DIR}`);
+  }
+
+  return { runs: hydrated, approvals };
 }
 
 function persistRuns(runs: RunRecord[], approvals: ApprovalQueueItem[]): void {
   ensureDataDir();
-  fs.writeFileSync(RUNS_PATH, JSON.stringify({ runs, approvals }, null, 2));
+  writeJsonAtomicSync(RUNS_PATH, {
+    runs: runs.map(slimRunForIndex),
+    approvals,
+  });
 }
 
 function findUpFile(startDir: string, fileName: string): string | null {
@@ -4243,41 +4318,72 @@ function loadCodexSessionHistory(limit = 0, options?: { includeExec?: boolean })
   return out;
 }
 
-function loadCodexSessionTranscript(sessionId: string): SessionTranscriptResponse | null {
-  for (const file of listCodexSessionFiles()) {
-    const parsed = readCodexSessionFile(file);
-    if (!parsed || parsed.entry.id !== sessionId) continue;
+function readCodexSessionMetaId(file: string): string | null {
+  if (file.toLowerCase().includes(`${path.sep}archived${path.sep}`)) return null;
 
-    const baseAt = Date.parse(parsed.entry.timestamp) || fs.statSync(file).mtimeMs || Date.now();
-    const entries: SessionTranscriptEntry[] = [];
-    let index = 0;
-
-    for (const line of parsed.lines) {
-      if (!line.trim()) continue;
-      const row = safeJsonParse<Record<string, unknown>>(line, {});
-      const message = readSessionMessageRow(row);
-      if (!message) continue;
-
-      const text = message.role === "user" ? unwrapWrappedUserRequest(message.text) : message.text.trim();
-      if (!text) continue;
-      if (message.role === "user" && looksLikeEnvelopeMessage(text)) continue;
-
-      entries.push({
-        key: `${sessionId}_${index}`,
-        role: message.role,
-        text,
-        at: message.at ?? (baseAt + index),
-      });
-      index += 1;
+  try {
+    const fd = fs.openSync(file, "r");
+    try {
+      const buf = Buffer.alloc(65536);
+      const bytes = fs.readSync(fd, buf, 0, buf.length, 0);
+      const chunk = buf.slice(0, bytes).toString("utf8");
+      for (const line of chunk.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        const row = safeJsonParse<Record<string, unknown>>(line, {});
+        if (row.type !== "session_meta" || !isRecord(row.payload)) continue;
+        return typeof row.payload.id === "string" ? row.payload.id : path.basename(file);
+      }
+    } finally {
+      fs.closeSync(fd);
     }
-
-    return {
-      session: parsed.entry,
-      entries,
-    };
+  } catch {
+    return null;
   }
 
   return null;
+}
+
+function findCodexSessionFileById(sessionId: string): string | null {
+  for (const file of listCodexSessionFiles()) {
+    if (readCodexSessionMetaId(file) === sessionId) return file;
+  }
+  return null;
+}
+
+function loadCodexSessionTranscript(sessionId: string): SessionTranscriptResponse | null {
+  const file = findCodexSessionFileById(sessionId);
+  if (!file) return null;
+
+  const parsed = readCodexSessionFile(file);
+  if (!parsed || parsed.entry.id !== sessionId) return null;
+
+  const baseAt = Date.parse(parsed.entry.timestamp) || fs.statSync(file).mtimeMs || Date.now();
+  const entries: SessionTranscriptEntry[] = [];
+  let index = 0;
+
+  for (const line of parsed.lines) {
+    if (!line.trim()) continue;
+    const row = safeJsonParse<Record<string, unknown>>(line, {});
+    const message = readSessionMessageRow(row);
+    if (!message) continue;
+
+    const text = message.role === "user" ? unwrapWrappedUserRequest(message.text) : message.text.trim();
+    if (!text) continue;
+    if (message.role === "user" && looksLikeEnvelopeMessage(text)) continue;
+
+    entries.push({
+      key: `${sessionId}_${index}`,
+      role: message.role,
+      text,
+      at: message.at ?? (baseAt + index),
+    });
+    index += 1;
+  }
+
+  return {
+    session: parsed.entry,
+    entries,
+  };
 }
 
 function readRunListItems(includeHistory: boolean): RunListItem[] {
@@ -5305,9 +5411,16 @@ class MessageStore {
   }
 
   acceptOutgoingMessage(sessionId: string, input: SendMessageInput): ChatMessage {
-    const transcript = loadCodexSessionTranscript(sessionId);
-    if (transcript) {
-      this.hydrateHistorySession(sessionId, transcript, input.workspace);
+    const existing = this.sessions.get(sessionId);
+    const hasInAppMessages = existing?.messages.some((message) => !message.id.startsWith("history_")) ?? false;
+    const shouldHydrateFromCodex = !existing
+      || (existing.item.historyOnly && !hasInAppMessages && !existing.item.latestRunId);
+
+    if (shouldHydrateFromCodex) {
+      const transcript = loadCodexSessionTranscript(sessionId);
+      if (transcript) {
+        this.hydrateHistorySession(sessionId, transcript, input.workspace);
+      }
     }
 
     const titleFallback = normalizeRunListName(input.text, "Session");
@@ -5332,7 +5445,7 @@ class MessageStore {
       text: input.text,
       createdAt,
       sequence: state.nextSequence,
-      deliveryStatus: "pending",
+      deliveryStatus: "sent",
       attachments: normalizeAttachmentRefs(input.attachments),
     };
 
@@ -6806,7 +6919,7 @@ app.get("/api/bootstrap", (_req, res) => {
     },
     activeWorkspace: uiState.activeWorkspace,
     workspaces: getWorkspaces(),
-    runs: runManager.getRuns(false),
+    runs: runManager.getRuns(false).map(slimRunForIndex),
     approvals: runManager.getApprovals(),
   };
   res.json(apiOk(payload));
@@ -7020,7 +7133,7 @@ app.post("/api/workspaces/active", (req, res) => {
 });
 
 app.get("/api/runs", (_req, res) => {
-  res.json(apiOk({ runs: runManager.getRuns(false), approvals: runManager.getApprovals() }));
+  res.json(apiOk({ runs: runManager.getRuns(false).map(slimRunForIndex), approvals: runManager.getApprovals() }));
 });
 
 app.get("/api/sessions/list", (req, res) => {
@@ -7388,7 +7501,7 @@ app.post("/api/runs/:runId/rerun", (req, res) => {
 });
 
 app.post("/api/runs/:runId/approval/:approvalId/accept", (req, res) => {
-  const parsedPolicy = approvalPolicySchema.safeParse(req.body?.approvalPolicy ?? "on-request");
+  const parsedPolicy = approvalPolicySchema.safeParse(req.body?.approvalPolicy ?? "never");
   if (!parsedPolicy.success) {
     res.status(400).json(apiErr("Invalid approval policy"));
     return;

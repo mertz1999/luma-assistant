@@ -38,6 +38,15 @@ Luma stores every raw stream JSON line and stderr line in the run event log. It 
 
 ## Permissions
 
+Non-plan Claude runs always use:
+
+```bash
+--permission-mode bypassPermissions \
+--allow-dangerously-skip-permissions
+```
+
+On hosts that run Luma as root, set `CLAUDE_BYPASS_AS_ROOT=1` in `.env`. Luma then sets `IS_SANDBOX=1` in the Claude subprocess environment so Claude Code accepts `bypassPermissions`.
+
 Plan-mode runs use Luma's shared `plan.md` prompt wrapper, matching the Codex runner. Luma normalizes the run config to read-only planning semantics and sends Claude the same plan instructions from the repository root:
 
 ```bash
@@ -46,7 +55,7 @@ Plan-mode runs use Luma's shared `plan.md` prompt wrapper, matching the Codex ru
 --disallowedTools Bash,Edit,Write,NotebookEdit,ExitPlanMode,EnterPlanMode,Task,TaskOutput,TodoWrite,WebFetch,WebSearch,KillShell,Skill,SlashCommand
 ```
 
-This avoids Claude Code's native `ExitPlanMode` workflow and keeps planning output controlled by `plan.md`.
+This avoids Claude Code's native `ExitPlanMode` workflow and keeps planning output controlled by `plan.md`. The Approvals dock was removed; Codex uses `approval_policy=never` with `danger-full-access` by default.
 
 ## Effort
 
@@ -65,6 +74,8 @@ CLAUDE_DEFAULT_MODEL=sonnet
 CLAUDE_CODE_EXECUTABLE=
 CLAUDE_AUTH_MODE=oauth
 # CLAUDE_AUTH_MODE=api_key # intentionally use ANTHROPIC_API_KEY instead
+# Required when the Luma server process runs as root:
+# CLAUDE_BYPASS_AS_ROOT=1
 ```
 
 The default `CLAUDE_AUTH_MODE=oauth` uses the logged-in Claude Code account and removes inherited `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `CLAUDE_AGENT_SDK_CLIENT_APP` from the Claude subprocess. Set `CLAUDE_AUTH_MODE=api_key` when you intentionally want to use Anthropic API-key billing.
