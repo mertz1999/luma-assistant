@@ -59,7 +59,7 @@ This avoids Claude Code's native `ExitPlanMode` workflow and keeps planning outp
 
 ## Effort
 
-Current Claude Code docs document `--effort` and `CLAUDE_CODE_EFFORT_LEVEL`. Luma probes the installed CLI once:
+Current Claude Code docs document `--effort` and `CLAUDE_CODE_EFFORT_LEVEL`. Supported levels are `low`, `medium`, `high`, `xhigh`, and `max`. Luma probes the installed CLI once:
 
 - If `--effort` is accepted, Luma passes the selected effort as a CLI flag.
 - If the CLI rejects `--effort`, Luma sets `CLAUDE_CODE_EFFORT_LEVEL=<effort>` and emits a run-log warning because older CLI builds may not enforce the setting.

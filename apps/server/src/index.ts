@@ -405,11 +405,17 @@ function normalizeRunRunner(input: unknown): RunRunner {
 }
 
 function normalizeReasoningEffort(input: unknown): ReasoningEffort {
-  return input === "low" || input === "medium" || input === "high" || input === "xhigh" ? input : "high";
+  return input === "low" || input === "medium" || input === "high" || input === "xhigh" || input === "max"
+    ? input
+    : "high";
 }
 
-function resolveClaudeCliEffort(effort: ReasoningEffort): "low" | "medium" | "high" {
-  return effort === "low" || effort === "medium" ? effort : "high";
+function resolveClaudeCliEffort(effort: ReasoningEffort): "low" | "medium" | "high" | "xhigh" | "max" {
+  // Claude Code accepts low/medium/high/xhigh/max. Codex-only values should not reach here.
+  if (effort === "low" || effort === "medium" || effort === "high" || effort === "xhigh" || effort === "max") {
+    return effort;
+  }
+  return "high";
 }
 
 function aggregateRunTokenUsage(runs: RunRecord[]): TokenUsageSummary | null {
@@ -4532,23 +4538,42 @@ function isPlanLike(itemType: string): boolean {
   return normalized === "plan" || normalized === "reasoning" || normalized.includes("todo");
 }
 
-function resolvePlanText(item: Record<string, unknown>): string {
-  if (typeof item.text === "string" && item.text.trim()) return item.text;
-  if (typeof item.explanation === "string" && item.explanation.trim()) return item.explanation;
+function readPlanStepText(step: Record<string, unknown>): string {
+  if (typeof step.step === "string" && step.step.trim()) return step.step.trim();
+  if (typeof step.text === "string" && step.text.trim()) return step.text.trim();
+  if (typeof step.content === "string" && step.content.trim()) return step.content.trim();
+  if (typeof step.title === "string" && step.title.trim()) return step.title.trim();
+  if (typeof step.description === "string" && step.description.trim()) return step.description.trim();
+  return "";
+}
 
-  if (Array.isArray(item.plan)) {
-    const steps = item.plan
-      .map((step) => {
-        if (!isRecord(step)) return "";
-        const text = typeof step.step === "string" ? step.step : "";
-        const status = typeof step.status === "string" ? step.status : "pending";
-        return text ? `- [${status}] ${text}` : "";
-      })
-      .filter(Boolean);
-    if (steps.length) return `Plan steps:\n${steps.join("\n")}`;
+function formatPlanSteps(steps: unknown[]): string {
+  const lines = steps
+    .map((step) => {
+      if (typeof step === "string" && step.trim()) return `- [pending] ${step.trim()}`;
+      if (!isRecord(step)) return "";
+      const text = readPlanStepText(step);
+      if (!text) return "";
+      const status = typeof step.status === "string" && step.status.trim() ? step.status.trim() : "pending";
+      return `- [${status}] ${text}`;
+    })
+    .filter(Boolean);
+  return lines.length ? `Plan steps:\n${lines.join("\n")}` : "";
+}
+
+function resolvePlanText(item: Record<string, unknown>): string {
+  if (typeof item.text === "string" && item.text.trim()) return item.text.trim();
+  if (typeof item.explanation === "string" && item.explanation.trim()) return item.explanation.trim();
+  if (typeof item.summary === "string" && item.summary.trim()) return item.summary.trim();
+
+  for (const key of ["plan", "items", "todos", "steps", "entries"] as const) {
+    const value = item[key];
+    if (!Array.isArray(value)) continue;
+    const formatted = formatPlanSteps(value);
+    if (formatted) return formatted;
   }
 
-  return readTextField(item.content);
+  return readTextField(item.content).trim();
 }
 
 function truncatePreview(input: string, max = 120): string {
@@ -4628,6 +4653,17 @@ function buildRunMessageEntries(run: RunRecord): RunMessageEntry[] {
       }
     >();
 
+  const planByItemId = new Map<
+    string,
+    {
+      itemId: string;
+      at: number;
+      title: string;
+      text: string;
+      pending: boolean;
+    }
+  >();
+
   const dedupe = new Set<string>();
   const orderedEvents = [...run.events].sort((a, b) => a.at - b.at);
 
@@ -4666,17 +4702,21 @@ function buildRunMessageEntries(run: RunRecord): RunMessageEntry[] {
     }
 
     if (isPlanLike(itemType) && (parsedType === "item.started" || parsedType === "item.updated" || parsedType === "item.completed")) {
-      const pending = parsedType === "item.started";
       const text = resolvePlanText(item || {});
-      entries.push({
-        key: `${run.id}_${itemId}_plan_${parsedType}`,
-        role: "plan",
-        title: itemType === "reasoning" ? "Reasoning" : "Plan",
-        text: text || (pending ? "Planning" : "Plan updated"),
-        pending,
+      const existing = planByItemId.get(itemId);
+      if (!text && !existing) continue;
+
+      const next = existing || {
+        itemId,
         at: event.at,
-        meta: { runId: run.id },
-      });
+        title: itemType === "reasoning" ? "Reasoning" : "Plan",
+        text: "",
+        pending: true,
+      };
+      if (text) next.text = text;
+      next.title = itemType === "reasoning" ? "Reasoning" : "Plan";
+      next.pending = parsedType !== "item.completed";
+      planByItemId.set(itemId, next);
       continue;
     }
 
@@ -4870,7 +4910,19 @@ function buildRunMessageEntries(run: RunRecord): RunMessageEntry[] {
     },
   }));
 
-  entries.push(...commandEntries, ...fileEntries, ...mcpEntries, ...webSearchEntries);
+  const planEntries = [...planByItemId.values()]
+    .filter((plan) => plan.text.trim())
+    .map((plan) => ({
+      key: `${run.id}_${plan.itemId}_plan`,
+      role: "plan" as const,
+      title: plan.title,
+      text: plan.text,
+      pending: plan.pending,
+      at: plan.at,
+      meta: { runId: run.id },
+    }));
+
+  entries.push(...commandEntries, ...fileEntries, ...mcpEntries, ...webSearchEntries, ...planEntries);
 
   if (run.usage) {
     entries.push({
@@ -6262,18 +6314,24 @@ class MessageProjector {
     }
 
     if (isPlanLike(itemType) && (type === "item.started" || type === "item.updated" || type === "item.completed")) {
-      const pending = type !== "item.completed";
       const text = resolvePlanText(item || {});
+      const messageId = `${event.run.id}_${itemId}_plan`;
+      if (!text) {
+        if (type === "item.completed") {
+          this.messageStore.markMessageSent(sessionId, messageId);
+        }
+        return;
+      }
       this.messageStore.upsertGeneratedMessage(sessionId, {
-        id: `${event.run.id}_${itemId}_plan`,
+        id: messageId,
         clientMessageId: null,
         runId: event.run.id,
         role: "plan",
         kind: "plan",
         title: itemType === "reasoning" ? "Reasoning" : "Plan",
-        text: text || (pending ? "Planning" : "Plan updated"),
+        text,
         createdAt: event.run.updatedAt,
-        deliveryStatus: pending ? "streaming" : "sent",
+        deliveryStatus: type === "item.completed" ? "sent" : "streaming",
         attachments: [],
         meta: { runId: event.run.id },
       });

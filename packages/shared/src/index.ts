@@ -15,7 +15,7 @@ export type RunSourceTag = z.infer<typeof runSourceTagSchema>;
 export const runRunnerSchema = z.enum(["codex", "claude"]);
 export type RunRunner = z.infer<typeof runRunnerSchema>;
 
-export const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh"]);
+export const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
 
 export const attachmentKindSchema = z.enum(["image", "text"]);

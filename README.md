@@ -118,7 +118,7 @@ Important variables:
 - `DEFAULT_RUNNER`: default runner for new sessions. Use `codex` or `claude`.
 - `DEFAULT_MODEL`: default Codex model for new sessions and new scheduled jobs.
 - `CLAUDE_DEFAULT_MODEL`: default Claude model when the Claude Code runner is selected.
-- `DEFAULT_REASONING_EFFORT`: default thinking effort for new sessions. Use `low`, `medium`, `high`, or `xhigh` for Codex extra high; it can also be changed in the new-session dialog.
+- `DEFAULT_REASONING_EFFORT`: default thinking effort for new sessions. Use `low`, `medium`, `high`, or `xhigh` (Codex extra high). Claude also accepts `max`. It can be changed in the new-session dialog and composer.
 - `CLAUDE_CODE_EXECUTABLE`: optional path to the Claude Code CLI. If omitted, Luma uses `claude` from `PATH`.
 - `CLAUDE_AUTH_MODE`: Claude auth mode. Defaults to `oauth`, which uses your logged-in Claude Code account and strips inherited Anthropic API-key variables from the Claude subprocess. Set `api_key` to intentionally use `ANTHROPIC_API_KEY`.
 - `DEFAULT_SANDBOX`: default sandbox mode for new sessions.

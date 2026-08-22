@@ -169,7 +169,7 @@ const runnerOptions: RunRunner[] = ["codex", "claude"];
 const codexModelOptions = ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4"];
 const claudeModelOptions = ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-4-1"];
 const codexReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
-const claudeReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high"];
+const claudeReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
 function modelOptionsForRunner(runner: RunRunner): string[] {
   return runner === "claude" ? claudeModelOptions : codexModelOptions;
 }
@@ -180,10 +180,12 @@ function runnerLabel(runner: RunRunner): string {
   return runner === "claude" ? "Claude Code" : "Codex";
 }
 function reasoningEffortLabel(effort: ReasoningEffort): string {
-  return effort === "xhigh" ? "extra high" : effort;
+  if (effort === "xhigh") return "extra high";
+  if (effort === "max") return "max";
+  return effort;
 }
 function isReasoningEffort(input: unknown): input is ReasoningEffort {
-  return input === "low" || input === "medium" || input === "high" || input === "xhigh";
+  return input === "low" || input === "medium" || input === "high" || input === "xhigh" || input === "max";
 }
 function compactSelectWidth(label: string): string {
   return `${Math.max(label.length + 2, 6)}ch`;
@@ -736,6 +738,18 @@ function chatMessageToTimelineEntry(message: ChatMessage): TimelineEntry {
     attachments: readAttachmentRefs(message.attachments),
     meta: message.meta ? { ...message.meta } : undefined,
   };
+}
+
+function isPlaceholderPlanMessage(message: ChatMessage): boolean {
+  if (message.role !== "plan") return false;
+  const text = message.text.replace(/\s+/g, " ").trim();
+  return !text || text === "Plan updated" || text === "Planning";
+}
+
+function timelineEntriesFromMessages(messages: ChatMessage[]): TimelineEntry[] {
+  return messages
+    .filter((message) => !isPlaceholderPlanMessage(message))
+    .map((message) => chatMessageToTimelineEntry(message));
 }
 
 function sameTimelineMessage(left: TimelineEntry, right: TimelineEntry): boolean {
@@ -1416,23 +1430,42 @@ function isPlanLike(itemType: string): boolean {
   return normalized === "plan" || normalized === "reasoning" || normalized.includes("todo");
 }
 
-function resolvePlanText(item: Record<string, unknown>): string {
-  if (typeof item.text === "string" && item.text.trim()) return item.text;
-  if (typeof item.explanation === "string" && item.explanation.trim()) return item.explanation;
+function readPlanStepText(step: Record<string, unknown>): string {
+  if (typeof step.step === "string" && step.step.trim()) return step.step.trim();
+  if (typeof step.text === "string" && step.text.trim()) return step.text.trim();
+  if (typeof step.content === "string" && step.content.trim()) return step.content.trim();
+  if (typeof step.title === "string" && step.title.trim()) return step.title.trim();
+  if (typeof step.description === "string" && step.description.trim()) return step.description.trim();
+  return "";
+}
 
-  if (Array.isArray(item.plan)) {
-    const steps = item.plan
-      .map((step) => {
-        if (!isRecord(step)) return "";
-        const text = typeof step.step === "string" ? step.step : "";
-        const status = typeof step.status === "string" ? step.status : "pending";
-        return text ? `- [${status}] ${text}` : "";
-      })
-      .filter(Boolean);
-    if (steps.length) return `Plan steps:\n${steps.join("\n")}`;
+function formatPlanSteps(steps: unknown[]): string {
+  const lines = steps
+    .map((step) => {
+      if (typeof step === "string" && step.trim()) return `- [pending] ${step.trim()}`;
+      if (!isRecord(step)) return "";
+      const text = readPlanStepText(step);
+      if (!text) return "";
+      const status = typeof step.status === "string" && step.status.trim() ? step.status.trim() : "pending";
+      return `- [${status}] ${text}`;
+    })
+    .filter(Boolean);
+  return lines.length ? `Plan steps:\n${lines.join("\n")}` : "";
+}
+
+function resolvePlanText(item: Record<string, unknown>): string {
+  if (typeof item.text === "string" && item.text.trim()) return item.text.trim();
+  if (typeof item.explanation === "string" && item.explanation.trim()) return item.explanation.trim();
+  if (typeof item.summary === "string" && item.summary.trim()) return item.summary.trim();
+
+  for (const key of ["plan", "items", "todos", "steps", "entries"] as const) {
+    const value = item[key];
+    if (!Array.isArray(value)) continue;
+    const formatted = formatPlanSteps(value);
+    if (formatted) return formatted;
   }
 
-  return readTextField(item.content);
+  return readTextField(item.content).trim();
 }
 
 function collectSessionDebugLogs(runs: RunRecord[]): DebugLogEntry[] {
@@ -3011,9 +3044,9 @@ export function App(): JSX.Element {
       setMessagesByRunId((prev) => ({
         ...prev,
         [sessionId]: options?.reset
-          ? payload.messages.map((message) => chatMessageToTimelineEntry(message))
+          ? timelineEntriesFromMessages(payload.messages)
           : mergeTimelineEntries(
-            payload.messages.map((message) => chatMessageToTimelineEntry(message)),
+            timelineEntriesFromMessages(payload.messages),
             prev[sessionId] || [],
           ),
       }));
@@ -3146,6 +3179,7 @@ export function App(): JSX.Element {
   }
 
   function applyIncomingMessage(message: ChatMessage): void {
+    if (isPlaceholderPlanMessage(message)) return;
     const nextEntry = chatMessageToTimelineEntry(message);
     setMessagesByRunId((prev) => ({
       ...prev,
