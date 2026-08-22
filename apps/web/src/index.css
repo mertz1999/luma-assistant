@@ -46,8 +46,9 @@ body,
 body {
   @apply bg-background font-sans text-foreground antialiased;
   text-rendering: optimizeLegibility;
-  line-height: 1.45;
+  line-height: 1.5;
   background: rgb(var(--color-bg));
+  font-feature-settings: "ss01" on, "kern" on;
 }
 
 html[data-theme="dark"] {
@@ -159,6 +160,40 @@ html[data-theme="dark"] .scrollbar-thin::-webkit-scrollbar-track {
 .claude-table th:last-child,
 .claude-table td:last-child {
   border-radius: 0 6px 6px 0;
+}
+
+.rich-text {
+  unicode-bidi: isolate;
+  text-align: start;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.rich-text[dir="rtl"] {
+  line-height: 1.85;
+  letter-spacing: 0;
+}
+
+.rich-text[dir="rtl"] ul,
+.rich-text[dir="rtl"] ol {
+  padding-inline-start: 1.25rem;
+  padding-inline-end: 0;
+}
+
+.rich-text[dir="rtl"] blockquote {
+  border-inline-start-width: 2px;
+  border-inline-end-width: 0;
+  padding-inline-start: 0.75rem;
+  padding-inline-end: 0;
+}
+
+.composer-input[dir="rtl"] {
+  line-height: 1.7;
+  text-align: right;
+}
+
+.composer-input[dir="ltr"] {
+  text-align: left;
 }
 
 .scrollbar-none {

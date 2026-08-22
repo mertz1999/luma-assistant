@@ -94,6 +94,7 @@ import {
   uploadAttachment,
 } from "@/lib/api";
 import { parsePlanningMessage, type PlanningSegment } from "@/lib/planning";
+import { resolveTextDirection } from "@/lib/textDirection";
 import { cn } from "@/lib/utils";
 import { useUiStore } from "@/store/useUiStore";
 import { Button } from "@/components/ui/button";
@@ -1502,58 +1503,62 @@ function flattenMarkdownText(children: ReactNode): string {
 }
 
 function MarkdownMessage({ text }: { text: string }): JSX.Element {
+  const direction = resolveTextDirection(text);
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      components={{
-        p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-        h1: ({ children }) => <h1 className="mb-2 text-lg font-bold">{children}</h1>,
-        h2: ({ children }) => <h2 className="mb-2 text-base font-bold">{children}</h2>,
-        h3: ({ children }) => <h3 className="mb-2 text-sm font-semibold">{children}</h3>,
-        ul: ({ children }) => <ul className="mb-2 list-disc space-y-1 pl-5 last:mb-0">{children}</ul>,
-        ol: ({ children }) => <ol className="mb-2 list-decimal space-y-1 pl-5 last:mb-0">{children}</ol>,
-        li: ({ children }) => <li className="leading-relaxed">{children}</li>,
-        blockquote: ({ children }) => (
-          <blockquote className="my-2 border-l-2 border-foreground/30 pl-3 italic text-foreground/80">{children}</blockquote>
-        ),
-        a: ({ href, children }) => (
-          <a
-            href={href}
-            target="_blank"
-            rel="noreferrer"
-            className="font-medium text-brand underline underline-offset-2 hover:text-brand-dark dark:text-[#8fc5ff] dark:hover:text-[#bddcff]"
-          >
-            {children}
-          </a>
-        ),
-        table: ({ children }) => (
-          <div className="claude-table my-2 overflow-x-auto rounded-md">
-            <table className="min-w-full border-collapse text-xs">{children}</table>
-          </div>
-        ),
-        th: ({ children }) => <th className="px-2 py-1.5 text-left font-semibold text-foreground/80">{children}</th>,
-        td: ({ children }) => <td className="px-2 py-1.5 align-top text-foreground/90">{children}</td>,
-        code: ({ className, children }) => {
-          const raw = flattenMarkdownText(children).replace(/\n$/, "");
-          const isBlock = Boolean(className) || raw.includes("\n");
-          return (
-            <code
-              className={cn(
-                isBlock
-                  ? "block whitespace-pre-wrap break-words bg-transparent font-mono text-[0.95em] leading-relaxed text-foreground"
-                  : "rounded bg-surface-2 px-1 py-0.5 font-mono text-[0.92em] text-foreground",
-                className,
-              )}
+    <div className="rich-text" dir={direction} lang={direction === "rtl" ? "fa" : undefined}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+          h1: ({ children }) => <h1 className="mb-2 text-lg font-bold">{children}</h1>,
+          h2: ({ children }) => <h2 className="mb-2 text-base font-bold">{children}</h2>,
+          h3: ({ children }) => <h3 className="mb-2 text-sm font-semibold">{children}</h3>,
+          ul: ({ children }) => <ul className="mb-2 list-disc space-y-1 ps-5 last:mb-0">{children}</ul>,
+          ol: ({ children }) => <ol className="mb-2 list-decimal space-y-1 ps-5 last:mb-0">{children}</ol>,
+          li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+          blockquote: ({ children }) => (
+            <blockquote className="my-2 border-s-2 border-foreground/30 ps-3 italic text-foreground/80">{children}</blockquote>
+          ),
+          a: ({ href, children }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              className="font-medium text-brand underline underline-offset-2 hover:text-brand-dark dark:text-[#8fc5ff] dark:hover:text-[#bddcff]"
             >
-              {raw}
-            </code>
-          );
-        },
-        pre: ({ children }) => <pre className="my-1.5 overflow-x-auto rounded-md border border-card-border bg-surface-2 px-3 py-2">{children}</pre>,
-      }}
-    >
-      {text}
-    </ReactMarkdown>
+              {children}
+            </a>
+          ),
+          table: ({ children }) => (
+            <div className="claude-table my-2 overflow-x-auto rounded-md">
+              <table className="min-w-full border-collapse text-xs">{children}</table>
+            </div>
+          ),
+          th: ({ children }) => <th className="px-2 py-1.5 text-start font-semibold text-foreground/80">{children}</th>,
+          td: ({ children }) => <td className="px-2 py-1.5 align-top text-start text-foreground/90">{children}</td>,
+          code: ({ className, children }) => {
+            const raw = flattenMarkdownText(children).replace(/\n$/, "");
+            const isBlock = Boolean(className) || raw.includes("\n");
+            return (
+              <code
+                className={cn(
+                  isBlock
+                    ? "block whitespace-pre-wrap break-words bg-transparent font-mono text-[0.95em] leading-relaxed text-foreground"
+                    : "rounded bg-surface-2 px-1 py-0.5 font-mono text-[0.92em] text-foreground",
+                  className,
+                )}
+                dir="ltr"
+              >
+                {raw}
+              </code>
+            );
+          },
+          pre: ({ children }) => <pre className="my-1.5 overflow-x-auto rounded-md border border-card-border bg-surface-2 px-3 py-2" dir="ltr">{children}</pre>,
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
   );
 }
 
@@ -1832,8 +1837,10 @@ function FinalApprovalCard({
 
         <div className="flex items-center gap-2 rounded-xl border border-dashed border-amber-300/80 bg-surface-1 px-3 py-2 dark:border-[#8b6a24]/40 dark:bg-[#17130e]">
           <input
-            className="h-9 w-full rounded-lg border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 dark:border-[#5f4d25]/35 dark:bg-[#100d09] dark:text-stone-100 dark:placeholder:text-stone-400 dark:focus:border-[#c59c39] dark:focus:ring-[#c59c39]/20"
+            className="composer-input h-9 w-full rounded-lg border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 dark:border-[#5f4d25]/35 dark:bg-[#100d09] dark:text-stone-100 dark:placeholder:text-stone-400 dark:focus:border-[#c59c39] dark:focus:ring-[#c59c39]/20"
             value={feedback}
+            dir={feedback.trim() ? resolveTextDirection(feedback) : "auto"}
+            lang={feedback.trim() && resolveTextDirection(feedback) === "rtl" ? "fa" : undefined}
             onChange={(event) => setFeedback(event.target.value)}
             placeholder="Add plan changes before approval"
             disabled={isDisabled || submitting !== null}
@@ -4360,7 +4367,7 @@ export function App(): JSX.Element {
           <Button size="sm" variant="ghost" onClick={() => setMobileThreadsOpen(true)}>
             <PanelLeft className="mr-1.5 h-4 w-4" /> Chats
           </Button>
-          <div className="max-w-[48vw] truncate text-sm font-semibold" title={mobileHeaderTitle}>
+          <div className="max-w-[48vw] truncate text-sm font-semibold" title={mobileHeaderTitle} dir="auto">
             {mobileHeaderTitle}
           </div>
           <Button size="sm" variant="ghost" onClick={() => setMobileContextOpen(true)}>
@@ -4929,7 +4936,7 @@ function SessionsPanel({
                 >
                   <div className="flex items-center gap-2">
                     <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", session.status === "running" || session.status === "queued" ? "bg-brand" : "bg-foreground/35")} />
-                    <p className="min-w-0 flex-1 truncate text-sm" title={session.summary}>
+                    <p className="min-w-0 flex-1 truncate text-sm" title={session.summary} dir="auto">
                       {session.summary || "Session"}
                     </p>
                   </div>
@@ -5304,6 +5311,10 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
     ? composerModelOptions
     : [props.model, ...composerModelOptions];
   const composerRunnerLabel = runnerLabel(props.runner);
+  const composerDirection = useMemo(
+    () => (props.prompt.trim() ? resolveTextDirection(props.prompt) : "auto"),
+    [props.prompt],
+  );
 
   useEffect(() => {
     return () => {
@@ -5406,7 +5417,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           <FileCode2 className="h-4 w-4 shrink-0 text-foreground/70" />
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-2">
-              <h1 className="truncate text-sm font-semibold" title={props.selectedSession ? props.selectedSession.summary : "No active chat"}>
+              <h1 className="truncate text-sm font-semibold" title={props.selectedSession ? props.selectedSession.summary : "No active chat"} dir="auto">
                 {props.selectedSession ? props.selectedSession.summary : "No active chat"}
               </h1>
             </div>
@@ -5544,13 +5555,21 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 	                    dangerouslySetInnerHTML={{ __html: props.ansi.toHtml(entry.text) }}
 	                  />
 	                ) : (
-		                  <div className={cn(
-                        "break-words text-sm leading-relaxed",
-                        entry.role === "user" && "whitespace-pre-wrap",
-                      )}
-                      >
-                        {entry.text}
-                      </div>
+		                  (() => {
+                        const direction = resolveTextDirection(entry.text);
+                        return (
+                          <div
+                            className={cn(
+                              "rich-text break-words text-sm leading-relaxed",
+                              entry.role === "user" && "whitespace-pre-wrap",
+                            )}
+                            dir={direction}
+                            lang={direction === "rtl" ? "fa" : undefined}
+                          >
+                            {entry.text}
+                          </div>
+                        );
+                      })()
 		                )}
 
                 {showUserDeliveryState ? (
@@ -5991,9 +6010,11 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             <textarea
               ref={composerTextareaRef}
               rows={1}
-              className="min-h-[44px] w-full resize-none rounded-lg border border-card-border bg-surface-1 px-3 py-2 text-base outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
+              className="composer-input min-h-[44px] w-full resize-none rounded-lg border border-card-border bg-surface-1 px-3 py-2 text-base outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
               placeholder="Type / for commands"
               value={props.prompt}
+              dir={composerDirection}
+              lang={composerDirection === "rtl" ? "fa" : undefined}
               onChange={(event) => props.setPrompt(event.target.value)}
               onKeyDown={props.onComposerKeyDown}
             />
