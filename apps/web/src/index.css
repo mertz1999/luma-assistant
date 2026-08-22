@@ -169,6 +169,11 @@ html[data-theme="dark"] .scrollbar-thin::-webkit-scrollbar-track {
   overflow-wrap: anywhere;
 }
 
+.rich-text:dir(rtl),
+.composer-input:dir(rtl) {
+  font-family: "Vazirmatn", "Noto Sans Arabic", ui-sans-serif, system-ui, sans-serif;
+}
+
 .rich-text[dir="rtl"] {
   line-height: 1.85;
   letter-spacing: 0;

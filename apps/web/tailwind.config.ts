@@ -26,7 +26,6 @@ export default {
       },
       fontFamily: {
         sans: [
-          "Vazirmatn",
           "Inter",
           "-apple-system",
           "BlinkMacSystemFont",
@@ -35,7 +34,6 @@ export default {
           "Helvetica Neue",
           "Arial",
           "Noto Sans",
-          "Noto Sans Arabic",
           "sans-serif",
           "Apple Color Emoji",
           "Segoe UI Emoji",
