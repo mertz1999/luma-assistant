@@ -6,6 +6,18 @@ const dotenv = require("dotenv");
 const root = path.resolve(__dirname, "..");
 dotenv.config({ path: path.join(root, ".env") });
 
+function isEnabled(raw, defaultEnabled = false) {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (!value) return defaultEnabled;
+  return ["1", "true", "yes", "on"].includes(value);
+}
+
+// Opt-in: skip Codex MCP registration unless explicitly enabled.
+if (!isEnabled(process.env.ENABLE_TASK_MANAGER_MCP, false)) {
+  console.log("[taskmanager-mcp] skipped (ENABLE_TASK_MANAGER_MCP is off by default)");
+  process.exit(0);
+}
+
 const codexPath = process.env.CODEX_PATH || "codex";
 const name = process.env.TASK_MANAGER_MCP_NAME || "luma-tasks";
 const port = process.env.TASK_MANAGER_MCP_PORT || "9014";

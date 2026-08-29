@@ -7,7 +7,8 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "concurrently -n server,web,telegram-mcp,tasks-mcp,image-mcp -c cyan,green,magenta,yellow,blue \"npm run dev -w @luma/server\" \"node scripts/wait-for-port.cjs && npm run dev -w @luma/web\" \"npm run dev -w @luma/telegram-mcp\" \"npm run dev -w @luma/taskmanager-mcp\" \"npm run dev -w @luma/image-mcp\"",
+    "dev": "concurrently -n server,web,telegram-mcp,image-mcp -c cyan,green,magenta,blue \"npm run dev -w @luma/server\" \"node scripts/wait-for-port.cjs && npm run dev -w @luma/web\" \"npm run dev -w @luma/telegram-mcp\" \"npm run dev -w @luma/image-mcp\"",
+    "dev:taskmanager": "npm run dev -w @luma/taskmanager-mcp",
     "build": "npm run build -w @luma/shared && npm run build -w @luma/server && npm run build -w @luma/web && npm run build -w @luma/telegram-mcp && npm run build -w @luma/taskmanager-mcp && npm run build -w @luma/image-mcp",
     "migrate": "node scripts/migrate-data.cjs",
     "typecheck": "npm run build -w @luma/shared && npm run typecheck -w @luma/server && npm run typecheck -w @luma/web && npm run typecheck -w @luma/telegram-mcp && npm run typecheck -w @luma/taskmanager-mcp && npm run typecheck -w @luma/image-mcp",

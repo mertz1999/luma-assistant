@@ -127,6 +127,10 @@ Important variables:
 - `IMAGE_MCP_MAX_BYTES`: max image size accepted by the image MCP and server-side image renderer. Defaults to 3 MB.
 - `IMAGE_MCP_MAX_HEIGHT`: max image height accepted by the image MCP and server-side image renderer. Defaults to 1200 px.
 - `MAX_CONCURRENT_RUNS`: server-side cap for active Codex runs.
+- `MESSAGE_STORE_HOT_SESSIONS`: max chat sessions that keep full message bodies in RAM (default `48`). Others stay index-only until opened.
+- `RUN_EVENTS_MEMORY_CAP`: max stdout/stderr events kept in RAM per *active* run (default `400`). Full history remains on disk under `data/runs/`.
+- `RUN_RETENTION_DAYS`: auto-archive finished runs older than this many days on startup (default `45`; set `0` to disable).
+- `ENABLE_TASK_MANAGER_MCP=1`: opt-in to start the Luma Tasks MCP (off by default).
 - `TERMINAL_DISABLE_PTY=1`: force plain-pipe terminal mode.
 - `TERMINAL_SHELL=/bin/bash`: choose the shell used by session terminals.
 
@@ -290,7 +294,7 @@ For group uploads, disable the bot's privacy mode with `@BotFather` or make the 
 
 ## Luma Tasks MCP
 
-The repo also includes a Luma Tasks MCP server registered as `luma-tasks` by default. It connects to the local Luma Tasks API and exposes tools for prompts and agents:
+The repo also includes a Luma Tasks MCP server (`luma-tasks`). It is **off by default** (to save CPU/RAM); set `ENABLE_TASK_MANAGER_MCP=1` to start it under PM2 and register it for Codex. The `/taskmanager` web app and `/api/taskmanager/*` routes still work without the MCP. When enabled, it connects to the local Luma Tasks API and exposes tools for prompts and agents:
 
 - `get_today_report`: returns the ready-to-send plain-text Today report.
 - `list_users`: lists task-manager users for assignment.
@@ -300,9 +304,10 @@ The repo also includes a Luma Tasks MCP server registered as `luma-tasks` by def
 - `create_project`: creates projects/lists with optional user access.
 - `create_task`, `update_task`, `complete_task`, `add_comment`: basic task actions.
 
-Default configuration:
+Default configuration (when enabling):
 
 ```env
+ENABLE_TASK_MANAGER_MCP=1
 TASK_MANAGER_MCP_PORT=9014
 TASK_MANAGER_MCP_NAME=luma-tasks
 LUMA_TASKS_API_BASE=http://127.0.0.1:9001
@@ -313,7 +318,7 @@ LUMA_TASKS_AUTH_TOKEN=
 
 If `LUMA_TASKS_PASSWORD` is omitted, the MCP server falls back to `TASK_MANAGER_ADMIN_PASSWORD`, then `PASSWORD`. `LUMA_TASKS_AUTH_TOKEN` is optional and can be used instead of username/password, but normal username/password login is preferred because task-manager tokens expire.
 
-`make run` and `make deploy-start` ensure the local MCP entries point at `luma-tel`, `luma-tasks`, and `luma-images` where supported.
+`make run` and `make deploy-start` ensure the local MCP entries for `luma-tel` and `luma-images`. `luma-tasks` is registered only when `ENABLE_TASK_MANAGER_MCP=1`. For local development without PM2, run `npm run dev:taskmanager` in a separate terminal when you need the MCP.
 
 ## Luma Images MCP
 
@@ -396,8 +401,8 @@ PM2 process names are:
 - `luma-assistant-server`
 - `luma-assistant-web`
 - `luma-telegram-mcp`
-- `luma-taskmanager-mcp`
 - `luma-image-mcp`
+- `luma-taskmanager-mcp` (only when `ENABLE_TASK_MANAGER_MCP=1`)
 
 ### Nginx
 

@@ -140,6 +140,12 @@ const SESSION_MESSAGE_PAGE_SIZE = 30;
 const STORED_EVENT_TEXT_MAX_CHARS = Number(process.env.STORED_EVENT_TEXT_MAX_CHARS || 24000);
 const RUNS_PERSIST_DEBOUNCE_MS = Number(process.env.RUNS_PERSIST_DEBOUNCE_MS || 750);
 const SESSION_INDEX_PERSIST_DEBOUNCE_MS = Number(process.env.SESSION_INDEX_PERSIST_DEBOUNCE_MS || 500);
+/** Max sessions that keep full message bodies in RAM (others stay index-only until opened). */
+const MESSAGE_STORE_HOT_SESSIONS = Math.max(8, Number(process.env.MESSAGE_STORE_HOT_SESSIONS || 48));
+/** Cap events retained in RAM per active run; full history stays on disk. */
+const RUN_EVENTS_MEMORY_CAP = Math.max(100, Number(process.env.RUN_EVENTS_MEMORY_CAP || 400));
+/** Auto-archive completed/failed/stopped runs older than this many days (0 disables). */
+const RUN_RETENTION_DAYS = Math.max(0, Number(process.env.RUN_RETENTION_DAYS || 45));
 const MESSAGE_OUTBOX_RETRY_DELAYS_MS = [1000, 3000, 10000];
 const MESSAGE_STORE_SCHEMA_VERSION = 1;
 const TEHRAN_TIMEZONE = "Asia/Tehran";
@@ -292,6 +298,8 @@ type SessionState = {
   messages: ChatMessage[];
   messageIds: Map<string, number>;
   nextSequence: number;
+  /** When false, `messages` is empty and must be loaded from disk before use. */
+  messagesHydrated: boolean;
 };
 
 type OutboxStatus = "pending" | "processing" | "failed";
@@ -2018,17 +2026,14 @@ class RunManager extends EventEmitter {
       const staleActiveRun = run.status === "queued" || run.status === "running";
       if (staleActiveRun) staleRunIds.add(run.id);
       const restartMessage = "Server restarted before this run completed. Marked as failed because no live Codex process is attached.";
-      const events = staleActiveRun
-        ? [
-            ...run.events,
-            {
-              id: `evt_${now}_${Math.random().toString(36).slice(2, 8)}`,
-              at: now,
-              source: "system" as const,
-              text: restartMessage,
-            },
-          ].slice(-1500)
-        : run.events;
+      if (staleActiveRun) {
+        appendRunEventToDisk(run.id, {
+          id: `evt_${now}_${Math.random().toString(36).slice(2, 8)}`,
+          at: now,
+          source: "system",
+          text: restartMessage,
+        });
+      }
       this.runs.set(run.id, {
         ...run,
         status: staleActiveRun ? "failed" : run.status,
@@ -2041,7 +2046,8 @@ class RunManager extends EventEmitter {
           skills: normalizeSelectedSkillRefs(run.config?.skills),
           agents: normalizeSelectedAgentRefs(run.config?.agents),
         },
-        events,
+        // Events stay on disk; only active runs accumulate a short in-memory window.
+        events: [],
         lastError: staleActiveRun ? restartMessage : run.lastError,
         sessionId: typeof run.sessionId === "string"
           ? run.sessionId
@@ -2056,6 +2062,28 @@ class RunManager extends EventEmitter {
       this.approvals.set(item.id, item);
     }
     if (staleRunIds.size > 0) this.persistState();
+    this.applyRetentionPolicy();
+  }
+
+  /** Archive old finished runs so the in-memory index stays bounded over months of use. */
+  applyRetentionPolicy(): { archived: number } {
+    if (RUN_RETENTION_DAYS <= 0) return { archived: 0 };
+    const cutoff = Date.now() - RUN_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    let archived = 0;
+    for (const run of this.runs.values()) {
+      if (run.archivedAt !== null) continue;
+      if (run.status === "queued" || run.status === "running") continue;
+      const stamp = run.updatedAt || run.createdAt;
+      if (stamp > cutoff) continue;
+      this.runs.set(run.id, { ...run, archivedAt: stamp, events: [] });
+      archived += 1;
+    }
+    if (archived > 0) {
+      // eslint-disable-next-line no-console
+      console.log(`[luma-assistant/server] retention archived ${archived} runs older than ${RUN_RETENTION_DAYS}d`);
+      this.persistState();
+    }
+    return { archived };
   }
 
   getRuns(includeArchived = true): RunRecord[] {
@@ -2282,6 +2310,7 @@ class RunManager extends EventEmitter {
         }
       }
 
+      this.releaseCachedEvents(runId);
       this.persistState();
     });
 
@@ -2439,6 +2468,7 @@ class RunManager extends EventEmitter {
       }
     }
 
+    this.releaseCachedEvents(runId);
     this.persistState();
   }
 
@@ -2811,9 +2841,16 @@ class RunManager extends EventEmitter {
 
     const event: RunEventEntry = { id: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, at: Date.now(), ...partial };
     const events = [...run.events, event];
-    const capped = events.length > 1500 ? events.slice(events.length - 1500) : events;
+    const capped = events.length > RUN_EVENTS_MEMORY_CAP ? events.slice(events.length - RUN_EVENTS_MEMORY_CAP) : events;
     this.updateRun(runId, { events: capped });
     appendRunEventToDisk(runId, event);
+  }
+
+  /** Drop in-memory event buffers after a run finishes; full history remains on disk. */
+  private releaseCachedEvents(runId: string): void {
+    const run = this.runs.get(runId);
+    if (!run || run.events.length === 0) return;
+    this.runs.set(runId, { ...run, events: [] });
   }
 
   private updateRun(runId: string, patch: Partial<RunRecord>): void {
@@ -3946,11 +3983,17 @@ function readRunEventsFromDisk(runId: string): RunEventEntry[] {
     if (!line.trim()) continue;
     const parsed = safeJsonParse<RunEventEntry | null>(line, null);
     if (!parsed || typeof parsed.id !== "string" || typeof parsed.at !== "number") continue;
-    if (parsed.source !== "stdout" && parsed.source !== "stderr") continue;
+    if (parsed.source !== "stdout" && parsed.source !== "stderr" && parsed.source !== "system") continue;
     if (typeof parsed.text !== "string") continue;
     events.push({ id: parsed.id, at: parsed.at, source: parsed.source, text: parsed.text });
   }
   return events.length > 1500 ? events.slice(events.length - 1500) : events;
+}
+
+/** Attach disk events for one-shot reads without permanently caching them on the run record. */
+function runWithEvents(run: RunRecord): RunRecord {
+  if (Array.isArray(run.events) && run.events.length > 0) return run;
+  return { ...run, events: readRunEventsFromDisk(run.id) };
 }
 
 function writeRunEventsToDisk(runId: string, events: RunEventEntry[]): void {
@@ -4011,16 +4054,17 @@ function loadPersistedRuns(): { runs: RunRecord[]; approvals: ApprovalQueueItem[
   const approvals = Array.isArray(parsed.approvals) ? parsed.approvals : [];
 
   let migratedInlineEvents = false;
+  // Keep events on disk only — hydrating every run's jsonl into RAM is what made the
+  // long-lived API process swell to ~1GB and GC-thrash after several days of use.
   const hydrated: RunRecord[] = runs.map((run) => {
     const inlineEvents = Array.isArray(run.events) ? run.events : [];
-    const diskEvents = readRunEventsFromDisk(run.id);
     if (inlineEvents.length > 0) {
+      const diskEvents = readRunEventsFromDisk(run.id);
       const merged = diskEvents.length >= inlineEvents.length ? diskEvents : inlineEvents;
       writeRunEventsToDisk(run.id, merged);
       migratedInlineEvents = true;
-      return { ...run, events: merged };
     }
-    return { ...run, events: diskEvents };
+    return { ...run, events: [] };
   });
 
   if (migratedInlineEvents) {
@@ -4582,7 +4626,8 @@ function truncatePreview(input: string, max = 120): string {
   return `${normalized.slice(0, max - 3)}...`;
 }
 
-function buildRunMessageEntries(run: RunRecord): RunMessageEntry[] {
+function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
+  const run = runWithEvents(runInput);
   const entries: RunMessageEntry[] = [];
 
   if (run.config.prompt.trim()) {
@@ -5285,6 +5330,9 @@ class MessageStore {
 
   private snapshotTimer: NodeJS.Timeout | null = null;
 
+  /** LRU order of session ids that currently hold message bodies in RAM. */
+  private hotSessionOrder: string[] = [];
+
   constructor(private readonly emitEvent: (event: SseEvent) => void) {}
 
   loadOrBackfill(runs: RunRecord[]): void {
@@ -5353,6 +5401,39 @@ class MessageStore {
       sourceTag: "in-app",
       sourceRaw: "in-app",
     });
+
+    // Cold sessions: update index metadata only. Rebuilding from every run's event
+    // jsonl at startup was loading ~100MB+ into RAM for no interactive benefit.
+    if (!state.messagesHydrated) {
+      const nextUpdatedAt = Math.max(
+        state.item.updatedAt,
+        latestRun ? (latestRun.updatedAt || latestRun.createdAt) : 0,
+      );
+      const metadataChanged =
+        state.item.status !== (latestRun?.status || state.item.status)
+        || state.item.runner !== normalizeRunRunner(latestRun?.config.runner || state.item.runner)
+        || state.item.model !== (latestRun?.config.model || state.item.model)
+        || state.item.reasoningEffort !== (latestRun ? normalizeReasoningEffort(latestRun.config.reasoningEffort) : state.item.reasoningEffort)
+        || state.item.workspace !== (latestRun?.config.workspace || state.item.workspace)
+        || state.item.latestRunId !== (latestRun?.id || state.item.latestRunId)
+        || state.item.updatedAt !== nextUpdatedAt
+        || (!state.item.title.trim() && titleFallback !== state.item.title);
+
+      if (!metadataChanged) return;
+
+      state.item.status = latestRun?.status || state.item.status;
+      state.item.runner = normalizeRunRunner(latestRun?.config.runner || state.item.runner);
+      state.item.model = latestRun?.config.model || state.item.model;
+      state.item.reasoningEffort = latestRun ? normalizeReasoningEffort(latestRun.config.reasoningEffort) : state.item.reasoningEffort;
+      state.item.workspace = latestRun?.config.workspace || state.item.workspace;
+      state.item.latestRunId = latestRun?.id || state.item.latestRunId;
+      state.item.updatedAt = nextUpdatedAt;
+      if (!state.item.title.trim()) state.item.title = titleFallback;
+      this.syncSessionSource(state);
+      this.scheduleSnapshot();
+      this.emitSessionUpsert(state.item);
+      return;
+    }
 
     const projectedMessages = buildSessionMessageEntries(runs)
       .map((entry, index) => timelineEntryToChatMessage(sessionId, entry, index + 1));
@@ -5424,6 +5505,7 @@ class MessageStore {
   getMessagesPage(sessionId: string, beforeCursor: string | null, limit = SESSION_MESSAGE_PAGE_SIZE): SessionMessagesResponse | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
+    this.ensureMessagesLoaded(state);
 
     const normalizedMessages = normalizeSessionMessages(state.messages).map((message, index) => ({
       ...message,
@@ -5464,6 +5546,7 @@ class MessageStore {
 
   acceptOutgoingMessage(sessionId: string, input: SendMessageInput): ChatMessage {
     const existing = this.sessions.get(sessionId);
+    if (existing) this.ensureMessagesLoaded(existing);
     const hasInAppMessages = existing?.messages.some((message) => !message.id.startsWith("history_")) ?? false;
     const shouldHydrateFromCodex = !existing
       || (existing.item.historyOnly && !hasInAppMessages && !existing.item.latestRunId);
@@ -5484,6 +5567,7 @@ class MessageStore {
       sourceTag: "in-app",
       sourceRaw: "in-app",
     });
+    this.ensureMessagesLoaded(state);
 
     const createdAt = Date.now();
     const message: ChatMessage = {
@@ -5587,6 +5671,7 @@ class MessageStore {
       sourceTag: "in-app",
       sourceRaw: "in-app",
     });
+    this.ensureMessagesLoaded(state);
 
     this.markSessionInApp(state);
     const next: ChatMessage = {
@@ -5604,8 +5689,10 @@ class MessageStore {
     if (!previousSessionId || previousSessionId === nextSessionId) return;
     const current = this.sessions.get(previousSessionId);
     if (!current) return;
+    this.ensureMessagesLoaded(current);
 
     const existingNext = this.sessions.get(nextSessionId);
+    if (existingNext) this.ensureMessagesLoaded(existingNext);
     const mergedMessages = existingNext
       ? [...existingNext.messages, ...current.messages]
       : [...current.messages];
@@ -5634,6 +5721,7 @@ class MessageStore {
       messages: deduped,
       messageIds: new Map(deduped.map((message, index) => [message.id, index])),
       nextSequence: deduped.reduce((max, message) => Math.max(max, message.sequence), 0) + 1,
+      messagesHydrated: true,
     };
 
     nextState.item.messageCount = deduped.length;
@@ -5641,7 +5729,9 @@ class MessageStore {
     this.syncSessionSource(nextState);
 
     this.sessions.delete(previousSessionId);
+    this.hotSessionOrder = this.hotSessionOrder.filter((id) => id !== previousSessionId);
     this.sessions.set(nextSessionId, nextState);
+    this.touchHotSession(nextSessionId);
     this.enqueueWrite(async () => {
       await fs.promises.mkdir(MESSAGE_LOG_DIR, { recursive: true });
       const fileContent = deduped.map((message) => JSON.stringify(message)).join("\n");
@@ -5657,6 +5747,7 @@ class MessageStore {
   removeSession(sessionId: string): void {
     if (!this.sessions.has(sessionId)) return;
     this.sessions.delete(sessionId);
+    this.hotSessionOrder = this.hotSessionOrder.filter((id) => id !== sessionId);
     this.enqueueWrite(async () => {
       if (fs.existsSync(messageLogPath(sessionId))) {
         await fs.promises.rm(messageLogPath(sessionId), { force: true });
@@ -5689,18 +5780,20 @@ class MessageStore {
   private loadFromDisk(): void {
     const rows = safeJsonParse<SessionListItem[]>(fs.readFileSync(SESSION_INDEX_PATH, "utf8"), []);
     this.sessions.clear();
+    this.hotSessionOrder = [];
     for (const item of rows) {
-      const messages = normalizeSessionMessages(readMessageLog(item.id));
+      // Index-only load: message bodies stay on disk until a session is opened.
       const state: SessionState = {
         item: {
           ...item,
           runner: normalizeRunRunner(item.runner),
-          lastMessagePreview: item.lastMessagePreview || previewText(messages[messages.length - 1]?.text || ""),
-          messageCount: messages.length,
+          lastMessagePreview: item.lastMessagePreview || "",
+          messageCount: typeof item.messageCount === "number" ? item.messageCount : 0,
         },
-        messages,
-        messageIds: new Map(messages.map((message, index) => [message.id, index])),
-        nextSequence: messages.reduce((max, message) => Math.max(max, message.sequence), 0) + 1,
+        messages: [],
+        messageIds: new Map(),
+        nextSequence: (typeof item.messageCount === "number" ? item.messageCount : 0) + 1,
+        messagesHydrated: false,
       };
       this.syncSessionSource(state);
       this.sessions.set(item.id, state);
@@ -5709,6 +5802,7 @@ class MessageStore {
 
   private backfillFromRuns(runs: RunRecord[]): void {
     this.sessions.clear();
+    this.hotSessionOrder = [];
     fs.mkdirSync(MESSAGE_LOG_DIR, { recursive: true });
 
     const grouped = new Map<string, RunRecord[]>();
@@ -5746,9 +5840,10 @@ class MessageStore {
 
       const state: SessionState = {
         item,
-        messages,
-        messageIds: new Map(messages.map((message, index) => [message.id, index])),
-        nextSequence: messages.reduce((max, message) => Math.max(max, message.sequence), 0) + 1,
+        messages: [],
+        messageIds: new Map(),
+        nextSequence: messages.length + 1,
+        messagesHydrated: false,
       };
       this.sessions.set(sessionId, state);
       const fileContent = messages.map((message) => JSON.stringify(message)).join("\n");
@@ -5783,11 +5878,65 @@ class MessageStore {
       messages: [],
       messageIds: new Map(),
       nextSequence: 1,
+      messagesHydrated: true,
     };
     this.sessions.set(sessionId, state);
+    this.touchHotSession(sessionId);
     this.scheduleSnapshot();
     this.emitSessionUpsert(state.item);
     return state;
+  }
+
+  private ensureMessagesLoaded(state: SessionState): void {
+    if (state.messagesHydrated) {
+      this.touchHotSession(state.item.id);
+      return;
+    }
+
+    const messages = normalizeSessionMessages(readMessageLog(state.item.id)).map((message, index) => ({
+      ...message,
+      sessionId: state.item.id,
+      sequence: message.sequence || index + 1,
+    }));
+    state.messages = messages;
+    state.messageIds = new Map(messages.map((message, index) => [message.id, index]));
+    state.nextSequence = messages.reduce((max, message) => Math.max(max, message.sequence), 0) + 1;
+    state.item.messageCount = messages.length;
+    if (!state.item.lastMessagePreview) {
+      state.item.lastMessagePreview = previewText(messages[messages.length - 1]?.text || "");
+    }
+    state.messagesHydrated = true;
+    this.syncSessionSource(state);
+    this.touchHotSession(state.item.id);
+    this.evictColdSessions();
+  }
+
+  private touchHotSession(sessionId: string): void {
+    this.hotSessionOrder = this.hotSessionOrder.filter((id) => id !== sessionId);
+    this.hotSessionOrder.push(sessionId);
+  }
+
+  private evictColdSessions(): void {
+    while (this.hotSessionOrder.length > MESSAGE_STORE_HOT_SESSIONS) {
+      const coldId = this.hotSessionOrder.shift();
+      if (!coldId) break;
+      const state = this.sessions.get(coldId);
+      if (!state || !state.messagesHydrated) continue;
+      if (state.item.status === "running" || state.item.status === "queued") {
+        this.hotSessionOrder.push(coldId);
+        // Avoid infinite loop if every hot session is busy.
+        if (this.hotSessionOrder.filter((id) => {
+          const s = this.sessions.get(id);
+          return s && (s.item.status === "running" || s.item.status === "queued");
+        }).length >= this.hotSessionOrder.length) {
+          break;
+        }
+        continue;
+      }
+      state.messages = [];
+      state.messageIds = new Map();
+      state.messagesHydrated = false;
+    }
   }
 
   private markSessionInApp(state: SessionState): void {
@@ -5802,7 +5951,10 @@ class MessageStore {
 
   private syncSessionSource(state: SessionState): void {
     const hasLocalEvidence =
-      Boolean(state.item.latestRunId) || state.messages.some((message) => !message.id.startsWith("history_"));
+      Boolean(state.item.latestRunId)
+      || state.item.sourceTag === "in-app"
+      || state.item.sourceRaw === "in-app"
+      || (state.messagesHydrated && state.messages.some((message) => !message.id.startsWith("history_")));
     if (hasLocalEvidence) {
       this.markSessionInApp(state);
       return;
@@ -5820,6 +5972,7 @@ class MessageStore {
       sourceTag: "in-app",
       sourceRaw: "in-app",
     });
+    this.ensureMessagesLoaded(state);
     this.markSessionInApp(state);
     const existingIndex = state.messageIds.get(message.id);
     if (existingIndex === undefined) {
@@ -5863,8 +6016,10 @@ class MessageStore {
     transform: (current: ChatMessage) => ChatMessage,
   ): ChatMessage | null {
     const state = this.sessions.get(sessionId);
-    const index = state?.messageIds.get(messageId);
-    if (state === undefined || index === undefined) return null;
+    if (!state) return null;
+    this.ensureMessagesLoaded(state);
+    const index = state.messageIds.get(messageId);
+    if (index === undefined) return null;
     const next = transform(state.messages[index]);
     this.writeMessage(next);
     return next;
@@ -5874,6 +6029,7 @@ class MessageStore {
     const historyItem = buildHistorySessionListItem(transcript.session);
     const historyMessages = transcriptToChatMessages(sessionId, transcript);
     const existing = this.sessions.get(sessionId);
+    if (existing) this.ensureMessagesLoaded(existing);
     const existingHasLocalMessages = existing?.messages.some((message) => !message.id.startsWith("history_")) ?? false;
 
     const mergedMessages = existing
@@ -5921,9 +6077,12 @@ class MessageStore {
       messages: normalizedMessages,
       messageIds: new Map(normalizedMessages.map((message, index) => [message.id, index])),
       nextSequence: normalizedMessages.length + 1,
+      messagesHydrated: true,
     };
 
     this.sessions.set(sessionId, nextState);
+    this.touchHotSession(sessionId);
+    this.evictColdSessions();
     this.enqueueWrite(async () => {
       await fs.promises.mkdir(MESSAGE_LOG_DIR, { recursive: true });
       const fileContent = normalizedMessages.map((message) => JSON.stringify(message)).join("\n");
@@ -6238,6 +6397,7 @@ class MessageProjector {
     this.messageStore.updateSessionFromRun(event.run, resolvedSessionId);
     if (event.kind === "completed" || event.kind === "failed" || event.kind === "stopped") {
       this.outboxBridge.handleRunFinished(event.run.id);
+      this.sessionIdByRunId.delete(event.run.id);
     }
 
     if (event.kind === "failed" && event.run.lastError) {
@@ -6977,7 +7137,7 @@ app.get("/api/bootstrap", (_req, res) => {
     },
     activeWorkspace: uiState.activeWorkspace,
     workspaces: getWorkspaces(),
-    runs: runManager.getRuns(false).map(slimRunForIndex),
+    runs: runManager.getRuns(false).slice(0, RUN_LIST_PAGE_DEFAULT).map(slimRunForIndex),
     approvals: runManager.getApprovals(),
   };
   res.json(apiOk(payload));
@@ -7190,8 +7350,16 @@ app.post("/api/workspaces/active", (req, res) => {
   res.json(apiOk({ activeWorkspace: workspace, workspaces: getWorkspaces() }));
 });
 
-app.get("/api/runs", (_req, res) => {
-  res.json(apiOk({ runs: runManager.getRuns(false).map(slimRunForIndex), approvals: runManager.getApprovals() }));
+app.get("/api/runs", (req, res) => {
+  const limit = clampListLimit(req.query.limit, RUN_LIST_PAGE_DEFAULT, RUN_LIST_PAGE_MAX);
+  const cursor = typeof req.query.cursor === "string" ? req.query.cursor : null;
+  const all = runManager.getRuns(false).map(slimRunForIndex);
+  const payload = sliceRunListItems(all, limit, cursor);
+  res.json(apiOk({
+    runs: payload.items,
+    nextCursor: payload.nextCursor,
+    approvals: runManager.getApprovals(),
+  }));
 });
 
 app.get("/api/sessions/list", (req, res) => {
@@ -7603,7 +7771,8 @@ app.get("/api/runs/:runId", (req, res) => {
   }
 
   const approvals = runManager.getApprovals().filter((item) => item.runId === run.id);
-  res.json(apiOk({ run, approvals }));
+  // Detail view may need events; load from disk without permanently caching on the index entry.
+  res.json(apiOk({ run: runWithEvents(run), approvals }));
 });
 
 app.get("/api/runs/:runId/messages", (req, res) => {
