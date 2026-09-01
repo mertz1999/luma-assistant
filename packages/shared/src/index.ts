@@ -260,6 +260,48 @@ export type RunRecord = {
   } | null;
 };
 
+/**
+ * A persistent, multi-step objective that owns a set of sessions/runs
+ * (first slice -- no task graph/dependencies/checkpoints yet, see
+ * apps/server/src/missions/mission-state.ts for the status state machine
+ * and the reasoning behind what this phase deliberately does not include).
+ */
+export const missionStatusSchema = z.enum(["PENDING", "ACTIVE", "COMPLETED", "FAILED", "CANCELLED"]);
+export type MissionStatus = z.infer<typeof missionStatusSchema>;
+
+export type Mission = {
+  id: string;
+  workspace: string;
+  objective: string;
+  status: MissionStatus;
+  createdAt: number;
+  updatedAt: number;
+  /**
+   * Run IDs this mission owns, in the order they were attached. Run id
+   * (RunRecord.id) rather than sessionId deliberately: sessionId is only
+   * ever set on a run that was explicitly resumed (--resume), so most
+   * first-time runs have sessionId=null and couldn't be tracked by it.
+   * Run id always exists. The actual run data lives in the existing runs
+   * store -- a mission just tracks which ones belong to it.
+   */
+  runIds: string[];
+  /** Set only on a terminal status (COMPLETED/FAILED/CANCELLED); null otherwise. */
+  closedAt: number | null;
+  /** Free-text note explaining a FAILED/CANCELLED outcome, or a completion summary for COMPLETED. */
+  statusNote: string | null;
+};
+
+export const createMissionSchema = z.object({
+  workspace: z.string().min(1),
+  objective: z.string().min(1),
+});
+export type CreateMissionInput = z.infer<typeof createMissionSchema>;
+
+export const setMissionStatusSchema = z.object({
+  status: missionStatusSchema,
+  note: z.string().optional(),
+});
+
 export type TokenUsageSummary = {
   inputTokens: number;
   outputTokens: number;

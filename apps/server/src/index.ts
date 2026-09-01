@@ -14,6 +14,7 @@ import { reconcileStaleRunPid } from "./recovery.js";
 import { appendAuditEvent, readAuditEvents, verifyAuditChain } from "./audit/audit-log.js";
 import { evaluateRunStartPolicy } from "./policy/policy-engine.js";
 import { evaluateResourcePolicy, type ResourceLimits } from "./resources/resource-watchdog.js";
+import { canTransitionMissionStatus } from "./missions/mission-state.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -28,6 +29,8 @@ import {
   createTaskManagerTaskSchema,
   createTaskManagerUserSchema,
   createAgentScheduleSchema,
+  createMissionSchema,
+  setMissionStatusSchema,
   rerunSchema,
   sendMessageSchema,
   setWorkspaceSchema,
@@ -55,6 +58,8 @@ import {
   type CodexMcpStatusResponse,
   type CodexSystemStatusResponse,
   type CodexTokenStatus,
+  type Mission,
+  type MissionStatus,
   type RunConfig,
   type ReasoningEffort,
   type RunListItem,
@@ -101,6 +106,7 @@ const require = createRequire(import.meta.url);
 const APP_STATE_PATH = path.resolve(rootDir, "data/ui-state.json");
 const RUNS_PATH = path.resolve(rootDir, "data/runs.json");
 const RUN_EVENTS_DIR = path.resolve(rootDir, "data/runs");
+const MISSIONS_PATH = path.resolve(rootDir, "data/missions.json");
 const AUDIT_DIR = path.resolve(rootDir, "data/audit");
 const AGENTS_DIR = path.resolve(rootDir, "agents");
 const CLAUDE_BYPASS_AS_ROOT = process.env.CLAUDE_BYPASS_AS_ROOT === "1";
@@ -3117,6 +3123,166 @@ function nextTehranDailyRun(time: AgentScheduleTime, afterTimestamp = Date.now()
     candidate = tehranLocalToTimestamp(nextDay.year, nextDay.month, nextDay.day, time.hour, time.minute);
   }
   return candidate;
+}
+
+class MissionTransitionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MissionTransitionError";
+  }
+}
+
+class MissionNotFoundError extends Error {
+  constructor(missionId: string) {
+    super(`Mission not found: ${missionId}`);
+    this.name = "MissionNotFoundError";
+  }
+}
+
+function loadPersistedMissions(): Mission[] {
+  if (!fs.existsSync(MISSIONS_PATH)) return [];
+  const payload = safeJsonParse<{ missions: Mission[] }>(fs.readFileSync(MISSIONS_PATH, "utf8"), { missions: [] });
+  return Array.isArray(payload.missions) ? payload.missions : [];
+}
+
+function persistMissionsToDisk(missions: Mission[]): void {
+  writeJsonAtomicSync(MISSIONS_PATH, { missions });
+}
+
+/**
+ * First slice of persistent missions (spec: "Mission state must survive UI
+ * close, terminal close, Luma restart... A mission should contain at
+ * minimum: mission ID, project ID, objective, status, timestamps..."). A
+ * mission is a persistent, multi-step objective that OWNS a set of
+ * sessions -- the actual Codex/Claude work still happens as normal
+ * sessions/runs through RunManager, unchanged; a mission is a thin,
+ * separately-persisted coordination layer on top, not a replacement for
+ * anything that already exists.
+ *
+ * Deliberately not in this first slice (see mission-state.ts for the
+ * reasoning): a task graph, dependencies, checkpoints, agent assignments,
+ * or approval gates. Those are real, separate features to build once this
+ * foundation -- a mission that reliably persists and reliably tracks which
+ * sessions belong to it -- actually exists and is proven, not invented
+ * speculatively all at once.
+ *
+ * No PID-based crash recovery is needed here the way RunManager needed it:
+ * a mission does not itself own a process. Every session it references
+ * already goes through RunManager's own crash recovery independently: on
+ * restart this class just reloads its own persisted state as-is.
+ */
+class MissionManager {
+  private missions = new Map<string, Mission>();
+
+  private persistTimer: NodeJS.Timeout | null = null;
+
+  /** Mirrors RunManager's own private audit() helper: never throws into a caller. */
+  private audit(eventType: string, runId: string | null, payload: Record<string, unknown> = {}): void {
+    try {
+      appendAuditEvent(AUDIT_DIR, { event_type: eventType, run_id: runId, payload });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[luma-assistant/server] audit log write failed for ${eventType}:`, (err as Error).message);
+    }
+  }
+
+  load(): void {
+    for (const mission of loadPersistedMissions()) {
+      this.missions.set(mission.id, mission);
+    }
+  }
+
+  list(): Mission[] {
+    return [...this.missions.values()].sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  get(missionId: string): Mission | null {
+    return this.missions.get(missionId) ?? null;
+  }
+
+  create(input: { workspace: string; objective: string }): Mission {
+    const now = Date.now();
+    const mission: Mission = {
+      id: `mission_${now}_${Math.random().toString(36).slice(2, 8)}`,
+      workspace: input.workspace,
+      objective: input.objective,
+      status: "PENDING",
+      createdAt: now,
+      updatedAt: now,
+      runIds: [],
+      closedAt: null,
+      statusNote: null,
+    };
+    this.missions.set(mission.id, mission);
+    this.persist();
+    this.audit("mission.created", null, { missionId: mission.id, workspace: mission.workspace, objective: mission.objective });
+    return mission;
+  }
+
+  /** Attaches an existing run to a mission, auto-advancing PENDING -> ACTIVE on the first one. */
+  attachRun(missionId: string, runId: string): Mission {
+    const mission = this.missions.get(missionId);
+    if (!mission) throw new MissionNotFoundError(missionId);
+
+    const targetStatus: MissionStatus = "ACTIVE";
+    const check = canTransitionMissionStatus(mission.status, targetStatus);
+    if (!check.allowed) {
+      throw new MissionTransitionError(`Cannot attach a run to mission ${missionId}: ${check.reason}`);
+    }
+
+    if (mission.runIds.includes(runId)) return mission; // idempotent: attaching the same run twice is a no-op, not an error
+
+    const updated: Mission = {
+      ...mission,
+      status: targetStatus,
+      runIds: [...mission.runIds, runId],
+      updatedAt: Date.now(),
+    };
+    this.missions.set(missionId, updated);
+    this.persist();
+    this.audit("mission.run_attached", runId, { missionId, runId, runCount: updated.runIds.length });
+    return updated;
+  }
+
+  setStatus(missionId: string, status: MissionStatus, note?: string): Mission {
+    const mission = this.missions.get(missionId);
+    if (!mission) throw new MissionNotFoundError(missionId);
+
+    const check = canTransitionMissionStatus(mission.status, status);
+    if (!check.allowed) {
+      throw new MissionTransitionError(`Cannot set mission ${missionId} to ${status}: ${check.reason}`);
+    }
+
+    const now = Date.now();
+    const isTerminal = status === "COMPLETED" || status === "FAILED" || status === "CANCELLED";
+    const updated: Mission = {
+      ...mission,
+      status,
+      updatedAt: now,
+      closedAt: isTerminal ? now : mission.closedAt,
+      statusNote: note ?? mission.statusNote,
+    };
+    this.missions.set(missionId, updated);
+    this.persist();
+    this.audit("mission.status_changed", null, { missionId, from: mission.status, to: status, note: note ?? null });
+    return updated;
+  }
+
+  private persist(): void {
+    if (this.persistTimer !== null) clearTimeout(this.persistTimer);
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      persistMissionsToDisk(this.list());
+    }, RUNS_PERSIST_DEBOUNCE_MS);
+  }
+
+  flushSync(): void {
+    if (this.persistTimer !== null) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    persistMissionsToDisk(this.list());
+  }
 }
 
 function loadPersistedAgentSchedules(): PersistedAgentScheduleState {
@@ -7064,6 +7230,8 @@ app.use(requireAuth);
 const runManager = new RunManager(CODEX_PATH);
 const persisted = loadPersistedRuns();
 runManager.loadPersisted(persisted.runs, persisted.approvals);
+const missionManager = new MissionManager();
+missionManager.load();
 const sseClients = new Set<express.Response>();
 function broadcastSse(event: SseEvent): void {
   const data = `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
@@ -7504,6 +7672,66 @@ app.get("/api/audit", (req, res) => {
 app.get("/api/audit/verify", (_req, res) => {
   const result = verifyAuditChain(AUDIT_DIR);
   res.json(apiOk(result));
+});
+
+app.get("/api/missions", (_req, res) => {
+  res.json(apiOk({ missions: missionManager.list() }));
+});
+
+app.post("/api/missions", (req, res) => {
+  const parsed = createMissionSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid mission payload"));
+    return;
+  }
+  const workspace = path.resolve(parsed.data.workspace);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+  const mission = missionManager.create({ workspace, objective: parsed.data.objective });
+  res.json(apiOk({ mission }));
+});
+
+app.get("/api/missions/:missionId", (req, res) => {
+  const mission = missionManager.get(req.params.missionId);
+  if (!mission) {
+    res.status(404).json(apiErr("Mission not found"));
+    return;
+  }
+  res.json(apiOk({ mission }));
+});
+
+app.post("/api/missions/:missionId/runs", (req, res) => {
+  const runId = typeof req.body?.runId === "string" ? req.body.runId.trim() : "";
+  if (!runId) {
+    res.status(400).json(apiErr("runId is required"));
+    return;
+  }
+  if (!runManager.getRun(runId)) {
+    res.status(400).json(apiErr(`No such run: ${runId}`));
+    return;
+  }
+  try {
+    const mission = missionManager.attachRun(req.params.missionId, runId);
+    res.json(apiOk({ mission }));
+  } catch (error) {
+    res.status(error instanceof MissionNotFoundError ? 404 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to attach run"));
+  }
+});
+
+app.post("/api/missions/:missionId/status", (req, res) => {
+  const parsed = setMissionStatusSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid status payload"));
+    return;
+  }
+  try {
+    const mission = missionManager.setStatus(req.params.missionId, parsed.data.status, parsed.data.note);
+    res.json(apiOk({ mission }));
+  } catch (error) {
+    res.status(error instanceof MissionNotFoundError ? 404 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to update mission status"));
+  }
 });
 
 app.post("/api/workspaces/active", (req, res) => {
@@ -8228,6 +8456,7 @@ function flushPersistentStateSync(): void {
   outboxProcessor?.flushSync();
   agentScheduleManager.flushSync();
   taskManagerStore.flushSync();
+  missionManager.flushSync();
 }
 
 process.on("beforeExit", () => {
