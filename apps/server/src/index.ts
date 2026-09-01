@@ -25,7 +25,10 @@ import {
 } from "./credentials/credential-store.js";
 import { resolveAuthorizedCredentials } from "./credentials/credential-resolver.js";
 import { redactKnownSecretValues } from "./security/secret-redaction.js";
-import { decideMissedRun, nextDailyRun } from "./scheduler/schedule-time.js";
+import { AgentScheduleManager } from "./scheduler/agent-schedule-manager.js";
+import { PolicyDeniedError, ResourceLimitError } from "./errors.js";
+import { safeJsonParse, writeJsonAtomicSync } from "./json-file-utils.js";
+import { normalizeReasoningEffort, normalizeRunRunner, normalizeSelectedSkillRefs } from "./run-config-normalize.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -186,7 +189,6 @@ const RUN_EVENTS_MEMORY_CAP = Math.max(100, Number(process.env.RUN_EVENTS_MEMORY
 const RUN_RETENTION_DAYS = Math.max(0, Number(process.env.RUN_RETENTION_DAYS || 45));
 const MESSAGE_OUTBOX_RETRY_DELAYS_MS = [1000, 3000, 10000];
 const MESSAGE_STORE_SCHEMA_VERSION = 1;
-const TEHRAN_TIMEZONE = "Asia/Tehran";
 const LOCAL_SESSION_SOURCE = "luma-assistant";
 const LEGACY_LOCAL_SESSION_SOURCE = "agentic-cli";
 const MANAGED_SKILL_MARKER = ".luma-managed-skill.json";
@@ -281,13 +283,8 @@ type ResolvedAgent = {
   content: string;
 };
 
-type DiscoveredAgent = AgentListItem & {
+export type DiscoveredAgent = AgentListItem & {
   prompt: string;
-};
-
-type PersistedAgentScheduleState = {
-  schedules: AgentSchedule[];
-  executions: AgentScheduleExecution[];
 };
 
 type PersistedUiState = {
@@ -447,16 +444,6 @@ function runSessionId(run: RunRecord): string {
   return run.sessionId || run.threadId || run.id;
 }
 
-function normalizeRunRunner(input: unknown): RunRunner {
-  return input === "claude" ? "claude" : "codex";
-}
-
-function normalizeReasoningEffort(input: unknown): ReasoningEffort {
-  return input === "low" || input === "medium" || input === "high" || input === "xhigh" || input === "max"
-    ? input
-    : "high";
-}
-
 function resolveClaudeCliEffort(effort: ReasoningEffort): "low" | "medium" | "high" | "xhigh" | "max" {
   // Claude Code accepts low/medium/high/xhigh/max. Codex-only values should not reach here.
   if (effort === "low" || effort === "medium" || effort === "high" || effort === "xhigh" || effort === "max") {
@@ -541,13 +528,6 @@ async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> 
   const tempPath = `${filePath}.tmp`;
   await fs.promises.writeFile(tempPath, JSON.stringify(value, null, 2));
   await fs.promises.rename(tempPath, filePath);
-}
-
-function writeJsonAtomicSync(filePath: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp`;
-  fs.writeFileSync(tempPath, JSON.stringify(value, null, 2));
-  fs.renameSync(tempPath, filePath);
 }
 
 function makeTaskManagerId(prefix: string): string {
@@ -1223,25 +1203,6 @@ function normalizeAttachmentRefs(input: unknown): AttachmentRef[] {
   return next;
 }
 
-function normalizeSelectedSkillRefs(input: unknown): SelectedSkillRef[] {
-  if (!Array.isArray(input)) return [];
-
-  const next: SelectedSkillRef[] = [];
-  const seen = new Set<string>();
-  for (const value of input) {
-    if (!isRecord(value) || typeof value.id !== "string" || typeof value.path !== "string") continue;
-    const id = value.id.trim();
-    const skillPath = value.path.trim();
-    if (!id || !skillPath) continue;
-    const key = `${id}\n${skillPath}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    next.push({ id, path: skillPath });
-    if (next.length >= 20) break;
-  }
-  return next;
-}
-
 function normalizeSelectedAgentRefs(input: unknown): SelectedAgentRef[] {
   if (!Array.isArray(input)) return [];
 
@@ -1452,20 +1413,6 @@ class AgentResolutionError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "AgentResolutionError";
-  }
-}
-
-class PolicyDeniedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "PolicyDeniedError";
-  }
-}
-
-class ResourceLimitError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ResourceLimitError";
   }
 }
 
@@ -3150,10 +3097,6 @@ class RunManager extends EventEmitter {
   }
 }
 
-function nextTehranDailyRun(time: AgentScheduleTime, afterTimestamp = Date.now()): number {
-  return nextDailyRun(time, afterTimestamp);
-}
-
 class MissionTransitionError extends Error {
   constructor(message: string) {
     super(message);
@@ -3311,463 +3254,6 @@ class MissionManager {
       this.persistTimer = null;
     }
     persistMissionsToDisk(this.list());
-  }
-}
-
-function loadPersistedAgentSchedules(): PersistedAgentScheduleState {
-  if (!fs.existsSync(AGENT_SCHEDULES_PATH)) {
-    return { schedules: [], executions: [] };
-  }
-  const payload = safeJsonParse<PersistedAgentScheduleState>(fs.readFileSync(AGENT_SCHEDULES_PATH, "utf8"), {
-    schedules: [],
-    executions: [],
-  });
-  return {
-    schedules: Array.isArray(payload.schedules) ? payload.schedules : [],
-    executions: Array.isArray(payload.executions) ? payload.executions : [],
-  };
-}
-
-class AgentScheduleManager {
-  private schedules = new Map<string, AgentSchedule>();
-
-  private executions = new Map<string, AgentScheduleExecution>();
-
-  private executionByRunId = new Map<string, string>();
-
-  private timer: NodeJS.Timeout | null = null;
-
-  constructor(
-    private readonly runManager: RunManager,
-    private readonly startScheduledRun: (
-      schedule: AgentSchedule,
-      prompt: string,
-      execution: AgentScheduleExecution,
-    ) => { run: RunRecord; sessionId: string },
-  ) {}
-
-  /** Mirrors RunManager's/MissionManager's own private audit() helper: never throws into a caller. */
-  private audit(eventType: string, scheduleId: string | null, payload: Record<string, unknown> = {}): void {
-    try {
-      appendAuditEvent(AUDIT_DIR, { event_type: eventType, run_id: null, payload: { scheduleId, ...payload } });
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error(`[luma-assistant/server] audit log write failed for ${eventType}:`, (err as Error).message);
-    }
-  }
-
-  private findExecutionForOccurrence(scheduleId: string, scheduledFor: number): AgentScheduleExecution | null {
-    for (const execution of this.executions.values()) {
-      if (execution.scheduleId === scheduleId && execution.scheduledFor === scheduledFor) return execution;
-    }
-    return null;
-  }
-
-  load(): void {
-    const persisted = loadPersistedAgentSchedules();
-    const now = Date.now();
-
-    // Executions loaded first so the missed-run reconciliation below can
-    // see what was already durably claimed before whatever stopped the
-    // previous process -- that is the actual "was this occurrence already
-    // handled" signal, not the schedule's own nextRunAt value.
-    for (const execution of persisted.executions) {
-      const staleRunning = execution.status === "running" || execution.status === "queued";
-      this.executions.set(execution.id, {
-        ...execution,
-        status: staleRunning ? "failed" : execution.status,
-        startedAt: typeof execution.startedAt === "number" ? execution.startedAt : null,
-        completedAt: staleRunning ? now : (typeof execution.completedAt === "number" ? execution.completedAt : null),
-        sessionId: typeof execution.sessionId === "string" ? execution.sessionId : null,
-        runId: typeof execution.runId === "string" ? execution.runId : null,
-        error: staleRunning
-          ? "Server restarted before this scheduled execution completed."
-          : (typeof execution.error === "string" ? execution.error : null),
-      });
-      if (execution.runId) this.executionByRunId.set(execution.runId, execution.id);
-    }
-
-    // Missed-run reconciliation (spec: a schedule due while Luma was
-    // offline must have explicit, not accidental, behavior). Computed
-    // BEFORE normalizeSchedule recomputes nextRunAt forward, using the
-    // RAW persisted nextRunAt -- that's the actual occurrence that was
-    // pending when this process last wrote schedule state.
-    const catchUps: Array<{ schedule: AgentSchedule; missedAt: number }> = [];
-    for (const raw of persisted.schedules) {
-      // Malformed persisted schedule (corrupted/missing/invalid fields)
-      // fails safely: skipped entirely, never partially trusted. zod's
-      // own .default() on missedRunPolicy/requestedCredentials also means
-      // a schedule persisted by an earlier version of this code (neither
-      // field existed yet) parses cleanly with policy "skip" -- the exact
-      // behavior that version actually had -- rather than needing a
-      // separate migration step.
-      const parsed = agentScheduleSchema.safeParse(raw);
-      if (!parsed.success) {
-        this.audit("schedule.load_failed", typeof (raw as { id?: unknown })?.id === "string" ? (raw as { id: string }).id : null, {
-          reason: "malformed persisted schedule",
-        });
-        continue;
-      }
-      const schedule = parsed.data;
-      const originalNextRunAt = schedule.status === "active" ? schedule.nextRunAt : null;
-      const alreadyClaimed = originalNextRunAt !== null && this.findExecutionForOccurrence(schedule.id, originalNextRunAt) !== null;
-
-      const decision = decideMissedRun({
-        nextRunAt: originalNextRunAt,
-        now,
-        policy: schedule.missedRunPolicy,
-        occurrenceAlreadyClaimed: alreadyClaimed,
-      });
-
-      if (decision.action !== "none") {
-        this.audit("schedule.missed_occurrence_handled", schedule.id, {
-          scheduleId: schedule.id,
-          missedOccurrenceAt: decision.missedOccurrenceAt,
-          policy: schedule.missedRunPolicy,
-          decision: decision.action,
-        });
-      } else if (alreadyClaimed) {
-        this.audit("schedule.recovered", schedule.id, { scheduleId: schedule.id, occurrenceAt: originalNextRunAt });
-      }
-
-      const normalized = this.normalizeSchedule(schedule, now);
-      this.schedules.set(normalized.id, normalized);
-      if (decision.action === "run_once") {
-        catchUps.push({ schedule: normalized, missedAt: decision.missedOccurrenceAt });
-      }
-    }
-
-    this.persist();
-    this.scheduleTimer();
-
-    // Catch-up dispatch happens last, after schedules/executions are fully
-    // loaded and persistence/timer machinery is armed -- executeSchedule
-    // is what actually calls into runManager.startRun (policy, resource
-    // watchdog, credential resolution, process manager, audit), so this
-    // must never run any earlier than the point the rest of startup
-    // already guarantees those are ready.
-    for (const item of catchUps) {
-      this.executeSchedule(item.schedule, item.missedAt);
-    }
-  }
-
-  list(): Pick<AgentScheduleListResponse, "schedules" | "upcoming" | "executions"> {
-    const schedules = [...this.schedules.values()].sort((a, b) => a.createdAt - b.createdAt);
-    const upcoming = schedules
-      .filter((schedule) => schedule.status === "active" && schedule.nextRunAt !== null)
-      .sort((a, b) => (a.nextRunAt ?? 0) - (b.nextRunAt ?? 0));
-    const executions = [...this.executions.values()]
-      .sort((a, b) => Math.max(b.startedAt || 0, b.scheduledFor) - Math.max(a.startedAt || 0, a.scheduledFor))
-      .slice(0, 80);
-    return { schedules, upcoming, executions };
-  }
-
-  getScheduledSessionIds(): Set<string> {
-    return new Set(
-      [...this.executions.values()]
-        .map((execution) => execution.sessionId)
-        .filter((sessionId): sessionId is string => Boolean(sessionId)),
-    );
-  }
-
-  getScheduledRunIds(): Set<string> {
-    return new Set(
-      [...this.executions.values()]
-        .map((execution) => execution.runId)
-        .filter((runId): runId is string => Boolean(runId)),
-    );
-  }
-
-  create(input: {
-    agentId: string;
-    hour: number;
-    minute: number;
-    runner: RunRunner;
-    workspace: string;
-    model: string;
-    sandbox: RunConfig["sandbox"];
-    approvalPolicy: RunConfig["approvalPolicy"];
-    reasoningEffort: ReasoningEffort;
-    skills: SelectedSkillRef[];
-    missedRunPolicy: AgentSchedule["missedRunPolicy"];
-    requestedCredentials: string[];
-  }): AgentSchedule {
-    const agent = discoverAgents().find((item) => item.id === input.agentId);
-    if (!agent) throw new Error("Agent not found");
-
-    const now = Date.now();
-    const time: AgentScheduleTime = {
-      hour: input.hour,
-      minute: input.minute,
-      timezone: TEHRAN_TIMEZONE,
-    };
-    const schedule: AgentSchedule = {
-      id: `schedule_${now}_${Math.random().toString(36).slice(2, 8)}`,
-      agentId: agent.id,
-      agentPath: agent.path,
-      agentName: agent.name,
-      status: "active",
-      time,
-      nextRunAt: nextTehranDailyRun(time, now),
-      createdAt: now,
-      updatedAt: now,
-      lastRunAt: null,
-      missedRunPolicy: input.missedRunPolicy,
-      runConfig: {
-        runner: normalizeRunRunner(input.runner),
-        workspace: input.workspace,
-        model: input.model,
-        reasoningEffort: normalizeReasoningEffort(input.reasoningEffort),
-        sandbox: input.sandbox,
-        approvalPolicy: input.approvalPolicy,
-        skills: normalizeSelectedSkillRefs(input.skills),
-        requestedCredentials: input.requestedCredentials,
-      },
-    };
-
-    this.schedules.set(schedule.id, schedule);
-    this.persist();
-    this.audit("schedule.created", schedule.id, {
-      scheduleId: schedule.id,
-      workspace: schedule.runConfig.workspace,
-      hour: input.hour,
-      minute: input.minute,
-      missedRunPolicy: input.missedRunPolicy,
-    });
-    this.scheduleTimer();
-    return schedule;
-  }
-
-  updateStatus(scheduleId: string, status: AgentSchedule["status"]): AgentSchedule | null {
-    const current = this.schedules.get(scheduleId);
-    if (!current) return null;
-    const now = Date.now();
-    const next: AgentSchedule = {
-      ...current,
-      status,
-      updatedAt: now,
-      nextRunAt: status === "active" ? nextTehranDailyRun(current.time, now) : null,
-    };
-    this.schedules.set(scheduleId, next);
-    this.persist();
-    this.audit(status === "active" ? "schedule.enabled" : "schedule.disabled", scheduleId, { scheduleId });
-    this.scheduleTimer();
-    return next;
-  }
-
-  delete(scheduleId: string): boolean {
-    const deleted = this.schedules.delete(scheduleId);
-    if (deleted) {
-      this.persist();
-      this.audit("schedule.deleted", scheduleId, { scheduleId });
-      this.scheduleTimer();
-    }
-    return deleted;
-  }
-
-  runNow(scheduleId: string): AgentScheduleExecution | null {
-    const schedule = this.schedules.get(scheduleId);
-    if (!schedule) return null;
-    return this.executeSchedule(schedule, Date.now());
-  }
-
-  onRunLifecycle(event: RunLifecycleEvent): void {
-    const executionId = this.executionByRunId.get(event.run.id);
-    if (!executionId) return;
-    const execution = this.executions.get(executionId);
-    if (!execution) return;
-
-    if (event.kind === "updated") {
-      const sessionId = runSessionId(event.run);
-      if (sessionId && sessionId !== execution.sessionId) {
-        this.executions.set(executionId, { ...execution, sessionId });
-        this.persist();
-      }
-      return;
-    }
-
-    if (event.kind !== "completed" && event.kind !== "failed" && event.kind !== "stopped") return;
-    const next: AgentScheduleExecution = {
-      ...execution,
-      status: event.kind,
-      completedAt: Date.now(),
-      sessionId: runSessionId(event.run),
-      error: event.kind === "failed" ? event.run.lastError || "Run failed" : execution.error,
-    };
-    this.executions.set(executionId, next);
-    this.persist();
-  }
-
-  flushSync(): void {
-    if (this.timer !== null) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    writeJsonAtomicSync(AGENT_SCHEDULES_PATH, this.snapshot());
-  }
-
-  private normalizeSchedule(schedule: AgentSchedule, now: number): AgentSchedule {
-    const time: AgentScheduleTime = {
-      hour: schedule.time.hour,
-      minute: schedule.time.minute,
-      timezone: TEHRAN_TIMEZONE,
-    };
-    return {
-      ...schedule,
-      time,
-      status: schedule.status === "paused" ? "paused" : "active",
-      nextRunAt: schedule.status === "paused" ? null : nextTehranDailyRun(time, now),
-      runConfig: {
-        ...schedule.runConfig,
-        runner: normalizeRunRunner(schedule.runConfig.runner),
-        reasoningEffort: normalizeReasoningEffort(schedule.runConfig.reasoningEffort),
-        skills: normalizeSelectedSkillRefs(schedule.runConfig.skills),
-      },
-    };
-  }
-
-  private scheduleTimer(): void {
-    if (this.timer !== null) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-
-    const nextAt = [...this.schedules.values()]
-      .filter((schedule) => schedule.status === "active" && schedule.nextRunAt !== null)
-      .map((schedule) => schedule.nextRunAt as number)
-      .sort((a, b) => a - b)[0];
-    if (typeof nextAt !== "number") return;
-
-    const delay = Math.min(Math.max(nextAt - Date.now(), 0), 60_000);
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      this.runDueSchedules();
-      this.scheduleTimer();
-    }, delay);
-  }
-
-  private runDueSchedules(): void {
-    const now = Date.now();
-    const due = [...this.schedules.values()]
-      .filter((schedule) => schedule.status === "active" && schedule.nextRunAt !== null && schedule.nextRunAt <= now)
-      .sort((a, b) => (a.nextRunAt ?? 0) - (b.nextRunAt ?? 0));
-
-    for (const schedule of due) {
-      this.executeSchedule(schedule, schedule.nextRunAt || now);
-    }
-  }
-
-  private executeSchedule(schedule: AgentSchedule, scheduledFor: number): AgentScheduleExecution {
-    // Idempotency guard: one logical occurrence (scheduleId + scheduledFor)
-    // is admitted at most once, no matter how many times this is called
-    // for it -- overlapping ticks, restart recovery replaying the same
-    // occurrence, etc. This IS the actual "exactly once" property; it does
-    // not depend on timing/ordering of when nextRunAt gets advanced.
-    const existing = this.findExecutionForOccurrence(schedule.id, scheduledFor);
-    if (existing) return existing;
-
-    const executionId = `agent_exec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const execution: AgentScheduleExecution = {
-      id: executionId,
-      scheduleId: schedule.id,
-      agentId: schedule.agentId,
-      agentName: schedule.agentName,
-      status: "queued",
-      scheduledFor,
-      startedAt: null,
-      completedAt: null,
-      sessionId: null,
-      runId: null,
-      error: null,
-    };
-    this.executions.set(execution.id, execution);
-
-    const nextSchedule: AgentSchedule = {
-      ...schedule,
-      lastRunAt: scheduledFor,
-      updatedAt: Date.now(),
-      nextRunAt: schedule.status === "active"
-        ? nextTehranDailyRun(schedule.time, Math.max(Date.now(), scheduledFor + 60_000))
-        : null,
-    };
-    this.schedules.set(schedule.id, nextSchedule);
-
-    // CLAIM, persisted durably BEFORE any run is created -- closes the
-    // crash window between "decided to dispatch this occurrence" and
-    // "actually dispatched it." From this instant on, even a crash before
-    // startScheduledRun ever runs leaves durable evidence this occurrence
-    // was claimed; load()'s missed-run reconciliation checks
-    // findExecutionForOccurrence (not nextRunAt) to decide whether an
-    // occurrence still needs handling, so this alone is what prevents a
-    // duplicate dispatch after restart -- not the order nextRunAt itself
-    // gets written in.
-    this.persist();
-    this.audit("schedule.occurrence_claimed", schedule.id, { scheduleId: schedule.id, scheduledFor });
-
-    const finish = (status: "failed" | "skipped", message: string, eventType: string): AgentScheduleExecution => {
-      const failed: AgentScheduleExecution = {
-        ...execution,
-        status,
-        completedAt: Date.now(),
-        error: message,
-      };
-      this.executions.set(execution.id, failed);
-      this.persist();
-      this.audit(eventType, schedule.id, { scheduleId: schedule.id, scheduledFor, reason: message });
-      this.scheduleTimer();
-      return failed;
-    };
-
-    const agent = discoverAgents().find((item) => item.id === schedule.agentId && item.path === schedule.agentPath);
-    if (!agent || !agent.prompt.trim()) {
-      return finish("failed", `Agent file is missing, unreadable, or empty: ${schedule.agentPath}`, "schedule.occurrence_failed");
-    }
-
-    if (!this.runManager.hasCapacity()) {
-      return finish("skipped", `Maximum concurrent runs reached (${MAX_CONCURRENT_RUNS})`, "schedule.occurrence_skipped");
-    }
-
-    try {
-      const started: AgentScheduleExecution = {
-        ...execution,
-        status: "running",
-        startedAt: Date.now(),
-      };
-      this.executions.set(execution.id, started);
-      const { run, sessionId } = this.startScheduledRun(nextSchedule, agent.prompt, started);
-      const running: AgentScheduleExecution = {
-        ...started,
-        runId: run.id,
-        sessionId,
-      };
-      this.executions.set(execution.id, running);
-      this.executionByRunId.set(run.id, execution.id);
-      this.persist();
-      this.audit("schedule.occurrence_dispatched", schedule.id, { scheduleId: schedule.id, scheduledFor, runId: run.id });
-      this.scheduleTimer();
-      return running;
-    } catch (error) {
-      // Policy/resource denial is distinguished from a generic failure --
-      // spec: "Policy may have changed since schedule creation... Audit
-      // the denial" as its own event, not folded into a generic failure.
-      const eventType = error instanceof PolicyDeniedError || error instanceof ResourceLimitError
-        ? "schedule.occurrence_denied"
-        : "schedule.occurrence_failed";
-      return finish("failed", error instanceof Error ? error.message : "Failed to start scheduled run", eventType);
-    }
-  }
-
-  private persist(): void {
-    writeJsonAtomicSync(AGENT_SCHEDULES_PATH, this.snapshot());
-  }
-
-  private snapshot(): PersistedAgentScheduleState {
-    return {
-      schedules: [...this.schedules.values()].sort((a, b) => a.createdAt - b.createdAt),
-      executions: [...this.executions.values()]
-        .sort((a, b) => Math.max(b.startedAt || 0, b.scheduledFor) - Math.max(a.startedAt || 0, a.scheduledFor))
-        .slice(0, 500),
-    };
   }
 }
 
@@ -4426,14 +3912,6 @@ function isClaudePermissionDenial(input: unknown): input is ClaudePermissionDeni
 function readClaudePermissionDenialText(denial: ClaudePermissionDenial): string {
   const input = truncateText(JSON.stringify(denial.tool_input, null, 2), 800);
   return [`Claude permission denied for ${denial.tool_name}.`, input ? `Input:\n${input}` : ""].filter(Boolean).join("\n\n");
-}
-
-function safeJsonParse<T>(text: string, fallback: T): T {
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    return fallback;
-  }
 }
 
 function ensureDataDir(): void {
@@ -7458,6 +6936,15 @@ const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, pro
     messageStore.markMessageFailed(sessionId, message.id, error instanceof Error ? error.message : "Failed to start scheduled run");
     throw error;
   }
+}, {
+  // Explicit (not relying on the constructor's own defaults) so it's
+  // obvious at the call site that production behavior is unchanged by the
+  // testability seam above -- these are exactly what the hardcoded globals
+  // used to be.
+  discoverAgentsFn: discoverAgents,
+  schedulesPath: AGENT_SCHEDULES_PATH,
+  auditDir: AUDIT_DIR,
+  now: Date.now,
 });
 agentScheduleManager.load();
 
