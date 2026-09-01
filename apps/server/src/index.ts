@@ -15,6 +15,7 @@ import { appendAuditEvent, readAuditEvents, verifyAuditChain } from "./audit/aud
 import { evaluateRunStartPolicy } from "./policy/policy-engine.js";
 import { evaluateResourcePolicy, type ResourceLimits } from "./resources/resource-watchdog.js";
 import { canTransitionMissionStatus } from "./missions/mission-state.js";
+import { pickSafeBaseEnv } from "./security/safe-environment.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -2005,15 +2006,18 @@ function claudeCliSupportsEffort(executable: string): boolean {
 }
 
 function buildClaudeEnvironment(): Record<string, string | undefined> {
-  const env: Record<string, string | undefined> = { ...process.env };
+  // Allowlist, not the full Luma server environment -- see
+  // security/safe-environment.ts for why. CLAUDE_AUTH_MODE=api_key is the
+  // one case that needs a real secret added back in on top of the safe
+  // base, deliberately and by name, not by inheriting everything.
+  const env: Record<string, string | undefined> = pickSafeBaseEnv();
 
   if (CLAUDE_AUTH_MODE === "oauth") {
-    delete env.ANTHROPIC_API_KEY;
-    delete env.ANTHROPIC_AUTH_TOKEN;
-    delete env.CLAUDE_AGENT_SDK_CLIENT_APP;
     return env;
   }
 
+  if (process.env.ANTHROPIC_API_KEY) env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+  if (process.env.ANTHROPIC_AUTH_TOKEN) env.ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN;
   env.CLAUDE_AGENT_SDK_CLIENT_APP = process.env.CLAUDE_AGENT_SDK_CLIENT_APP || "luma-assistant";
   return env;
 }
@@ -2338,6 +2342,12 @@ class RunManager extends EventEmitter {
     const child = spawn(resolvedCodex.command, [...resolvedCodex.prependArgs, ...args], {
       cwd: effectiveConfig.workspace,
       stdio: ["ignore", "pipe", "pipe"],
+      // Allowlist, not the full Luma server environment -- previously
+      // omitted entirely here, which meant child_process.spawn inherited
+      // every env var this server process has, secrets included. Codex's
+      // own auth is stored under its config directory (resolved via
+      // USERPROFILE/HOME, both in the safe base), not passed via env.
+      env: pickSafeBaseEnv(),
       // A real process group on Unix (so cancellation can signal the whole
       // tree, not just this direct child); harmless on Windows, where tree
       // termination instead goes through killProcessTree's taskkill /T.
