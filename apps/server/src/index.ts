@@ -13,6 +13,7 @@ import {
 import { reconcileStaleRunPid } from "./recovery.js";
 import { appendAuditEvent, readAuditEvents, verifyAuditChain } from "./audit/audit-log.js";
 import { evaluateRunStartPolicy } from "./policy/policy-engine.js";
+import { evaluateResourcePolicy, type ResourceLimits } from "./resources/resource-watchdog.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -125,6 +126,14 @@ const CLAUDE_CODE_EXECUTABLE = resolveClaudeCodeExecutable(process.env.CLAUDE_CO
 const DEFAULT_REASONING_EFFORT = normalizeReasoningEffort(process.env.DEFAULT_REASONING_EFFORT);
 const DEFAULT_SANDBOX = resolveDefaultSandboxMode();
 const MAX_CONCURRENT_RUNS = Number(process.env.MAX_CONCURRENT_RUNS || 8);
+// Conservative, backward-compatible-by-default floors: low enough that no
+// existing install with reasonable headroom is affected, high enough to
+// catch a machine that is genuinely almost out of RAM/disk before Luma
+// spawns one more full-permission agent process onto it.
+const RESOURCE_LIMITS: ResourceLimits = {
+  minFreeMemoryBytes: Number(process.env.MIN_FREE_MEMORY_MB || 512) * 1024 * 1024,
+  minFreeDiskBytes: Number(process.env.MIN_FREE_DISK_MB || 1024) * 1024 * 1024,
+};
 const AUTH_PASSWORD = process.env.PASSWORD || process.env.APP_PASSWORD || "";
 const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
 const AUTH_TOKEN_TTL_SECONDS = Number(process.env.AUTH_TOKEN_TTL_SECONDS || 24 * 60 * 60);
@@ -1426,6 +1435,20 @@ class AgentResolutionError extends Error {
   }
 }
 
+class PolicyDeniedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PolicyDeniedError";
+  }
+}
+
+class ResourceLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ResourceLimitError";
+  }
+}
+
 function skillIdForPath(skillPath: string): string {
   const normalized = path.resolve(skillPath).split(path.sep).join(path.posix.sep);
   return `skill_${createHash("sha256").update(normalized).digest("hex").slice(0, 16)}`;
@@ -2182,6 +2205,29 @@ class RunManager extends EventEmitter {
     }
 
     const effectiveConfig = resolveEffectiveRunConfig(config);
+
+    // Enforced HERE, inside startRun itself, rather than only in the
+    // POST /api/runs/start route -- this is the one call path every run
+    // goes through (HTTP, scheduled/cron jobs, reruns), so putting it
+    // anywhere else would leave scheduled runs unprotected.
+    const policyDecision = evaluateRunStartPolicy({
+      operation: "run.start",
+      runner: effectiveConfig.runner,
+      workspace: effectiveConfig.workspace,
+      sandbox: effectiveConfig.sandbox,
+      approvalPolicy: effectiveConfig.approvalPolicy,
+    });
+    this.audit("policy.decision", null, { operation: "run.start", workspace: effectiveConfig.workspace, runner: effectiveConfig.runner, ...policyDecision });
+    if (policyDecision.decision !== "ALLOW") {
+      throw new PolicyDeniedError(policyDecision.reason);
+    }
+
+    const resourceDecision = evaluateResourcePolicy(effectiveConfig.workspace, RESOURCE_LIMITS);
+    this.audit("resource.decision", null, { operation: "run.start", workspace: effectiveConfig.workspace, ...resourceDecision });
+    if (resourceDecision.decision !== "ALLOW") {
+      throw new ResourceLimitError(resourceDecision.reason);
+    }
+
     const resolvedAttachments = resolveRunAttachments(effectiveConfig);
     const resolvedSkills = resolveSelectedSkills(effectiveConfig.workspace, effectiveConfig.skills);
     const resolvedAgents = resolveSelectedAgents(effectiveConfig.agents);
@@ -7798,27 +7844,13 @@ app.post("/api/runs/start", (req, res) => {
     return;
   }
 
-  const policyDecision = evaluateRunStartPolicy({
-    operation: "run.start",
-    runner: parsed.data.runner,
-    workspace,
-    sandbox: parsed.data.sandbox,
-    approvalPolicy: parsed.data.approvalPolicy,
-  });
-  appendAuditEvent(AUDIT_DIR, {
-    event_type: "policy.decision",
-    payload: { operation: "run.start", workspace, runner: parsed.data.runner, ...policyDecision },
-  });
-  // REQUIRE_APPROVAL is a real decision kind this engine can return, but
-  // there is no run-start approval flow to route it into yet (spec: don't
-  // fabricate one) -- treated the same as DENY here rather than silently
-  // downgraded to ALLOW, matching "never silently fall back to a less
-  // secure execution path."
-  if (policyDecision.decision !== "ALLOW") {
-    res.status(403).json(apiErr(policyDecision.reason));
-    return;
-  }
-
+  // Policy and resource admission are enforced inside runManager.startRun
+  // itself (not here) so every call path -- this route, scheduled/cron
+  // runs, reruns -- gets the same protection, not just requests that came
+  // in over HTTP. REQUIRE_APPROVAL is a real decision kind the policy
+  // engine can return, but there is no run-start approval flow to route it
+  // into yet (spec: don't fabricate one) -- PolicyDeniedError covers that
+  // case too rather than silently downgrading it to ALLOW.
   try {
     const run = runManager.startRun({
       runner: parsed.data.runner,
@@ -7837,7 +7869,12 @@ app.post("/api/runs/start", (req, res) => {
 
     res.json(apiOk({ run }));
   } catch (error) {
-    res.status(error instanceof SkillResolutionError || error instanceof AgentResolutionError ? 400 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to start run"));
+    const status = error instanceof SkillResolutionError || error instanceof AgentResolutionError
+      ? 400
+      : error instanceof PolicyDeniedError || error instanceof ResourceLimitError
+        ? 403
+        : 409;
+    res.status(status).json(apiErr(error instanceof Error ? error.message : "Failed to start run"));
   }
 });
 
