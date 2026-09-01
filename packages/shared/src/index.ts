@@ -86,6 +86,18 @@ export type AgentScheduleStatus = z.infer<typeof agentScheduleStatusSchema>;
 export const agentScheduleExecutionStatusSchema = z.enum(["queued", "running", "completed", "failed", "stopped", "skipped"]);
 export type AgentScheduleExecutionStatus = z.infer<typeof agentScheduleExecutionStatusSchema>;
 
+/**
+ * SKIP (default, matches the product's pre-existing behavior exactly --
+ * a schedule that was overdue while Luma was offline previously just had
+ * its next occurrence silently recomputed forward with no record of what
+ * was missed): an occurrence that became due while offline is not
+ * replayed; the schedule just resumes normally.
+ * RUN_ONCE: exactly one catch-up run for the missed occurrence(s) --
+ * never one per missed day/occurrence.
+ */
+export const missedRunPolicySchema = z.enum(["skip", "run_once"]);
+export type MissedRunPolicy = z.infer<typeof missedRunPolicySchema>;
+
 export const agentScheduleSchema = z.object({
   id: z.string().min(1),
   agentId: z.string().min(1),
@@ -97,6 +109,7 @@ export const agentScheduleSchema = z.object({
   createdAt: z.number().int().nonnegative(),
   updatedAt: z.number().int().nonnegative(),
   lastRunAt: z.number().int().nonnegative().nullable(),
+  missedRunPolicy: missedRunPolicySchema.default("skip"),
   runConfig: z.object({
     runner: runRunnerSchema.default("codex"),
     workspace: z.string().min(1),
@@ -105,6 +118,8 @@ export const agentScheduleSchema = z.object({
     sandbox: sandboxSchema,
     approvalPolicy: approvalPolicySchema,
     skills: z.array(selectedSkillRefSchema).max(20).default([]),
+    /** Same meaning as RunConfig.requestedCredentials -- explicit, resolved against this schedule's own project (derived from workspace) at EXECUTION time, never at creation time. */
+    requestedCredentials: z.array(z.string()).max(20).default([]),
   }),
 });
 export type AgentSchedule = z.infer<typeof agentScheduleSchema>;
@@ -135,6 +150,8 @@ export const createAgentScheduleSchema = z.object({
   sandbox: sandboxSchema,
   approvalPolicy: approvalPolicySchema,
   skills: z.array(selectedSkillRefSchema).max(20).default([]),
+  missedRunPolicy: missedRunPolicySchema.default("skip"),
+  requestedCredentials: z.array(z.string()).max(20).default([]),
 });
 export type CreateAgentScheduleInput = z.infer<typeof createAgentScheduleSchema>;
 

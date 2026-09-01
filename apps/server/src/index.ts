@@ -25,6 +25,7 @@ import {
 } from "./credentials/credential-store.js";
 import { resolveAuthorizedCredentials } from "./credentials/credential-resolver.js";
 import { redactKnownSecretValues } from "./security/secret-redaction.js";
+import { decideMissedRun, nextDailyRun } from "./scheduler/schedule-time.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -38,6 +39,7 @@ import {
   createTaskManagerProjectSchema,
   createTaskManagerTaskSchema,
   createTaskManagerUserSchema,
+  agentScheduleSchema,
   createAgentScheduleSchema,
   createCredentialSchema,
   createMissionSchema,
@@ -3148,58 +3150,8 @@ class RunManager extends EventEmitter {
   }
 }
 
-function tehranDateParts(timestamp: number): { year: number; month: number; day: number; hour: number; minute: number; second: number } {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: TEHRAN_TIMEZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(new Date(timestamp));
-  const value = (type: string) => Number(parts.find((part) => part.type === type)?.value || 0);
-  return {
-    year: value("year"),
-    month: value("month"),
-    day: value("day"),
-    hour: value("hour"),
-    minute: value("minute"),
-    second: value("second"),
-  };
-}
-
-function tehranLocalToTimestamp(year: number, month: number, day: number, hour: number, minute: number): number {
-  let guess = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
-  for (let index = 0; index < 3; index += 1) {
-    const actual = tehranDateParts(guess);
-    const actualLocal = Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute, actual.second, 0);
-    const desiredLocal = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
-    const diff = actualLocal - desiredLocal;
-    if (diff === 0) break;
-    guess -= diff;
-  }
-  return guess;
-}
-
-function addLocalDays(year: number, month: number, day: number, days: number): { year: number; month: number; day: number } {
-  const next = new Date(Date.UTC(year, month - 1, day + days, 0, 0, 0, 0));
-  return {
-    year: next.getUTCFullYear(),
-    month: next.getUTCMonth() + 1,
-    day: next.getUTCDate(),
-  };
-}
-
 function nextTehranDailyRun(time: AgentScheduleTime, afterTimestamp = Date.now()): number {
-  const parts = tehranDateParts(afterTimestamp);
-  let candidate = tehranLocalToTimestamp(parts.year, parts.month, parts.day, time.hour, time.minute);
-  if (candidate <= afterTimestamp) {
-    const nextDay = addLocalDays(parts.year, parts.month, parts.day, 1);
-    candidate = tehranLocalToTimestamp(nextDay.year, nextDay.month, nextDay.day, time.hour, time.minute);
-  }
-  return candidate;
+  return nextDailyRun(time, afterTimestamp);
 }
 
 class MissionTransitionError extends Error {
@@ -3394,13 +3346,31 @@ class AgentScheduleManager {
     ) => { run: RunRecord; sessionId: string },
   ) {}
 
+  /** Mirrors RunManager's/MissionManager's own private audit() helper: never throws into a caller. */
+  private audit(eventType: string, scheduleId: string | null, payload: Record<string, unknown> = {}): void {
+    try {
+      appendAuditEvent(AUDIT_DIR, { event_type: eventType, run_id: null, payload: { scheduleId, ...payload } });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[luma-assistant/server] audit log write failed for ${eventType}:`, (err as Error).message);
+    }
+  }
+
+  private findExecutionForOccurrence(scheduleId: string, scheduledFor: number): AgentScheduleExecution | null {
+    for (const execution of this.executions.values()) {
+      if (execution.scheduleId === scheduleId && execution.scheduledFor === scheduledFor) return execution;
+    }
+    return null;
+  }
+
   load(): void {
     const persisted = loadPersistedAgentSchedules();
     const now = Date.now();
-    for (const schedule of persisted.schedules) {
-      const normalized = this.normalizeSchedule(schedule, now);
-      this.schedules.set(normalized.id, normalized);
-    }
+
+    // Executions loaded first so the missed-run reconciliation below can
+    // see what was already durably claimed before whatever stopped the
+    // previous process -- that is the actual "was this occurrence already
+    // handled" signal, not the schedule's own nextRunAt value.
     for (const execution of persisted.executions) {
       const staleRunning = execution.status === "running" || execution.status === "queued";
       this.executions.set(execution.id, {
@@ -3416,8 +3386,69 @@ class AgentScheduleManager {
       });
       if (execution.runId) this.executionByRunId.set(execution.runId, execution.id);
     }
+
+    // Missed-run reconciliation (spec: a schedule due while Luma was
+    // offline must have explicit, not accidental, behavior). Computed
+    // BEFORE normalizeSchedule recomputes nextRunAt forward, using the
+    // RAW persisted nextRunAt -- that's the actual occurrence that was
+    // pending when this process last wrote schedule state.
+    const catchUps: Array<{ schedule: AgentSchedule; missedAt: number }> = [];
+    for (const raw of persisted.schedules) {
+      // Malformed persisted schedule (corrupted/missing/invalid fields)
+      // fails safely: skipped entirely, never partially trusted. zod's
+      // own .default() on missedRunPolicy/requestedCredentials also means
+      // a schedule persisted by an earlier version of this code (neither
+      // field existed yet) parses cleanly with policy "skip" -- the exact
+      // behavior that version actually had -- rather than needing a
+      // separate migration step.
+      const parsed = agentScheduleSchema.safeParse(raw);
+      if (!parsed.success) {
+        this.audit("schedule.load_failed", typeof (raw as { id?: unknown })?.id === "string" ? (raw as { id: string }).id : null, {
+          reason: "malformed persisted schedule",
+        });
+        continue;
+      }
+      const schedule = parsed.data;
+      const originalNextRunAt = schedule.status === "active" ? schedule.nextRunAt : null;
+      const alreadyClaimed = originalNextRunAt !== null && this.findExecutionForOccurrence(schedule.id, originalNextRunAt) !== null;
+
+      const decision = decideMissedRun({
+        nextRunAt: originalNextRunAt,
+        now,
+        policy: schedule.missedRunPolicy,
+        occurrenceAlreadyClaimed: alreadyClaimed,
+      });
+
+      if (decision.action !== "none") {
+        this.audit("schedule.missed_occurrence_handled", schedule.id, {
+          scheduleId: schedule.id,
+          missedOccurrenceAt: decision.missedOccurrenceAt,
+          policy: schedule.missedRunPolicy,
+          decision: decision.action,
+        });
+      } else if (alreadyClaimed) {
+        this.audit("schedule.recovered", schedule.id, { scheduleId: schedule.id, occurrenceAt: originalNextRunAt });
+      }
+
+      const normalized = this.normalizeSchedule(schedule, now);
+      this.schedules.set(normalized.id, normalized);
+      if (decision.action === "run_once") {
+        catchUps.push({ schedule: normalized, missedAt: decision.missedOccurrenceAt });
+      }
+    }
+
     this.persist();
     this.scheduleTimer();
+
+    // Catch-up dispatch happens last, after schedules/executions are fully
+    // loaded and persistence/timer machinery is armed -- executeSchedule
+    // is what actually calls into runManager.startRun (policy, resource
+    // watchdog, credential resolution, process manager, audit), so this
+    // must never run any earlier than the point the rest of startup
+    // already guarantees those are ready.
+    for (const item of catchUps) {
+      this.executeSchedule(item.schedule, item.missedAt);
+    }
   }
 
   list(): Pick<AgentScheduleListResponse, "schedules" | "upcoming" | "executions"> {
@@ -3458,6 +3489,8 @@ class AgentScheduleManager {
     approvalPolicy: RunConfig["approvalPolicy"];
     reasoningEffort: ReasoningEffort;
     skills: SelectedSkillRef[];
+    missedRunPolicy: AgentSchedule["missedRunPolicy"];
+    requestedCredentials: string[];
   }): AgentSchedule {
     const agent = discoverAgents().find((item) => item.id === input.agentId);
     if (!agent) throw new Error("Agent not found");
@@ -3479,6 +3512,7 @@ class AgentScheduleManager {
       createdAt: now,
       updatedAt: now,
       lastRunAt: null,
+      missedRunPolicy: input.missedRunPolicy,
       runConfig: {
         runner: normalizeRunRunner(input.runner),
         workspace: input.workspace,
@@ -3487,11 +3521,19 @@ class AgentScheduleManager {
         sandbox: input.sandbox,
         approvalPolicy: input.approvalPolicy,
         skills: normalizeSelectedSkillRefs(input.skills),
+        requestedCredentials: input.requestedCredentials,
       },
     };
 
     this.schedules.set(schedule.id, schedule);
     this.persist();
+    this.audit("schedule.created", schedule.id, {
+      scheduleId: schedule.id,
+      workspace: schedule.runConfig.workspace,
+      hour: input.hour,
+      minute: input.minute,
+      missedRunPolicy: input.missedRunPolicy,
+    });
     this.scheduleTimer();
     return schedule;
   }
@@ -3508,6 +3550,7 @@ class AgentScheduleManager {
     };
     this.schedules.set(scheduleId, next);
     this.persist();
+    this.audit(status === "active" ? "schedule.enabled" : "schedule.disabled", scheduleId, { scheduleId });
     this.scheduleTimer();
     return next;
   }
@@ -3516,6 +3559,7 @@ class AgentScheduleManager {
     const deleted = this.schedules.delete(scheduleId);
     if (deleted) {
       this.persist();
+      this.audit("schedule.deleted", scheduleId, { scheduleId });
       this.scheduleTimer();
     }
     return deleted;
@@ -3614,6 +3658,14 @@ class AgentScheduleManager {
   }
 
   private executeSchedule(schedule: AgentSchedule, scheduledFor: number): AgentScheduleExecution {
+    // Idempotency guard: one logical occurrence (scheduleId + scheduledFor)
+    // is admitted at most once, no matter how many times this is called
+    // for it -- overlapping ticks, restart recovery replaying the same
+    // occurrence, etc. This IS the actual "exactly once" property; it does
+    // not depend on timing/ordering of when nextRunAt gets advanced.
+    const existing = this.findExecutionForOccurrence(schedule.id, scheduledFor);
+    if (existing) return existing;
+
     const executionId = `agent_exec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const execution: AgentScheduleExecution = {
       id: executionId,
@@ -3640,7 +3692,19 @@ class AgentScheduleManager {
     };
     this.schedules.set(schedule.id, nextSchedule);
 
-    const failExecution = (status: "failed" | "skipped", message: string): AgentScheduleExecution => {
+    // CLAIM, persisted durably BEFORE any run is created -- closes the
+    // crash window between "decided to dispatch this occurrence" and
+    // "actually dispatched it." From this instant on, even a crash before
+    // startScheduledRun ever runs leaves durable evidence this occurrence
+    // was claimed; load()'s missed-run reconciliation checks
+    // findExecutionForOccurrence (not nextRunAt) to decide whether an
+    // occurrence still needs handling, so this alone is what prevents a
+    // duplicate dispatch after restart -- not the order nextRunAt itself
+    // gets written in.
+    this.persist();
+    this.audit("schedule.occurrence_claimed", schedule.id, { scheduleId: schedule.id, scheduledFor });
+
+    const finish = (status: "failed" | "skipped", message: string, eventType: string): AgentScheduleExecution => {
       const failed: AgentScheduleExecution = {
         ...execution,
         status,
@@ -3649,17 +3713,18 @@ class AgentScheduleManager {
       };
       this.executions.set(execution.id, failed);
       this.persist();
+      this.audit(eventType, schedule.id, { scheduleId: schedule.id, scheduledFor, reason: message });
       this.scheduleTimer();
       return failed;
     };
 
     const agent = discoverAgents().find((item) => item.id === schedule.agentId && item.path === schedule.agentPath);
     if (!agent || !agent.prompt.trim()) {
-      return failExecution("failed", `Agent file is missing, unreadable, or empty: ${schedule.agentPath}`);
+      return finish("failed", `Agent file is missing, unreadable, or empty: ${schedule.agentPath}`, "schedule.occurrence_failed");
     }
 
     if (!this.runManager.hasCapacity()) {
-      return failExecution("skipped", `Maximum concurrent runs reached (${MAX_CONCURRENT_RUNS})`);
+      return finish("skipped", `Maximum concurrent runs reached (${MAX_CONCURRENT_RUNS})`, "schedule.occurrence_skipped");
     }
 
     try {
@@ -3678,10 +3743,17 @@ class AgentScheduleManager {
       this.executions.set(execution.id, running);
       this.executionByRunId.set(run.id, execution.id);
       this.persist();
+      this.audit("schedule.occurrence_dispatched", schedule.id, { scheduleId: schedule.id, scheduledFor, runId: run.id });
       this.scheduleTimer();
       return running;
     } catch (error) {
-      return failExecution("failed", error instanceof Error ? error.message : "Failed to start scheduled run");
+      // Policy/resource denial is distinguished from a generic failure --
+      // spec: "Policy may have changed since schedule creation... Audit
+      // the denial" as its own event, not folded into a generic failure.
+      const eventType = error instanceof PolicyDeniedError || error instanceof ResourceLimitError
+        ? "schedule.occurrence_denied"
+        : "schedule.occurrence_failed";
+      return finish("failed", error instanceof Error ? error.message : "Failed to start scheduled run", eventType);
     }
   }
 
@@ -7371,7 +7443,11 @@ const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, pro
       attachments: [],
       skills: schedule.runConfig.skills,
       agents: [],
-      requestedCredentials: [],
+      // Resolved against THIS schedule's own project (derived from
+      // workspace, same as every other execution path) inside
+      // runManager.startRun itself -- policy is re-evaluated at dispatch
+      // time, never grandfathered from when the schedule was created.
+      requestedCredentials: schedule.runConfig.requestedCredentials,
     });
     messageProjector.registerRun(run.id, sessionId);
     messageStore.updateSessionFromRun(run, sessionId);
@@ -7667,6 +7743,8 @@ app.post("/api/agent-schedules", (req, res) => {
       sandbox: parsed.data.sandbox,
       approvalPolicy: parsed.data.approvalPolicy,
       skills: selectedSkills,
+      missedRunPolicy: parsed.data.missedRunPolicy,
+      requestedCredentials: parsed.data.requestedCredentials,
     });
     res.json(apiOk({ schedule }));
   } catch (error) {
