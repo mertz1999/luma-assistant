@@ -187,3 +187,52 @@ export function killProcessTree(pid: number | undefined | null, signal: NodeJS.S
     }
   }
 }
+
+/**
+ * Checks whether a pid genuinely refers to a live process, using the
+ * standard `kill -0` idiom: signal 0 sends no actual signal, only performs
+ * the existence/permission check. Node implements this identically on
+ * Windows (no real POSIX signals there either).
+ */
+export function isProcessAlive(pid: number | undefined | null): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Best-effort command-line lookup for a live pid, used to distinguish "this
+ * is genuinely the process we started" from "the OS reused this pid for an
+ * unrelated process" after a restart -- a real failure mode, not a
+ * hypothetical one, on any long-lived host. Returns null if the pid is
+ * gone, permission is denied, or the lookup itself fails for any reason;
+ * callers must treat null as "cannot verify," never as "confirmed unrelated."
+ */
+export function getProcessCommandLine(pid: number): string | null {
+  try {
+    if (process.platform === "win32") {
+      const result = spawnSync(
+        "wmic",
+        ["process", "where", `ProcessId=${pid}`, "get", "CommandLine", "/value"],
+        { encoding: "utf8", timeout: 5000 },
+      );
+      if (result.status !== 0 || !result.stdout) return null;
+      const match = result.stdout.match(/CommandLine=(.*)/);
+      const line = match?.[1]?.trim();
+      return line || null;
+    }
+
+    const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    if (result.status !== 0 || !result.stdout) return null;
+    return result.stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}

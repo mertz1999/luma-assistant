@@ -6,19 +6,14 @@ import os from "node:os";
 import path from "node:path";
 import {
   ExecutableNotFoundError,
+  getProcessCommandLine,
+  isProcessAlive,
   killProcessTree,
   resolveCommandPath,
   resolveExecutableForSpawn,
 } from "./process-utils.js";
 
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
+const isAlive = isProcessAlive;
 
 function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
   const original = process.platform;
@@ -204,4 +199,42 @@ test("resolveCommandPath + resolveExecutableForSpawn: real Claude Code CLI on th
     child.on("exit", resolve);
   });
   assert.equal(exitCode, 0, "claude --version must exit cleanly via the resolved executable (no ENOENT)");
+});
+
+test("isProcessAlive: true for this process's own pid, false for a definitely-dead one", () => {
+  assert.equal(isProcessAlive(process.pid), true);
+  assert.equal(isProcessAlive(999999), false);
+});
+
+test("isProcessAlive: null/undefined/0/negative are all treated as not alive, not errors", () => {
+  assert.equal(isProcessAlive(null), false);
+  assert.equal(isProcessAlive(undefined), false);
+  assert.equal(isProcessAlive(0), false);
+  assert.equal(isProcessAlive(-5), false);
+});
+
+test("getProcessCommandLine: a real live process's command line contains an identifying marker, and reads null once it's gone", async () => {
+  const marker = `luma-marker-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", marker], {
+    stdio: "ignore",
+  });
+  assert.ok(child.pid, "child must have a pid");
+
+  // Give the OS a moment to make the command line queryable.
+  await new Promise((r) => setTimeout(r, 300));
+
+  const commandLine = getProcessCommandLine(child.pid!);
+  assert.ok(commandLine, "must be able to read the command line of a real live process");
+  assert.ok(
+    commandLine!.includes(marker),
+    `command line should contain the marker argument; got: ${commandLine}`,
+  );
+
+  killProcessTree(child.pid, "SIGKILL");
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && isProcessAlive(child.pid!)) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.equal(isProcessAlive(child.pid!), false, "child must actually be dead before checking the null case");
+  assert.equal(getProcessCommandLine(child.pid!), null, "a dead pid must read as null, not throw or return stale data");
 });

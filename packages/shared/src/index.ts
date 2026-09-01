@@ -245,6 +245,14 @@ export type RunRecord = {
   lastError: string | null;
   changedFiles: string[];
   archivedAt: number | null;
+  /**
+   * PID of the currently (or most recently) spawned Codex/Claude process
+   * for this run, if any is known. Persisted so a server restart can check
+   * whether a run left "running" actually still has a live process behind
+   * it (crash recovery) rather than assuming every restart means the
+   * process died. Cleared (null) once the run reaches a terminal status.
+   */
+  pid: number | null;
   usage: {
     inputTokens?: number;
     outputTokens?: number;

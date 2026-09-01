@@ -5,7 +5,12 @@ import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypt
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
-import { resolveExecutableForSpawn, killProcessTree, resolveCommandPath as resolveCommandPathCrossPlatform } from "./platform/process-utils.js";
+import {
+  resolveExecutableForSpawn,
+  killProcessTree,
+  resolveCommandPath as resolveCommandPathCrossPlatform,
+} from "./platform/process-utils.js";
+import { reconcileStaleRunPid } from "./recovery.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -2023,13 +2028,20 @@ class RunManager extends EventEmitter {
     for (const run of runs) {
       const staleActiveRun = run.status === "queued" || run.status === "running";
       if (staleActiveRun) staleRunIds.add(run.id);
-      const restartMessage = "Server restarted before this run completed. Marked as failed because no live Codex process is attached.";
-      if (staleActiveRun) {
+      // Crash recovery (spec: a restart must not automatically mean the run
+      // is just forgotten). Checks whether the recorded pid is genuinely
+      // still alive -- and, if it looks like a real orphaned Codex/Claude
+      // process, terminates it -- rather than assuming every restart means
+      // the process already died. See recovery.ts for the full reasoning,
+      // including why a pid that can't be confirmed as ours is left
+      // untouched instead of killed.
+      const reconciled = staleActiveRun ? reconcileStaleRunPid(run) : null;
+      if (staleActiveRun && reconciled) {
         appendRunEventToDisk(run.id, {
           id: `evt_${now}_${Math.random().toString(36).slice(2, 8)}`,
           at: now,
           source: "system",
-          text: restartMessage,
+          text: reconciled.message,
         });
       }
       this.runs.set(run.id, {
@@ -2046,7 +2058,8 @@ class RunManager extends EventEmitter {
         },
         // Events stay on disk; only active runs accumulate a short in-memory window.
         events: [],
-        lastError: staleActiveRun ? restartMessage : run.lastError,
+        lastError: staleActiveRun ? (reconciled?.message ?? null) : run.lastError,
+        pid: staleActiveRun ? null : (run.pid ?? null),
         sessionId: typeof run.sessionId === "string"
           ? run.sessionId
           : typeof run.threadId === "string"
@@ -2183,6 +2196,7 @@ class RunManager extends EventEmitter {
       lastError: null,
       changedFiles: [],
       archivedAt: null,
+      pid: null,
       usage: null,
     };
 
@@ -2237,7 +2251,7 @@ class RunManager extends EventEmitter {
       resolvedCodex = resolveExecutableForSpawn(this.codexPath);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to resolve Codex executable";
-      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600) });
+      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
       this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code: null } });
       this.persistState();
       return this.runs.get(runId) ?? record;
@@ -2263,11 +2277,11 @@ class RunManager extends EventEmitter {
       const message = error instanceof Error ? error.message : "Failed to start Codex CLI";
       this.appendEvent(runId, { source: "stderr", text: `${message}\n` });
       this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${message}\n` } });
-      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600) });
+      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
     });
 
     this.activeRuns.set(runId, { runner: "codex", process: child, stdoutBuffer: "", stopRequested: false });
-    this.updateRun(runId, { status: "running" });
+    this.updateRun(runId, { status: "running", pid: child.pid ?? null });
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
     const startedRun = this.runs.get(runId);
     if (startedRun) {
@@ -2312,21 +2326,21 @@ class RunManager extends EventEmitter {
       if (!run) return;
 
       if (stopRequested) {
-        this.updateRun(runId, { status: "stopped" });
+        this.updateRun(runId, { status: "stopped", pid: null });
         this.emitSse({ kind: "run.stopped", runId, at: Date.now() });
         const stoppedRun = this.runs.get(runId);
         if (stoppedRun) {
           this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous: run } as RunLifecycleEvent);
         }
       } else if (code === 0 && run.status !== "failed") {
-        this.updateRun(runId, { status: "completed" });
+        this.updateRun(runId, { status: "completed", pid: null });
         this.emitSse({ kind: "run.completed", runId, at: Date.now() });
         const completedRun = this.runs.get(runId);
         if (completedRun) {
           this.emit("run.lifecycle", { kind: "completed", run: completedRun, previous: run } as RunLifecycleEvent);
         }
       } else if (run.status !== "stopped") {
-        this.updateRun(runId, { status: "failed" });
+        this.updateRun(runId, { status: "failed", pid: null });
         this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code } });
         const failedRun = this.runs.get(runId);
         if (failedRun) {
@@ -2388,7 +2402,7 @@ class RunManager extends EventEmitter {
       resolvedClaude = resolveExecutableForSpawn(executable);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to resolve Claude Code executable";
-      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600) });
+      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
       this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code: null } });
       this.persistState();
       return;
@@ -2414,7 +2428,7 @@ class RunManager extends EventEmitter {
       stopRequested: false,
     };
     this.activeRuns.set(runId, active);
-    this.updateRun(runId, { status: "running" });
+    this.updateRun(runId, { status: "running", pid: child.pid ?? null });
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
     const startedRun = this.runs.get(runId);
     if (startedRun) {
@@ -2457,7 +2471,7 @@ class RunManager extends EventEmitter {
       const message = error instanceof Error ? error.message : "Failed to start Claude CLI";
       this.appendEvent(runId, { source: "stderr", text: `${message}\n` });
       this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${message}\n` } });
-      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600) });
+      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
     });
 
     child.on("exit", (code) => {
@@ -2482,21 +2496,21 @@ class RunManager extends EventEmitter {
     if (!run) return;
 
     if (stopRequested) {
-      this.updateRun(runId, { status: "stopped" });
+      this.updateRun(runId, { status: "stopped", pid: null });
       this.emitSse({ kind: "run.stopped", runId, at: Date.now() });
       const stoppedRun = this.runs.get(runId);
       if (stoppedRun) {
         this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous: run } as RunLifecycleEvent);
       }
     } else if (code === 0 && run.status !== "failed" && run.status !== "stopped") {
-      this.updateRun(runId, { status: "completed" });
+      this.updateRun(runId, { status: "completed", pid: null });
       this.emitSse({ kind: "run.completed", runId, at: Date.now() });
       const completedRun = this.runs.get(runId);
       if (completedRun) {
         this.emit("run.lifecycle", { kind: "completed", run: completedRun, previous: run } as RunLifecycleEvent);
       }
     } else if (run.status !== "stopped") {
-      this.updateRun(runId, { status: "failed" });
+      this.updateRun(runId, { status: "failed", pid: null });
       this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code } });
       const failedRun = this.runs.get(runId);
       if (failedRun) {
