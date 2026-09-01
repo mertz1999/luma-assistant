@@ -12,6 +12,7 @@ import {
 } from "./platform/process-utils.js";
 import { reconcileStaleRunPid } from "./recovery.js";
 import { appendAuditEvent, readAuditEvents, verifyAuditChain } from "./audit/audit-log.js";
+import { evaluateRunStartPolicy } from "./policy/policy-engine.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -7794,6 +7795,27 @@ app.post("/api/runs/start", (req, res) => {
   const workspace = path.resolve(parsed.data.workspace || uiState.activeWorkspace);
   if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
     res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+
+  const policyDecision = evaluateRunStartPolicy({
+    operation: "run.start",
+    runner: parsed.data.runner,
+    workspace,
+    sandbox: parsed.data.sandbox,
+    approvalPolicy: parsed.data.approvalPolicy,
+  });
+  appendAuditEvent(AUDIT_DIR, {
+    event_type: "policy.decision",
+    payload: { operation: "run.start", workspace, runner: parsed.data.runner, ...policyDecision },
+  });
+  // REQUIRE_APPROVAL is a real decision kind this engine can return, but
+  // there is no run-start approval flow to route it into yet (spec: don't
+  // fabricate one) -- treated the same as DENY here rather than silently
+  // downgraded to ALLOW, matching "never silently fall back to a less
+  // secure execution path."
+  if (policyDecision.decision !== "ALLOW") {
+    res.status(403).json(apiErr(policyDecision.reason));
     return;
   }
 
