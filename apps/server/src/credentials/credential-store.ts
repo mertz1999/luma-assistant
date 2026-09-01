@@ -104,7 +104,18 @@ function safeJoinWithinRoot(root: string, ...segments: string[]): string {
   // and re-check containment -- catches a symlink planted somewhere along
   // the path that a pure string check on `target` would miss. Walk up to
   // the nearest existing ancestor since the leaf file may not exist yet
-  // (e.g. about to be created).
+  // (e.g. about to be created) -- but never past `root` itself: if root
+  // doesn't exist on disk at all (e.g. no credential has ever been created
+  // anywhere on this server yet, so data/credentials/ was never made),
+  // there is nothing to canonicalize -- no symlink can be planted inside a
+  // directory tree that doesn't exist -- and without this guard the walk
+  // continues past root into ITS parent, which is always "outside root" by
+  // definition. That false positive broke every credential operation
+  // (including a plain list, which should just return []) on a server
+  // where the credentials root had never been created.
+  if (!fs.existsSync(rootResolved)) {
+    return target;
+  }
   let probe = target;
   while (!fs.existsSync(probe)) {
     const parent = path.dirname(probe);
@@ -117,7 +128,9 @@ function safeJoinWithinRoot(root: string, ...segments: string[]): string {
   } catch {
     realProbe = probe;
   }
-  const realRoot = fs.existsSync(rootResolved) ? fs.realpathSync(rootResolved) : rootResolved;
+  // rootResolved is guaranteed to exist here (the early return above
+  // handles the case where it doesn't).
+  const realRoot = fs.realpathSync(rootResolved);
   const realRelative = path.relative(realRoot, realProbe);
   if (realRelative.startsWith("..") || path.isAbsolute(realRelative)) {
     throw new CredentialPathError(`Resolved path escapes credential store root (symlink?): ${segments.join("/")}`);

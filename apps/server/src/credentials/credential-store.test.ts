@@ -51,6 +51,22 @@ test("createCredential + listCredentials: metadata round-trips, secret is stored
   assert.equal(getCredentialValue(dataDir, projectId, created.id), "ghp_realvalue123");
 });
 
+test("listCredentials: returns [] (not a thrown CredentialPathError) when the credentials root has never been created on this server -- regression, found via a real Luma dogfood run's first-ever GET /api/credentials call", () => {
+  // A brand-new tempDataDir() has no data/credentials/ directory at all --
+  // the exact state of every real server before its first createCredential
+  // call. safeJoinWithinRoot's symlink-containment walk previously had no
+  // base case for "root itself doesn't exist yet": it walked past root up
+  // to root's own parent looking for an existing ancestor, then compared
+  // that ancestor against the still-nonexistent root and found it "outside"
+  // -- a false-positive escape detection that threw on every credential
+  // operation (including a plain list, which should just return []) until
+  // something had created the root directory.
+  const dataDir = tempDataDir();
+  const projectId = deriveProjectId(fs.mkdtempSync(path.join(os.tmpdir(), "luma-ws-")));
+  assert.ok(!fs.existsSync(path.join(dataDir, "credentials")));
+  assert.deepEqual(listCredentials(dataDir, projectId), []);
+});
+
 test("createCredential: rejects a name that doesn't look like an env var", () => {
   const dataDir = tempDataDir();
   const projectId = deriveProjectId(fs.mkdtempSync(path.join(os.tmpdir(), "luma-ws-")));

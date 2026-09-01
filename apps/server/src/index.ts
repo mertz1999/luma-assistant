@@ -2441,7 +2441,15 @@ class RunManager extends EventEmitter {
           this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous: run } as RunLifecycleEvent);
         }
       } else if (code === 0 && run.status !== "failed") {
-        this.updateRun(runId, { status: "completed", pid: null });
+        // lastError can be non-null here even on a genuinely successful
+        // run: it's set (without changing status) whenever Codex reports
+        // ANY command_execution item as failed, including ones the agent
+        // itself recovered from mid-session (e.g. one shell invocation
+        // failed, it retried a different way, and the run still
+        // completed). A stale error from a recovered failure must not
+        // survive onto a run whose actual outcome was success -- a caller
+        // reading lastError on a "completed" run should never see it.
+        this.updateRun(runId, { status: "completed", pid: null, lastError: null });
         this.emitSse({ kind: "run.completed", runId, at: Date.now() });
         const completedRun = this.runs.get(runId);
         if (completedRun) {
@@ -2628,7 +2636,10 @@ class RunManager extends EventEmitter {
         this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous: run } as RunLifecycleEvent);
       }
     } else if (code === 0 && run.status !== "failed" && run.status !== "stopped") {
-      this.updateRun(runId, { status: "completed", pid: null });
+      // See the matching comment in the Codex exit handler: a completed
+      // run must not carry over a stale lastError from a mid-session
+      // failure the agent already recovered from.
+      this.updateRun(runId, { status: "completed", pid: null, lastError: null });
       this.emitSse({ kind: "run.completed", runId, at: Date.now() });
       const completedRun = this.runs.get(runId);
       if (completedRun) {
