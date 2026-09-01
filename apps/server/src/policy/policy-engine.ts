@@ -100,3 +100,51 @@ export function evaluateRunStartPolicy(input: PolicyInput): PolicyDecision {
     reason: "Workspace is a normal project path; no policy rule denied it.",
   };
 }
+
+/**
+ * Per-project credential access (spec: "Credential access must be
+ * deny-by-default"). Pure decision logic only -- it takes the requesting
+ * project/adapter and the target credential's OWN metadata (already
+ * looked up by the caller) and decides; it does not touch the filesystem
+ * or the credential store itself, so it's trivially testable with fabricated
+ * metadata and stays reusable if credential storage ever changes.
+ */
+export interface CredentialAccessInput {
+  requestingProjectId: string;
+  adapter: string;
+  credentialId: string;
+  /** null means the credential id does not exist at all (unknown credential -> deny). */
+  credentialMetadata: { projectId: string; allowedAdapters: string[] } | null;
+}
+
+export function evaluateCredentialAccessPolicy(input: CredentialAccessInput): PolicyDecision {
+  if (!input.credentialMetadata) {
+    return {
+      decision: "DENY",
+      rule: "unknown-credential",
+      reason: `Credential ${input.credentialId} does not exist.`,
+    };
+  }
+
+  if (input.credentialMetadata.projectId !== input.requestingProjectId) {
+    return {
+      decision: "DENY",
+      rule: "cross-project-credential-access",
+      reason: `Credential ${input.credentialId} belongs to a different project; refusing cross-project access.`,
+    };
+  }
+
+  if (!input.credentialMetadata.allowedAdapters.includes(input.adapter)) {
+    return {
+      decision: "DENY",
+      rule: "adapter-not-permitted",
+      reason: `Credential ${input.credentialId} is not authorized for adapter "${input.adapter}" (allowed: ${input.credentialMetadata.allowedAdapters.join(", ") || "none"}).`,
+    };
+  }
+
+  return {
+    decision: "ALLOW",
+    rule: "project-and-adapter-match",
+    reason: `Credential ${input.credentialId} belongs to this project and is authorized for adapter "${input.adapter}".`,
+  };
+}

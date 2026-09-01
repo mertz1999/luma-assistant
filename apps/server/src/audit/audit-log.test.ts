@@ -63,6 +63,27 @@ test("appendAuditEvent: never stores raw secret-shaped values, redacts by key na
   assert.ok(!onDisk.includes("sk-abc123"), "raw secret value must never reach disk");
 });
 
+test("appendAuditEvent: an identifier field (credentialId, apiKeyId, ...) is NOT redacted even though its name contains a secret-shaped word", () => {
+  const dir = tempAuditDir();
+  const entry = appendAuditEvent(dir, {
+    event_type: "credential.access_allowed",
+    payload: {
+      credentialId: "cred_abc123",
+      apiKeyId: "key_def456",
+      projectId: "proj_xyz789",
+      adapter: "codex",
+      decision: "ALLOW",
+      // The actual secret value must still be redacted -- only the
+      // reference/identifier fields are exempt from the pattern match.
+      credentialValue: "this-is-the-real-secret-and-must-be-redacted",
+    },
+  });
+  assert.equal(entry.payload.credentialId, "cred_abc123");
+  assert.equal(entry.payload.apiKeyId, "key_def456");
+  assert.equal(entry.payload.projectId, "proj_xyz789");
+  assert.equal(entry.payload.credentialValue, "[REDACTED]");
+});
+
 test("verifyAuditChain: an untampered chain of many entries verifies ok", () => {
   const dir = tempAuditDir();
   for (let i = 0; i < 20; i += 1) {

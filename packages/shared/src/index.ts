@@ -176,6 +176,15 @@ export const runConfigSchema = z.object({
   attachments: z.array(attachmentRefSchema).max(10).default([]),
   skills: z.array(selectedSkillRefSchema).max(20).default([]),
   agents: z.array(selectedAgentRefSchema).max(10).default([]),
+  /**
+   * Explicit, by-id credential requests for this run's own project
+   * (derived from `workspace`). Deliberately explicit, never inferred from
+   * prompt/command text -- a task with no declared requirement receives no
+   * project credential, only the safe base environment. Empty by default
+   * so every existing caller that doesn't know about this field keeps
+   * getting exactly the safe-base-only environment from the previous phase.
+   */
+  requestedCredentials: z.array(z.string()).max(20).default([]),
 });
 export type RunConfig = z.infer<typeof runConfigSchema>;
 
@@ -192,6 +201,7 @@ export const startRunSchema = z.object({
   attachments: z.array(attachmentRefSchema).max(10).default([]),
   skills: z.array(selectedSkillRefSchema).max(20).default([]),
   agents: z.array(selectedAgentRefSchema).max(10).default([]),
+  requestedCredentials: z.array(z.string()).max(20).default([]),
 });
 export type StartRunInput = z.infer<typeof startRunSchema>;
 
@@ -301,6 +311,20 @@ export const setMissionStatusSchema = z.object({
   status: missionStatusSchema,
   note: z.string().optional(),
 });
+
+/**
+ * A project is identified by its workspace path, the same way a mission
+ * is -- never a raw project id round-tripped from the client. The server
+ * derives the actual (opaque, filesystem-safe) project id from this path;
+ * see apps/server/src/credentials/credential-store.ts:deriveProjectId.
+ */
+export const createCredentialSchema = z.object({
+  workspace: z.string().min(1),
+  name: z.string().min(1),
+  allowedAdapters: z.array(runRunnerSchema).min(1),
+  value: z.string().min(1),
+});
+export type CreateCredentialInput = z.infer<typeof createCredentialSchema>;
 
 export type TokenUsageSummary = {
   inputTokens: number;

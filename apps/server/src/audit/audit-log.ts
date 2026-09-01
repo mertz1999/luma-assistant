@@ -67,10 +67,19 @@ function canonicalJson(value: unknown): string {
 // raw secrets" guarantee, not a UX nicety.
 const SECRET_KEY_PATTERN = /password|secret|token|api[_-]?key|credential|authorization|cookie/i;
 
+// An identifier (credentialId, apiKeyId, secretId, ...) is a REFERENCE, not
+// the sensitive value itself -- exactly the kind of field the credential
+// audit trail needs visible ("Safe audit payload" includes credential_id
+// by name). Checked before SECRET_KEY_PATTERN so e.g. "credentialId" is
+// never swept up just because it contains the substring "credential".
+const IDENTIFIER_KEY_SUFFIX = /id$/i;
+
 function redactPayload(payload: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(payload)) {
-    if (SECRET_KEY_PATTERN.test(key)) {
+    if (IDENTIFIER_KEY_SUFFIX.test(key)) {
+      out[key] = value;
+    } else if (SECRET_KEY_PATTERN.test(key)) {
       out[key] = "[REDACTED]";
     } else if (value && typeof value === "object" && !Array.isArray(value)) {
       out[key] = redactPayload(value as Record<string, unknown>);

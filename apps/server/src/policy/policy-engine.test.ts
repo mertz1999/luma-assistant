@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { evaluateRunStartPolicy } from "./policy-engine.js";
+import { evaluateCredentialAccessPolicy, evaluateRunStartPolicy } from "./policy-engine.js";
 
 function input(workspace: string) {
   return { operation: "run.start" as const, runner: "codex", workspace, sandbox: "danger-full-access", approvalPolicy: "never" };
@@ -44,5 +44,48 @@ test("evaluateRunStartPolicy: allows a normal, unrelated project path (regressio
 
 test("evaluateRunStartPolicy: allows a temp-directory workspace, the shape this session's own runtime-verification runs actually use", () => {
   const result = evaluateRunStartPolicy(input(path.join(os.tmpdir(), "some-run-workspace")));
+  assert.equal(result.decision, "ALLOW");
+});
+
+test("evaluateCredentialAccessPolicy: unknown credential (no metadata) is denied", () => {
+  const result = evaluateCredentialAccessPolicy({
+    requestingProjectId: "proj_a",
+    adapter: "codex",
+    credentialId: "cred_missing",
+    credentialMetadata: null,
+  });
+  assert.equal(result.decision, "DENY");
+  assert.equal(result.rule, "unknown-credential");
+});
+
+test("evaluateCredentialAccessPolicy: cross-project access is denied even with a valid credential and adapter", () => {
+  const result = evaluateCredentialAccessPolicy({
+    requestingProjectId: "proj_b",
+    adapter: "codex",
+    credentialId: "cred_a1",
+    credentialMetadata: { projectId: "proj_a", allowedAdapters: ["codex"] },
+  });
+  assert.equal(result.decision, "DENY");
+  assert.equal(result.rule, "cross-project-credential-access");
+});
+
+test("evaluateCredentialAccessPolicy: same project, adapter not in allowedAdapters is denied", () => {
+  const result = evaluateCredentialAccessPolicy({
+    requestingProjectId: "proj_a",
+    adapter: "claude",
+    credentialId: "cred_a1",
+    credentialMetadata: { projectId: "proj_a", allowedAdapters: ["codex"] },
+  });
+  assert.equal(result.decision, "DENY");
+  assert.equal(result.rule, "adapter-not-permitted");
+});
+
+test("evaluateCredentialAccessPolicy: same project, allowed adapter is allowed", () => {
+  const result = evaluateCredentialAccessPolicy({
+    requestingProjectId: "proj_a",
+    adapter: "codex",
+    credentialId: "cred_a1",
+    credentialMetadata: { projectId: "proj_a", allowedAdapters: ["codex", "claude"] },
+  });
   assert.equal(result.decision, "ALLOW");
 });

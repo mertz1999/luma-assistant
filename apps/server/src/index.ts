@@ -16,6 +16,15 @@ import { evaluateRunStartPolicy } from "./policy/policy-engine.js";
 import { evaluateResourcePolicy, type ResourceLimits } from "./resources/resource-watchdog.js";
 import { canTransitionMissionStatus } from "./missions/mission-state.js";
 import { pickSafeBaseEnv } from "./security/safe-environment.js";
+import {
+  createCredential,
+  deleteCredential,
+  deriveProjectId,
+  listCredentials,
+  CredentialPathError,
+} from "./credentials/credential-store.js";
+import { resolveAuthorizedCredentials } from "./credentials/credential-resolver.js";
+import { redactKnownSecretValues } from "./security/secret-redaction.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -30,6 +39,7 @@ import {
   createTaskManagerTaskSchema,
   createTaskManagerUserSchema,
   createAgentScheduleSchema,
+  createCredentialSchema,
   createMissionSchema,
   setMissionStatusSchema,
   rerunSchema,
@@ -109,6 +119,7 @@ const RUNS_PATH = path.resolve(rootDir, "data/runs.json");
 const RUN_EVENTS_DIR = path.resolve(rootDir, "data/runs");
 const MISSIONS_PATH = path.resolve(rootDir, "data/missions.json");
 const AUDIT_DIR = path.resolve(rootDir, "data/audit");
+const DATA_DIR = path.resolve(rootDir, "data");
 const AGENTS_DIR = path.resolve(rootDir, "agents");
 const CLAUDE_BYPASS_AS_ROOT = process.env.CLAUDE_BYPASS_AS_ROOT === "1";
 const REPO_SKILLS_DIR = path.resolve(rootDir, "skills");
@@ -2283,8 +2294,58 @@ class RunManager extends EventEmitter {
       approvalPolicy: effectiveConfig.approvalPolicy,
     });
 
+    // Per-project credential resolution: explicit, deny-by-default, and
+    // the ONLY place a credential's actual value is read off disk for this
+    // run. A run with no requestedCredentials (the default, and every run
+    // started before this field existed) resolves to an empty env here --
+    // no project secret appears "magically." See credentials/ for why a
+    // project's identity is derived from its workspace path rather than a
+    // separate registry, and audit-log.ts's IDENTIFIER_KEY_SUFFIX rule for
+    // why `credentialId` stays visible in the audit trail below while any
+    // value never does.
+    const projectId = deriveProjectId(effectiveConfig.workspace);
+    let credentialEnv: Record<string, string> = {};
+    if (effectiveConfig.requestedCredentials.length > 0) {
+      for (const credentialId of effectiveConfig.requestedCredentials) {
+        this.audit("credential.access_requested", runId, { projectId, credentialId, adapter: effectiveConfig.runner });
+      }
+      let resolved: ReturnType<typeof resolveAuthorizedCredentials>;
+      try {
+        resolved = resolveAuthorizedCredentials({
+          dataDir: DATA_DIR,
+          projectId,
+          adapter: effectiveConfig.runner,
+          credentialIds: effectiveConfig.requestedCredentials,
+        });
+      } catch (err) {
+        for (const credentialId of effectiveConfig.requestedCredentials) {
+          this.audit("credential.access_failed", runId, { projectId, credentialId, adapter: effectiveConfig.runner, error: (err as Error).message });
+        }
+        throw err;
+      }
+      for (const decision of resolved.decisions) {
+        this.audit(decision.decision === "ALLOW" ? "credential.access_allowed" : "credential.access_denied", runId, {
+          projectId,
+          credentialId: decision.credentialId,
+          adapter: effectiveConfig.runner,
+          rule: decision.rule,
+        });
+        if (decision.decision === "ALLOW") {
+          this.audit("credential.injected", runId, { projectId, credentialId: decision.credentialId, adapter: effectiveConfig.runner });
+        }
+      }
+      credentialEnv = resolved.env;
+    }
+    // Exact-value redaction target list: only values THIS run was actually
+    // authorized to receive -- see security/secret-redaction.ts. Applied to
+    // every raw stdout/stderr chunk below, before any parsing/storage/SSE
+    // broadcast, so a credential value that ends up in the agent's own
+    // output (deliberately or by prompt injection) never reaches disk or
+    // the UI unredacted.
+    const knownSecretValues = Object.values(credentialEnv).filter((v): v is string => Boolean(v));
+
     if (effectiveConfig.runner === "claude") {
-      this.startClaudeExecution(runId, effectiveConfig, prompt);
+      this.startClaudeExecution(runId, effectiveConfig, prompt, credentialEnv);
       this.persistState();
       return record;
     }
@@ -2347,7 +2408,10 @@ class RunManager extends EventEmitter {
       // every env var this server process has, secrets included. Codex's
       // own auth is stored under its config directory (resolved via
       // USERPROFILE/HOME, both in the safe base), not passed via env.
-      env: pickSafeBaseEnv(),
+      // A fresh object per spawn (SAFE_BASE + this run's own authorized
+      // credentials only) -- never the global process.env, never mutated
+      // in place, never shared with any other run's environment.
+      env: { ...pickSafeBaseEnv(), ...credentialEnv },
       // A real process group on Unix (so cancellation can signal the whole
       // tree, not just this direct child); harmless on Windows, where tree
       // termination instead goes through killProcessTree's taskkill /T.
@@ -2386,7 +2450,7 @@ class RunManager extends EventEmitter {
     child.stdout.on("data", (chunk: Buffer) => {
       const active = this.activeRuns.get(runId);
       if (!active || active.runner !== "codex") return;
-      active.stdoutBuffer += chunk.toString("utf8");
+      active.stdoutBuffer += redactKnownSecretValues(chunk.toString("utf8"), knownSecretValues);
       let idx = active.stdoutBuffer.indexOf("\n");
       while (idx >= 0) {
         const line = active.stdoutBuffer.slice(0, idx).trim();
@@ -2397,7 +2461,7 @@ class RunManager extends EventEmitter {
     });
 
     child.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
+      const text = redactKnownSecretValues(chunk.toString("utf8"), knownSecretValues);
       for (const line of text.split(/\r?\n/)) {
         if (!line.trim()) continue;
         if (isBenignCodexStderr(line)) continue;
@@ -2457,11 +2521,14 @@ class RunManager extends EventEmitter {
     return record;
   }
 
-  private startClaudeExecution(runId: string, effectiveConfig: RunConfig, prompt: string): void {
+  private startClaudeExecution(runId: string, effectiveConfig: RunConfig, prompt: string, credentialEnv: Record<string, string> = {}): void {
     const executable = CLAUDE_CODE_EXECUTABLE || "claude";
     const effort = resolveClaudeCliEffort(effectiveConfig.reasoningEffort);
     const supportsEffort = claudeCliSupportsEffort(executable);
-    const env = buildClaudeEnvironment();
+    // Fresh object per run (SAFE_BASE + this run's own authorized
+    // credentials only), same guarantee as the Codex path above.
+    const env = { ...buildClaudeEnvironment(), ...credentialEnv };
+    const knownSecretValues = Object.values(credentialEnv).filter((v): v is string => Boolean(v));
     const permissionMode = effectiveConfig.planMode ? "dontAsk" : "bypassPermissions";
     const args = [
       "-p",
@@ -2552,7 +2619,7 @@ class RunManager extends EventEmitter {
     child.stdout.on("data", (chunk: Buffer) => {
       const active = this.activeRuns.get(runId);
       if (!active || active.runner !== "claude") return;
-      active.stdoutBuffer += chunk.toString("utf8");
+      active.stdoutBuffer += redactKnownSecretValues(chunk.toString("utf8"), knownSecretValues);
       let idx = active.stdoutBuffer.indexOf("\n");
       while (idx >= 0) {
         const line = active.stdoutBuffer.slice(0, idx).trim();
@@ -2565,7 +2632,7 @@ class RunManager extends EventEmitter {
     child.stderr.on("data", (chunk: Buffer) => {
       const active = this.activeRuns.get(runId);
       if (!active || active.runner !== "claude") return;
-      active.stderrBuffer += chunk.toString("utf8");
+      active.stderrBuffer += redactKnownSecretValues(chunk.toString("utf8"), knownSecretValues);
       let idx = active.stderrBuffer.search(/\r?\n/);
       while (idx >= 0) {
         const line = active.stderrBuffer.slice(0, idx).trim();
@@ -6664,6 +6731,7 @@ class OutboxProcessor {
           attachments: item.attachments,
           skills: item.skills,
           agents: item.agents,
+          requestedCredentials: [],
         });
 
         item.latestRunId = run.id;
@@ -7303,6 +7371,7 @@ const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, pro
       attachments: [],
       skills: schedule.runConfig.skills,
       agents: [],
+      requestedCredentials: [],
     });
     messageProjector.registerRun(run.id, sessionId);
     messageStore.updateSessionFromRun(run, sessionId);
@@ -7744,6 +7813,82 @@ app.post("/api/missions/:missionId/status", (req, res) => {
   }
 });
 
+// Minimal credential management interface -- deliberately no UI this
+// phase, matching "avoid building UI for this phase." A project is
+// identified by its workspace path everywhere here, exactly like
+// missions; the server derives the actual opaque project id internally
+// (see credentials/credential-store.ts:deriveProjectId) -- a raw project
+// id is never accepted from a client for filesystem purposes.
+app.get("/api/credentials", (req, res) => {
+  const workspaceInput = typeof req.query.workspace === "string" ? req.query.workspace : "";
+  if (!workspaceInput) {
+    res.status(400).json(apiErr("workspace query parameter is required"));
+    return;
+  }
+  const workspace = path.resolve(workspaceInput);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+  const projectId = deriveProjectId(workspace);
+  // Metadata only -- listing NEVER reads secret material off disk.
+  res.json(apiOk({ credentials: listCredentials(DATA_DIR, projectId) }));
+});
+
+app.post("/api/credentials", (req, res) => {
+  const parsed = createCredentialSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid credential payload"));
+    return;
+  }
+  const workspace = path.resolve(parsed.data.workspace);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+  const projectId = deriveProjectId(workspace);
+  try {
+    const credential = createCredential(DATA_DIR, projectId, {
+      name: parsed.data.name,
+      allowedAdapters: parsed.data.allowedAdapters,
+      value: parsed.data.value,
+    });
+    appendAuditEvent(AUDIT_DIR, {
+      event_type: "credential.created",
+      payload: { projectId, credentialId: credential.id, name: credential.name, allowedAdapters: credential.allowedAdapters },
+    });
+    // The descriptor returned here is metadata only -- CredentialDescriptor
+    // has no value field at all, so there is nothing to accidentally echo.
+    res.json(apiOk({ credential }));
+  } catch (error) {
+    res.status(error instanceof CredentialPathError ? 400 : 500).json(apiErr(error instanceof Error ? error.message : "Failed to create credential"));
+  }
+});
+
+app.delete("/api/credentials/:credentialId", (req, res) => {
+  const workspaceInput = typeof req.query.workspace === "string" ? req.query.workspace : "";
+  if (!workspaceInput) {
+    res.status(400).json(apiErr("workspace query parameter is required"));
+    return;
+  }
+  const workspace = path.resolve(workspaceInput);
+  if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+    res.status(400).json(apiErr("Workspace does not exist"));
+    return;
+  }
+  const projectId = deriveProjectId(workspace);
+  const removed = deleteCredential(DATA_DIR, projectId, req.params.credentialId);
+  appendAuditEvent(AUDIT_DIR, {
+    event_type: "credential.deleted",
+    payload: { projectId, credentialId: req.params.credentialId, removed },
+  });
+  if (!removed) {
+    res.status(404).json(apiErr("Credential not found"));
+    return;
+  }
+  res.json(apiOk({ removed: true }));
+});
+
 app.post("/api/workspaces/active", (req, res) => {
   const parsed = setWorkspaceSchema.safeParse(req.body || {});
   if (!parsed.success) {
@@ -8103,6 +8248,7 @@ app.post("/api/runs/start", (req, res) => {
       attachments: parsed.data.attachments,
       skills: parsed.data.skills,
       agents: parsed.data.agents,
+      requestedCredentials: parsed.data.requestedCredentials,
     });
 
     res.json(apiOk({ run }));
