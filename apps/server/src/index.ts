@@ -311,11 +311,12 @@ type ClaudeActiveRun = {
 type ActiveRun = CodexActiveRun | ClaudeActiveRun;
 
 type ClaudeToolUseInfo = {
-  itemType: "command_execution" | "mcp_tool_call";
+  itemType: "command_execution" | "mcp_tool_call" | "file_change";
   server?: string;
   tool?: string;
   command?: string;
   description?: string;
+  filePath?: string;
 };
 
 type ClaudePermissionDenial = {
@@ -2832,6 +2833,17 @@ class RunManager extends EventEmitter {
         type: "item.completed",
         item: buildClaudeToolItem(result.toolUseId, info, undefined, result.content, result.isError, true),
       });
+      // Mirrors the Codex path's itemType === "file_change" handling in
+      // handleStdoutLine (see there for the shared reasoning): only
+      // recorded once the write actually succeeded, not on tool_use request.
+      if (info.itemType === "file_change" && !result.isError && info.filePath) {
+        const run = this.runs.get(runId);
+        if (run) {
+          const current = new Set(run.changedFiles);
+          current.add(info.filePath);
+          this.updateRun(runId, { changedFiles: [...current] });
+        }
+      }
     }
 
     if (message.isReplay !== true) return;
@@ -3757,6 +3769,20 @@ function classifyClaudeToolUse(toolUse: { name: string; input: unknown }): Claud
       description,
     };
   }
+  // Claude's own file-editing tools -- these actually write to disk (unlike
+  // the generic mcp_tool_call bucket below), so a run's changedFiles must
+  // reflect them the same way Codex's item.file_change events already do.
+  // Only tracked on tool_result completion (see handleClaudeUserMessage),
+  // not here on request, since the write hasn't happened yet at this point.
+  if (
+    (toolUse.name === "Write" || toolUse.name === "Edit" || toolUse.name === "MultiEdit")
+    && typeof input.file_path === "string"
+  ) {
+    return { itemType: "file_change", filePath: input.file_path };
+  }
+  if (toolUse.name === "NotebookEdit" && typeof input.notebook_path === "string") {
+    return { itemType: "file_change", filePath: input.notebook_path };
+  }
   return {
     itemType: "mcp_tool_call",
     server: "claude",
@@ -3783,6 +3809,15 @@ function buildClaudeToolItem(
       status,
       aggregated_output: output,
       exit_code: completed ? (isError ? 1 : 0) : null,
+    };
+  }
+
+  if (info.itemType === "file_change") {
+    return {
+      id,
+      type: "file_change",
+      changes: info.filePath ? [{ path: info.filePath, kind: "update" }] : [],
+      status,
     };
   }
 
