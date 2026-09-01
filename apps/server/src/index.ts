@@ -5,6 +5,7 @@ import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypt
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
+import { resolveExecutableForSpawn, killProcessTree, resolveCommandPath as resolveCommandPathCrossPlatform } from "./platform/process-utils.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -1932,19 +1933,13 @@ function loadNodePty(): NodePtyModule | null {
 }
 
 function commandExists(command: string): boolean {
-  return Boolean(resolveCommandPath(command));
-}
-
-function resolveCommandPath(command: string): string {
-  const result = spawnSync("which", [command], { encoding: "utf8" });
-  if (result.status !== 0 || !result.stdout.trim()) return "";
-  return result.stdout.trim().split(/\r?\n/)[0]?.trim() || "";
+  return Boolean(resolveCommandPathCrossPlatform(command));
 }
 
 function resolveClaudeCodeExecutable(configured: string | undefined): string {
   const explicit = (configured || "").trim();
   if (explicit) return explicit;
-  return resolveCommandPath("claude");
+  return resolveCommandPathCrossPlatform("claude");
 }
 
 const claudeEffortSupportCache = new Map<string, boolean>();
@@ -1954,9 +1949,20 @@ function claudeCliSupportsEffort(executable: string): boolean {
   const cached = claudeEffortSupportCache.get(command);
   if (cached !== undefined) return cached;
 
-  const result = spawnSync(command, ["-p", "--help"], { encoding: "utf8", timeout: 5000 });
-  const output = `${result.stdout || ""}\n${result.stderr || ""}`;
-  const supported = !result.error && output.includes("--effort");
+  let supported = false;
+  try {
+    const resolved = resolveExecutableForSpawn(command);
+    const result = spawnSync(resolved.command, [...resolved.prependArgs, "-p", "--help"], {
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    const output = `${result.stdout || ""}\n${result.stderr || ""}`;
+    supported = !result.error && output.includes("--effort");
+  } catch {
+    // ExecutableNotFoundError or any other resolution failure -> treat as
+    // "effort flag not confirmed supported", same as the prior ENOENT case.
+    supported = false;
+  }
   claudeEffortSupportCache.set(command, supported);
   return supported;
 }
@@ -1973,15 +1979,6 @@ function buildClaudeEnvironment(): Record<string, string | undefined> {
 
   env.CLAUDE_AGENT_SDK_CLIENT_APP = process.env.CLAUDE_AGENT_SDK_CLIENT_APP || "luma-assistant";
   return env;
-}
-
-function getChildPids(pid: number): number[] {
-  const result = spawnSync("pgrep", ["-P", String(pid)], { encoding: "utf8" });
-  if (result.status !== 0 || !result.stdout) return [];
-  return result.stdout
-    .split(/\s+/)
-    .map((value) => Number(value.trim()))
-    .filter((value) => Number.isInteger(value) && value > 0);
 }
 
 function resolveTerminalShell(): string {
@@ -2235,13 +2232,39 @@ class RunManager extends EventEmitter {
           prompt,
         ];
 
-    const child = spawn(this.codexPath, args, {
+    let resolvedCodex: { command: string; prependArgs: string[] };
+    try {
+      resolvedCodex = resolveExecutableForSpawn(this.codexPath);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to resolve Codex executable";
+      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600) });
+      this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code: null } });
+      this.persistState();
+      return this.runs.get(runId) ?? record;
+    }
+
+    const child = spawn(resolvedCodex.command, [...resolvedCodex.prependArgs, ...args], {
       cwd: effectiveConfig.workspace,
       stdio: ["ignore", "pipe", "pipe"],
+      // A real process group on Unix (so cancellation can signal the whole
+      // tree, not just this direct child); harmless on Windows, where tree
+      // termination instead goes through killProcessTree's taskkill /T.
+      detached: process.platform !== "win32",
     });
     if (!child.stdout || !child.stderr) {
       throw new Error("Failed to initialize codex process streams");
     }
+
+    child.on("error", (error) => {
+      // Previously unhandled: an 'error' event with zero listeners throws
+      // inside EventEmitter, which (there is no global uncaughtException
+      // handler in this process) would crash the entire Luma server on any
+      // Codex spawn failure. Mirrors the Claude path's existing handler.
+      const message = error instanceof Error ? error.message : "Failed to start Codex CLI";
+      this.appendEvent(runId, { source: "stderr", text: `${message}\n` });
+      this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${message}\n` } });
+      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600) });
+    });
 
     this.activeRuns.set(runId, { runner: "codex", process: child, stdoutBuffer: "", stopRequested: false });
     this.updateRun(runId, { status: "running" });
@@ -2360,10 +2383,22 @@ class RunManager extends EventEmitter {
     if (effectiveConfig.sessionId) args.push("--resume", effectiveConfig.sessionId);
     args.push("--", prompt);
 
-    const child = spawn(executable, args, {
+    let resolvedClaude: { command: string; prependArgs: string[] };
+    try {
+      resolvedClaude = resolveExecutableForSpawn(executable);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to resolve Claude Code executable";
+      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600) });
+      this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code: null } });
+      this.persistState();
+      return;
+    }
+
+    const child = spawn(resolvedClaude.command, [...resolvedClaude.prependArgs, ...args], {
       cwd: effectiveConfig.workspace,
       stdio: ["ignore", "pipe", "pipe"],
       env,
+      detached: process.platform !== "win32",
     });
 
     if (!child.stdout || !child.stderr) {
@@ -2721,20 +2756,25 @@ class RunManager extends EventEmitter {
     if (!active) return false;
 
     active.stopRequested = true;
-    if (active.runner === "claude") {
-      active.process.kill("SIGINT");
-    } else {
-      active.process.kill("SIGINT");
-    }
+    // First stage: ask only the direct process to shut down gracefully.
+    // This does NOT reach any subprocess Codex/Claude spawned on its own --
+    // that guarantee comes from the escalation below, which is why it is
+    // not optional even though most runs will exit cleanly right here.
+    active.process.kill("SIGINT");
 
     setTimeout(() => {
       const running = this.activeRuns.get(runId);
       if (!running) return;
-      running.process.kill("SIGTERM");
+      // Escalation: terminate the ENTIRE process tree, not just the direct
+      // child. Without this, a Codex/Claude run that itself spawned a
+      // shell command, linter, or nested process would leave that
+      // subprocess running as an orphan after Luma marks the task
+      // cancelled/stopped.
+      killProcessTree(running.process.pid, "SIGTERM");
       setTimeout(() => {
         const stillRunning = this.activeRuns.get(runId);
         if (!stillRunning) return;
-        stillRunning.process.kill("SIGKILL");
+        killProcessTree(stillRunning.process.pid, "SIGKILL");
       }, 2500);
     }, 2500);
 
@@ -3608,27 +3648,10 @@ class TerminalManager extends EventEmitter {
   }
 
   private signalProcessTree(rootPid: number | undefined, signal: NodeJS.Signals): void {
-    if (!rootPid || rootPid <= 0 || process.platform === "win32") return;
-    const visited = new Set<number>();
-    const queue: number[] = [rootPid];
-
-    while (queue.length > 0) {
-      const pid = queue.shift();
-      if (!pid || visited.has(pid)) continue;
-      visited.add(pid);
-      for (const child of getChildPids(pid)) {
-        if (!visited.has(child)) queue.push(child);
-      }
-    }
-
-    const ordered = [...visited].sort((a, b) => b - a);
-    for (const pid of ordered) {
-      try {
-        process.kill(pid, signal);
-      } catch {
-        // ignore missing-process or permission errors
-      }
-    }
+    // Delegates to the shared, tested cross-platform implementation --
+    // this used to be a no-op on Windows (killed only the direct child),
+    // same underlying gap fixed for RunManager's Codex/Claude runs.
+    killProcessTree(rootPid, signal);
   }
 }
 
