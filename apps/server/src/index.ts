@@ -11,6 +11,7 @@ import {
   resolveCommandPath as resolveCommandPathCrossPlatform,
 } from "./platform/process-utils.js";
 import { reconcileStaleRunPid } from "./recovery.js";
+import { appendAuditEvent, readAuditEvents, verifyAuditChain } from "./audit/audit-log.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -98,6 +99,7 @@ const require = createRequire(import.meta.url);
 const APP_STATE_PATH = path.resolve(rootDir, "data/ui-state.json");
 const RUNS_PATH = path.resolve(rootDir, "data/runs.json");
 const RUN_EVENTS_DIR = path.resolve(rootDir, "data/runs");
+const AUDIT_DIR = path.resolve(rootDir, "data/audit");
 const AGENTS_DIR = path.resolve(rootDir, "agents");
 const CLAUDE_BYPASS_AS_ROOT = process.env.CLAUDE_BYPASS_AS_ROOT === "1";
 const REPO_SKILLS_DIR = path.resolve(rootDir, "skills");
@@ -2022,6 +2024,16 @@ class RunManager extends EventEmitter {
     super();
   }
 
+  /** Append-only audit trail entry point -- see audit/audit-log.ts. Never throws into a caller: a logging failure must not break the run it's describing. */
+  private audit(eventType: string, runId: string | null, payload: Record<string, unknown> = {}): void {
+    try {
+      appendAuditEvent(AUDIT_DIR, { event_type: eventType, run_id: runId, payload });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[luma-assistant/server] audit log write failed for ${eventType}:`, (err as Error).message);
+    }
+  }
+
   loadPersisted(runs: RunRecord[], approvals: ApprovalQueueItem[]): void {
     const now = Date.now();
     const staleRunIds = new Set<string>();
@@ -2042,6 +2054,11 @@ class RunManager extends EventEmitter {
           at: now,
           source: "system",
           text: reconciled.message,
+        });
+        this.audit("run.recovery", run.id, {
+          previousPid: run.pid ?? null,
+          orphanKilled: reconciled.orphanKilled,
+          message: reconciled.message,
         });
       }
       this.runs.set(run.id, {
@@ -2201,6 +2218,13 @@ class RunManager extends EventEmitter {
     };
 
     this.runs.set(runId, record);
+    this.audit("run.created", runId, {
+      runner: effectiveConfig.runner,
+      workspace: effectiveConfig.workspace,
+      model: effectiveConfig.model,
+      sandbox: effectiveConfig.sandbox,
+      approvalPolicy: effectiveConfig.approvalPolicy,
+    });
 
     if (effectiveConfig.runner === "claude") {
       this.startClaudeExecution(runId, effectiveConfig, prompt);
@@ -2252,6 +2276,7 @@ class RunManager extends EventEmitter {
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to resolve Codex executable";
       this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.audit("run.spawn_failed", runId, { runner: "codex", stage: "resolve", message });
       this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code: null } });
       this.persistState();
       return this.runs.get(runId) ?? record;
@@ -2278,10 +2303,17 @@ class RunManager extends EventEmitter {
       this.appendEvent(runId, { source: "stderr", text: `${message}\n` });
       this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${message}\n` } });
       this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.audit("run.spawn_failed", runId, { runner: "codex", stage: "process_error", message });
     });
 
     this.activeRuns.set(runId, { runner: "codex", process: child, stdoutBuffer: "", stopRequested: false });
     this.updateRun(runId, { status: "running", pid: child.pid ?? null });
+    this.audit("run.process_started", runId, {
+      runner: "codex",
+      pid: child.pid ?? null,
+      command: resolvedCodex.command,
+      workspace: effectiveConfig.workspace,
+    });
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
     const startedRun = this.runs.get(runId);
     if (startedRun) {
@@ -2347,6 +2379,12 @@ class RunManager extends EventEmitter {
           this.emit("run.lifecycle", { kind: "failed", run: failedRun, previous: run } as RunLifecycleEvent);
         }
       }
+      this.audit("run.process_terminated", runId, {
+        runner: "codex",
+        exitCode: code,
+        stopRequested,
+        finalStatus: this.runs.get(runId)?.status ?? null,
+      });
 
       this.releaseCachedEvents(runId);
       this.persistState();
@@ -2403,6 +2441,7 @@ class RunManager extends EventEmitter {
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to resolve Claude Code executable";
       this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.audit("run.spawn_failed", runId, { runner: "claude", stage: "resolve", message });
       this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code: null } });
       this.persistState();
       return;
@@ -2429,6 +2468,12 @@ class RunManager extends EventEmitter {
     };
     this.activeRuns.set(runId, active);
     this.updateRun(runId, { status: "running", pid: child.pid ?? null });
+    this.audit("run.process_started", runId, {
+      runner: "claude",
+      pid: child.pid ?? null,
+      command: resolvedClaude.command,
+      workspace: effectiveConfig.workspace,
+    });
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
     const startedRun = this.runs.get(runId);
     if (startedRun) {
@@ -2472,6 +2517,7 @@ class RunManager extends EventEmitter {
       this.appendEvent(runId, { source: "stderr", text: `${message}\n` });
       this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${message}\n` } });
       this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.audit("run.spawn_failed", runId, { runner: "claude", stage: "process_error", message });
     });
 
     child.on("exit", (code) => {
@@ -2517,6 +2563,12 @@ class RunManager extends EventEmitter {
         this.emit("run.lifecycle", { kind: "failed", run: failedRun, previous: run } as RunLifecycleEvent);
       }
     }
+    this.audit("run.process_terminated", runId, {
+      runner: "claude",
+      exitCode: code,
+      stopRequested,
+      finalStatus: this.runs.get(runId)?.status ?? null,
+    });
 
     this.releaseCachedEvents(runId);
     this.persistState();
@@ -2770,6 +2822,7 @@ class RunManager extends EventEmitter {
     if (!active) return false;
 
     active.stopRequested = true;
+    this.audit("run.stop_requested", runId, { runner: active.runner, pid: active.process.pid ?? null });
     // First stage: ask only the direct process to shut down gracefully.
     // This does NOT reach any subprocess Codex/Claude spawned on its own --
     // that guarantee comes from the escalation below, which is why it is
@@ -2800,6 +2853,12 @@ class RunManager extends EventEmitter {
     if (!item) return null;
     item.status = "accepted";
     this.approvals.set(id, item);
+    this.audit("approval.accepted", item.runId, {
+      approvalId: id,
+      kind: item.kind ?? null,
+      reason: item.reason,
+      command: item.command,
+    });
     this.persistState();
     return item;
   }
@@ -7385,6 +7444,19 @@ app.get("/api/system/status", (_req, res) => {
     tokenStatus: resolveTokenStatus(account),
   };
   res.json(apiOk(payload));
+});
+
+app.get("/api/audit", (req, res) => {
+  const events = readAuditEvents(AUDIT_DIR);
+  const runId = typeof req.query.runId === "string" ? req.query.runId : null;
+  const filtered = runId ? events.filter((e) => e.run_id === runId) : events;
+  const limit = Math.min(Number(req.query.limit) || 500, 5000);
+  res.json(apiOk({ events: filtered.slice(-limit), total: filtered.length }));
+});
+
+app.get("/api/audit/verify", (_req, res) => {
+  const result = verifyAuditChain(AUDIT_DIR);
+  res.json(apiOk(result));
 });
 
 app.post("/api/workspaces/active", (req, res) => {
