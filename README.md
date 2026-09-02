@@ -280,6 +280,8 @@ TELEGRAM_MESSAGE_FILE_THREAD_ID=42
 TELEGRAM_MESSAGE_TEXT_THREAD_ID=43
 TELEGRAM_MCP_PORT=9013
 TELEGRAM_MCP_NAME=luma-tel
+TELEGRAM_API_BASE=https://api.telegram.org
+TELEGRAM_FILE_BASE=https://api.telegram.org
 TELEGRAM_ALLOWED_ROOTS=/Users/applestation/Project
 TELEGRAM_MAX_FILE_BYTES=52428800
 TELEGRAM_DOWNLOAD_DIR=/Users/applestation/Project/.luma/telegram-uploads
@@ -287,6 +289,8 @@ TELEGRAM_MAX_TEXT_READ_BYTES=262144
 ```
 
 The MCP exposes `get_last_uploaded_file` for inbound documents. It reads Telegram's bot update stream, finds the latest user-uploaded document in the configured chat/topic, and saves it under `TELEGRAM_DOWNLOAD_DIR` (or `.luma/telegram-uploads` beneath the first allowed root). Recognized text and code files also return their leading UTF-8 content; binary files return the saved local path. The last downloaded file is cached, so asking for it again returns the saved copy until a newer document arrives.
+
+Telegram's hosted Bot API limits `getFile` downloads to 20 MB. To receive larger documents, run a local Telegram Bot API server and set `TELEGRAM_API_BASE` and `TELEGRAM_FILE_BASE` to its base URL. `TELEGRAM_MAX_FILE_BYTES` remains the MCP's independent local upload/download policy.
 
 For group uploads, disable the bot's privacy mode with `@BotFather` or make the bot an administrator so it can receive ordinary document messages. `getUpdates` cannot be used while a webhook is configured, and this MCP should be the only consumer of the bot's update stream.
 

@@ -18,7 +18,10 @@ dotenv.config({ path: path.join(rootDir, ".env") });
 const MCP_NAME = process.env.TELEGRAM_MCP_NAME || "luma-tel";
 const MCP_PORT = Number(process.env.TELEGRAM_MCP_PORT || 9013);
 const MCP_HOST = process.env.TELEGRAM_MCP_HOST || "127.0.0.1";
-const TELEGRAM_API_BASE = "https://api.telegram.org";
+const DEFAULT_TELEGRAM_API_BASE = "https://api.telegram.org";
+const TELEGRAM_API_BASE = normalizeTelegramApiBase(process.env.TELEGRAM_API_BASE || DEFAULT_TELEGRAM_API_BASE);
+const TELEGRAM_FILE_BASE = normalizeTelegramApiBase(process.env.TELEGRAM_FILE_BASE || TELEGRAM_API_BASE);
+const TELEGRAM_HOSTED_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
 const TELEGRAM_MAX_FILE_BYTES = Number(process.env.TELEGRAM_MAX_FILE_BYTES || 50 * 1024 * 1024);
 const TELEGRAM_MAX_TEXT_READ_BYTES = Number(process.env.TELEGRAM_MAX_TEXT_READ_BYTES || 256 * 1024);
 const TELEGRAM_RECEIVE_MAX_PAGES = Number(process.env.TELEGRAM_RECEIVE_MAX_PAGES || 100);
@@ -164,6 +167,34 @@ type GetLastUploadedFileResult = SavedInboundFile & {
   text_content_bytes: number;
   text_content_truncated: boolean;
 };
+
+function normalizeTelegramApiBase(value: string): string {
+  return value.trim().replace(/\/+$/, "");
+}
+
+function usesHostedTelegramApi(): boolean {
+  try {
+    return new URL(TELEGRAM_API_BASE).hostname.toLowerCase() === "api.telegram.org";
+  } catch {
+    return TELEGRAM_API_BASE === DEFAULT_TELEGRAM_API_BASE;
+  }
+}
+
+function assertTelegramDownloadSize(fileSize: number | null | undefined): void {
+  if (fileSize === null || fileSize === undefined) return;
+  if (fileSize > TELEGRAM_MAX_FILE_BYTES) {
+    throw new Error(
+      `Telegram file is too large for the configured download policy: ${fileSize} bytes > ${TELEGRAM_MAX_FILE_BYTES} bytes`,
+    );
+  }
+  if (usesHostedTelegramApi() && fileSize > TELEGRAM_HOSTED_DOWNLOAD_LIMIT_BYTES) {
+    throw new Error(
+      `Telegram's hosted Bot API cannot download this ${fileSize}-byte file because getFile is limited to `
+      + `${TELEGRAM_HOSTED_DOWNLOAD_LIMIT_BYTES} bytes. Configure TELEGRAM_API_BASE and TELEGRAM_FILE_BASE `
+      + "for a local Telegram Bot API server, then restart luma-telegram-mcp.",
+    );
+  }
+}
 
 function findWorkspaceRoot(startDir: string): string | null {
   let current = path.resolve(startDir);
@@ -514,11 +545,7 @@ async function callTelegramWithCurl<T>(
 }
 
 async function downloadTelegramFile(candidate: InboundFileCandidate, destinationDirectory: string): Promise<SavedInboundFile> {
-  if (candidate.file_size !== null && candidate.file_size > TELEGRAM_MAX_FILE_BYTES) {
-    throw new Error(
-      `Telegram file is too large for the configured download policy: ${candidate.file_size} bytes > ${TELEGRAM_MAX_FILE_BYTES} bytes`,
-    );
-  }
+  assertTelegramDownloadSize(candidate.file_size);
 
   const body = new URLSearchParams({ file_id: candidate.file_id });
   const telegramFile = await callTelegram<TelegramFile>("getFile", {
@@ -527,11 +554,7 @@ async function downloadTelegramFile(candidate: InboundFileCandidate, destination
     body,
   });
   if (!telegramFile.file_path) throw new Error("Telegram getFile did not return a downloadable file path.");
-  if (telegramFile.file_size !== undefined && telegramFile.file_size > TELEGRAM_MAX_FILE_BYTES) {
-    throw new Error(
-      `Telegram file is too large for the configured download policy: ${telegramFile.file_size} bytes > ${TELEGRAM_MAX_FILE_BYTES} bytes`,
-    );
-  }
+  assertTelegramDownloadSize(telegramFile.file_size);
 
   const stableName = `${candidate.update_id}_${candidate.message_id}_${candidate.file_name}`;
   const destinationPath = path.join(destinationDirectory, stableName);
@@ -549,7 +572,7 @@ async function downloadTelegramFile(candidate: InboundFileCandidate, destination
   }
 
   const token = requireTelegramToken();
-  const sourceUrl = `${TELEGRAM_API_BASE}/file/bot${token}/${telegramFile.file_path}`;
+  const sourceUrl = `${TELEGRAM_FILE_BASE}/file/bot${token}/${telegramFile.file_path}`;
   const temporaryPath = `${destinationPath}.${process.pid}.${Date.now()}.tmp`;
   try {
     let response: Response | null = null;
@@ -970,6 +993,7 @@ app.get("/health", (_req, res) => {
     port: MCP_PORT,
     mcpUrl: `http://127.0.0.1:${MCP_PORT}/mcp`,
     allowedRoots,
+    telegramApiMode: usesHostedTelegramApi() ? "hosted" : "local",
     missingEnv: missing,
   });
 });
