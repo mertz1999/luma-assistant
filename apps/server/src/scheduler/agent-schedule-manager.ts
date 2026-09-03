@@ -236,6 +236,7 @@ export class AgentScheduleManager {
     minute: number;
     runner: RunRunner;
     workspace: string;
+    project?: string;
     model: string;
     sandbox: RunConfig["sandbox"];
     approvalPolicy: RunConfig["approvalPolicy"];
@@ -268,6 +269,7 @@ export class AgentScheduleManager {
       runConfig: {
         runner: normalizeRunRunner(input.runner),
         workspace: input.workspace,
+        project: input.project,
         model: input.model,
         reasoningEffort: normalizeReasoningEffort(input.reasoningEffort),
         sandbox: input.sandbox,

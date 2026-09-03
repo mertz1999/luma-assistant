@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { evaluateCredentialAccessPolicy, evaluateRunStartPolicy } from "./policy-engine.js";
+import { evaluateCredentialAccessPolicy, evaluateRunStartPolicy, evaluateProjectWorkspaceBinding } from "./policy-engine.js";
 
 function input(workspace: string) {
   return { operation: "run.start" as const, runner: "codex", workspace, sandbox: "danger-full-access", approvalPolicy: "never" };
@@ -86,6 +86,142 @@ test("evaluateCredentialAccessPolicy: same project, allowed adapter is allowed",
     adapter: "codex",
     credentialId: "cred_a1",
     credentialMetadata: { projectId: "proj_a", allowedAdapters: ["codex", "claude"] },
+  });
+  assert.equal(result.decision, "ALLOW");
+});
+
+// -- evaluateProjectWorkspaceBinding --------------------------------------
+// Closes the cross-project defect found 2026-09-03: a "KoraIQ" mission/run
+// could declare workspace C:/Dalilfinance and evaluateRunStartPolicy (above)
+// would ALLOW it -- that function only ever asks "is this path a system
+// dir," never "is this project authorized for this path." These tests
+// operate on already-canonicalized strings (the function is pure and does
+// no filesystem I/O itself -- canonicalization is the caller's job in
+// index.ts via fs.realpathSync.native), matching this file's existing style
+// of testing the pure decision logic directly. Forward slashes are used
+// throughout (node:path's win32 implementation accepts them identically to
+// backslashes) purely to keep these literals simple and unambiguous.
+
+test("evaluateProjectWorkspaceBinding: no project declared -> legacy ALLOW (backward compat, workspace-only path still applies elsewhere)", () => {
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: null,
+    requestedWorkspace: "C:/Dalilfinance",
+    authorizedWorkspace: null,
+  });
+  assert.equal(result.decision, "ALLOW");
+  assert.equal(result.rule, "no-project-declared-legacy");
+});
+
+test("evaluateProjectWorkspaceBinding: KoraIQ project + KoraIQ workspace -> ALLOW", () => {
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: "botolaiq",
+    requestedWorkspace: "C:/BotolaIQ",
+    authorizedWorkspace: "C:/BotolaIQ",
+  });
+  assert.equal(result.decision, "ALLOW");
+  assert.equal(result.rule, "project-workspace-match");
+});
+
+test("evaluateProjectWorkspaceBinding: KoraIQ project + descendant subfolder -> ALLOW", () => {
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: "botolaiq",
+    requestedWorkspace: "C:/BotolaIQ/trainer",
+    authorizedWorkspace: "C:/BotolaIQ",
+  });
+  assert.equal(result.decision, "ALLOW");
+  assert.equal(result.rule, "project-workspace-match");
+});
+
+test("evaluateProjectWorkspaceBinding: KoraIQ project + Dalil workspace -> DENY (the original defect, now closed)", () => {
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: "botolaiq",
+    requestedWorkspace: "C:/Dalilfinance",
+    authorizedWorkspace: "C:/BotolaIQ",
+  });
+  assert.equal(result.decision, "DENY");
+  assert.equal(result.rule, "cross-project-workspace");
+});
+
+test("evaluateProjectWorkspaceBinding: Dalil project + Dalil workspace -> ALLOW", () => {
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: "dalilfinance",
+    requestedWorkspace: "C:/Dalilfinance",
+    authorizedWorkspace: "C:/Dalilfinance",
+  });
+  assert.equal(result.decision, "ALLOW");
+});
+
+test("evaluateProjectWorkspaceBinding: Dalil project + KoraIQ workspace -> DENY (reverse direction)", () => {
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: "dalilfinance",
+    requestedWorkspace: "C:/BotolaIQ",
+    authorizedWorkspace: "C:/Dalilfinance",
+  });
+  assert.equal(result.decision, "DENY");
+  assert.equal(result.rule, "cross-project-workspace");
+});
+
+test("evaluateProjectWorkspaceBinding: unknown/unregistered project -> DENY (fail closed, never silently allowed)", () => {
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: "totally-unregistered-project",
+    requestedWorkspace: "C:/BotolaIQ",
+    authorizedWorkspace: null,
+  });
+  assert.equal(result.decision, "DENY");
+  assert.equal(result.rule, "unknown-project");
+});
+
+test("evaluateProjectWorkspaceBinding: prefix collision -- 'C:/BotolaIQ2' is NOT a descendant of 'C:/BotolaIQ' (naive startsWith would wrongly allow this)", () => {
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: "botolaiq",
+    requestedWorkspace: "C:/BotolaIQ2",
+    authorizedWorkspace: "C:/BotolaIQ",
+  });
+  assert.equal(result.decision, "DENY");
+  assert.equal(result.rule, "cross-project-workspace");
+});
+
+test("evaluateProjectWorkspaceBinding: sibling-prefix collision -- 'C:/BotolaIQ-evil' is NOT a descendant of 'C:/BotolaIQ'", () => {
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: "botolaiq",
+    requestedWorkspace: "C:/BotolaIQ-evil",
+    authorizedWorkspace: "C:/BotolaIQ",
+  });
+  assert.equal(result.decision, "DENY");
+});
+
+test("evaluateProjectWorkspaceBinding: traversal that lexically collapses back to the authorized workspace -> ALLOW (path.resolve/realpath already normalizes '..' before this function ever sees it)", () => {
+  // Simulates what the caller's canonicalizePath() would have already
+  // produced for "C:/BotolaIQ/trainer/..": the lexical/real result IS
+  // "C:/BotolaIQ", so this function correctly allows it -- it is not a
+  // traversal *escape*, just a verbose way of writing the same root.
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: "botolaiq",
+    requestedWorkspace: "C:/BotolaIQ",
+    authorizedWorkspace: "C:/BotolaIQ",
+  });
+  assert.equal(result.decision, "ALLOW");
+});
+
+test("evaluateProjectWorkspaceBinding: traversal that escapes the authorized workspace -> DENY", () => {
+  // "C:/BotolaIQ/../Dalilfinance" canonicalizes to "C:/Dalilfinance" --
+  // a real cross-project escape via traversal syntax, correctly denied.
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: "botolaiq",
+    requestedWorkspace: "C:/Dalilfinance",
+    authorizedWorkspace: "C:/BotolaIQ",
+  });
+  assert.equal(result.decision, "DENY");
+});
+
+test("evaluateProjectWorkspaceBinding: case-variant paths that canonicalize to the same real path -> ALLOW", () => {
+  // The caller is responsible for canonicalizing case via
+  // fs.realpathSync.native before calling this function; once both sides
+  // are canonicalized to the same on-disk casing, plain equality holds.
+  const result = evaluateProjectWorkspaceBinding({
+    projectId: "botolaiq",
+    requestedWorkspace: "C:/BotolaIQ",
+    authorizedWorkspace: "C:/BotolaIQ",
   });
   assert.equal(result.decision, "ALLOW");
 });

@@ -12,7 +12,7 @@ import {
 } from "./platform/process-utils.js";
 import { reconcileStaleRunPid } from "./recovery.js";
 import { appendAuditEvent, readAuditEvents, verifyAuditChain } from "./audit/audit-log.js";
-import { evaluateRunStartPolicy } from "./policy/policy-engine.js";
+import { evaluateRunStartPolicy, evaluateProjectWorkspaceBinding } from "./policy/policy-engine.js";
 import { evaluateResourcePolicy, type ResourceLimits } from "./resources/resource-watchdog.js";
 import { canTransitionMissionStatus } from "./missions/mission-state.js";
 import { pickSafeBaseEnv } from "./security/safe-environment.js";
@@ -2196,9 +2196,47 @@ class RunManager extends EventEmitter {
       sandbox: effectiveConfig.sandbox,
       approvalPolicy: effectiveConfig.approvalPolicy,
     });
-    this.audit("policy.decision", null, { operation: "run.start", workspace: effectiveConfig.workspace, runner: effectiveConfig.runner, ...policyDecision });
+
+    // Mechanical project/workspace binding (additive on top of the
+    // workspace-only denylist above -- see policy-engine.ts's own
+    // docstring for why this is a SEPARATE, opt-in check rather than a
+    // retrofit onto every existing untagged workspace). Both sides are
+    // realpath-canonicalized here, at the one call path every run goes
+    // through, so manual runs, scheduled dispatch, reruns, and
+    // approval-escalation runs all get the identical check -- no separate
+    // policy copy per caller.
+    const declaredProjectId = effectiveConfig.project ?? null;
+    const requestedWorkspaceCanonical = canonicalizePath(effectiveConfig.workspace);
+    const authorizedWorkspaceCanonical = declaredProjectId ? resolveAuthorizedWorkspaceForProject(declaredProjectId) : null;
+    const bindingDecision = evaluateProjectWorkspaceBinding({
+      projectId: declaredProjectId,
+      // A canonicalization failure (path vanished between the route's
+      // existsSync check and here, or a scheduler dispatch that skipped
+      // that check) must still fail closed rather than comparing against
+      // an empty string, which path.relative would happily treat as "no
+      // relation" -> DENY anyway, but explicitly is clearer than relying
+      // on that fallthrough.
+      requestedWorkspace: requestedWorkspaceCanonical ?? `<<unresolvable:${effectiveConfig.workspace}>>`,
+      authorizedWorkspace: authorizedWorkspaceCanonical,
+    });
+
+    this.audit("policy.decision", null, {
+      operation: "run.start",
+      workspace: effectiveConfig.workspace,
+      runner: effectiveConfig.runner,
+      ...policyDecision,
+      project: declaredProjectId,
+      requestedWorkspaceCanonical,
+      authorizedWorkspaceCanonical,
+      projectBindingDecision: bindingDecision.decision,
+      projectBindingRule: bindingDecision.rule,
+      projectBindingReason: bindingDecision.reason,
+    });
     if (policyDecision.decision !== "ALLOW") {
       throw new PolicyDeniedError(policyDecision.reason);
+    }
+    if (bindingDecision.decision !== "ALLOW") {
+      throw new PolicyDeniedError(bindingDecision.reason);
     }
 
     const resourceDecision = evaluateResourcePolicy(effectiveConfig.workspace, RESOURCE_LIMITS);
@@ -3252,7 +3290,14 @@ class MissionManager {
 
   load(): void {
     for (const mission of loadPersistedMissions()) {
-      this.missions.set(mission.id, mission);
+      // Missions persisted before `project` existed have no such key in
+      // their JSON at all -- normalize to null explicitly rather than
+      // leaving it `undefined` at runtime despite the Mission type's
+      // compile-time claim. These stay on the legacy/unbound admission
+      // path (evaluateProjectWorkspaceBinding treats null the same as
+      // never having declared a project), never silently upgraded to a
+      // guessed project.
+      this.missions.set(mission.id, { ...mission, project: mission.project ?? null });
     }
   }
 
@@ -3264,11 +3309,12 @@ class MissionManager {
     return this.missions.get(missionId) ?? null;
   }
 
-  create(input: { workspace: string; objective: string }): Mission {
+  create(input: { workspace: string; project?: string; objective: string }): Mission {
     const now = Date.now();
     const mission: Mission = {
       id: `mission_${now}_${Math.random().toString(36).slice(2, 8)}`,
       workspace: input.workspace,
+      project: input.project?.trim() || null,
       objective: input.objective,
       status: "PENDING",
       createdAt: now,
@@ -3279,7 +3325,7 @@ class MissionManager {
     };
     this.missions.set(mission.id, mission);
     this.persist();
-    this.audit("mission.created", null, { missionId: mission.id, workspace: mission.workspace, objective: mission.objective });
+    this.audit("mission.created", null, { missionId: mission.id, workspace: mission.workspace, project: mission.project, objective: mission.objective });
     return mission;
   }
 
@@ -4234,6 +4280,61 @@ function resolveConfigWorkspaces(): { defaultWorkspace: string; options: Workspa
 function expandHome(value: string): string {
   if (!value.startsWith("~")) return value;
   return path.join(os.homedir(), value.slice(1));
+}
+
+/**
+ * The trusted project registry for mechanical workspace binding
+ * (evaluateProjectWorkspaceBinding). Built from config.yaml's `repos:` map
+ * -- the same file resolveConfigWorkspaces() already parses for the UI
+ * workspace dropdown -- keyed by lowercased project name so lookups are
+ * case-insensitive ("botolaiq", "BotolaIQ", "BOTOLAIQ" all resolve the same
+ * registered entry). Deliberately excludes the generic `default_workspace`
+ * entry: that is Luma's own working directory, not a product project, and
+ * binding to it would be meaningless. Cached per-process; config.yaml
+ * changes require a server restart to take effect, same as every other use
+ * of resolveConfigWorkspaces() today.
+ */
+let projectRegistryCache: Map<string, string> | null = null;
+
+function projectRegistry(): Map<string, string> {
+  if (projectRegistryCache) return projectRegistryCache;
+  const { options } = resolveConfigWorkspaces();
+  const registry = new Map<string, string>();
+  for (const option of options) {
+    if (option.source !== "config-repo") continue;
+    registry.set(option.name.toLowerCase(), option.path);
+  }
+  projectRegistryCache = registry;
+  return registry;
+}
+
+/**
+ * Canonicalizes a path with fs.realpathSync.native (resolves symlinks/
+ * junctions, normalizes Windows drive-letter case) rather than the merely
+ * lexical path.resolve() used elsewhere in this file for non-security
+ * purposes. Returns null instead of throwing so a nonexistent/unreadable
+ * path becomes a clean DENY at the call site (fail closed) rather than an
+ * uncaught exception crashing the request.
+ */
+function canonicalizePath(input: string): string | null {
+  try {
+    return fs.realpathSync.native(path.resolve(input));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolves the authorized (realpath-canonicalized) workspace for a
+ * declared project id, or null if the project is not registered in
+ * config.yaml's repos: map, or its registered path does not currently
+ * exist on disk (fails closed rather than binding against a dangling
+ * registration).
+ */
+function resolveAuthorizedWorkspaceForProject(projectId: string): string | null {
+  const registeredPath = projectRegistry().get(projectId.trim().toLowerCase());
+  if (!registeredPath) return null;
+  return canonicalizePath(registeredPath);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -7027,6 +7128,7 @@ const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, pro
     const run = runManager.startRun({
       runner: schedule.runConfig.runner,
       workspace: schedule.runConfig.workspace,
+      project: schedule.runConfig.project,
       prompt,
       model: schedule.runConfig.model,
       reasoningEffort: schedule.runConfig.reasoningEffort,
@@ -7358,6 +7460,20 @@ app.post("/api/agent-schedules", (req, res) => {
     return;
   }
 
+  if (parsed.data.project) {
+    const requestedWorkspaceCanonical = canonicalizePath(workspace);
+    const authorizedWorkspaceCanonical = resolveAuthorizedWorkspaceForProject(parsed.data.project);
+    const bindingDecision = evaluateProjectWorkspaceBinding({
+      projectId: parsed.data.project,
+      requestedWorkspace: requestedWorkspaceCanonical ?? `<<unresolvable:${workspace}>>`,
+      authorizedWorkspace: authorizedWorkspaceCanonical,
+    });
+    if (bindingDecision.decision !== "ALLOW") {
+      res.status(403).json(apiErr(bindingDecision.reason));
+      return;
+    }
+  }
+
   try {
     const schedule = agentScheduleManager.create({
       agentId: parsed.data.agentId,
@@ -7365,6 +7481,7 @@ app.post("/api/agent-schedules", (req, res) => {
       minute: parsed.data.minute,
       runner: parsed.data.runner,
       workspace,
+      project: parsed.data.project,
       model: parsed.data.model,
       reasoningEffort: parsed.data.reasoningEffort,
       sandbox: parsed.data.sandbox,
@@ -7473,7 +7590,26 @@ app.post("/api/missions", (req, res) => {
     res.status(400).json(apiErr("Workspace does not exist"));
     return;
   }
-  const mission = missionManager.create({ workspace, objective: parsed.data.objective });
+
+  // If this mission declares a project, its own workspace must already be
+  // authorized for that project -- fail at creation time rather than
+  // creating an unbindable mission that would only fail later when a run
+  // is attached to it.
+  if (parsed.data.project) {
+    const requestedWorkspaceCanonical = canonicalizePath(workspace);
+    const authorizedWorkspaceCanonical = resolveAuthorizedWorkspaceForProject(parsed.data.project);
+    const bindingDecision = evaluateProjectWorkspaceBinding({
+      projectId: parsed.data.project,
+      requestedWorkspace: requestedWorkspaceCanonical ?? `<<unresolvable:${workspace}>>`,
+      authorizedWorkspace: authorizedWorkspaceCanonical,
+    });
+    if (bindingDecision.decision !== "ALLOW") {
+      res.status(403).json(apiErr(bindingDecision.reason));
+      return;
+    }
+  }
+
+  const mission = missionManager.create({ workspace, project: parsed.data.project, objective: parsed.data.objective });
   res.json(apiOk({ mission }));
 });
 
@@ -7492,13 +7628,53 @@ app.post("/api/missions/:missionId/runs", (req, res) => {
     res.status(400).json(apiErr("runId is required"));
     return;
   }
-  if (!runManager.getRun(runId)) {
+  const run = runManager.getRun(runId);
+  if (!run) {
     res.status(400).json(apiErr(`No such run: ${runId}`));
     return;
   }
+
+  // A run already passed evaluateProjectWorkspaceBinding at start time
+  // (against whatever project IT declared, if any). Attaching it to a
+  // mission is a second, independent chokepoint: a mission that declares
+  // a project must not accumulate a run whose own workspace falls outside
+  // that project, even if the run itself declared no project (or a
+  // different one) when it started. Same shared function, not a policy
+  // copy, per the rule that manual/scheduled/attach paths all use one
+  // enforcement path.
+  const mission = missionManager.get(req.params.missionId);
+  if (mission?.project) {
+    const requestedWorkspaceCanonical = canonicalizePath(run.config.workspace);
+    const authorizedWorkspaceCanonical = resolveAuthorizedWorkspaceForProject(mission.project);
+    const bindingDecision = evaluateProjectWorkspaceBinding({
+      projectId: mission.project,
+      requestedWorkspace: requestedWorkspaceCanonical ?? `<<unresolvable:${run.config.workspace}>>`,
+      authorizedWorkspace: authorizedWorkspaceCanonical,
+    });
+    appendAuditEvent(AUDIT_DIR, {
+      event_type: "policy.decision",
+      run_id: runId,
+      payload: {
+        operation: "mission.attach_run",
+        missionId: req.params.missionId,
+        project: mission.project,
+        runWorkspace: run.config.workspace,
+        requestedWorkspaceCanonical,
+        authorizedWorkspaceCanonical,
+        decision: bindingDecision.decision,
+        rule: bindingDecision.rule,
+        reason: bindingDecision.reason,
+      },
+    });
+    if (bindingDecision.decision !== "ALLOW") {
+      res.status(403).json(apiErr(bindingDecision.reason));
+      return;
+    }
+  }
+
   try {
-    const mission = missionManager.attachRun(req.params.missionId, runId);
-    res.json(apiOk({ mission }));
+    const updated = missionManager.attachRun(req.params.missionId, runId);
+    res.json(apiOk({ mission: updated }));
   } catch (error) {
     res.status(error instanceof MissionNotFoundError ? 404 : 409).json(apiErr(error instanceof Error ? error.message : "Failed to attach run"));
   }
@@ -7943,6 +8119,7 @@ app.post("/api/runs/start", (req, res) => {
     const run = runManager.startRun({
       runner: parsed.data.runner,
       workspace,
+      project: parsed.data.project,
       prompt: parsed.data.prompt,
       model: parsed.data.model,
       reasoningEffort: parsed.data.reasoningEffort,

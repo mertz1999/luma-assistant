@@ -115,6 +115,8 @@ export const agentScheduleSchema = z.object({
   runConfig: z.object({
     runner: runRunnerSchema.default("codex"),
     workspace: z.string().min(1),
+    /** See runConfigSchema.project -- schedules should declare this so dispatch-time admission is bound, not just workspace-only. */
+    project: z.string().trim().min(1).optional(),
     model: z.string().min(1),
     reasoningEffort: reasoningEffortSchema.default("high"),
     sandbox: sandboxSchema,
@@ -147,6 +149,8 @@ export const createAgentScheduleSchema = z.object({
   minute: z.number().int().min(0).max(59),
   runner: runRunnerSchema.default("codex"),
   workspace: z.string().min(1),
+  /** See runConfigSchema.project. */
+  project: z.string().trim().min(1).optional(),
   model: z.string().min(1),
   reasoningEffort: reasoningEffortSchema.default("high"),
   sandbox: sandboxSchema,
@@ -185,6 +189,18 @@ export type AgentListResponse = {
 export const runConfigSchema = z.object({
   runner: runRunnerSchema.default("codex"),
   workspace: z.string().min(1),
+  /**
+   * Optional declared project identity (a `config.yaml` `repos:` key, e.g.
+   * "botolaiq"/"dalilfinance"), independent of and never trusted from
+   * `workspace` alone. When set, `RunManager.startRun` mechanically
+   * verifies `workspace` resolves to this project's own registered
+   * workspace (or a subfolder of it) before spawning -- see
+   * policy/policy-engine.ts:evaluateProjectWorkspaceBinding. Omitted
+   * entirely, this is the pre-existing (legacy) admission path: only the
+   * workspace-only denylist in evaluateRunStartPolicy applies. Additive by
+   * design so no existing caller (ad-hoc workspaces, test fixtures) breaks.
+   */
+  project: z.string().trim().min(1).optional(),
   prompt: z.string().min(1),
   model: z.string().min(1),
   reasoningEffort: reasoningEffortSchema.default("high"),
@@ -211,6 +227,8 @@ export const startRunSchema = z.object({
   runner: runRunnerSchema.default("codex"),
   prompt: z.string().min(1),
   workspace: z.string().min(1),
+  /** See runConfigSchema.project -- same optional, mechanically-checked declared project identity. */
+  project: z.string().trim().min(1).optional(),
   model: z.string().min(1),
   reasoningEffort: reasoningEffortSchema.default("high"),
   sandbox: sandboxSchema.default("read-only"),
@@ -230,6 +248,8 @@ export const sendMessageSchema = z.object({
   text: z.string().min(1),
   runner: runRunnerSchema.default("codex"),
   workspace: z.string().min(1),
+  /** See runConfigSchema.project. */
+  project: z.string().trim().min(1).optional(),
   model: z.string().min(1),
   reasoningEffort: reasoningEffortSchema.default("high"),
   sandbox: sandboxSchema.default("read-only"),
@@ -301,6 +321,15 @@ export type MissionStatus = z.infer<typeof missionStatusSchema>;
 export type Mission = {
   id: string;
   workspace: string;
+  /**
+   * Optional declared project identity (see runConfigSchema.project). When
+   * set, any run attached to this mission (POST /api/missions/:id/runs)
+   * must resolve its own workspace to this project's registered workspace
+   * (or a subfolder of it) -- enforced mechanically, not by trusting the
+   * mission's own `workspace` field, which the caller supplies. Null for
+   * missions created before this field existed (legacy/unbound).
+   */
+  project: string | null;
   objective: string;
   status: MissionStatus;
   createdAt: number;
@@ -322,6 +351,8 @@ export type Mission = {
 
 export const createMissionSchema = z.object({
   workspace: z.string().min(1),
+  /** See Mission.project. */
+  project: z.string().trim().min(1).optional(),
   objective: z.string().min(1),
 });
 export type CreateMissionInput = z.infer<typeof createMissionSchema>;
