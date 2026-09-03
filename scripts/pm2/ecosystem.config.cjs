@@ -20,12 +20,26 @@ function isEnabled(raw, defaultEnabled = false) {
 // Opt-in: taskmanager MCP is heavy; keep off unless explicitly enabled.
 const enableTaskManagerMcp = isEnabled(process.env.ENABLE_TASK_MANAGER_MCP, false);
 
+// PM2's `script: 'npm', args: 'run ...'` pattern crash-loops on Windows:
+// npm's own global entrypoint is `npm.cmd` (a batch/shim file), and PM2
+// hands that path straight to Node's module loader, which tries to parse
+// the batch script as JavaScript and fails immediately on `:: comment`
+// syntax ("SyntaxError: Unexpected token ':'") -- observed directly on
+// this machine, 11 restarts in seconds. This is the exact same class of
+// bug as functions/../process-utils.ts's Windows .cmd-shim handling for
+// Codex/Claude, just hitting PM2 itself instead. Fix: point every app at
+// its real compiled entrypoint (or vite's own .js binary) and spawn node
+// directly, bypassing npm/vite shims entirely -- also PM2's more typical
+// usage pattern regardless of platform.
+const nodeExe = process.execPath;
+const viteBin = path.join(root, 'node_modules', 'vite', 'bin', 'vite.js');
+
 const apps = [
   {
     name: 'luma-assistant-server',
-    cwd: root,
-    script: 'npm',
-    args: 'run start -w @luma/server',
+    cwd: path.join(root, 'apps', 'server'),
+    script: nodeExe,
+    args: ['dist/index.js'],
     env: {
       ...process.env,
       NODE_ENV: 'production',
@@ -42,9 +56,9 @@ const apps = [
   },
   {
     name: 'luma-assistant-web',
-    cwd: root,
-    script: 'npm',
-    args: `run preview -w @luma/web -- --host 0.0.0.0 --port ${webPort}`,
+    cwd: path.join(root, 'apps', 'web'),
+    script: nodeExe,
+    args: [viteBin, 'preview', '--host', '0.0.0.0', '--port', webPort],
     env: {
       ...process.env,
       NODE_ENV: 'production',
@@ -58,9 +72,9 @@ const apps = [
   },
   {
     name: 'luma-telegram-mcp',
-    cwd: root,
-    script: 'npm',
-    args: 'run start -w @luma/telegram-mcp',
+    cwd: path.join(root, 'apps', 'telegram-mcp'),
+    script: nodeExe,
+    args: ['dist/index.js'],
     env: {
       ...process.env,
       NODE_ENV: 'production',
@@ -75,9 +89,9 @@ const apps = [
   },
   {
     name: 'luma-image-mcp',
-    cwd: root,
-    script: 'npm',
-    args: 'run start -w @luma/image-mcp',
+    cwd: path.join(root, 'apps', 'image-mcp'),
+    script: nodeExe,
+    args: ['dist/index.js'],
     env: {
       ...process.env,
       NODE_ENV: 'production',
@@ -95,9 +109,9 @@ const apps = [
 if (enableTaskManagerMcp) {
   apps.splice(3, 0, {
     name: 'luma-taskmanager-mcp',
-    cwd: root,
-    script: 'npm',
-    args: 'run start -w @luma/taskmanager-mcp',
+    cwd: path.join(root, 'apps', 'taskmanager-mcp'),
+    script: nodeExe,
+    args: ['dist/index.js'],
     env: {
       ...process.env,
       NODE_ENV: 'production',
