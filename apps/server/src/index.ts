@@ -149,6 +149,14 @@ const CLAUDE_CODE_EXECUTABLE = resolveClaudeCodeExecutable(process.env.CLAUDE_CO
 const DEFAULT_REASONING_EFFORT = normalizeReasoningEffort(process.env.DEFAULT_REASONING_EFFORT);
 const DEFAULT_SANDBOX = resolveDefaultSandboxMode();
 const MAX_CONCURRENT_RUNS = Number(process.env.MAX_CONCURRENT_RUNS || 8);
+// MAX_CONCURRENT_RUNS bounds how many runs may be active AT ONCE; nothing
+// previously bounded how LONG any single one of them could run -- confirmed
+// by reading the whole spawn path, no timeout/setTimeout-based kill existed
+// anywhere near it. A stuck run (Codex or Claude looping internally, never
+// exiting) would hold its workspace's mutation lock forever with nobody
+// watching, which is a real risk specifically for unattended scheduled
+// missions. 0 (or any non-positive value) disables the cap.
+const MAX_RUN_DURATION_MS = Number(process.env.MAX_RUN_DURATION_MS || 30 * 60 * 1000);
 // Conservative, backward-compatible-by-default floors: low enough that no
 // existing install with reasonable headroom is affected, high enough to
 // catch a machine that is genuinely almost out of RAM/disk before Luma
@@ -2422,6 +2430,7 @@ class RunManager extends EventEmitter {
       command: resolvedCodex.command,
       workspace: effectiveConfig.workspace,
     });
+    this.scheduleRunTimeout(runId);
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
     const startedRun = this.runs.get(runId);
     if (startedRun) {
@@ -2593,6 +2602,7 @@ class RunManager extends EventEmitter {
       command: resolvedClaude.command,
       workspace: effectiveConfig.workspace,
     });
+    this.scheduleRunTimeout(runId);
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
     const startedRun = this.runs.get(runId);
     if (startedRun) {
@@ -2948,6 +2958,34 @@ class RunManager extends EventEmitter {
     if (run) {
       this.emit("run.parsed", { runId, run, parsed } as RunParsedEvent);
     }
+  }
+
+  /**
+   * Force-stops a run that has been active for longer than MAX_RUN_DURATION_MS,
+   * reusing stopRun's own graceful-then-escalating kill (SIGINT, then the
+   * whole process tree via killProcessTree) rather than a second kill path.
+   * Called once per run, right after it starts, for both runners identically
+   * -- the same cap applies regardless of which CLI is running.
+   */
+  private scheduleRunTimeout(runId: string): void {
+    if (!(MAX_RUN_DURATION_MS > 0)) return;
+    const timer = setTimeout(() => {
+      const active = this.activeRuns.get(runId);
+      if (!active) return; // already finished on its own
+      const seconds = Math.round(MAX_RUN_DURATION_MS / 1000);
+      this.audit("run.timeout", runId, {
+        runner: active.runner,
+        pid: active.process.pid ?? null,
+        maxDurationMs: MAX_RUN_DURATION_MS,
+      });
+      this.updateRun(runId, {
+        lastError: `Run exceeded the maximum duration of ${seconds}s and was stopped automatically.`,
+      });
+      this.stopRun(runId);
+    }, MAX_RUN_DURATION_MS);
+    // Never keep the whole Node process alive solely for this timer, e.g.
+    // during a clean server shutdown while a run happens to be active.
+    timer.unref?.();
   }
 
   stopRun(runId: string): boolean {
