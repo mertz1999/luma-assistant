@@ -1,8 +1,10 @@
-default_workspace: /Users/applestation/Project
+default_workspace: C:\projects\luma-assistant
 
 repos:
   insurance-verificatin: /Users/applestation/Project/deepspring/PI_insurance_verification
   coding: /Users/applestation/Project/deepspring/PI_coding
   atlas: /Users/applestation/Project/deepspring/deepspring-atlas/PI
   agentfa-admin: /Users/applestation/Project/archive/agentfa-admin
-  luma-assistant: /Users/applestation/Project/archive/luma-assistant
+  luma-assistant: C:\projects\luma-assistant
+  dalilfinance: C:\Dalilfinance
+  botoliq: C:\BotolaIQ
