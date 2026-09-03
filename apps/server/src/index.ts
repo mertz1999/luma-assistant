@@ -2199,6 +2199,37 @@ class RunManager extends EventEmitter {
       throw new ResourceLimitError(resourceDecision.reason);
     }
 
+    // Concurrent-mutation guard: reject a second non-read-only run against
+    // a workspace that already has one queued/running -- proven live to be
+    // otherwise unguarded (two simultaneous scheduled Dalil runs against
+    // the same workspace both started with no denial). Two runs racing to
+    // edit the same repo can interleave git operations (a mid-edit
+    // `git add`/commit from one run swept up by the other, or worse).
+    // Read-only runs never trigger this and are never blocked by it -- they
+    // cannot mutate anything, so overlapping them (including with an
+    // active mutating run) is a stale read at worst, not a corrupted commit.
+    if (effectiveConfig.sandbox !== "read-only") {
+      const targetWorkspace = path.resolve(effectiveConfig.workspace);
+      const conflicting = [...this.runs.values()].find(
+        (r) =>
+          (r.status === "queued" || r.status === "running") &&
+          r.config.sandbox !== "read-only" &&
+          path.resolve(r.config.workspace) === targetWorkspace,
+      );
+      if (conflicting) {
+        const reason = `Another mutating run (${conflicting.id}) is already active against this workspace. Only one mutating run per workspace is allowed at a time.`;
+        this.audit("workspace.mutation_lock", null, {
+          operation: "run.start",
+          workspace: effectiveConfig.workspace,
+          decision: "DENY",
+          rule: "one-mutating-run-per-workspace",
+          reason,
+          conflictingRunId: conflicting.id,
+        });
+        throw new PolicyDeniedError(reason);
+      }
+    }
+
     const resolvedAttachments = resolveRunAttachments(effectiveConfig);
     const resolvedSkills = resolveSelectedSkills(effectiveConfig.workspace, effectiveConfig.skills);
     const resolvedAgents = resolveSelectedAgents(effectiveConfig.agents);
