@@ -13,6 +13,7 @@ import {
 import { reconcileStaleRunPid } from "./recovery.js";
 import { appendAuditEvent, readAuditEvents, verifyAuditChain } from "./audit/audit-log.js";
 import { evaluateRunStartPolicy, evaluateProjectWorkspaceBinding } from "./policy/policy-engine.js";
+import { buildCodexApprovalArgs, resolveClaudePermissionMode, resolveClaudeToolLists } from "./runners/permission-mapping.js";
 import { evaluateResourcePolicy, type ResourceLimits } from "./resources/resource-watchdog.js";
 import { canTransitionMissionStatus } from "./missions/mission-state.js";
 import { pickSafeBaseEnv } from "./security/safe-environment.js";
@@ -258,69 +259,6 @@ const TEXT_ATTACHMENT_MIME_TYPES = new Set([
   "application/x-sh",
   "image/svg+xml",
 ]);
-const CLAUDE_PLAN_ALLOWED_TOOLS = ["Read", "Glob", "Grep"];
-const CLAUDE_PLAN_DISALLOWED_TOOLS = [
-  "Bash",
-  "Edit",
-  "Write",
-  "NotebookEdit",
-  "ExitPlanMode",
-  "EnterPlanMode",
-  "Task",
-  "TaskOutput",
-  "TodoWrite",
-  "WebFetch",
-  "WebSearch",
-  "KillShell",
-  "Skill",
-  "SlashCommand",
-];
-
-/**
- * Bounded, non-bypass Claude permission profiles keyed to the same
- * `sandbox` field Codex already uses -- one shared vocabulary across both
- * runners rather than a second, Claude-only concept. `--allowedTools`
- * pre-approves exactly what a project-health/engineering task needs, so
- * nothing in that set ever needs a live approval prompt (there is none in
- * headless `-p` mode -- verified 2026-09-03: with a non-bypass permission
- * mode and no approver, an unlisted tool call is denied outright,
- * `permission_denials` populated, no prompt/hang). `--disallowedTools` is
- * defense in depth for the highest-risk surface, not the primary control
- * (omission from the allowlist already denies it) -- kept explicit so the
- * boundary is self-documenting in the spawned command line and in the
- * audit trail below, not just an absence.
- *
- * These lists are deliberately generous enough for real engineering work
- * (read/write/edit within the workspace, git status/diff/log/add/commit,
- * npm/node/npx/python test-and-build commands) while excluding every
- * network-publishing and history-rewriting command a health/engineering
- * agent has no legitimate reason to run.
- */
-const CLAUDE_READ_ONLY_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git branch:*)", "Bash(git rev-parse:*)"];
-const CLAUDE_READ_ONLY_DISALLOWED_TOOLS = ["Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch"];
-
-const CLAUDE_WORKSPACE_WRITE_ALLOWED_TOOLS = [
-  "Read",
-  "Write",
-  "Edit",
-  "Glob",
-  "Grep",
-  "Bash(git status:*)",
-  "Bash(git diff:*)",
-  "Bash(git log:*)",
-  "Bash(git branch:*)",
-  "Bash(git rev-parse:*)",
-  "Bash(git add:*)",
-  "Bash(git commit:*)",
-  "Bash(npm run:*)",
-  "Bash(npm test:*)",
-  "Bash(npm ci:*)",
-  "Bash(node:*)",
-  "Bash(npx:*)",
-  "Bash(python:*)",
-  "Bash(python3:*)",
-];
-const CLAUDE_WORKSPACE_WRITE_DISALLOWED_TOOLS = ["Bash(git push:*)", "Bash(git reset --hard:*)", "Bash(git clean:*)", "Bash(git checkout --:*)", "Bash(gh:*)", "WebFetch", "WebSearch"];
 
 type ResolvedAttachment = {
   ref: AttachmentRef;
@@ -2622,21 +2560,9 @@ class RunManager extends EventEmitter {
     // credentials only), same guarantee as the Codex path above.
     const env = { ...buildClaudeEnvironment(), ...credentialEnv };
     const knownSecretValues = Object.values(credentialEnv).filter((v): v is string => Boolean(v));
-    // Permission mode now follows the SAME `sandbox` choice Codex already
-    // uses, rather than an unconditional bypass -- verified 2026-09-03:
-    // `bypassPermissions` was previously hardcoded for every non-planMode
-    // run regardless of the caller's requested sandbox, which made
-    // `sandbox` meaningless for the Claude runner even though it was
-    // faithfully recorded and enforced for Codex. `danger-full-access` is
-    // preserved exactly as an explicit, caller-chosen override (unchanged
-    // behavior for that one case) -- it is never selected merely because
-    // no sandbox was specified, since `sandbox` has no such silent
-    // fallback in runConfigSchema (the caller/schedule must say so).
-    const permissionMode = effectiveConfig.planMode
-      ? "dontAsk"
-      : effectiveConfig.sandbox === "danger-full-access"
-        ? "bypassPermissions"
-        : "acceptEdits";
+    // See runners/permission-mapping.ts:resolveClaudePermissionMode for
+    // the rationale (sandbox-driven, not an unconditional bypass).
+    const permissionMode = resolveClaudePermissionMode(effectiveConfig.sandbox, effectiveConfig.planMode);
     const args = [
       "-p",
       "--output-format",
@@ -2664,16 +2590,10 @@ class RunManager extends EventEmitter {
       env.CLAUDE_CODE_EFFORT_LEVEL = effort;
     }
 
-    if (effectiveConfig.planMode) {
-      args.push("--allowedTools", CLAUDE_PLAN_ALLOWED_TOOLS.join(","));
-      args.push("--disallowedTools", CLAUDE_PLAN_DISALLOWED_TOOLS.join(","));
-    } else if (permissionMode === "acceptEdits") {
-      const [allowed, disallowed] =
-        effectiveConfig.sandbox === "read-only"
-          ? [CLAUDE_READ_ONLY_ALLOWED_TOOLS, CLAUDE_READ_ONLY_DISALLOWED_TOOLS]
-          : [CLAUDE_WORKSPACE_WRITE_ALLOWED_TOOLS, CLAUDE_WORKSPACE_WRITE_DISALLOWED_TOOLS];
-      args.push("--allowedTools", allowed.join(","));
-      args.push("--disallowedTools", disallowed.join(","));
+    const toolLists = resolveClaudeToolLists(effectiveConfig.sandbox, effectiveConfig.planMode);
+    if (toolLists) {
+      args.push("--allowedTools", toolLists.allowed.join(","));
+      args.push("--disallowedTools", toolLists.disallowed.join(","));
     }
 
     if (effectiveConfig.sessionId) args.push("--resume", effectiveConfig.sessionId);
@@ -4356,39 +4276,6 @@ function resolveConfigWorkspaces(): { defaultWorkspace: string; options: Workspa
     defaultWorkspace,
     options: [...dedup.values()],
   };
-}
-
-/**
- * On this Codex build (0.151.0) / Windows host, `-s workspace-write -c
- * approval_policy=<never|on-failure|on-request>` deadlocks in headless
- * `codex exec`: there is no interactive channel to grant an approval, so
- * EVERY gated command is rejected outright ("blocked by policy") -- even a
- * plain file read. Verified empirically 2026-09-03 against a throwaway
- * workspace (C:\projects\luma-permission-diagnostics) across all three
- * approval_policy values; `read-only` fails the same way and has no
- * documented workaround. Codex's own `--approve-for-me` flag ("route
- * approval requests through automatic review using the workspace-write
- * sandbox") is the CLI's documented headless-safe equivalent, and was
- * verified end-to-end: read/write/git/subprocess all succeeded. `-s`/
- * `--sandbox` cannot be combined with `--approve-for-me` (the CLI itself
- * rejects that combination), so this substitutes the whole sandbox/approval
- * arg pair rather than adding a flag alongside the broken ones.
- *
- * Important caveat, reported honestly rather than silently assumed away:
- * `--approve-for-me` does NOT provide network isolation on this build --
- * a real HTTP GET succeeded under it in the same diagnostic session. A
- * caller choosing workspace-write for network isolation (rather than for
- * write-confinement) is not actually getting that from this substitution;
- * only `read-only` (currently non-functional here in headless exec) would.
- * `danger-full-access` is untouched -- it needs no approval channel at
- * all and was independently verified to work (the real Dalil Daily Health
- * schedule dispatch).
- */
-function buildCodexApprovalArgs(sandbox: RunConfig["sandbox"], approvalPolicy: RunConfig["approvalPolicy"]): string[] {
-  if (sandbox === "workspace-write") {
-    return ["--approve-for-me"];
-  }
-  return ["-s", sandbox, "-c", `approval_policy=${JSON.stringify(approvalPolicy)}`];
 }
 
 function expandHome(value: string): string {
