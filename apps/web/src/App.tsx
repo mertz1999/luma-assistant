@@ -3967,6 +3967,8 @@ export function App(): JSX.Element {
         sandbox,
         approvalPolicy,
         skills: selectedSkills.map(selectedSkillRef),
+        missedRunPolicy: "skip",
+        requestedCredentials: [],
       });
       await refreshAgentSchedules();
     } catch (error) {
