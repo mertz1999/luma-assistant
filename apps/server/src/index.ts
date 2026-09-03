@@ -7061,8 +7061,33 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
 
 function runCodexCommandStatus(args: string[]): CodexCommandStatus {
   const command = [CODEX_PATH, ...args].join(" ");
-  const result = spawnSync(CODEX_PATH, args, {
-    cwd: uiState.activeWorkspace,
+
+  // CODEX_PATH is usually just "codex", which on Windows resolves to a
+  // .cmd npm shim -- spawnSync(command, args) does NOT follow PATHEXT/.cmd
+  // resolution the way a shell does, so calling it directly here produced a
+  // false "codex ENOENT" even when Codex is genuinely installed and every
+  // real run (which goes through resolveExecutableForSpawn) works fine.
+  // Mirror that same resolution here instead of spawning CODEX_PATH raw.
+  let resolved: { command: string; prependArgs: string[] };
+  try {
+    resolved = resolveExecutableForSpawn(CODEX_PATH);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Failed to resolve Codex executable";
+    return { command, ok: false, exitCode: 1, stdout: "", stderr: message };
+  }
+
+  // A stale/example active workspace (e.g. config.yaml's default_workspace
+  // copied from a different machine) does not exist on THIS disk. Node's
+  // spawnSync on Windows then reports a misleading ENOENT against the
+  // *executable* rather than the cwd (reproduced directly: a definitely-
+  // real .exe with a nonexistent cwd fails the same way), which made a
+  // perfectly valid Codex install look uninstalled. Fall back to this
+  // server process's own (always-valid) cwd rather than failing this
+  // health check on an unrelated workspace-selection problem.
+  const spawnCwd = fs.existsSync(uiState.activeWorkspace) ? uiState.activeWorkspace : process.cwd();
+
+  const result = spawnSync(resolved.command, [...resolved.prependArgs, ...args], {
+    cwd: spawnCwd,
     encoding: "utf8",
     timeout: 15000,
   });
