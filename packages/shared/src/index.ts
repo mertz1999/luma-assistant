@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export { sanitizeExternalText, fenceExternalText, type FenceOptions } from "./fencing.js";
+
 export const runStatusSchema = z.enum(["queued", "running", "completed", "failed", "stopped"]);
 export type RunStatus = z.infer<typeof runStatusSchema>;
 

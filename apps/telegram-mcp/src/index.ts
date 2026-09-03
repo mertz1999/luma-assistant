@@ -8,6 +8,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import * as z from "zod/v4";
+import { fenceExternalText } from "@luma/shared";
 
 const execFileAsync = promisify(execFile);
 
@@ -678,9 +679,21 @@ async function readDownloadedText(
     const buffer = Buffer.alloc(bytesToRead);
     const { bytesRead } = await handle.read(buffer, 0, bytesToRead, 0);
     const content = buffer.subarray(0, bytesRead).toString("utf8").replace(/^\uFEFF/, "");
+    // This file was uploaded by whoever can message the configured Telegram
+    // chat/topic -- untrusted, third-party text, not this deployment's own
+    // instructions. Fenced (see @luma/shared/fencing, concept credited to
+    // Anthropic's commerce-agents reference) so a model reading this tool
+    // result cannot mistake its contents for a new instruction, no matter
+    // how the uploader phrased it. text_content_bytes still reports the raw
+    // file size read, not the fenced wrapper's length, so it keeps meaning
+    // "how much of the document did we actually read."
+    const fenced = fenceExternalText(content, {
+      source: `telegram-uploaded-file:${savedFile.file_name}`,
+      maxChars: Math.max(bytesRead, 1),
+    });
     return {
       is_text: true,
-      text_content: content,
+      text_content: fenced,
       text_content_bytes: bytesRead,
       text_content_truncated: stat.size > bytesRead,
     };
