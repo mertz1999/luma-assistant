@@ -27,15 +27,40 @@ import type { ApprovalPolicy, RunConfig, SandboxMode } from "@luma/shared";
  * rejects that combination), so this substitutes the whole sandbox/approval
  * arg pair rather than adding a flag alongside the broken ones.
  *
- * Important caveat, reported honestly rather than silently assumed away:
- * `--approve-for-me` does NOT provide network isolation on this build --
- * a real HTTP GET succeeded under it in the same diagnostic session. A
- * caller choosing workspace-write for network isolation (rather than for
- * write-confinement) is not actually getting that from this substitution;
- * only `read-only` (currently non-functional here in headless exec) would.
- * `danger-full-access` is untouched -- it needs no approval channel at
- * all and was independently verified to work (the real Dalil Daily Health
- * schedule dispatch).
+ * CORRECTED 2026-09-03 (evening) -- an earlier version of this comment
+ * claimed `--approve-for-me` provides real filesystem write-confinement
+ * to the workspace, just not network isolation. That was wrong and has
+ * been directly disproven: live-tested against two throwaway directories
+ * (A as -C workspace, B a sibling), a Codex run under `--approve-for-me`
+ * successfully wrote a file into B via BOTH a relative path
+ * (`../B/file.txt`) and an absolute path (`C:\...\B\file.txt`) -- no
+ * error, no denial, real file on disk. The same test against Claude's
+ * `acceptEdits` + workspace-write allowlist (below) had an identical
+ * result: the Write tool has no path-boundary check of its own; the
+ * allowlist controls which TOOLS run, not WHERE a permitted tool writes.
+ *
+ * Honest, verified conclusion: on this machine (Windows, Codex CLI
+ * 0.151.0, Claude Code 2.1.259), NEITHER runner's "workspace-write"
+ * profile provides real OS-level filesystem or network confinement.
+ * "workspace-write" vs "danger-full-access" differ in practice only in
+ * (a) whether `-C`/cwd is set to the intended project directory, (b) for
+ * Claude, which specific tool NAMES are pre-approved, and (c) audit
+ * labeling -- not in what either runner can actually reach once invoked.
+ * The real boundary that has held in every observed run so far is
+ * prompt-level self-restraint (the AGENT.md's own "never touch files
+ * outside <workspace>" instruction), not a mechanical one. This is a
+ * platform/tooling limitation, not something fixable inside Luma without
+ * real OS-level sandboxing (Windows Job Objects/AppContainer or an
+ * external sandbox like Windows Sandbox) -- a materially larger,
+ * separately-authorized undertaking, not a bounded fix. Flagged to the
+ * operator; the KoraIQ weekly schedule that depended on this assumption
+ * was paused pending that decision (see agents/koraiq-forward-health/
+ * AGENT.md and the session's own morning report for the reasoning).
+ *
+ * `danger-full-access` carries no such false implication -- it is
+ * accurately named and was independently verified to work (the real
+ * Dalil Daily Health schedule dispatch), so Dalil's existing schedules
+ * (which already use it) are not affected by this correction.
  *
  * `codex exec resume` has no `-s`/`--sandbox` or `--approve-for-me` flag
  * at all (verified via `codex exec resume --help`) -- callers on the
@@ -82,6 +107,15 @@ export const CLAUDE_PLAN_DISALLOWED_TOOLS = [
  * (omission from the allowlist already denies it) -- kept explicit so the
  * boundary is self-documenting in the spawned command line and in the
  * audit trail, not just an absence.
+ *
+ * These allowlists control WHICH TOOLS run (e.g. Write is absent from
+ * the read-only list below), never WHERE a permitted tool is allowed to
+ * write. Live-tested 2026-09-03: Claude's Write tool under the
+ * workspace-write list happily wrote outside the declared workspace via
+ * both a relative and an absolute path, `permission_denials: []` --
+ * there is no path-boundary enforcement here, same gap as Codex's
+ * `--approve-for-me` above. Read this file's Codex section for the full
+ * finding; it applies to both runners identically.
  */
 export const CLAUDE_READ_ONLY_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git branch:*)", "Bash(git rev-parse:*)"];
 export const CLAUDE_READ_ONLY_DISALLOWED_TOOLS = ["Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch"];
