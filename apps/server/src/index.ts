@@ -13,7 +13,7 @@ import {
 import { reconcileStaleRunPid } from "./recovery.js";
 import { appendAuditEvent, readAuditEvents, verifyAuditChain } from "./audit/audit-log.js";
 import { evaluateRunStartPolicy, evaluateProjectWorkspaceBinding } from "./policy/policy-engine.js";
-import { buildCodexApprovalArgs, resolveClaudePermissionMode, resolveClaudeToolLists } from "./runners/permission-mapping.js";
+import { buildCodexApprovalArgs, resolveClaudePermissionMode, resolveClaudeToolLists, resolveEffectiveSandbox } from "./runners/permission-mapping.js";
 import { evaluateResourcePolicy, type ResourceLimits } from "./resources/resource-watchdog.js";
 import { canTransitionMissionStatus } from "./missions/mission-state.js";
 import { pickSafeBaseEnv } from "./security/safe-environment.js";
@@ -2168,6 +2168,10 @@ class RunManager extends EventEmitter {
     }
 
     const effectiveConfig = resolveEffectiveRunConfig(config);
+    const isFullMachine = effectiveConfig.permissionProfile === "FULL_MACHINE";
+    if (isFullMachine) {
+      effectiveConfig.sandbox = resolveEffectiveSandbox(effectiveConfig.sandbox, effectiveConfig.permissionProfile);
+    }
 
     // Enforced HERE, inside startRun itself, rather than only in the
     // POST /api/runs/start route -- this is the one call path every run
@@ -2192,17 +2196,24 @@ class RunManager extends EventEmitter {
     const declaredProjectId = effectiveConfig.project ?? null;
     const requestedWorkspaceCanonical = canonicalizePath(effectiveConfig.workspace);
     const authorizedWorkspaceCanonical = declaredProjectId ? resolveAuthorizedWorkspaceForProject(declaredProjectId) : null;
-    const bindingDecision = evaluateProjectWorkspaceBinding({
-      projectId: declaredProjectId,
-      // A canonicalization failure (path vanished between the route's
-      // existsSync check and here, or a scheduler dispatch that skipped
-      // that check) must still fail closed rather than comparing against
-      // an empty string, which path.relative would happily treat as "no
-      // relation" -> DENY anyway, but explicitly is clearer than relying
-      // on that fallthrough.
-      requestedWorkspace: requestedWorkspaceCanonical ?? `<<unresolvable:${effectiveConfig.workspace}>>`,
-      authorizedWorkspace: authorizedWorkspaceCanonical,
-    });
+    // FULL_MACHINE (manual-only, see runConfigSchema.permissionProfile) is
+    // the sole exception: the operator explicitly asked to cross the
+    // project boundary, so this specific check is skipped -- the denylist
+    // in policyDecision above (root/system-dir/home) is NOT skipped and
+    // still applies unchanged.
+    const bindingDecision = isFullMachine
+      ? { decision: "ALLOW" as const, rule: "full-machine-manual-override", reason: "permissionProfile=FULL_MACHINE explicitly bypasses project-workspace binding." }
+      : evaluateProjectWorkspaceBinding({
+          projectId: declaredProjectId,
+          // A canonicalization failure (path vanished between the route's
+          // existsSync check and here, or a scheduler dispatch that skipped
+          // that check) must still fail closed rather than comparing against
+          // an empty string, which path.relative would happily treat as "no
+          // relation" -> DENY anyway, but explicitly is clearer than relying
+          // on that fallthrough.
+          requestedWorkspace: requestedWorkspaceCanonical ?? `<<unresolvable:${effectiveConfig.workspace}>>`,
+          authorizedWorkspace: authorizedWorkspaceCanonical,
+        });
 
     this.audit("policy.decision", null, {
       operation: "run.start",
@@ -2221,6 +2232,15 @@ class RunManager extends EventEmitter {
     }
     if (bindingDecision.decision !== "ALLOW") {
       throw new PolicyDeniedError(bindingDecision.reason);
+    }
+    if (isFullMachine) {
+      this.audit("run.permission_escalated", null, {
+        runner: effectiveConfig.runner,
+        project: declaredProjectId,
+        workspace: effectiveConfig.workspace,
+        requestedProfile: "FULL_MACHINE",
+        effectiveSandbox: effectiveConfig.sandbox,
+      });
     }
 
     const resourceDecision = evaluateResourcePolicy(effectiveConfig.workspace, RESOURCE_LIMITS);
@@ -8121,6 +8141,7 @@ app.post("/api/runs/start", (req, res) => {
       runner: parsed.data.runner,
       workspace,
       project: parsed.data.project,
+      permissionProfile: parsed.data.permissionProfile,
       prompt: parsed.data.prompt,
       model: parsed.data.model,
       reasoningEffort: parsed.data.reasoningEffort,

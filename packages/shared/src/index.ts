@@ -201,6 +201,8 @@ export const runConfigSchema = z.object({
    * design so no existing caller (ad-hoc workspaces, test fixtures) breaks.
    */
   project: z.string().trim().min(1).optional(),
+  /** Manual-only escalation flag. See RunManager.startRun / permission-mapping.ts for enforcement. Absent from schedule/outbox schemas by design. */
+  permissionProfile: z.enum(["FULL_MACHINE"]).optional(),
   prompt: z.string().min(1),
   model: z.string().min(1),
   reasoningEffort: reasoningEffortSchema.default("high"),
@@ -229,6 +231,8 @@ export const startRunSchema = z.object({
   workspace: z.string().min(1),
   /** See runConfigSchema.project -- same optional, mechanically-checked declared project identity. */
   project: z.string().trim().min(1).optional(),
+  /** See runConfigSchema.permissionProfile. */
+  permissionProfile: z.enum(["FULL_MACHINE"]).optional(),
   model: z.string().min(1),
   reasoningEffort: reasoningEffortSchema.default("high"),
   sandbox: sandboxSchema.default("read-only"),

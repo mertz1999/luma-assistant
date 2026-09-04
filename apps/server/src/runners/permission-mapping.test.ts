@@ -4,6 +4,7 @@ import {
   buildCodexApprovalArgs,
   resolveClaudePermissionMode,
   resolveClaudeToolLists,
+  resolveEffectiveSandbox,
   CLAUDE_PLAN_ALLOWED_TOOLS,
   CLAUDE_PLAN_DISALLOWED_TOOLS,
   CLAUDE_READ_ONLY_ALLOWED_TOOLS,
@@ -87,4 +88,18 @@ test("resolveClaudeToolLists: workspace-write returns the workspace-write list, 
   assert.deepEqual(lists!.allowed, CLAUDE_WORKSPACE_WRITE_ALLOWED_TOOLS);
   assert.ok(!lists!.allowed.some((t) => t.includes("git push")), "git push must never be in the allowlist");
   assert.ok(lists!.disallowed.includes("Bash(git push:*)"), "git push must be explicit in the disallowlist (defense in depth)");
+});
+
+// -- resolveEffectiveSandbox (D3: FULL_MACHINE) -----------------------------
+
+test("resolveEffectiveSandbox: FULL_MACHINE forces danger-full-access regardless of requested sandbox", () => {
+  assert.equal(resolveEffectiveSandbox("read-only", "FULL_MACHINE"), "danger-full-access");
+  assert.equal(resolveEffectiveSandbox("workspace-write", "FULL_MACHINE"), "danger-full-access");
+  assert.equal(resolveEffectiveSandbox("danger-full-access", "FULL_MACHINE"), "danger-full-access");
+});
+
+test("resolveEffectiveSandbox: no profile (undefined) passes the requested sandbox through unchanged -- the bounded default", () => {
+  assert.equal(resolveEffectiveSandbox("read-only", undefined), "read-only");
+  assert.equal(resolveEffectiveSandbox("workspace-write", undefined), "workspace-write");
+  assert.equal(resolveEffectiveSandbox("danger-full-access", undefined), "danger-full-access");
 });

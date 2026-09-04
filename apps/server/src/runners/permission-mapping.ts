@@ -9,6 +9,21 @@ import type { ApprovalPolicy, RunConfig, SandboxMode } from "@luma/shared";
  * does.
  */
 
+// -- FULL_MACHINE escalation ------------------------------------------------
+
+/**
+ * The one manual-only escalation: forces the effective sandbox to
+ * "danger-full-access" regardless of what was separately requested,
+ * reusing (not duplicating) the sandbox->runner-args mapping both
+ * adapters already have for that value. This is deliberately the ONLY
+ * thing FULL_MACHINE changes about the runner-args side -- the project-
+ * workspace-binding bypass is a separate, policy-layer decision (see
+ * RunManager.startRun), not something this pure function knows about.
+ */
+export function resolveEffectiveSandbox(sandbox: SandboxMode, permissionProfile: "FULL_MACHINE" | undefined): SandboxMode {
+  return permissionProfile === "FULL_MACHINE" ? "danger-full-access" : sandbox;
+}
+
 // -- Codex --------------------------------------------------------------
 
 /**
