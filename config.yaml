@@ -1,5 +1,21 @@
 default_workspace: C:\projects\luma-assistant
 
+# Optional BrowserAct browser adapter (apps/server/src/browser/). Disabled
+# by default: BrowserAct (github.com/browser-act/skills) is not installed
+# on this host as of this block's addition (verified: not on PATH, not on
+# the public npm registry under this name). Flip enabled to true only
+# after installing and vetting it -- resolveProjectBrowserPermission()
+# returns null (deny) for every project while enabled is false, regardless
+# of project_permissions below, so this block being present ahead of time
+# does not itself grant anything.
+browser:
+  enabled: false
+  provider: browseract
+  default_permission: read_only
+  project_permissions:
+    dalilfinance: read_only
+    botolaiq: read_only
+
 repos:
   insurance-verificatin: /Users/applestation/Project/deepspring/PI_insurance_verification
   coding: /Users/applestation/Project/deepspring/PI_coding
