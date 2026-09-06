@@ -36,7 +36,6 @@ import {
   Terminal,
   Trash2,
   X,
-  Globe,
 } from "lucide-react";
 import type {
   AgentListItem,
@@ -101,12 +100,11 @@ import { useUiStore } from "@/store/useUiStore";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { CardContent } from "@/components/ui/card";
-import { PreviewPanel } from "@/components/PreviewPanel";
 import { TaskManager } from "@/TaskManager";
 
 type StatusFilter = "all" | "running" | "completed" | "failed" | "stopped";
 type SessionFilterValue = StatusFilter | "all-history";
-type DockTab = "terminal" | "context" | "preview";
+type DockTab = "terminal" | "context";
 type SidebarMode = "code" | "agents";
 type BackendConnectionStatus = "connecting" | "connected" | "disconnected";
 
@@ -2062,11 +2060,6 @@ export function App(): JSX.Element {
     theme,
     setTheme,
     toggleTheme,
-    previewOpen,
-    previewMode,
-    togglePreview,
-    openPreview,
-    closePreview,
   } = useUiStore();
 
   const [loading, setLoading] = useState(true);
@@ -2581,25 +2574,6 @@ export function App(): JSX.Element {
     }, 30000);
     return () => window.clearInterval(timer);
   }, [authReady, isAuthenticated, sidebarMode]);
-
-  useEffect(() => {
-    if (!authReady || !isAuthenticated) return;
-
-    function onKeyDown(event: globalThis.KeyboardEvent): void {
-      if (!(event.metaKey || event.ctrlKey) || !event.shiftKey) return;
-      if (event.key.toLowerCase() !== "p") return;
-      const target = event.target;
-      if (target instanceof HTMLElement) {
-        const tag = target.tagName;
-        if (tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable) return;
-      }
-      event.preventDefault();
-      togglePreview();
-    }
-
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [authReady, isAuthenticated, togglePreview]);
 
   const allSessions = useMemo(() => buildSessionCards(runItems), [runItems]);
   const filteredSessions = useMemo(() => {
@@ -4387,7 +4361,7 @@ export function App(): JSX.Element {
       : "lg:grid-cols-1";
 
   return (
-    <div className="flex h-[100dvh] w-full flex-col overflow-hidden bg-background text-[color:var(--text)]">
+    <div className="h-[100dvh] w-full overflow-hidden bg-background text-[color:var(--text)]">
       <header className="fixed inset-x-0 top-0 z-20 bg-surface-1/95 px-2 py-2 shadow-[0_14px_30px_-24px_rgba(0,0,0,0.9)] lg:hidden">
         <div className="mx-auto flex max-w-7xl items-center justify-between">
           <Button size="sm" variant="ghost" onClick={() => setMobileThreadsOpen(true)}>
@@ -4402,16 +4376,9 @@ export function App(): JSX.Element {
         </div>
       </header>
 
-      {previewOpen && previewMode === "top" ? (
-        <div className="relative z-10 hidden shrink-0 pt-12 lg:block lg:pt-2 lg:px-2">
-          <PreviewPanel layout="top" className="rounded-lg shadow-[0_14px_30px_-28px_rgba(0,0,0,0.9)]" />
-        </div>
-      ) : null}
-
       <div
         className={cn(
-          "grid min-h-0 flex-1 grid-cols-1 pt-12 lg:gap-2 lg:p-2",
-          previewOpen && previewMode === "top" ? "lg:pt-0" : "lg:pt-2",
+          "grid h-full min-h-0 grid-cols-1 pt-12 lg:gap-2 lg:p-2 lg:pt-2",
           desktopGridColumns,
         )}
       >
@@ -4457,21 +4424,9 @@ export function App(): JSX.Element {
             claudeEffortFlagSupported={claudeEffortFlagSupported}
             rightPanelTab={rightPanelTab}
             rightDockOpen={rightDockOpen}
-            previewOpen={previewOpen}
             onOpenRightPanel={(tab) => {
-              if (tab === "preview") {
-                openPreview("dock");
-                return;
-              }
               setRightPanelTab(tab);
               setRightDockOpen(true);
-            }}
-            onTogglePreview={() => {
-              if (previewOpen) {
-                closePreview();
-                return;
-              }
-              openPreview(previewMode);
             }}
             leftSidebarOpen={leftSidebarOpen}
             onOpenLeftSidebar={() => setLeftSidebarOpen(true)}
@@ -4540,13 +4495,7 @@ export function App(): JSX.Element {
         <aside className="hidden min-h-0 flex-col overflow-hidden rounded-lg bg-surface-1 shadow-[-10px_0_26px_-26px_rgba(0,0,0,0.9)] lg:flex">
           <ClaudeRightPanel
             rightPanelTab={rightPanelTab}
-            setRightPanelTab={(tab) => {
-              if (tab === "preview") {
-                openPreview("dock");
-                return;
-              }
-              setRightPanelTab(tab);
-            }}
+            setRightPanelTab={setRightPanelTab}
             onClose={() => setRightDockOpen(false)}
             workspaces={workspaces}
             activeWorkspace={activeWorkspace}
@@ -4736,13 +4685,7 @@ export function App(): JSX.Element {
             <div className="flex h-full min-h-0 flex-col overflow-hidden animate-slide-in">
               <ClaudeRightPanel
                 rightPanelTab={rightPanelTab}
-                setRightPanelTab={(tab) => {
-                  if (tab === "preview") {
-                    openPreview("dock");
-                    return;
-                  }
-                  setRightPanelTab(tab);
-                }}
+                setRightPanelTab={setRightPanelTab}
                 onClose={() => setMobileContextOpen(false)}
                 workspaces={workspaces}
                 activeWorkspace={activeWorkspace}
@@ -5290,9 +5233,7 @@ type CenterPanelProps = {
   claudeEffortFlagSupported: boolean;
   rightPanelTab: DockTab;
   rightDockOpen: boolean;
-  previewOpen: boolean;
   onOpenRightPanel: (tab: DockTab) => void;
-  onTogglePreview: () => void;
   leftSidebarOpen: boolean;
   onOpenLeftSidebar: () => void;
   timeline: TimelineEntry[];
@@ -5489,9 +5430,6 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
-          <Button type="button" variant={props.previewOpen ? "primary" : "ghost"} size="sm" className="h-7 w-7 p-0" onClick={props.onTogglePreview} aria-label="Toggle preview" title="Preview (Ctrl/Cmd+Shift+P)">
-            <Globe className="h-3.5 w-3.5" />
-          </Button>
           <Button type="button" variant={props.rightDockOpen && props.rightPanelTab === "terminal" ? "primary" : "ghost"} size="sm" className="h-7 w-7 p-0" onClick={() => props.onOpenRightPanel("terminal")} aria-label="Open terminal" title="Terminal">
             <Terminal className="h-3.5 w-3.5" />
           </Button>
@@ -6192,7 +6130,6 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
   const activeTabLabel = {
     terminal: "Terminal",
     context: "Context",
-    preview: "Preview",
   }[props.rightPanelTab];
 
   useEffect(() => {
@@ -6298,7 +6235,6 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-surface-1">
-      {props.rightPanelTab === "preview" ? null : (
       <div className="relative z-10 flex h-12 shrink-0 items-center justify-between px-3 shadow-[0_14px_30px_-28px_rgba(0,0,0,0.9)]">
         <div className="flex min-w-0 items-center gap-2">
           <Terminal className="h-4 w-4 text-brand" />
@@ -6308,14 +6244,12 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
           <X className="h-4 w-4" />
         </button>
       </div>
-      )}
 
       {props.mobile ? (
-        <div className="relative z-10 grid shrink-0 grid-cols-3 gap-1 bg-background px-2 py-2 shadow-[0_12px_26px_-26px_rgba(0,0,0,0.9)]">
+        <div className="relative z-10 grid shrink-0 grid-cols-2 gap-1 bg-background px-2 py-2 shadow-[0_12px_26px_-26px_rgba(0,0,0,0.9)]">
           {([
             ["terminal", Terminal, ""],
             ["context", Layers, ""],
-            ["preview", Globe, ""],
           ] as const).map(([tab, Icon, count]) => (
             <button
               key={tab}
@@ -6334,11 +6268,6 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
         </div>
       ) : null}
 
-      {props.rightPanelTab === "preview" ? (
-        <div className="min-h-0 flex-1 overflow-hidden">
-          <PreviewPanel layout="dock" />
-        </div>
-      ) : (
       <div className="scrollbar-thin min-h-0 flex-1 overflow-auto p-3">
         {props.rightPanelTab === "terminal" ? (
           <section className="flex min-h-full flex-col">
@@ -6530,7 +6459,6 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
         ) : null}
 
       </div>
-      )}
     </div>
   );
 }

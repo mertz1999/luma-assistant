@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import http from "node:http";
 import path from "node:path";
 import os from "node:os";
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
@@ -11,8 +10,6 @@ import dotenv from "dotenv";
 import express from "express";
 import jwt from "jsonwebtoken";
 import type { IPty } from "node-pty";
-import { mountPreviewProxy, readPreviewAuthCookie } from "./previewProxy.js";
-import { extractTokenFromUpgradeRequest, PreviewBrowserManager } from "./previewBrowser.js";
 import {
   approvalPolicySchema,
   attachmentRefSchema,
@@ -6896,19 +6893,6 @@ app.post("/api/auth/login", (req, res) => {
 
 app.use(requireAuth);
 
-mountPreviewProxy(app, {
-  enabled: AUTH_ENABLED,
-  extractToken: extractAuthToken,
-  verifyToken: (token) => {
-    try {
-      jwt.verify(token, JWT_SECRET);
-      return true;
-    } catch {
-      return false;
-    }
-  },
-});
-
 const runManager = new RunManager(CODEX_PATH);
 const persisted = loadPersistedRuns();
 runManager.loadPersisted(persisted.runs, persisted.approvals);
@@ -7022,9 +7006,6 @@ function extractAuthToken(req: express.Request): string | null {
 
   const queryToken = typeof req.query.token === "string" ? req.query.token.trim() : "";
   if (queryToken) return queryToken;
-
-  const cookieToken = readPreviewAuthCookie(req);
-  if (cookieToken) return cookieToken;
 
   return null;
 }
@@ -8056,39 +8037,23 @@ function flushPersistentStateSync(): void {
   taskManagerStore.flushSync();
 }
 
-const httpServer = http.createServer(app);
-let previewBrowserManager: PreviewBrowserManager | null = null;
-
-previewBrowserManager = new PreviewBrowserManager(httpServer, {
-  enabled: AUTH_ENABLED,
-  extractToken: extractTokenFromUpgradeRequest,
-  verifyToken: (token) => {
-    try {
-      jwt.verify(token, JWT_SECRET);
-      return true;
-    } catch {
-      return false;
-    }
-  },
-});
-
 process.on("beforeExit", () => {
   flushPersistentStateSync();
 });
 
 process.on("SIGINT", () => {
   flushPersistentStateSync();
-  void previewBrowserManager?.dispose().finally(() => process.exit(0));
+  process.exit(0);
 });
 
 process.on("SIGTERM", () => {
   flushPersistentStateSync();
-  void previewBrowserManager?.dispose().finally(() => process.exit(0));
+  process.exit(0);
 });
 
-httpServer.listen(API_PORT, HOST, () => {
+app.listen(API_PORT, HOST, () => {
   // eslint-disable-next-line no-console
   console.log(
-    `[luma-assistant/server] listening on http://${HOST}:${API_PORT} | auth=${AUTH_ENABLED ? "enabled" : "disabled"} | preview-browser=on`,
+    `[luma-assistant/server] listening on http://${HOST}:${API_PORT} | auth=${AUTH_ENABLED ? "enabled" : "disabled"}`,
   );
 });

@@ -52,49 +52,6 @@ export function setApiAuthToken(token: string | null): void {
   authToken = token && token.trim() ? token.trim() : null;
 }
 
-export function getApiAuthToken(): string | null {
-  return authToken;
-}
-
-/** True when the current page is not on loopback (remote Luma needs server proxy for localhost apps). */
-export function pageNeedsPreviewProxy(): boolean {
-  if (typeof window === "undefined") return false;
-  const host = window.location.hostname.toLowerCase();
-  return host !== "localhost" && host !== "127.0.0.1";
-}
-
-export function isLoopbackPreviewUrl(rawUrl: string): boolean {
-  try {
-    const parsed = new URL(rawUrl);
-    const host = parsed.hostname.toLowerCase();
-    return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Build the iframe src. On remote Luma, loopback URLs go through `/api/preview-proxy`
- * so they hit the server's localhost, not the operator's laptop.
- */
-export function buildPreviewFrameSrc(rawUrl: string): string {
-  if (!rawUrl) return "";
-  if (!pageNeedsPreviewProxy() || !isLoopbackPreviewUrl(rawUrl)) return rawUrl;
-
-  try {
-    const parsed = new URL(rawUrl);
-    const host = parsed.hostname === "::1" || parsed.hostname === "[::1]" ? "127.0.0.1" : parsed.hostname;
-    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
-    const suffix = `${parsed.pathname || "/"}${parsed.search}${parsed.hash}`;
-    const path = `/api/preview-proxy/${encodeURIComponent(host)}/${port}${suffix.startsWith("/") ? suffix : `/${suffix}`}`;
-    if (!authToken) return path;
-    const join = path.includes("?") ? "&" : "?";
-    return `${path}${join}token=${encodeURIComponent(authToken)}`;
-  } catch {
-    return rawUrl;
-  }
-}
-
 export function setTaskManagerAuthToken(token: string | null): void {
   taskManagerAuthToken = token && token.trim() ? token.trim() : null;
 }
