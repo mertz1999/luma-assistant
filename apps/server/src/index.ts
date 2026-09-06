@@ -10,6 +10,7 @@ import dotenv from "dotenv";
 import express from "express";
 import jwt from "jsonwebtoken";
 import type { IPty } from "node-pty";
+import { mountPreviewProxy, readPreviewAuthCookie } from "./previewProxy.js";
 import {
   approvalPolicySchema,
   attachmentRefSchema,
@@ -6893,6 +6894,19 @@ app.post("/api/auth/login", (req, res) => {
 
 app.use(requireAuth);
 
+mountPreviewProxy(app, {
+  enabled: AUTH_ENABLED,
+  extractToken: extractAuthToken,
+  verifyToken: (token) => {
+    try {
+      jwt.verify(token, JWT_SECRET);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+});
+
 const runManager = new RunManager(CODEX_PATH);
 const persisted = loadPersistedRuns();
 runManager.loadPersisted(persisted.runs, persisted.approvals);
@@ -7006,6 +7020,9 @@ function extractAuthToken(req: express.Request): string | null {
 
   const queryToken = typeof req.query.token === "string" ? req.query.token.trim() : "";
   if (queryToken) return queryToken;
+
+  const cookieToken = readPreviewAuthCookie(req);
+  if (cookieToken) return cookieToken;
 
   return null;
 }

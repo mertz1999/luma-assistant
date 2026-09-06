@@ -10,6 +10,7 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { buildPreviewFrameSrc, isLoopbackPreviewUrl, pageNeedsPreviewProxy } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import {
   normalizePreviewUrl,
@@ -61,6 +62,8 @@ export function PreviewPanel({ layout, className, onClose }: PreviewPanelProps):
   const canGoBack = previewHistoryIndex > 0;
   const canGoForward = previewHistoryIndex >= 0 && previewHistoryIndex < previewHistory.length - 1;
   const recentSuggestions = previewRecents.filter((url) => url !== previewUrl).slice(0, 5);
+  const frameSrc = buildPreviewFrameSrc(previewUrl);
+  const usingServerProxy = Boolean(previewUrl && pageNeedsPreviewProxy() && isLoopbackPreviewUrl(previewUrl));
 
   function commitUrl(raw: string): void {
     const normalized = normalizePreviewUrl(raw);
@@ -99,8 +102,9 @@ export function PreviewPanel({ layout, className, onClose }: PreviewPanelProps):
   }
 
   function openExternally(): void {
-    if (!previewUrl) return;
-    window.open(previewUrl, "_blank", "noopener,noreferrer");
+    const src = frameSrc || previewUrl;
+    if (!src) return;
+    window.open(src, "_blank", "noopener,noreferrer");
   }
 
   function onResizePointerDown(event: ReactPointerEvent<HTMLDivElement>): void {
@@ -270,16 +274,20 @@ export function PreviewPanel({ layout, className, onClose }: PreviewPanelProps):
               {url.replace(/^https?:\/\//i, "")}
             </button>
           ))}
-          <span className="ml-auto text-[10px] text-foreground/45">Blank? Open externally — some apps block iframes.</span>
+          <span className="ml-auto text-[10px] text-foreground/45">
+            {usingServerProxy
+              ? "Via server proxy → this machine’s localhost"
+              : "Blank? Open externally — some apps block iframes."}
+          </span>
         </div>
       </div>
 
       <div className="relative min-h-0 flex-1 bg-background">
         {previewUrl ? (
           <iframe
-            key={`${previewUrl}::${previewReloadToken}`}
+            key={`${frameSrc}::${previewReloadToken}`}
             title="App preview"
-            src={previewUrl}
+            src={frameSrc}
             className="h-full w-full border-0 bg-white"
             sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads"
             referrerPolicy="no-referrer"
