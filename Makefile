@@ -115,6 +115,7 @@ run: install-if-needed ensure-mcps stop-pm2-apps stop-dev-processes kill-ports
 
 deploy-start: install-if-needed install-pm2 ensure-mcps stop-pm2-apps stop-dev-processes kill-ports
 	@mkdir -p data/logs
+	npx playwright install chromium
 	npm run build
 	npm run migrate
 	API_PORT=$(API_PORT) WEB_PORT=$(WEB_PORT) TELEGRAM_MCP_PORT=$(TELEGRAM_MCP_PORT) TASK_MANAGER_MCP_PORT=$(TASK_MANAGER_MCP_PORT) IMAGE_MCP_PORT=$(IMAGE_MCP_PORT) HOST=$(HOST) NODE_ENV=production $(PM2_BIN) startOrReload $(PM2_ECOSYSTEM) --update-env
