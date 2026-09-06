@@ -289,7 +289,7 @@ export function PreviewPanel({ layout, className, onClose }: PreviewPanelProps):
             title="App preview"
             src={frameSrc}
             className="h-full w-full border-0 bg-white"
-            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads"
+            allow="clipboard-read; clipboard-write; fullscreen"
             referrerPolicy="no-referrer"
           />
         ) : (

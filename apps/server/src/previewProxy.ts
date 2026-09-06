@@ -81,11 +81,20 @@ function shouldRewriteBody(contentType: string | undefined): boolean {
   );
 }
 
-function rewriteBody(raw: string, host: string, port: string, contentType: string): string {
+function rewriteBody(
+  raw: string,
+  host: string,
+  port: string,
+  contentType: string,
+  authToken?: string | null,
+): string {
   const prefix = proxyPrefix(host, port);
   let next = raw;
 
   const absolutePatterns = [
+    new RegExp(`wss?://${host.replace(/\./g, "\\.")}:${port}`, "gi"),
+    new RegExp(`wss?://127\\.0\\.0\\.1:${port}`, "gi"),
+    new RegExp(`wss?://localhost:${port}`, "gi"),
     new RegExp(`https?://${host.replace(/\./g, "\\.")}:${port}`, "gi"),
     new RegExp(`https?://127\\.0\\.0\\.1:${port}`, "gi"),
     new RegExp(`https?://localhost:${port}`, "gi"),
@@ -103,18 +112,42 @@ function rewriteBody(raw: string, host: string, port: string, contentType: strin
     /(\burl\(\s*['"]?)\/(?!\/|api\/preview-proxy\/)/gi,
     `$1${prefix}/`,
   );
+
+  // ESM / Vite absolute imports: import "/x", import x from "/x", import("/x"), export from "/x"
   next = next.replace(
-    /(import\s*\(\s*["'])\/(?!\/|api\/preview-proxy\/)/g,
+    /(\bimport\s*\(\s*["'`])\/(?!\/|api\/preview-proxy\/)/g,
     `$1${prefix}/`,
   );
   next = next.replace(
-    /(\bfrom\s+["'])\/(?!\/|api\/preview-proxy\/)/g,
+    /(\bimport\s+["'`])\/(?!\/|api\/preview-proxy\/)/g,
     `$1${prefix}/`,
   );
   next = next.replace(
-    /(new\s+URL\(\s*["'])\/(?!\/|api\/preview-proxy\/)/g,
+    /(\bfrom\s+["'`])\/(?!\/|api\/preview-proxy\/)/g,
     `$1${prefix}/`,
   );
+  next = next.replace(
+    /(new\s+URL\(\s*["'`])\/(?!\/|api\/preview-proxy\/)/g,
+    `$1${prefix}/`,
+  );
+
+  // Catch remaining quoted root-absolute paths common in Vite-transformed modules.
+  next = next.replace(
+    /(["'`])\/(?!\/|api\/preview-proxy\/)(?=@|[A-Za-z0-9._-]+\/|[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+)/g,
+    `$1${prefix}/`,
+  );
+
+  if (authToken) {
+    const tokenQuery = `token=${encodeURIComponent(authToken)}`;
+    const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    next = next.replace(
+      new RegExp(`${escapedPrefix}/[^"'\\s)\\]>]*(?:\\?[^"'\\s)\\]>]*)?`, "g"),
+      (match) => {
+        if (match.includes("token=")) return match;
+        return match.includes("?") ? `${match}&${tokenQuery}` : `${match}?${tokenQuery}`;
+      },
+    );
+  }
 
   if (contentType.toLowerCase().includes("text/html") && !/<base\s/i.test(next)) {
     next = next.replace(
@@ -216,16 +249,20 @@ function handlePreviewProxy(req: Request, res: Response, auth: PreviewProxyAuth)
     const contentLength = Number(upstreamRes.headers["content-length"] || 0);
     const canRewrite = shouldRewriteBody(contentType)
       && (!contentLength || contentLength <= MAX_REWRITE_BYTES);
+    const requestToken = auth.extractToken(req);
 
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (!value) continue;
-      if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
-      if (key.toLowerCase() === "location") {
+      const lower = key.toLowerCase();
+      if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+      // Allow embedding inside Luma Preview even if upstream forbids framing.
+      if (lower === "x-frame-options" || lower === "content-security-policy") continue;
+      if (lower === "location") {
         const locations = Array.isArray(value) ? value : [value];
         res.setHeader(key, locations.map((item) => rewriteLocation(String(item), host, port)));
         continue;
       }
-      if (canRewrite && (key.toLowerCase() === "content-length" || key.toLowerCase() === "content-encoding")) {
+      if (canRewrite && (lower === "content-length" || lower === "content-encoding")) {
         continue;
       }
       res.setHeader(key, value);
@@ -240,8 +277,9 @@ function handlePreviewProxy(req: Request, res: Response, auth: PreviewProxyAuth)
 
     void collectBody(upstreamRes, MAX_REWRITE_BYTES)
       .then((buffer) => {
-        const rewritten = rewriteBody(buffer.toString("utf8"), host, port, contentType);
+        const rewritten = rewriteBody(buffer.toString("utf8"), host, port, contentType, requestToken);
         const out = Buffer.from(rewritten, "utf8");
+        res.setHeader("content-type", contentType || "text/plain; charset=utf-8");
         res.setHeader("content-length", String(out.length));
         res.end(out);
       })
