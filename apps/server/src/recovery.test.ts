@@ -60,6 +60,48 @@ test("reconcileStaleRunPid: pid alive but command line does NOT match the runner
   }
 });
 
+test("reconcileStaleRunPid: qwythos runner matches against 'openclaude' in the command line, NOT 'qwythos' (the actual spawned executable name)", async () => {
+  // Regression coverage for the qwythos-runner integration: qwythos missions
+  // spawn the `openclaude` CLI, not a literal "qwythos" process, so the
+  // orphan-detection substring match must key off "openclaude" or a genuine
+  // orphaned qwythos process would never be found/killed after a restart.
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", "openclaude-marker"], {
+    stdio: "ignore",
+  });
+  assert.ok(child.pid);
+  await new Promise((r) => setTimeout(r, 300));
+
+  try {
+    const result = reconcileStaleRunPid({ pid: child.pid!, config: { runner: "qwythos" } });
+    assert.equal(result.orphanKilled, true);
+    assert.match(result.message, /orphaned process.*was found and terminated/);
+
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && isProcessAlive(child.pid!)) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(isProcessAlive(child.pid!), false, "a confirmed qwythos/openclaude orphan must actually be terminated");
+  } finally {
+    killProcessTree(child.pid, "SIGKILL"); // safety net if the assertion above failed
+  }
+});
+
+test("reconcileStaleRunPid: qwythos runner does NOT match a process whose command line only contains 'qwythos' (must match 'openclaude', not the runner name)", async () => {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", "qwythos-unrelated-marker"], {
+    stdio: "ignore",
+  });
+  assert.ok(child.pid);
+  await new Promise((r) => setTimeout(r, 300));
+
+  try {
+    const result = reconcileStaleRunPid({ pid: child.pid!, config: { runner: "qwythos" } });
+    assert.equal(result.orphanKilled, false);
+    assert.match(result.message, /left untouched to avoid terminating an unrelated process/);
+  } finally {
+    killProcessTree(child.pid, "SIGKILL"); // test cleanup, not part of what's under test
+  }
+});
+
 test("reconcileStaleRunPid: is idempotent -- calling it again after the pid is already dead does not error or re-kill anything", () => {
   const first = reconcileStaleRunPid({ pid: 999998, config: { runner: "claude" } });
   const second = reconcileStaleRunPid({ pid: 999998, config: { runner: "claude" } });

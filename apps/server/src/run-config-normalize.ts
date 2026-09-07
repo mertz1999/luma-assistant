@@ -5,7 +5,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function normalizeRunRunner(input: unknown): RunRunner {
-  return input === "claude" ? "claude" : "codex";
+  if (input === "claude") return "claude";
+  if (input === "qwythos") return "qwythos";
+  return "codex";
 }
 
 export function normalizeReasoningEffort(input: unknown): ReasoningEffort {

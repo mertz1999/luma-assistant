@@ -11,6 +11,7 @@ import {
   ClipboardList,
   CircleStop,
   Copy,
+  Cpu,
   Download,
   ExternalLink,
   FileCode2,
@@ -166,19 +167,31 @@ type SessionCard = {
 type PlanSessionState = "idle" | "armed" | "active";
 
 const sandboxOptions: SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
-const runnerOptions: RunRunner[] = ["codex", "claude"];
+const runnerOptions: RunRunner[] = ["codex", "claude", "qwythos"];
 const codexModelOptions = ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4"];
 const claudeModelOptions = ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-4-1"];
+// Matches DEFAULT_QWYTHOS_MODEL in apps/server/src/index.ts -- the frozen
+// Qwythos baseline serves exactly this one local model, so there is no
+// picker list here beyond it (unlike codex/claude, which proxy to a
+// multi-model cloud API).
+const qwythosModelOptions = ["qwythos-9b-q6"];
 const codexReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 const claudeReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
 function modelOptionsForRunner(runner: RunRunner): string[] {
-  return runner === "claude" ? claudeModelOptions : codexModelOptions;
+  if (runner === "claude") return claudeModelOptions;
+  if (runner === "qwythos") return qwythosModelOptions;
+  return codexModelOptions;
 }
 function reasoningEffortOptionsForRunner(runner: RunRunner): ReasoningEffort[] {
-  return runner === "claude" ? claudeReasoningEffortOptions : codexReasoningEffortOptions;
+  // qwythos spawns `openclaude`, which accepts the same --effort values as
+  // Claude Code (see resolveClaudeCliEffort in apps/server/src/index.ts).
+  if (runner === "claude" || runner === "qwythos") return claudeReasoningEffortOptions;
+  return codexReasoningEffortOptions;
 }
 function runnerLabel(runner: RunRunner): string {
-  return runner === "claude" ? "Claude Code" : "Codex";
+  if (runner === "claude") return "Claude Code";
+  if (runner === "qwythos") return "Qwythos (local)";
+  return "Codex";
 }
 function reasoningEffortLabel(effort: ReasoningEffort): string {
   if (effort === "xhigh") return "extra high";
@@ -545,7 +558,7 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
         const id = typeof item.id === "string" ? item.id : "";
         const prompt = typeof item.prompt === "string" ? item.prompt : "";
         const workspace = typeof item.workspace === "string" ? item.workspace : "";
-        const runner: RunRunner = item.runner === "claude" ? "claude" : "codex";
+        const runner: RunRunner = item.runner === "claude" ? "claude" : item.runner === "qwythos" ? "qwythos" : "codex";
         const model = typeof item.model === "string" ? item.model : "";
         const reasoningEffort: ReasoningEffort = isReasoningEffort(item.reasoningEffort) ? item.reasoningEffort : "high";
         const createdAt = typeof item.createdAt === "number" ? item.createdAt : Date.now();
@@ -601,15 +614,13 @@ function describeSessionMeta(session: SessionCard): string {
 
 function getSessionSourceBadge(session: SessionCard): { label: string; className: string } {
   if (session.sourceTag === "in-app") {
-    return session.runner === "claude"
-      ? {
-          label: "Claude",
-          className: "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-200",
-        }
-      : {
-          label: "Codex",
-          className: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200",
-        };
+    if (session.runner === "claude") {
+      return { label: "Claude", className: "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-200" };
+    }
+    if (session.runner === "qwythos") {
+      return { label: "Qwythos", className: "bg-cyan-100 text-cyan-700 dark:bg-cyan-900/40 dark:text-cyan-200" };
+    }
+    return { label: "Codex", className: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200" };
   }
   if (session.sourceTag === "vscode") {
     return {
@@ -654,7 +665,7 @@ function buildSessionCards(items: SessionListItem[]): SessionCard[] {
     summary: item.title,
     status: item.status,
     updatedAt: item.updatedAt,
-    runner: item.runner === "claude" ? "claude" : "codex",
+    runner: item.runner === "claude" ? "claude" : item.runner === "qwythos" ? "qwythos" : "codex",
     model: item.model,
     reasoningEffort: item.reasoningEffort,
     sourceTag: item.sourceTag,
@@ -1296,7 +1307,7 @@ function readSessionListItem(input: unknown): SessionListItem | null {
         title: input.title,
         status: input.status as SessionListItem["status"],
         updatedAt: input.updatedAt,
-        runner: input.runner === "claude" ? "claude" : "codex",
+        runner: input.runner === "claude" ? "claude" : input.runner === "qwythos" ? "qwythos" : "codex",
         model: typeof input.model === "string" ? input.model : undefined,
         reasoningEffort: isReasoningEffort(input.reasoningEffort) ? input.reasoningEffort : undefined,
         sourceTag: input.sourceTag as RunSourceTag,
@@ -3252,7 +3263,7 @@ export function App(): JSX.Element {
     setRunnerState(nextRunner);
     setModel((current) => {
       if (modelOptionsForRunner(nextRunner).includes(current)) return current;
-      return nextRunner === "claude" ? defaultClaudeModel : defaultCodexModel;
+      return nextRunner === "claude" ? defaultClaudeModel : nextRunner === "qwythos" ? qwythosModelOptions[0] : defaultCodexModel;
     });
     setReasoningEffort((current) => {
       if (reasoningEffortOptionsForRunner(nextRunner).includes(current)) return current;
@@ -3265,7 +3276,7 @@ export function App(): JSX.Element {
     if (nextModel?.trim()) {
       setModel(nextModel);
     } else {
-      setModel(nextRunner === "claude" ? defaultClaudeModel : defaultCodexModel);
+      setModel(nextRunner === "claude" ? defaultClaudeModel : nextRunner === "qwythos" ? qwythosModelOptions[0] : defaultCodexModel);
     }
     setReasoningEffort((current) => {
       const nextEffort = nextReasoningEffort && reasoningEffortOptionsForRunner(nextRunner).includes(nextReasoningEffort)
@@ -3310,7 +3321,9 @@ export function App(): JSX.Element {
             ? selectedRunRecord.config.model
             : requestRunner === "claude"
               ? defaultClaudeModel
-              : defaultCodexModel;
+              : requestRunner === "qwythos"
+                ? qwythosModelOptions[0]
+                : defaultCodexModel;
     const requestReasoningEffort =
       requestRunner === runner && reasoningEffortOptionsForRunner(requestRunner).includes(reasoningEffort)
         ? reasoningEffort
@@ -4575,7 +4588,7 @@ export function App(): JSX.Element {
               </Button>
             </div>
 
-            <div className="grid gap-2 sm:grid-cols-2">
+            <div className="grid gap-2 sm:grid-cols-3">
               <Button
                 type="button"
                 variant={runner === "codex" ? "primary" : "ghost"}
@@ -4598,6 +4611,18 @@ export function App(): JSX.Element {
                 <span className="min-w-0">
                   <span className="block text-sm font-semibold">Claude Code</span>
                   <span className="block truncate text-xs opacity-70">{runner === "claude" ? model : defaultClaudeModel}</span>
+                </span>
+              </Button>
+              <Button
+                type="button"
+                variant={runner === "qwythos" ? "primary" : "ghost"}
+                className="h-16 justify-start gap-3 rounded-md border border-card-border px-3 text-left"
+                onClick={() => setRunner("qwythos")}
+              >
+                <Cpu className="h-5 w-5 shrink-0" />
+                <span className="min-w-0">
+                  <span className="block text-sm font-semibold">Qwythos</span>
+                  <span className="block truncate text-xs opacity-70">local · {qwythosModelOptions[0]}</span>
                 </span>
               </Button>
             </div>
@@ -4630,7 +4655,9 @@ export function App(): JSX.Element {
                     className="mt-2 h-9 w-full rounded-md border border-card-border bg-control px-3 text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
                     value={model}
                     onChange={(event) => setModel(event.target.value)}
-                    placeholder={runner === "claude" ? "Enter Claude model id" : "Enter Codex model id"}
+                    placeholder={
+                      runner === "claude" ? "Enter Claude model id" : runner === "qwythos" ? "Enter Qwythos model id" : "Enter Codex model id"
+                    }
                   />
                 ) : null}
               </div>
@@ -6424,7 +6451,7 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
                 <>
                   <p className="mb-2 truncate font-mono text-[11px] text-foreground/65" title={props.selectedSession.sessionId}>{props.selectedSession.sessionId}</p>
                   <p className="mb-2 text-xs text-foreground/70">{describeSessionMeta(props.selectedSession)}</p>
-                  <p className="mb-2 text-xs text-foreground/60">runner: {props.selectedSession.runner === "claude" ? "Claude Code" : "Codex"} | source: {props.selectedSession.sourceRaw || props.selectedSession.sourceTag}</p>
+                  <p className="mb-2 text-xs text-foreground/60">runner: {runnerLabel(props.selectedSession.runner)} | source: {props.selectedSession.sourceRaw || props.selectedSession.sourceTag}</p>
                   <div className="mb-3 flex flex-wrap gap-2">
                     <Button size="sm" variant="ghost" disabled={props.tokenUsageLoading} onClick={() => void props.onLoadTokenUsage(props.selectedSession!.sessionId)}>
                       {props.tokenUsageLoading ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
@@ -6461,7 +6488,7 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
               <h3 className="mb-2 text-sm font-semibold">Run defaults</h3>
               <div className="space-y-2">
                 <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.runner} onChange={(event) => props.setRunner(event.target.value as RunRunner)}>
-                  {runnerOptions.map((runnerOption) => <option key={runnerOption} value={runnerOption}>{runnerOption === "claude" ? "Claude Code" : "Codex"}</option>)}
+                  {runnerOptions.map((runnerOption) => <option key={runnerOption} value={runnerOption}>{runnerLabel(runnerOption)}</option>)}
                 </select>
                 <select
                   className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none"

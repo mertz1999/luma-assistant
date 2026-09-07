@@ -14,7 +14,15 @@ export type ApprovalPolicy = z.infer<typeof approvalPolicySchema>;
 export const runSourceTagSchema = z.enum(["in-app", "vscode", "cli", "exec", "other"]);
 export type RunSourceTag = z.infer<typeof runSourceTagSchema>;
 
-export const runRunnerSchema = z.enum(["codex", "claude"]);
+/**
+ * "qwythos" is a local-only runner (no cloud API, ever) that spawns the
+ * `openclaude` CLI -- a CLI-compatible fork of Claude Code -- pointed at a
+ * separately-managed local llama-server endpoint (127.0.0.1:8080/v1,
+ * frozen baseline QWYTHOS-LUMA-BASELINE-v1, see
+ * C:\Users\it hp\qwythos-stack\luma\). Luma does not own that server's
+ * lifecycle; it only connects to it. See docs/qwythos-cli.md.
+ */
+export const runRunnerSchema = z.enum(["codex", "claude", "qwythos"]);
 export type RunRunner = z.infer<typeof runRunnerSchema>;
 
 export const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);

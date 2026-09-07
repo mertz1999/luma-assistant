@@ -99,6 +99,67 @@ test("resolveExecutableForSpawn: unwraps a .cmd shim that forwards directly to a
   }
 });
 
+test("resolveExecutableForSpawn: unwraps a .cmd shim that forwards to node.exe + an extensionless shebang bin script (observed: openclaude.cmd -> bin/openclaude)", () => {
+  // Regression coverage for the qwythos-runner integration: openclaude's
+  // real installed npm shim points at "bin\\openclaude" with NO file
+  // extension (a shebang-style entrypoint, not "bin\\openclaude.js"), which
+  // the original .exe|.js-only regex rejected outright as an "unrecognized
+  // .cmd shim format" -- verified live against the actual installed shim
+  // before this fix existed.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "luma-shim-noext-"));
+  try {
+    fs.writeFileSync(path.join(dir, "node.exe"), "stub");
+    fs.mkdirSync(path.join(dir, "node_modules", "@gitlawb", "openclaude", "bin"), { recursive: true });
+    const binPath = path.join(dir, "node_modules", "@gitlawb", "openclaude", "bin", "openclaude");
+    fs.writeFileSync(binPath, "#!/usr/bin/env node\n// stub");
+    const shimPath = path.join(dir, "openclaude.cmd");
+    fs.writeFileSync(
+      shimPath,
+      [
+        "@ECHO off",
+        "GOTO start",
+        ":find_dp0",
+        "SET dp0=%~dp0",
+        "EXIT /b",
+        ":start",
+        "SETLOCAL",
+        "CALL :find_dp0",
+        'IF EXIST "%dp0%\\node.exe" (',
+        '  SET "_prog=%dp0%\\node.exe"',
+        ") ELSE (",
+        '  SET "_prog=node"',
+        "  SET PATHEXT=%PATHEXT:;.JS;=;%",
+        ")",
+        'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@gitlawb\\openclaude\\bin\\openclaude" %*',
+        "",
+      ].join("\r\n"),
+    );
+
+    const result = withPlatform("win32", () => resolveExecutableForSpawn(shimPath));
+    assert.equal(result.command, path.join(dir, "node.exe"));
+    assert.deepEqual(result.prependArgs, [binPath]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveExecutableForSpawn: still fails closed on a shim target with a genuinely unrecognized extension (e.g. .ps1)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "luma-shim-badext-"));
+  try {
+    const shimPath = path.join(dir, "weird.cmd");
+    fs.writeFileSync(
+      shimPath,
+      ["@ECHO off", "SETLOCAL", 'CALL :find_dp0', '"%dp0%\\node_modules\\weird\\bin\\weird.ps1"   %*', ""].join("\r\n"),
+    );
+    assert.throws(
+      () => withPlatform("win32", () => resolveExecutableForSpawn(shimPath)),
+      ExecutableNotFoundError,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("resolveExecutableForSpawn: fails closed (throws) on an unrecognized shim shape rather than falling back to a shell", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "luma-shim-bad-"));
   try {
@@ -199,6 +260,21 @@ test("resolveCommandPath + resolveExecutableForSpawn: real Claude Code CLI on th
     child.on("exit", resolve);
   });
   assert.equal(exitCode, 0, "claude --version must exit cleanly via the resolved executable (no ENOENT)");
+});
+
+test("resolveCommandPath + resolveExecutableForSpawn: real openclaude CLI on this machine resolves to a genuinely spawnable target", { skip: process.platform !== "win32" }, async () => {
+  const resolvedPath = resolveCommandPath("openclaude");
+  assert.ok(resolvedPath, "openclaude must be found on PATH for this runtime-verification test to be meaningful");
+
+  const { command, prependArgs } = resolveExecutableForSpawn(resolvedPath);
+  assert.ok(fs.existsSync(command), `resolved command must exist on disk: ${command}`);
+
+  const child = spawn(command, [...prependArgs, "--version"], { stdio: ["ignore", "pipe", "pipe"] });
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", resolve);
+  });
+  assert.equal(exitCode, 0, "openclaude --version must exit cleanly via the resolved executable (no ENOENT)");
 });
 
 test("isProcessAlive: true for this process's own pid, false for a definitely-dead one", () => {

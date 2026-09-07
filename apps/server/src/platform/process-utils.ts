@@ -108,13 +108,14 @@ export function resolveExecutableForSpawn(commandOrPath: string): ResolvedExecut
   // this shim's own arguments) -- NOT an incidental `%dp0%\node.exe`
   // existence check earlier in the script, which also matches a naive
   // `.exe` pattern but is not the real target.
-  const invocation = /%dp0%\\([^"%]+\.(exe|js))"\s+%\*/i.exec(content);
+  const invocation = /%dp0%\\([^"%]+)"\s+%\*/i.exec(content);
   if (!invocation) {
     throw new ExecutableNotFoundError(commandOrPath, "unrecognized .cmd shim format");
   }
-  const [, targetRelative, targetExt] = invocation;
+  const targetRelative = invocation[1];
+  const targetExt = path.extname(targetRelative).toLowerCase();
 
-  if (targetExt.toLowerCase() === "exe") {
+  if (targetExt === ".exe") {
     // Shim forwards to a real .exe next to it (observed: claude.cmd -> claude.exe).
     const exePath = path.join(dp0, targetRelative);
     if (!fs.existsSync(exePath)) {
@@ -123,7 +124,17 @@ export function resolveExecutableForSpawn(commandOrPath: string): ResolvedExecut
     return { command: exePath, prependArgs: [] };
   }
 
-  // Shim forwards to a .js entrypoint via node.exe (observed: codex.cmd -> bin/codex.js).
+  if (targetExt !== ".js" && targetExt !== "") {
+    // Anything else (.ps1, .sh, ...) is a genuinely unrecognized shape --
+    // fail closed rather than guess how to spawn it.
+    throw new ExecutableNotFoundError(commandOrPath, `unrecognized shim target extension: "${targetExt}"`);
+  }
+
+  // Shim forwards to a .js entrypoint via node.exe (observed: codex.cmd ->
+  // bin/codex.js), OR to an extensionless shebang-style bin script (observed:
+  // openclaude.cmd -> bin/openclaude, npm's usual shape for a package whose
+  // "bin" entrypoint has no file extension) -- node runs both identically
+  // when passed as a script path, extension or not.
   const jsPath = path.join(dp0, targetRelative);
   if (!fs.existsSync(jsPath)) {
     throw new ExecutableNotFoundError(commandOrPath, `shim points at missing file: ${jsPath}`);

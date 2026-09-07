@@ -33,6 +33,13 @@ import { AgentScheduleManager } from "./scheduler/agent-schedule-manager.js";
 import { PolicyDeniedError, ResourceLimitError } from "./errors.js";
 import { safeJsonParse, writeJsonAtomicSync } from "./json-file-utils.js";
 import { normalizeReasoningEffort, normalizeRunRunner, normalizeSelectedSkillRefs } from "./run-config-normalize.js";
+import {
+  resolveQwythosEndpoint,
+  resolveQwythosExecutable,
+  buildQwythosEnvironment,
+  checkQwythosEndpointReachable,
+  DEFAULT_QWYTHOS_MODEL,
+} from "./runners/qwythos-config.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -151,6 +158,13 @@ const DEFAULT_CLAUDE_MODEL = process.env.CLAUDE_DEFAULT_MODEL || "sonnet";
 const DEFAULT_MODEL = DEFAULT_RUNNER === "claude" ? DEFAULT_CLAUDE_MODEL : DEFAULT_CODEX_MODEL;
 const CLAUDE_AUTH_MODE = process.env.CLAUDE_AUTH_MODE === "api_key" ? "api_key" : "oauth";
 const CLAUDE_CODE_EXECUTABLE = resolveClaudeCodeExecutable(process.env.CLAUDE_CODE_EXECUTABLE);
+// Qwythos: local-only runner. Config/env/health-check logic lives in
+// runners/qwythos-config.ts (see C:\Users\it hp\qwythos-stack\luma\config\qwythos-local.json
+// for the frozen QWYTHOS-LUMA-BASELINE-v1 profile this mirrors, and
+// docs/qwythos-cli.md), extracted out of index.ts so it can be unit-tested
+// without importing this file (which starts a real server at module load).
+const QWYTHOS_ENDPOINT = resolveQwythosEndpoint();
+const QWYTHOS_CODE_EXECUTABLE = resolveQwythosExecutable(process.env.QWYTHOS_CODE_EXECUTABLE);
 const DEFAULT_REASONING_EFFORT = normalizeReasoningEffort(process.env.DEFAULT_REASONING_EFFORT);
 const DEFAULT_SANDBOX = resolveDefaultSandboxMode();
 const MAX_CONCURRENT_RUNS = Number(process.env.MAX_CONCURRENT_RUNS || 8);
@@ -318,7 +332,14 @@ type CodexActiveRun = {
 };
 
 type ClaudeActiveRun = {
-  runner: "claude";
+  // "qwythos" reuses this whole shape and the Claude stream-json parsing
+  // pipeline below (handleClaudeStdoutLine/handleClaudeMessage/etc.)
+  // unchanged: the qwythos runner spawns `openclaude`, a CLI-compatible
+  // fork of Claude Code that emits the identical --output-format
+  // stream-json protocol -- verified directly against a running Qwythos
+  // endpoint, not assumed. Only spawn setup (executable/env/pre-flight
+  // health check) differs; see startQwythosExecution.
+  runner: "claude" | "qwythos";
   process: ChildProcess;
   stdoutBuffer: string;
   stderrBuffer: string;
@@ -327,6 +348,11 @@ type ClaudeActiveRun = {
 };
 
 type ActiveRun = CodexActiveRun | ClaudeActiveRun;
+
+/** True for both runners that share the Claude stream-json parsing pipeline (see ClaudeActiveRun). */
+function isClaudeProtocolRun(active: ActiveRun | undefined): active is ClaudeActiveRun {
+  return active?.runner === "claude" || active?.runner === "qwythos";
+}
 
 type ClaudeToolUseInfo = {
   itemType: "command_execution" | "mcp_tool_call" | "file_change";
@@ -2418,6 +2444,17 @@ class RunManager extends EventEmitter {
       return record;
     }
 
+    if (effectiveConfig.runner === "qwythos") {
+      // Fire-and-forget, matching the event-driven spawn() pattern the
+      // other two runners use -- this function's own health-check-then-
+      // spawn body handles both outcomes (updateRun/audit/emitSse) itself,
+      // exactly like the synchronous resolveExecutableForSpawn failure
+      // branch in startClaudeExecution does for its own failure mode.
+      void this.startQwythosExecution(runId, effectiveConfig, prompt, credentialEnv);
+      this.persistState();
+      return record;
+    }
+
     // `codex exec resume` has no `-s`/`--sandbox` or `--approve-for-me` flag
     // at all (verified via `codex exec resume --help`) -- only raw `-c
     // key=value` overrides. buildCodexApprovalArgs()'s --approve-for-me
@@ -2752,10 +2789,187 @@ class RunManager extends EventEmitter {
     this.persistState();
   }
 
+  /**
+   * Qwythos: local-only runner. Spawns `openclaude` (a CLI-compatible fork
+   * of Claude Code) pointed at a separately-managed local llama-server
+   * endpoint via buildQwythosEnvironment() -- never a cloud API, never
+   * silently falling back to Codex/Claude/OpenAI/Anthropic/any other
+   * provider. Reuses the exact Claude stream-json parsing/finish pipeline
+   * (handleClaudeStdoutLine/handleClaudeMessage/finishClaudeExecution --
+   * see isClaudeProtocolRun) since `openclaude` emits the identical
+   * protocol; only spawn setup differs from startClaudeExecution above:
+   * executable resolution, environment, and a pre-flight health check
+   * (Phase 4's QWYTHOS_LOCAL_UNAVAILABLE requirement) that fails the run
+   * immediately and clearly instead of spawning against a dead endpoint.
+   */
+  private async startQwythosExecution(
+    runId: string,
+    effectiveConfig: RunConfig,
+    prompt: string,
+    credentialEnv: Record<string, string> = {},
+  ): Promise<void> {
+    const health = await checkQwythosEndpointReachable();
+    if (!health.ok) {
+      const message =
+        `QWYTHOS_LOCAL_UNAVAILABLE: local Qwythos endpoint ${QWYTHOS_ENDPOINT} is not reachable (${health.reason}). ` +
+        `Qwythos is a local-only runner and does not fall back to any other provider. Start the frozen Qwythos ` +
+        `server (C:\\Users\\it hp\\qwythos-stack\\scripts\\start-qwythos-server.ps1) and retry.`;
+      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.audit("run.spawn_failed", runId, { runner: "qwythos", stage: "health_check", endpoint: QWYTHOS_ENDPOINT, reason: health.reason });
+      this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code: null } });
+      this.persistState();
+      return;
+    }
+
+    const executable = QWYTHOS_CODE_EXECUTABLE || "openclaude";
+    const model = effectiveConfig.model || DEFAULT_QWYTHOS_MODEL;
+    const effort = resolveClaudeCliEffort(effectiveConfig.reasoningEffort);
+    const supportsEffort = claudeCliSupportsEffort(executable);
+    // Explicit-only env (buildQwythosEnvironment), THEN credentialEnv (a
+    // qwythos mission should normally request none -- local inference
+    // needs no credentials) -- if a caller ever does request one, it is
+    // layered on top and cannot un-set the required OPENAI_* pins below it
+    // in source order, matching the "never inherit, always explicit"
+    // requirement for this runner specifically.
+    const env = { ...buildQwythosEnvironment(model), ...credentialEnv };
+    const knownSecretValues = Object.values(credentialEnv).filter((v): v is string => Boolean(v));
+    const permissionMode = resolveClaudePermissionMode(effectiveConfig.sandbox, effectiveConfig.planMode);
+    const args = [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      model,
+      "--tools",
+      "default",
+      "--permission-mode",
+      permissionMode,
+    ];
+
+    if (permissionMode === "bypassPermissions") {
+      args.push("--allow-dangerously-skip-permissions");
+      if (CLAUDE_BYPASS_AS_ROOT || process.getuid?.() === 0) {
+        env.IS_SANDBOX = "1";
+      }
+    }
+
+    if (supportsEffort) {
+      args.push("--effort", effort);
+    } else {
+      env.CLAUDE_CODE_EFFORT_LEVEL = effort;
+    }
+
+    const toolLists = resolveClaudeToolLists(effectiveConfig.sandbox, effectiveConfig.planMode);
+    if (toolLists) {
+      args.push("--allowedTools", toolLists.allowed.join(","));
+      args.push("--disallowedTools", toolLists.disallowed.join(","));
+    }
+
+    if (effectiveConfig.sessionId) args.push("--resume", effectiveConfig.sessionId);
+    args.push("--", prompt);
+
+    let resolvedQwythos: { command: string; prependArgs: string[] };
+    try {
+      resolvedQwythos = resolveExecutableForSpawn(executable);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to resolve openclaude executable";
+      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.audit("run.spawn_failed", runId, { runner: "qwythos", stage: "resolve", message });
+      this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code: null } });
+      this.persistState();
+      return;
+    }
+
+    const child = spawn(resolvedQwythos.command, [...resolvedQwythos.prependArgs, ...args], {
+      cwd: effectiveConfig.workspace,
+      stdio: ["ignore", "pipe", "pipe"],
+      env,
+      detached: process.platform !== "win32",
+    });
+
+    if (!child.stdout || !child.stderr) {
+      throw new Error("Failed to initialize openclaude process streams");
+    }
+
+    const active: ClaudeActiveRun = {
+      runner: "qwythos",
+      process: child,
+      stdoutBuffer: "",
+      stderrBuffer: "",
+      toolUses: new Map(),
+      stopRequested: false,
+    };
+    this.activeRuns.set(runId, active);
+    this.updateRun(runId, { status: "running", pid: child.pid ?? null });
+    this.audit("run.process_started", runId, {
+      runner: "qwythos",
+      pid: child.pid ?? null,
+      command: resolvedQwythos.command,
+      workspace: effectiveConfig.workspace,
+      sandbox: effectiveConfig.sandbox,
+      permissionMode,
+      fullAccessEscalation: permissionMode === "bypassPermissions",
+      endpoint: QWYTHOS_ENDPOINT,
+    });
+    this.scheduleRunTimeout(runId);
+    this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
+    const startedRun = this.runs.get(runId);
+    if (startedRun) {
+      this.emit("run.lifecycle", { kind: "started", run: startedRun, previous: null } as RunLifecycleEvent);
+    }
+
+    if (!supportsEffort) {
+      const warning = `openclaude did not accept --effort during capability detection; using CLAUDE_CODE_EFFORT_LEVEL=${effort}.`;
+      this.appendEvent(runId, { source: "stderr", text: `${warning}\n` });
+      this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${warning}\n` } });
+    }
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      const active = this.activeRuns.get(runId);
+      if (!active || active.runner !== "qwythos") return;
+      active.stdoutBuffer += redactKnownSecretValues(chunk.toString("utf8"), knownSecretValues);
+      let idx = active.stdoutBuffer.indexOf("\n");
+      while (idx >= 0) {
+        const line = active.stdoutBuffer.slice(0, idx).trim();
+        active.stdoutBuffer = active.stdoutBuffer.slice(idx + 1);
+        if (line.length > 0) this.handleClaudeStdoutLine(runId, line);
+        idx = active.stdoutBuffer.indexOf("\n");
+      }
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      const active = this.activeRuns.get(runId);
+      if (!active || active.runner !== "qwythos") return;
+      active.stderrBuffer += redactKnownSecretValues(chunk.toString("utf8"), knownSecretValues);
+      let idx = active.stderrBuffer.search(/\r?\n/);
+      while (idx >= 0) {
+        const line = active.stderrBuffer.slice(0, idx).trim();
+        active.stderrBuffer = active.stderrBuffer.slice(idx + (active.stderrBuffer[idx] === "\r" && active.stderrBuffer[idx + 1] === "\n" ? 2 : 1));
+        if (line.length > 0) this.handleClaudeStderrLine(runId, line);
+        idx = active.stderrBuffer.search(/\r?\n/);
+      }
+    });
+
+    child.on("error", (error) => {
+      const message = error instanceof Error ? error.message : "Failed to start openclaude";
+      this.appendEvent(runId, { source: "stderr", text: `${message}\n` });
+      this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${message}\n` } });
+      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.audit("run.spawn_failed", runId, { runner: "qwythos", stage: "process_error", message });
+    });
+
+    child.on("exit", (code) => {
+      this.finishClaudeExecution(runId, code);
+    });
+
+    this.persistState();
+  }
+
   private finishClaudeExecution(runId: string, code: number | null): void {
     const active = this.activeRuns.get(runId);
     const stopRequested = Boolean(active?.stopRequested);
-    if (active?.runner === "claude") {
+    if (isClaudeProtocolRun(active)) {
       const trailingStdout = active.stdoutBuffer.trim();
       const trailingStderr = active.stderrBuffer.trim();
       if (trailingStdout) this.handleClaudeStdoutLine(runId, trailingStdout);
@@ -2879,7 +3093,7 @@ class RunManager extends EventEmitter {
     for (const toolUse of toolUses) {
       const info = classifyClaudeToolUse(toolUse);
       const active = this.activeRuns.get(runId);
-      if (active?.runner === "claude") active.toolUses.set(toolUse.id, info);
+      if (isClaudeProtocolRun(active)) active.toolUses.set(toolUse.id, info);
       this.emitClaudeParsed(runId, {
         type: "item.started",
         item: buildClaudeToolItem(toolUse.id, info, toolUse.input, ""),
@@ -2964,7 +3178,7 @@ class RunManager extends EventEmitter {
     const toolResults = readClaudeToolResults(message);
     for (const result of toolResults) {
       const active = this.activeRuns.get(runId);
-      const info = active?.runner === "claude" ? active.toolUses.get(result.toolUseId) : null;
+      const info = isClaudeProtocolRun(active) ? active.toolUses.get(result.toolUseId) : null;
       if (!info) continue;
       this.emitClaudeParsed(runId, {
         type: "item.completed",

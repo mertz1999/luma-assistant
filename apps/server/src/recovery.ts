@@ -18,9 +18,12 @@ import { getProcessCommandLine, isProcessAlive, killProcessTree } from "./platfo
  * This function decides, and (when it can act confidently) acts:
  *   - no recorded pid, or the pid is not alive: the process really is gone.
  *   - pid alive AND its command line plausibly names this run's own runner
- *     (codex/claude): treat as a confirmed orphan and terminate the whole
- *     tree -- leaving a full-permission agent process running unmonitored
- *     is a real safety hazard, not a cosmetic one.
+ *     (codex/claude/qwythos -- the qwythos runner spawns the `openclaude`
+ *     CLI, so its command-line signature is "openclaude", not "qwythos";
+ *     see run-config-normalize.ts's RunRunner->executable-name split):
+ *     treat as a confirmed orphan and terminate the whole tree -- leaving
+ *     a full-permission agent process running unmonitored is a real
+ *     safety hazard, not a cosmetic one.
  *   - pid alive but the command line does not match (or could not be
  *     read): DO NOT kill it. The pid may have been reused by an unrelated
  *     process after a reboot -- a real failure mode, not hypothetical, and
@@ -38,7 +41,8 @@ export function reconcileStaleRunPid(run: {
   config: { runner?: string };
 }): { message: string; orphanKilled: boolean } {
   const pid = run.pid;
-  const runnerName = run.config?.runner === "claude" ? "claude" : "codex";
+  const runnerName =
+    run.config?.runner === "claude" ? "claude" : run.config?.runner === "qwythos" ? "openclaude" : "codex";
 
   if (!pid || !isProcessAlive(pid)) {
     return {
