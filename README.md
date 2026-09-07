@@ -322,7 +322,7 @@ LUMA_TASKS_AUTH_TOKEN=
 
 If `LUMA_TASKS_PASSWORD` is omitted, the MCP server falls back to `TASK_MANAGER_ADMIN_PASSWORD`, then `PASSWORD`. `LUMA_TASKS_AUTH_TOKEN` is optional and can be used instead of username/password, but normal username/password login is preferred because task-manager tokens expire.
 
-`make run` and `make deploy-start` ensure the local MCP entries for `luma-tel` and `luma-images`. `luma-tasks` is registered only when `ENABLE_TASK_MANAGER_MCP=1`. For local development without PM2, run `npm run dev:taskmanager` in a separate terminal when you need the MCP.
+`make run` and `make deploy-start` ensure the local MCP entries for `luma-tel` and `luma-images` for both Codex and Claude Code (Claude uses user-scope registration so every workspace cwd can see them). `luma-tasks` is registered only when `ENABLE_TASK_MANAGER_MCP=1`. For local development without PM2, run `npm run dev:taskmanager` in a separate terminal when you need the MCP.
 
 ## Luma Images MCP
 

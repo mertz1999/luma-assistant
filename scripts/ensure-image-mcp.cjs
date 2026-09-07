@@ -55,26 +55,21 @@ function ensureClaude() {
     return;
   }
 
-  let shouldAdd = true;
+  // Always (re)register at user scope so Claude sessions in any Luma workspace cwd can see it.
   const existing = run(claudePath, ["mcp", "get", name]);
   if (existing.status === 0) {
-    const configuredUrl = currentUrl(`${existing.stdout}\n${existing.stderr}`);
-    if (configuredUrl === url) {
-      console.log(`[image-mcp] Claude MCP '${name}' already points to ${url}`);
-      shouldAdd = false;
-    } else {
-      console.log(`[image-mcp] Updating Claude MCP '${name}' from ${configuredUrl || "unknown"} to ${url}`);
-      const removed = run(claudePath, ["mcp", "remove", name], { stdio: "inherit" });
-      if (removed.status !== 0) process.exit(removed.status || 1);
-    }
+    console.log(`[image-mcp] Refreshing Claude MCP '${name}' to user scope at ${url}`);
+    run(claudePath, ["mcp", "remove", name], { stdio: "inherit" });
   } else {
-    console.log(`[image-mcp] Adding Claude MCP '${name}' at ${url}`);
+    console.log(`[image-mcp] Adding Claude MCP '${name}' at ${url} (user scope)`);
   }
 
-  if (shouldAdd) {
-    const added = run(claudePath, ["mcp", "add", "--transport", "http", name, url], { stdio: "inherit" });
-    if (added.status !== 0) process.exit(added.status || 1);
-  }
+  const added = run(
+    claudePath,
+    ["mcp", "add", "--scope", "user", "--transport", "http", name, url],
+    { stdio: "inherit" },
+  );
+  if (added.status !== 0) process.exit(added.status || 1);
 }
 
 ensureCodex();
