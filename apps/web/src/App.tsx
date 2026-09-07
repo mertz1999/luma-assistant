@@ -951,6 +951,36 @@ function toolEntryTypeLabel(entry: TimelineEntry): string {
   return "tool update";
 }
 
+function toolEntryDescription(entry: TimelineEntry): string {
+  const description = String(entry.meta?.description || "").trim();
+  if (description) return description;
+  const text = String(entry.text || "").trim();
+  if (text && !text.startsWith("$ ") && !/^MCP\s+\S+\.\S+/.test(text) && !/^Web search/i.test(text)) {
+    return text;
+  }
+  return "";
+}
+
+function toolEntryDisplayName(entry: TimelineEntry): string {
+  const description = toolEntryDescription(entry);
+  if (description) return description;
+  const type = String(entry.meta?.type || "").toLowerCase();
+  if (type === "commandexecution") {
+    const command = String(entry.meta?.command || "").trim();
+    if (command) return truncatePreview(command, 80);
+  }
+  if (type === "mcptoolcall") {
+    const server = String(entry.meta?.server || "mcp").trim();
+    const tool = String(entry.meta?.tool || "tool").trim();
+    return `${server}.${tool}`;
+  }
+  if (type === "websearch") {
+    const query = String(entry.meta?.query || "").trim();
+    return query ? `Web search: ${query}` : "Web search";
+  }
+  return summarizeToolEntriesInline([entry]);
+}
+
 function countChangedFiles(entries: TimelineEntry[]): number {
   let count = 0;
   for (const entry of entries) {
@@ -976,6 +1006,12 @@ function summarizeToolEntriesInline(entries: TimelineEntry[]): string {
   const action = running ? "Running" : "Ran";
   const onlyType = Object.keys(typeCounts).length === 1 ? Object.keys(typeCounts)[0] : "";
   const count = onlyType ? typeCounts[onlyType] || total : total;
+
+  if (total === 1) {
+    const only = entries[0];
+    const description = only ? toolEntryDescription(only) : "";
+    if (description) return description;
+  }
 
   if (onlyType === "commandexecution") return `${action} ${count} command${count === 1 ? "" : "s"}`;
   if (onlyType === "mcptoolcall") return `${action} ${count} MCP tool${count === 1 ? "" : "s"}`;
@@ -1032,7 +1068,8 @@ function summarizeToolGroup(entries: TimelineEntry[]): { summary: string; detail
   if (runningCount > 0) detailParts.push(`${runningCount} running`);
 
   const firstEntry = entries[0];
-  const previewSource = firstEntry && String(firstEntry.meta?.command || firstEntry.text || "").trim();
+  const previewSource = firstEntry
+    && String(toolEntryDescription(firstEntry) || firstEntry.meta?.command || firstEntry.text || "").trim();
 
   return {
     summary: summarizeToolEntriesInline(entries),
@@ -1887,7 +1924,7 @@ function ToolEntry({
           className="group inline-flex max-w-full items-center gap-1 text-left text-sm leading-6 text-foreground/55 transition hover:text-foreground/85"
           onClick={() => setExpanded((current) => !current)}
         >
-          <span className="truncate">{summarizeToolEntriesInline([entry])}</span>
+          <span className="truncate">{toolEntryDisplayName(entry)}</span>
           <span className={cn("text-foreground/35 transition group-hover:text-foreground/70", expanded && "rotate-90")}>›</span>
         </button>
         {expanded ? (
@@ -1914,7 +1951,7 @@ function ToolEntry({
           className="group inline-flex max-w-full items-center gap-1 text-left text-sm leading-6 text-foreground/55 transition hover:text-foreground/85"
           onClick={() => setExpanded((current) => !current)}
         >
-          <span className="truncate">{summarizeToolEntriesInline([entry])}</span>
+          <span className="truncate">{toolEntryDisplayName(entry)}</span>
           <span className={cn("text-foreground/35 transition group-hover:text-foreground/70", expanded && "rotate-90")}>›</span>
         </button>
         {expanded ? (
@@ -1940,7 +1977,7 @@ function ToolEntry({
         className="group inline-flex max-w-full items-center gap-1 text-left text-sm leading-6 text-foreground/55 transition hover:text-foreground/85"
         onClick={() => setExpanded((current) => !current)}
       >
-        <span className="truncate">{summarizeToolEntriesInline([entry])}</span>
+        <span className="truncate">{toolEntryDisplayName(entry)}</span>
         <span className={cn("text-foreground/35 transition group-hover:text-foreground/70", expanded && "rotate-90")}>›</span>
       </button>
       {expanded ? (
@@ -2013,7 +2050,8 @@ function ToolEntryGroup({
   entries: TimelineEntry[];
   ansi: Convert;
 }): JSX.Element {
-  const [loaded, setLoaded] = useState(false);
+  const hasNamedEntries = entries.some((entry) => Boolean(toolEntryDescription(entry)));
+  const [loaded, setLoaded] = useState(hasNamedEntries && entries.length > 1);
   const groupSummary = useMemo(() => summarizeToolGroup(entries), [entries]);
 
   return (

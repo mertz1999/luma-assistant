@@ -280,6 +280,7 @@ type ClaudeToolUseInfo = {
   server?: string;
   tool?: string;
   command?: string;
+  description?: string;
 };
 
 type ClaudePermissionDenial = {
@@ -3785,18 +3786,27 @@ function readClaudeToolUses(message: Record<string, unknown>): Array<{ id: strin
     .filter((item): item is { id: string; name: string; input: unknown } => item !== null);
 }
 
+function readClaudeToolDescription(input: Record<string, unknown>): string | undefined {
+  if (typeof input.description === "string" && input.description.trim()) return input.description.trim();
+  if (typeof input.title === "string" && input.title.trim()) return input.title.trim();
+  return undefined;
+}
+
 function classifyClaudeToolUse(toolUse: { name: string; input: unknown }): ClaudeToolUseInfo {
   const input = isRecord(toolUse.input) ? toolUse.input : {};
+  const description = readClaudeToolDescription(input);
   if (toolUse.name === "Bash" && typeof input.command === "string") {
     return {
       itemType: "command_execution",
       command: input.command,
+      description,
     };
   }
   return {
     itemType: "mcp_tool_call",
     server: "claude",
     tool: toolUse.name,
+    description,
   };
 }
 
@@ -3814,6 +3824,7 @@ function buildClaudeToolItem(
       id,
       type: "command_execution",
       command: info.command || "command",
+      description: info.description,
       status,
       aggregated_output: output,
       exit_code: completed ? (isError ? 1 : 0) : null,
@@ -3826,6 +3837,7 @@ function buildClaudeToolItem(
     status,
     server: info.server || "claude",
     tool: info.tool || "tool",
+    description: info.description,
     arguments: input,
     result: output,
     error: isError ? output : undefined,
@@ -3942,9 +3954,10 @@ function readClaudeSystemText(message: Record<string, unknown>): string {
   }
   if (message.subtype === "local_command_output" && typeof message.content === "string") return message.content;
   if (message.subtype === "informational" && typeof message.content === "string") return message.content;
-  if (message.subtype === "task_started" && typeof message.description === "string") return `Claude started task: ${message.description}`;
-  if (message.subtype === "task_progress" && typeof message.description === "string") return `Claude task progress: ${message.description}`;
-  if (message.subtype === "task_notification" && typeof message.summary === "string") return `Claude task ${message.status || "updated"}: ${message.summary}`;
+  // Task lifecycle events are used to name tool rows in the UI; skip chat noise.
+  if (message.subtype === "task_started" || message.subtype === "task_progress" || message.subtype === "task_notification") {
+    return "";
+  }
   return "";
 }
 
@@ -4649,6 +4662,7 @@ function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
       itemId: string;
       at: number;
       command: string;
+      description: string;
       output: string;
       status: string;
       exitCode: number | null;
@@ -4680,6 +4694,7 @@ function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
         server: string;
         tool: string;
         command: string;
+        description: string;
         output: string;
         errorMessage?: string;
       }
@@ -4770,6 +4785,7 @@ function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
         itemId,
         at: event.at,
         command: "command",
+        description: "",
         output: "",
         status: parsedType === "item.started" ? "in_progress" : "completed",
         exitCode: null,
@@ -4778,6 +4794,7 @@ function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
 
       if (event.at < existing.at) existing.at = event.at;
       if (typeof item?.command === "string" && item.command.trim()) existing.command = item.command;
+      if (typeof item?.description === "string" && item.description.trim()) existing.description = item.description.trim();
       if (typeof item?.aggregated_output === "string") existing.output = item.aggregated_output;
       if (typeof item?.status === "string" && item.status.trim()) existing.status = item.status;
       if (typeof item?.exit_code === "number") existing.exitCode = item.exit_code;
@@ -4821,6 +4838,7 @@ function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
         server: typeof item?.server === "string" ? item.server : "mcp",
         tool: typeof item?.tool === "string" ? item.tool : "tool",
         command: formatMcpToolCommand(item?.server, item?.tool, item?.arguments),
+        description: typeof item?.description === "string" ? item.description.trim() : "",
         output: "",
         errorMessage: undefined,
       };
@@ -4829,6 +4847,7 @@ function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
       if (typeof item?.status === "string" && item.status.trim()) existing.status = item.status;
       if (typeof item?.server === "string" && item.server.trim()) existing.server = item.server;
       if (typeof item?.tool === "string" && item.tool.trim()) existing.tool = item.tool;
+      if (typeof item?.description === "string" && item.description.trim()) existing.description = item.description.trim();
       existing.command = formatMcpToolCommand(existing.server, existing.tool, item?.arguments);
       const output = readToolOutputText(item?.result);
       if (output.trim()) existing.output = output;
@@ -4882,7 +4901,7 @@ function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
     key: `${run.id}_${command.itemId}_command`,
     role: "tool" as const,
     title: "Tool",
-    text: `$ ${truncatePreview(command.command)}`,
+    text: command.description || `$ ${truncatePreview(command.command)}`,
     pending: command.pending,
     at: command.at,
     meta: {
@@ -4890,6 +4909,7 @@ function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
       runId: run.id,
       status: command.status || (command.pending ? "in_progress" : "completed"),
       command: command.command,
+      description: command.description || undefined,
       output: command.output,
       exitCode: command.exitCode,
     },
@@ -4923,7 +4943,7 @@ function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
     key: `${run.id}_${call.itemId}_mcp_tool`,
     role: "tool" as const,
     title: "Tool",
-    text: `MCP ${call.server}.${call.tool}`,
+    text: call.description || `MCP ${call.server}.${call.tool}`,
     pending: call.pending,
     at: call.at,
     meta: {
@@ -4931,6 +4951,7 @@ function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
       runId: run.id,
       status: call.status || (call.pending ? "in_progress" : "completed"),
       command: call.command,
+      description: call.description || undefined,
       output: call.output,
       server: call.server,
       tool: call.tool,
@@ -6500,6 +6521,7 @@ class MessageProjector {
 
     if (itemType === "command_execution" && (type === "item.started" || type === "item.completed")) {
       const command = typeof item?.command === "string" && item.command.trim() ? item.command : "command";
+      const description = typeof item?.description === "string" && item.description.trim() ? item.description.trim() : "";
       const status = typeof item?.status === "string" ? item.status : (type === "item.started" ? "in_progress" : "completed");
       const output = typeof item?.aggregated_output === "string" ? item.aggregated_output : "";
       this.messageStore.upsertGeneratedMessage(sessionId, {
@@ -6509,7 +6531,7 @@ class MessageProjector {
         role: "tool",
         kind: "tool",
         title: "Tool",
-        text: `$ ${truncatePreview(command)}`,
+        text: description || `$ ${truncatePreview(command)}`,
         createdAt: event.run.updatedAt,
         deliveryStatus: type === "item.started" || status === "in_progress" ? "streaming" : "sent",
         attachments: [],
@@ -6518,6 +6540,7 @@ class MessageProjector {
           runId: event.run.id,
           status,
           command,
+          description: description || undefined,
           output,
           exitCode: typeof item?.exit_code === "number" ? item.exit_code : null,
         },
@@ -6529,6 +6552,7 @@ class MessageProjector {
       const status = typeof item?.status === "string" ? item.status : (type === "item.started" ? "in_progress" : "completed");
       const server = typeof item?.server === "string" && item.server.trim() ? item.server : "mcp";
       const tool = typeof item?.tool === "string" && item.tool.trim() ? item.tool : "tool";
+      const description = typeof item?.description === "string" && item.description.trim() ? item.description.trim() : "";
       const output = readToolOutputText(item?.result);
       const errorMessage = readToolOutputText(item?.error);
       this.messageStore.upsertGeneratedMessage(sessionId, {
@@ -6538,7 +6562,7 @@ class MessageProjector {
         role: "tool",
         kind: "tool",
         title: "Tool",
-        text: `MCP ${server}.${tool}`,
+        text: description || `MCP ${server}.${tool}`,
         createdAt: event.run.updatedAt,
         deliveryStatus: type === "item.started" || status === "in_progress" ? "streaming" : "sent",
         attachments: [],
@@ -6547,6 +6571,7 @@ class MessageProjector {
           runId: event.run.id,
           status,
           command: formatMcpToolCommand(server, tool, item?.arguments),
+          description: description || undefined,
           output,
           server,
           tool,

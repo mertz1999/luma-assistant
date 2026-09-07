@@ -343,6 +343,7 @@ export type RunMessageEntry = {
     runId?: string;
     status?: string;
     command?: string;
+    description?: string;
     output?: string;
     exitCode?: number | null;
     server?: string;
@@ -403,6 +404,7 @@ export type ChatMessage = {
     runId?: string;
     status?: string;
     command?: string;
+    description?: string;
     output?: string;
     exitCode?: number | null;
     server?: string;
