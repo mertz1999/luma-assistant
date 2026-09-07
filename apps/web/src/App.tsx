@@ -5342,6 +5342,22 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
   const attachmentDragDepthRef = useRef(0);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const timelineBlocks = useMemo(() => buildTimelineRenderBlocks(props.timeline), [props.timeline]);
+  const timelineActionsRef = useRef({
+    onTimelineScroll: props.onTimelineScroll,
+    onLoadOlderTimelineMessages: props.onLoadOlderTimelineMessages,
+    onRetryMessage: props.onRetryMessage,
+    onAnswerPlanQuestions: props.onAnswerPlanQuestions,
+    onApprovePlanImplementation: props.onApprovePlanImplementation,
+    onSubmitPlanFeedback: props.onSubmitPlanFeedback,
+  });
+  timelineActionsRef.current = {
+    onTimelineScroll: props.onTimelineScroll,
+    onLoadOlderTimelineMessages: props.onLoadOlderTimelineMessages,
+    onRetryMessage: props.onRetryMessage,
+    onAnswerPlanQuestions: props.onAnswerPlanQuestions,
+    onApprovePlanImplementation: props.onApprovePlanImplementation,
+    onSubmitPlanFeedback: props.onSubmitPlanFeedback,
+  };
   const selectedSessionBusy = Boolean(props.selectedSession && !props.selectedSession.historyOnly && (props.selectedSession.status === "queued" || props.selectedSession.status === "running"));
   const attachmentDropDisabled = props.submitting || props.isUploadingAttachments;
   const composerModelOptions = modelOptionsForRunner(props.runner);
@@ -5353,6 +5369,201 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
     () => (props.prompt.trim() ? resolveTextDirection(props.prompt) : "auto"),
     [props.prompt],
   );
+  const laterUserMessageAts = useMemo(
+    () => props.timeline.filter((entry) => entry.role === "user").map((entry) => entry.at),
+    [props.timeline],
+  );
+
+  const timelineFeed = useMemo(() => (
+    <div
+      ref={props.timelineScrollRef}
+      onScroll={() => timelineActionsRef.current.onTimelineScroll()}
+      className="scrollbar-thin min-h-0 flex-1 overflow-auto px-4 pb-4 pt-4 lg:px-8"
+    >
+      <div className="mx-auto flex w-full max-w-5xl flex-col gap-5">
+        {props.loading ? <p className="text-sm text-foreground/70">Loading...</p> : null}
+
+        {!props.loading && !props.selectedSession ? (
+          <div className="mx-auto max-w-3xl rounded-md border border-dashed border-card-border bg-surface-2 px-4 py-3 text-sm text-foreground/75">
+            Start a new session or pick one from chats.
+          </div>
+        ) : null}
+
+        {props.hiddenTimelineCount > 0 ? (
+          <div className="flex justify-center">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => timelineActionsRef.current.onLoadOlderTimelineMessages()}
+              disabled={props.loadingOlderMessages}
+            >
+              {props.loadingOlderMessages ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+              Load older messages
+            </Button>
+          </div>
+        ) : null}
+
+        {timelineBlocks.map((block) => {
+          if (block.kind === "tool-group") {
+            return <ToolEntryGroup key={block.key} entries={block.entries} ansi={props.ansi} />;
+          }
+
+          const entry = block.entry;
+          const hasLaterUserMessage = laterUserMessageAts.some((at) => at > entry.at);
+          const showUserDeliveryState = entry.role === "user"
+            && (entry.deliveryStatus === "pending" || entry.deliveryStatus === "failed");
+          const canRetryUserMessage = entry.role === "user" && entry.deliveryStatus === "failed";
+          const canCopyMessage = (entry.role === "assistant" || entry.role === "plan" || entry.role === "user")
+            && Boolean(entry.text.trim());
+          const messageAlignment = entry.role === "user"
+            ? "items-end"
+            : entry.role === "system"
+              ? "items-center"
+              : "items-start";
+
+          return (
+            <div key={entry.key} className={cn("flex w-full flex-col animate-fade-up", messageAlignment)}>
+              <article
+                className={cn(
+                  "relative shadow-none",
+                  entry.role === "user" && "ml-auto max-w-[min(760px,82%)] rounded-lg border border-card-border bg-control px-3 py-2 text-foreground",
+                  entry.role === "user" && entry.deliveryStatus === "failed" && "border-rose-500/60 bg-danger-bg text-danger-fg",
+                  entry.role === "assistant" && "mr-auto w-full bg-transparent px-0 py-0 text-foreground/90",
+                  entry.role === "plan" && "mr-auto w-full rounded-md border border-card-border bg-surface-1 px-3 py-2",
+                  entry.role === "tool" && "w-full bg-transparent px-0 py-0",
+                  entry.role === "system" && "mx-auto max-w-fit rounded-md border border-card-border bg-surface-1 px-3 py-1 text-xs text-foreground/75",
+                  entry.role === "error" && "mr-auto max-w-[90%] rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-rose-900 dark:border-danger-fg/40 dark:bg-danger-bg/90 dark:text-danger-fg",
+                )}
+              >
+                {entry.role !== "system" && entry.role !== "assistant" && entry.role !== "user" && entry.title ? (
+                  <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-foreground/70">{entry.title}</div>
+                ) : null}
+
+                {entry.attachments && entry.attachments.length > 0 ? (
+                  <div className="mb-2 flex flex-col gap-2">
+                    {entry.attachments.map((attachment) => (
+                      attachment.kind === "image" ? (
+                        <ImageAttachmentPreview
+                          key={`${entry.key}_${attachment.id}`}
+                          attachment={attachment}
+                          workspace={props.selectedSession?.workspace || props.activeWorkspace}
+                        />
+                      ) : (
+                        <AttachmentChip
+                          key={`${entry.key}_${attachment.id}`}
+                          attachment={attachment}
+                          className={entry.role === "user"
+                            ? "border-card-border bg-surface-2 text-foreground"
+                            : "border-card-border bg-surface-1/80 text-foreground"}
+                        />
+                      )
+                    ))}
+                  </div>
+                ) : null}
+
+                {entry.role === "tool" ? (
+                  <ToolEntry entry={entry} ansi={props.ansi} />
+                ) : entry.role === "assistant" || entry.role === "plan" ? (
+                  <div className="break-words text-[15px] leading-7">
+                    <StructuredMessage
+                      entryKey={entry.key}
+                      text={entry.text}
+                      interactive={entry.role === "assistant" && !entry.pending}
+                      resolved={hasLaterUserMessage}
+                      onAnswerPlanQuestions={(answers) => timelineActionsRef.current.onAnswerPlanQuestions(answers)}
+                      onApprovePlanImplementation={() => timelineActionsRef.current.onApprovePlanImplementation()}
+                      onSubmitPlanFeedback={(feedback) => timelineActionsRef.current.onSubmitPlanFeedback(feedback)}
+                    />
+                    {entry.pending ? (
+                      <div className="mt-1">
+                        <ThinkingDots label={entry.title || "Thinking"} />
+                      </div>
+                    ) : null}
+                  </div>
+                ) : entry.role === "error" ? (
+                  <div
+                    className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs"
+                    dangerouslySetInnerHTML={{ __html: props.ansi.toHtml(entry.text) }}
+                  />
+                ) : (
+                  (() => {
+                    const direction = resolveTextDirection(entry.text);
+                    return (
+                      <div
+                        className={cn(
+                          "rich-text break-words text-sm leading-relaxed",
+                          entry.role === "user" && "whitespace-pre-wrap",
+                        )}
+                        dir={direction}
+                        lang={direction === "rtl" ? "fa" : undefined}
+                      >
+                        {entry.text}
+                      </div>
+                    );
+                  })()
+                )}
+
+                {showUserDeliveryState ? (
+                  <div className="mt-2 flex items-center justify-end gap-2 text-[11px] text-foreground/70">
+                    <span>{entry.deliveryStatus === "failed" ? "Failed to send" : "Sending..."}</span>
+                    {canRetryUserMessage ? (
+                      <button
+                        type="button"
+                        className="rounded-md border border-card-border px-2 py-0.5 font-semibold transition hover:bg-control-hover disabled:cursor-not-allowed disabled:opacity-70"
+                        onClick={() => void timelineActionsRef.current.onRetryMessage(entry)}
+                        disabled={props.submitting}
+                      >
+                        Retry
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+              </article>
+              {canCopyMessage ? (
+                <div className={cn("mt-1 flex items-center gap-1", entry.role === "user" ? "justify-end" : "justify-start")}>
+                  <button
+                    type="button"
+                    className="inline-flex h-6 w-6 items-center justify-center rounded-md text-foreground/40 transition hover:bg-control-hover hover:text-foreground/75"
+                    onClick={() => void copyMessage(entry)}
+                    aria-label={copiedEntryKey === entry.key ? "Message copied" : "Copy message"}
+                    title={copiedEntryKey === entry.key ? "Copied" : "Copy message"}
+                  >
+                    {copiedEntryKey === entry.key ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
+
+        {props.hasPendingIndicator ? (
+          <article className="mr-auto max-w-5xl animate-fade-up px-0 py-1.5">
+            <div className="inline-flex items-center gap-2 rounded-md bg-surface-1/45 px-2.5 py-1.5">
+              <span className="font-mono text-[10px] uppercase tracking-wider text-foreground/45">Reasoning</span>
+              <ThinkingDots label="Thinking" />
+            </div>
+          </article>
+        ) : null}
+
+        <div ref={props.timelineBottomRef} />
+      </div>
+    </div>
+  ), [
+    copiedEntryKey,
+    laterUserMessageAts,
+    props.activeWorkspace,
+    props.ansi,
+    props.hasPendingIndicator,
+    props.hiddenTimelineCount,
+    props.loading,
+    props.loadingOlderMessages,
+    props.selectedSession,
+    props.submitting,
+    props.timelineBottomRef,
+    props.timelineScrollRef,
+    timelineBlocks,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -5481,180 +5692,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
       </div>
 
       <CardContent className="flex min-h-0 flex-1 flex-col gap-0 p-0">
-        <div
-          ref={props.timelineScrollRef}
-          onScroll={props.onTimelineScroll}
-          className="scrollbar-thin min-h-0 flex-1 overflow-auto px-4 pb-4 pt-4 lg:px-8"
-        >
-          <div className="mx-auto flex w-full max-w-5xl flex-col gap-5">
-          {props.loading ? <p className="text-sm text-foreground/70">Loading...</p> : null}
-
-          {!props.loading && !props.selectedSession ? (
-            <div className="mx-auto max-w-3xl rounded-md border border-dashed border-card-border bg-surface-2 px-4 py-3 text-sm text-foreground/75">
-              Start a new session or pick one from chats.
-            </div>
-          ) : null}
-
-          {props.hiddenTimelineCount > 0 ? (
-            <div className="flex justify-center">
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={props.onLoadOlderTimelineMessages}
-                disabled={props.loadingOlderMessages}
-              >
-                {props.loadingOlderMessages ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
-                Load older messages
-              </Button>
-            </div>
-          ) : null}
-
-		          {timelineBlocks.map((block) => {
-                if (block.kind === "tool-group") {
-                  return <ToolEntryGroup key={block.key} entries={block.entries} ansi={props.ansi} />;
-                }
-
-                const entry = block.entry;
-		            const hasLaterUserMessage = props.timeline.some((item) => item.role === "user" && item.at > entry.at);
-	              const showUserDeliveryState = entry.role === "user"
-	                && (entry.deliveryStatus === "pending" || entry.deliveryStatus === "failed");
-	              const canRetryUserMessage = entry.role === "user" && entry.deliveryStatus === "failed";
-              const canCopyMessage = (entry.role === "assistant" || entry.role === "plan" || entry.role === "user")
-                && Boolean(entry.text.trim());
-              const messageAlignment = entry.role === "user"
-                ? "items-end"
-                : entry.role === "system"
-                  ? "items-center"
-                  : "items-start";
-
-	            return (
-                <div key={entry.key} className={cn("flex w-full flex-col animate-fade-up", messageAlignment)}>
-	              <article
-	                className={cn(
-	                  "relative shadow-none",
-	                  entry.role === "user" && "ml-auto max-w-[min(760px,82%)] rounded-lg border border-card-border bg-control px-3 py-2 text-foreground",
-                    entry.role === "user" && entry.deliveryStatus === "failed" && "border-rose-500/60 bg-danger-bg text-danger-fg",
-	                  entry.role === "assistant" && "mr-auto w-full bg-transparent px-0 py-0 text-foreground/90",
-	                  entry.role === "plan" && "mr-auto w-full rounded-md border border-card-border bg-surface-1 px-3 py-2",
-	                  entry.role === "tool" && "w-full bg-transparent px-0 py-0",
-                  entry.role === "system" && "mx-auto max-w-fit rounded-md border border-card-border bg-surface-1 px-3 py-1 text-xs text-foreground/75",
-                  entry.role === "error" && "mr-auto max-w-[90%] rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-rose-900 dark:border-danger-fg/40 dark:bg-danger-bg/90 dark:text-danger-fg",
-                )}
-              >
-                {entry.role !== "system" && entry.role !== "assistant" && entry.role !== "user" && entry.title ? (
-                  <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-foreground/70">{entry.title}</div>
-                ) : null}
-
-                {entry.attachments && entry.attachments.length > 0 ? (
-                  <div className="mb-2 flex flex-col gap-2">
-                    {entry.attachments.map((attachment) => (
-                      attachment.kind === "image" ? (
-                        <ImageAttachmentPreview
-                          key={`${entry.key}_${attachment.id}`}
-                          attachment={attachment}
-                          workspace={props.selectedSession?.workspace || props.activeWorkspace}
-                        />
-                      ) : (
-                        <AttachmentChip
-                          key={`${entry.key}_${attachment.id}`}
-                          attachment={attachment}
-                          className={entry.role === "user"
-                            ? "border-card-border bg-surface-2 text-foreground"
-                            : "border-card-border bg-surface-1/80 text-foreground"}
-                        />
-                      )
-                    ))}
-                  </div>
-                ) : null}
-
-                {entry.role === "tool" ? (
-                  <ToolEntry entry={entry} ansi={props.ansi} />
-                ) : entry.role === "assistant" || entry.role === "plan" ? (
-                  <div className="break-words text-[15px] leading-7">
-                    <StructuredMessage
-                      entryKey={entry.key}
-                      text={entry.text}
-                      interactive={entry.role === "assistant" && !entry.pending}
-                      resolved={hasLaterUserMessage}
-                      onAnswerPlanQuestions={props.onAnswerPlanQuestions}
-                      onApprovePlanImplementation={props.onApprovePlanImplementation}
-                      onSubmitPlanFeedback={props.onSubmitPlanFeedback}
-                    />
-                    {entry.pending ? (
-                      <div className="mt-1">
-                        <ThinkingDots label={entry.title || "Thinking"} />
-                      </div>
-                    ) : null}
-                  </div>
-	                ) : entry.role === "error" ? (
-	                  <div
-	                    className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs"
-	                    dangerouslySetInnerHTML={{ __html: props.ansi.toHtml(entry.text) }}
-	                  />
-	                ) : (
-		                  (() => {
-                        const direction = resolveTextDirection(entry.text);
-                        return (
-                          <div
-                            className={cn(
-                              "rich-text break-words text-sm leading-relaxed",
-                              entry.role === "user" && "whitespace-pre-wrap",
-                            )}
-                            dir={direction}
-                            lang={direction === "rtl" ? "fa" : undefined}
-                          >
-                            {entry.text}
-                          </div>
-                        );
-                      })()
-		                )}
-
-                {showUserDeliveryState ? (
-                  <div className="mt-2 flex items-center justify-end gap-2 text-[11px] text-foreground/70">
-                    <span>{entry.deliveryStatus === "failed" ? "Failed to send" : "Sending..."}</span>
-                    {canRetryUserMessage ? (
-                      <button
-                        type="button"
-                      className="rounded-md border border-card-border px-2 py-0.5 font-semibold transition hover:bg-control-hover disabled:cursor-not-allowed disabled:opacity-70"
-                        onClick={() => void props.onRetryMessage(entry)}
-                        disabled={props.submitting}
-                      >
-                        Retry
-                      </button>
-                    ) : null}
-                  </div>
-                ) : null}
-	              </article>
-                {canCopyMessage ? (
-                  <div className={cn("mt-1 flex items-center gap-1", entry.role === "user" ? "justify-end" : "justify-start")}>
-                    <button
-                      type="button"
-                      className="inline-flex h-6 w-6 items-center justify-center rounded-md text-foreground/40 transition hover:bg-control-hover hover:text-foreground/75"
-                      onClick={() => void copyMessage(entry)}
-                      aria-label={copiedEntryKey === entry.key ? "Message copied" : "Copy message"}
-                      title={copiedEntryKey === entry.key ? "Copied" : "Copy message"}
-                    >
-                      {copiedEntryKey === entry.key ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-                    </button>
-                  </div>
-                ) : null}
-                </div>
-	            );
-	          })}
-
-          {props.hasPendingIndicator ? (
-            <article className="mr-auto max-w-5xl animate-fade-up px-0 py-1.5">
-              <div className="inline-flex items-center gap-2 rounded-md bg-surface-1/45 px-2.5 py-1.5">
-                <span className="font-mono text-[10px] uppercase tracking-wider text-foreground/45">Reasoning</span>
-                <ThinkingDots label="Thinking" />
-              </div>
-            </article>
-          ) : null}
-
-          <div ref={props.timelineBottomRef} />
-          </div>
-        </div>
+        {timelineFeed}
 
         <form
           className={cn(
