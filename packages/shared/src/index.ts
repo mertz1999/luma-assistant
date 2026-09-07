@@ -20,8 +20,26 @@ export type RunRunner = z.infer<typeof runRunnerSchema>;
 export const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
 
-export const attachmentKindSchema = z.enum(["image", "text"]);
+export const attachmentKindSchema = z.enum(["image", "text", "document"]);
 export type AttachmentKind = z.infer<typeof attachmentKindSchema>;
+
+/**
+ * Present only on kind: "document" attachments (apps/server/src/ingestion/).
+ * Describes the local MarkItDown conversion Luma ran on upload -- deliberately
+ * generic field names (no "markitdown" in the shape itself) so a future
+ * conversion backend could populate the same shape.
+ */
+export const attachmentConversionSchema = z.object({
+  backend: z.string().min(1),
+  markdownRelativePath: z.string().min(1),
+  contentHash: z.string().min(1),
+  durationMs: z.number().int().nonnegative(),
+  title: z.string().nullable().optional(),
+  warnings: z.array(z.string()).default([]),
+  markdownChars: z.number().int().nonnegative(),
+  truncatedForPrompt: z.boolean().default(false),
+});
+export type AttachmentConversion = z.infer<typeof attachmentConversionSchema>;
 
 export const attachmentRefSchema = z.object({
   id: z.string().min(1),
@@ -35,6 +53,7 @@ export const attachmentRefSchema = z.object({
   width: z.number().int().positive().optional(),
   height: z.number().int().positive().optional(),
   alt: z.string().optional(),
+  conversion: attachmentConversionSchema.optional(),
 });
 export type AttachmentRef = z.infer<typeof attachmentRefSchema>;
 
@@ -815,6 +834,8 @@ export type CreateTaskManagerCommentInput = z.infer<typeof createTaskManagerComm
 
 export type ApiError = {
   message: string;
+  /** Stable machine-readable error code, when the failure has one (e.g. document-ingestion's DocumentRejectCode values). Optional so existing callers that only ever read `message` are unaffected. */
+  code?: string;
 };
 
 export type ApiResponse<T> =

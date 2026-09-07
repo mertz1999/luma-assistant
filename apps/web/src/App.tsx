@@ -1070,7 +1070,7 @@ function readAttachmentRef(input: unknown): AttachmentRef | null {
     && typeof input.name === "string"
     && typeof input.mimeType === "string"
     && typeof input.size === "number"
-    && (input.kind === "image" || input.kind === "text")
+    && (input.kind === "image" || input.kind === "text" || input.kind === "document")
     && typeof input.relativePath === "string"
     && typeof input.uploadedAt === "number"
     ? {
@@ -1085,6 +1085,7 @@ function readAttachmentRef(input: unknown): AttachmentRef | null {
         width: typeof input.width === "number" && input.width > 0 ? input.width : undefined,
         height: typeof input.height === "number" && input.height > 0 ? input.height : undefined,
         alt: typeof input.alt === "string" ? input.alt : undefined,
+        conversion: isRecord(input.conversion) ? (input.conversion as AttachmentRef["conversion"]) : undefined,
       }
     : null;
 }
@@ -5087,7 +5088,7 @@ function AttachmentChip({ attachment, className, onRemove }: AttachmentChipProps
   return (
     <div className={cn("inline-flex items-center gap-2 rounded-full border px-2 py-1 text-[11px]", className)}>
       <span className="font-medium">{attachment.name}</span>
-      <span className="opacity-70">{attachment.kind === "image" ? "image" : "file"} · {formatAttachmentSize(attachment.size)}</span>
+      <span className="opacity-70">{attachment.kind === "image" ? "image" : attachment.kind === "document" ? "document" : "file"} · {formatAttachmentSize(attachment.size)}</span>
       {onRemove ? (
         <button
           type="button"

@@ -1,0 +1,27 @@
+# Pinned MarkItDown install for Luma's local document-ingestion adapter
+# (apps/server/src/ingestion/markitdown-adapter.ts).
+#
+# Extras included, and why:
+#   pdf   - pdfminer-six + pdfplumber: text-native PDF extraction (local, no network)
+#   docx  - mammoth + lxml: Word documents
+#   pptx  - python-pptx: PowerPoint slide/text/table/notes extraction
+#   xlsx  - openpyxl + pandas: modern Excel workbooks
+#   xls   - pandas + xlrd: legacy Excel workbooks
+#
+# Extras deliberately EXCLUDED, and why:
+#   az-doc-intel, az-content-understanding - require an Azure AI endpoint + API key.
+#     Would silently add a cloud dependency; forbidden by Luma's local-first requirement.
+#   audio-transcription - SpeechRecognition's default recognizer calls Google's hosted
+#     Web Speech API unless explicitly reconfigured with an offline engine. Not local by
+#     default, so left disabled rather than shipping a hidden cloud call.
+#   youtube-transcription - fetches transcripts from YouTube over the network; irrelevant
+#     to local file ingestion and requires internet access.
+#   all - would silently pull in the Azure/audio/YouTube extras above.
+#
+# Base install (no extras) already covers, via its own base dependencies
+# (beautifulsoup4, defusedxml, markdownify, magika, charset-normalizer):
+#   .txt, .md, .html, .csv, .json, .xml, .zip, .epub, plain images (metadata only)
+#
+# MarkItDown's own MarkItDown() constructor makes no network/LLM calls unless the
+# caller explicitly passes llm_client/mlm_client. This adapter never does.
+markitdown[pdf,docx,pptx,xlsx,xls]==0.1.7

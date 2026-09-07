@@ -17,6 +17,9 @@ import { buildCodexApprovalArgs, resolveClaudePermissionMode, resolveClaudeToolL
 import { evaluateResourcePolicy, type ResourceLimits } from "./resources/resource-watchdog.js";
 import { canTransitionMissionStatus } from "./missions/mission-state.js";
 import { pickSafeBaseEnv } from "./security/safe-environment.js";
+import { convertDocumentForIngestion } from "./ingestion/document-ingest.js";
+import { DocumentIngestError, userMessageForCode } from "./ingestion/errors.js";
+import { DEFAULT_DOCUMENT_INGEST_LIMITS } from "./ingestion/limits.js";
 import {
   createCredential,
   deleteCredential,
@@ -68,6 +71,7 @@ import {
   type ApprovalQueueItem,
   type AppBootstrap,
   type AppBootstrapLite,
+  type AttachmentConversion,
   type AttachmentRef,
   type ChatMessage,
   type CodexAccountStatusResponse,
@@ -258,6 +262,28 @@ const TEXT_ATTACHMENT_MIME_TYPES = new Set([
   "application/csv",
   "application/x-sh",
   "image/svg+xml",
+]);
+
+/**
+ * Formats Luma cannot read natively today (binary Office/archive/eBook
+ * formats) but MarkItDown can convert locally to Markdown
+ * (apps/server/src/ingestion/). PDF/CSV/HTML/JSON/XML/TXT/MD are
+ * deliberately NOT here: PDF has no working path without this kind, but
+ * CSV/HTML/JSON/XML/TXT/MD already work fine as plain "text" attachments
+ * (classified above) and gain nothing from a MarkItDown round-trip.
+ */
+const DOCUMENT_ATTACHMENT_EXTENSIONS = new Set([".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".zip", ".epub"]);
+const DOCUMENT_ATTACHMENT_MIME_TYPES = new Set([
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-excel",
+  "application/zip",
+  "application/x-zip-compressed",
+  "application/epub+zip",
 ]);
 
 type ResolvedAttachment = {
@@ -1220,7 +1246,7 @@ function normalizeMimeType(input: string | undefined): string {
   return raw || "application/octet-stream";
 }
 
-function classifyAttachment(name: string, mimeType: string): "image" | "text" | null {
+function classifyAttachment(name: string, mimeType: string): "image" | "text" | "document" | null {
   const normalizedMimeType = normalizeMimeType(mimeType);
   const extension = path.extname(name).toLowerCase();
 
@@ -1234,6 +1260,10 @@ function classifyAttachment(name: string, mimeType: string): "image" | "text" | 
     TEXT_ATTACHMENT_EXTENSIONS.has(extension)
   ) {
     return "text";
+  }
+
+  if (DOCUMENT_ATTACHMENT_MIME_TYPES.has(normalizedMimeType) || DOCUMENT_ATTACHMENT_EXTENSIONS.has(extension)) {
+    return "document";
   }
 
   return null;
@@ -1377,6 +1407,13 @@ function buildPromptWithAttachments(prompt: string, attachments: ResolvedAttachm
       ? `attached directly and stored at ${attachment.ref.relativePath}`
       : `stored at ${attachment.ref.relativePath}`;
     lines.push(`- ${attachment.ref.name} (${attachment.ref.kind}, ${location})`);
+    if (attachment.ref.kind === "document" && attachment.ref.conversion) {
+      const conversion = attachment.ref.conversion;
+      lines.push(`  Converted to Markdown at ${conversion.markdownRelativePath} (backend: ${conversion.backend}). Read the Markdown file for reliable text -- the original binary is also available at the path above if you need it (e.g. for layout/images).`);
+      if (conversion.warnings.length > 0) {
+        lines.push(`  Conversion warnings: ${conversion.warnings.join(", ")}.`);
+      }
+    }
   }
   lines.push("Use these attachments as part of the request.");
   lines.push("");
@@ -7209,8 +7246,8 @@ function apiOk<T>(data: T): ApiResponse<T> {
   return { ok: true, data };
 }
 
-function apiErr(message: string): ApiResponse<never> {
-  return { ok: false, error: { message } };
+function apiErr(message: string, code?: string): ApiResponse<never> {
+  return { ok: false, error: code ? { message, code } : { message } };
 }
 
 function extractAuthToken(req: express.Request): string | null {
@@ -7854,7 +7891,7 @@ app.get("/api/runs/list", (req, res) => {
   res.json(apiOk({ ...payload, approvals: runManager.getApprovals() }));
 });
 
-app.post("/api/attachments", express.raw({ limit: ATTACHMENT_MAX_BYTES, type: () => true }), (req, res) => {
+app.post("/api/attachments", express.raw({ limit: ATTACHMENT_MAX_BYTES, type: () => true }), async (req, res) => {
   const workspaceRaw = typeof req.query.workspace === "string" && req.query.workspace.trim()
     ? req.query.workspace
     : uiState.activeWorkspace;
@@ -7876,7 +7913,7 @@ app.post("/api/attachments", express.raw({ limit: ATTACHMENT_MAX_BYTES, type: ()
   const mimeType = normalizeMimeType(req.header("x-attachment-content-type") || req.header("content-type") || undefined);
   const kind = classifyAttachment(displayName, mimeType);
   if (!kind) {
-    res.status(400).json(apiErr("Unsupported attachment type. Use an image or a text/code file."));
+    res.status(400).json(apiErr("Unsupported attachment type. Use an image, a text/code file, or a document (PDF, DOCX, PPTX, XLSX, ZIP, EPUB)."));
     return;
   }
 
@@ -7892,6 +7929,71 @@ app.post("/api/attachments", express.raw({ limit: ATTACHMENT_MAX_BYTES, type: ()
   fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
   fs.writeFileSync(absolutePath, body);
 
+  let conversion: AttachmentConversion | undefined;
+
+  if (kind === "document") {
+    const extension = path.extname(displayName).toLowerCase();
+    appendAuditEvent(AUDIT_DIR, {
+      event_type: "document.ingest_started",
+      actor: "attachment-upload",
+      payload: { workspace, filename: displayName, extension, size: body.byteLength },
+    });
+
+    try {
+      const result = await convertDocumentForIngestion(absolutePath, {
+        workspaceId: workspace,
+        filename: displayName,
+        mimeType,
+        extension,
+      }, DEFAULT_DOCUMENT_INGEST_LIMITS);
+
+      const markdownRelativePath = `${relativePath}.md`;
+      const metadataRelativePath = `${relativePath}.meta.json`;
+      fs.writeFileSync(resolveStoredAttachmentPath(workspace, markdownRelativePath), result.markdown, "utf8");
+      fs.writeFileSync(
+        resolveStoredAttachmentPath(workspace, metadataRelativePath),
+        JSON.stringify({ ...result.metadata, warnings: result.warnings, conversionBackend: result.conversionBackend, conversionDurationMs: result.conversionDurationMs }, null, 2),
+        "utf8",
+      );
+
+      conversion = {
+        backend: result.conversionBackend,
+        markdownRelativePath,
+        contentHash: result.contentHash,
+        durationMs: result.conversionDurationMs,
+        title: result.title,
+        warnings: result.warnings,
+        markdownChars: result.markdown.length,
+        truncatedForPrompt: false,
+      };
+
+      appendAuditEvent(AUDIT_DIR, {
+        event_type: "document.converted",
+        actor: "attachment-upload",
+        payload: {
+          workspace,
+          filename: displayName,
+          backend: result.conversionBackend,
+          duration_ms: result.conversionDurationMs,
+          content_hash: result.contentHash,
+          markdown_chars: result.markdown.length,
+          warnings: result.warnings,
+        },
+      });
+    } catch (err) {
+      fs.rmSync(absolutePath, { force: true });
+      const code = err instanceof DocumentIngestError ? err.code : "CORRUPT_DOCUMENT";
+      const message = err instanceof DocumentIngestError ? userMessageForCode(err.code) : "Document conversion failed unexpectedly.";
+      appendAuditEvent(AUDIT_DIR, {
+        event_type: "document.rejected",
+        actor: "attachment-upload",
+        payload: { workspace, filename: displayName, extension, error_code: code },
+      });
+      res.status(422).json(apiErr(message, code));
+      return;
+    }
+  }
+
   const attachment: AttachmentRef = {
     id: attachmentId,
     name: displayName,
@@ -7900,6 +8002,7 @@ app.post("/api/attachments", express.raw({ limit: ATTACHMENT_MAX_BYTES, type: ()
     kind,
     relativePath,
     uploadedAt: Date.now(),
+    ...(conversion ? { conversion } : {}),
   };
 
   res.json(apiOk({ attachment }));
