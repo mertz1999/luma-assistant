@@ -952,32 +952,14 @@ function toolEntryTypeLabel(entry: TimelineEntry): string {
 }
 
 function toolEntryDescription(entry: TimelineEntry): string {
-  const description = String(entry.meta?.description || "").trim();
-  if (description) return description;
-  const text = String(entry.text || "").trim();
-  if (text && !text.startsWith("$ ") && !/^MCP\s+\S+\.\S+/.test(text) && !/^Web search/i.test(text)) {
-    return text;
-  }
-  return "";
+  // Only use explicit tool descriptions (Claude Bash `description`, etc.).
+  // Do not infer from command text — that made Codex rows show raw /bin/bash -lc payloads.
+  return String(entry.meta?.description || "").trim();
 }
 
 function toolEntryDisplayName(entry: TimelineEntry): string {
   const description = toolEntryDescription(entry);
   if (description) return description;
-  const type = String(entry.meta?.type || "").toLowerCase();
-  if (type === "commandexecution") {
-    const command = String(entry.meta?.command || "").trim();
-    if (command) return truncatePreview(command, 80);
-  }
-  if (type === "mcptoolcall") {
-    const server = String(entry.meta?.server || "mcp").trim();
-    const tool = String(entry.meta?.tool || "tool").trim();
-    return `${server}.${tool}`;
-  }
-  if (type === "websearch") {
-    const query = String(entry.meta?.query || "").trim();
-    return query ? `Web search: ${query}` : "Web search";
-  }
   return summarizeToolEntriesInline([entry]);
 }
 
