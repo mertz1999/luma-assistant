@@ -16,9 +16,9 @@ It keeps the core coding-agent workflow available in the app: runner selection, 
 
 ## Capabilities
 
-- `Choose Codex or Claude Code`: create each new session with the runner you want, while keeping live output, plan mode, MCP, and session history visible.
+- `Choose Codex, Claude Code, or Qwythos`: create each new session with the runner you want, while keeping live output, plan mode, MCP, and session history visible.
 - `Claude-like workspace`: use a compact dark coding UI with centered messages, right-aligned user bubbles, collapsible left navigation, and a right dock that opens only when Terminal or Context is selected.
-- `Runner controls`: change runner, model, and thinking effort from the new-session flow and composer strip. Codex and Claude use their own defaults.
+- `Runner controls`: change runner, model, and thinking effort from the new-session flow and composer strip. Codex, Claude, and Qwythos each use their own defaults.
 - `Use it anywhere by URL`: deploy Luma Assistant on a server and access your workspace from desktop, phone, or another machine.
 - `Cron-style jobs`: schedule specific assistant work for specific moments and inspect each run as a normal Codex session.
 - `Browser terminal`: open a controlled terminal from the browser, type directly in the terminal surface, interrupt commands, and close the dock when you are done.
@@ -153,6 +153,16 @@ More implementation notes are in:
 ```text
 docs/claude-cli.md
 ```
+
+## Qwythos Runner
+
+Qwythos is a third, local-only runner: it spawns `openclaude` (a CLI-compatible fork of Claude Code) pointed at a separately-managed local `llama-server` endpoint (frozen baseline `QWYTHOS-LUMA-BASELINE-v1`, see `C:\Users\it hp\qwythos-stack`). Luma does not manage that server's lifecycle — it only connects to it, and never falls back to a cloud provider if the endpoint is unavailable; a pre-flight health check fails the run immediately and clearly instead.
+
+- `QWYTHOS_ENDPOINT`: local OpenAI-compatible endpoint. Defaults to `http://127.0.0.1:8080/v1`; a blank/whitespace-only override still falls back to the local default rather than resolving to nothing.
+- `QWYTHOS_DEFAULT_MODEL`: default model name sent to the endpoint. Defaults to `qwythos-9b-q6`.
+- `QWYTHOS_CODE_EXECUTABLE`: optional path to the `openclaude` executable if it is not simply `openclaude` on `PATH`.
+
+`DEFAULT_RUNNER` cannot be set to `qwythos` (it only recognizes `codex`/`claude`, per above) — Qwythos is selectable per-session from Run defaults, not as the server-wide default.
 
 ## Web Interface
 
