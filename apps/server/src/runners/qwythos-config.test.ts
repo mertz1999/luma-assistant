@@ -33,6 +33,24 @@ test("resolveQwythosEndpoint: respects an explicit QWYTHOS_ENDPOINT override, tr
   }
 });
 
+test("resolveQwythosEndpoint: a whitespace-only override still falls back to the local default, never resolving to a blank endpoint", () => {
+  // Regression coverage for a real bug found during hardening review: the
+  // original `(process.env.QWYTHOS_ENDPOINT || default).trim()` trimmed
+  // AFTER the fallback check, so a whitespace-only value (truthy, so it
+  // survives the `||`) trimmed down to "" -- handing
+  // buildQwythosEnvironment() a blank OPENAI_BASE_URL instead of the local
+  // default. That is exactly the "resolves to nothing" failure mode this
+  // module's Phase 10 guarantee exists to prevent.
+  const original = process.env.QWYTHOS_ENDPOINT;
+  process.env.QWYTHOS_ENDPOINT = "   ";
+  try {
+    assert.equal(resolveQwythosEndpoint(), "http://127.0.0.1:8080/v1");
+  } finally {
+    if (original === undefined) delete process.env.QWYTHOS_ENDPOINT;
+    else process.env.QWYTHOS_ENDPOINT = original;
+  }
+});
+
 // -- buildQwythosEnvironment: no-cloud-fallback guarantee --------------------
 // Phase 10 of the qwythos-runner task explicitly calls out "a generic
 // OpenAI-compatible client that defaults to OpenAI when base_url is missing"
@@ -119,6 +137,28 @@ test("checkQwythosEndpointReachable: a non-responsive listener reports ok:false 
   }
 });
 
+test("checkQwythosEndpointReachable: a listener that responds with a non-2xx status reports ok:false with the status in the reason", async () => {
+  const http = await import("node:http");
+  const server = http.createServer((req, res) => {
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "model still loading" }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  assert.ok(port > 0);
+
+  try {
+    const result = await checkQwythosEndpointReachable(`http://127.0.0.1:${port}/v1`, 2000);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /503/);
+    }
+  } finally {
+    server.close();
+  }
+});
+
 test("checkQwythosEndpointReachable: a real, healthy HTTP endpoint reports ok:true", async () => {
   const http = await import("node:http");
   const server = http.createServer((req, res) => {
@@ -142,6 +182,10 @@ test("checkQwythosEndpointReachable: a real, healthy HTTP endpoint reports ok:tr
 
 test("resolveQwythosExecutable: an explicit configured path is returned as-is, trimmed", () => {
   assert.equal(resolveQwythosExecutable("  C:\\tools\\openclaude.cmd  "), "C:\\tools\\openclaude.cmd");
+});
+
+test("resolveQwythosExecutable: a whitespace-only configured value is treated as unconfigured, falling back to PATH resolution", () => {
+  assert.doesNotThrow(() => resolveQwythosExecutable("   "));
 });
 
 test("resolveQwythosExecutable: with nothing configured, falls back to PATH resolution and never throws", () => {

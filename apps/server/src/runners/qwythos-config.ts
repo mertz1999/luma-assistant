@@ -20,7 +20,13 @@ import { pickSafeBaseEnv } from "../security/safe-environment.js";
 // silently default to the real OpenAI cloud API -- exactly what Phase 10 of
 // the qwythos-runner task calls out as unacceptable).
 export function resolveQwythosEndpoint(): string {
-  return (process.env.QWYTHOS_ENDPOINT || "http://127.0.0.1:8080/v1").trim();
+  // Trim BEFORE falling back, not after: a whitespace-only override (e.g.
+  // " ") is truthy and would otherwise survive the `||` and trim down to
+  // "", handing buildQwythosEnvironment() a blank OPENAI_BASE_URL -- the
+  // exact "silently resolves to nothing" failure mode this function exists
+  // to prevent (see the module-level comment above).
+  const configured = (process.env.QWYTHOS_ENDPOINT || "").trim();
+  return configured || "http://127.0.0.1:8080/v1";
 }
 
 export const DEFAULT_QWYTHOS_MODEL = process.env.QWYTHOS_DEFAULT_MODEL || "qwythos-9b-q6";
