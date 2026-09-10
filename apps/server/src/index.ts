@@ -16,6 +16,7 @@ import { evaluateRunStartPolicy, evaluateProjectWorkspaceBinding } from "./polic
 import { buildCodexApprovalArgs, resolveClaudePermissionMode, resolveClaudeToolLists, resolveEffectiveSandbox } from "./runners/permission-mapping.js";
 import { evaluateResourcePolicy, type ResourceLimits } from "./resources/resource-watchdog.js";
 import { canTransitionMissionStatus } from "./missions/mission-state.js";
+import { deriveMissionEffectiveStatus, type EffectiveMissionStatus } from "./missions/derived-status.js";
 import { pickSafeBaseEnv } from "./security/safe-environment.js";
 import { convertDocumentForIngestion } from "./ingestion/document-ingest.js";
 import { DocumentIngestError, userMessageForCode } from "./ingestion/errors.js";
@@ -7348,6 +7349,42 @@ const persisted = loadPersistedRuns();
 runManager.loadPersisted(persisted.runs, persisted.approvals);
 const missionManager = new MissionManager();
 missionManager.load();
+
+/**
+ * Resolves a mission's currently-attached RunRecords (skipping any run id
+ * whose record no longer exists) and derives its effective status from
+ * them. Shared by the mission read routes and the startup mismatch scan
+ * below so both use the exact same facts -- see derived-status.ts.
+ */
+function attachedRunsFor(mission: Pick<Mission, "runIds">): RunRecord[] {
+  return mission.runIds
+    .map((runId) => runManager.getRun(runId))
+    .filter((run): run is RunRecord => run !== null);
+}
+
+function withEffectiveStatus(mission: Mission): Mission & { effectiveStatus: EffectiveMissionStatus } {
+  return { ...mission, effectiveStatus: deriveMissionEffectiveStatus(mission, attachedRunsFor(mission)) };
+}
+
+// Derived-status Phase A (docs/experiments/cline-ao-evaluation/FINDINGS.md):
+// a one-time, low-noise diagnostic pass at startup, once both managers have
+// finished loading (and RunManager.loadPersisted() has already reconciled
+// any stale run pids -- see recovery.ts). Logs, but never auto-corrects,
+// any mission whose stored status has already drifted from what its
+// attached runs' now-reconciled state supports. Phase A intentionally
+// keeps the stored `status` field as-is; only the audit trail and the API's
+// additive `effectiveStatus` field are new.
+for (const mission of missionManager.list()) {
+  const effectiveStatus = deriveMissionEffectiveStatus(mission, attachedRunsFor(mission));
+  if (effectiveStatus !== mission.status) {
+    appendAuditEvent(AUDIT_DIR, {
+      event_type: "mission.status_mismatch_detected",
+      run_id: null,
+      payload: { missionId: mission.id, storedStatus: mission.status, effectiveStatus, runCount: mission.runIds.length },
+    });
+  }
+}
+
 const sseClients = new Set<express.Response>();
 function broadcastSse(event: SseEvent): void {
   const data = `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
@@ -7848,7 +7885,7 @@ app.get("/api/audit/verify", (_req, res) => {
 });
 
 app.get("/api/missions", (_req, res) => {
-  res.json(apiOk({ missions: missionManager.list() }));
+  res.json(apiOk({ missions: missionManager.list().map(withEffectiveStatus) }));
 });
 
 app.post("/api/missions", (req, res) => {
@@ -7891,7 +7928,7 @@ app.get("/api/missions/:missionId", (req, res) => {
     res.status(404).json(apiErr("Mission not found"));
     return;
   }
-  res.json(apiOk({ mission }));
+  res.json(apiOk({ mission: withEffectiveStatus(mission) }));
 });
 
 app.post("/api/missions/:missionId/runs", (req, res) => {
