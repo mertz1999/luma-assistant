@@ -226,14 +226,21 @@ export function isProcessAlive(pid: number | undefined | null): boolean {
 export function getProcessCommandLine(pid: number): string | null {
   try {
     if (process.platform === "win32") {
+      // `wmic` is deprecated and absent on current Windows 11 builds
+      // (verified directly on this machine: `wmic` is not on PATH) --
+      // Get-CimInstance is its still-supported replacement.
       const result = spawnSync(
-        "wmic",
-        ["process", "where", `ProcessId=${pid}`, "get", "CommandLine", "/value"],
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`,
+        ],
         { encoding: "utf8", timeout: 5000 },
       );
       if (result.status !== 0 || !result.stdout) return null;
-      const match = result.stdout.match(/CommandLine=(.*)/);
-      const line = match?.[1]?.trim();
+      const line = result.stdout.trim();
       return line || null;
     }
 
