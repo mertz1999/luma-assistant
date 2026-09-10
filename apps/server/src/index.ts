@@ -11,6 +11,7 @@ import {
   resolveCommandPath as resolveCommandPathCrossPlatform,
 } from "./platform/process-utils.js";
 import { reconcileStaleRunPid } from "./recovery.js";
+import { shouldApplyEvent, computeNextControllerGeneration } from "./recovery-generation.js";
 import { appendAuditEvent, readAuditEvents, verifyAuditChain } from "./audit/audit-log.js";
 import { evaluateRunStartPolicy, evaluateProjectWorkspaceBinding } from "./policy/policy-engine.js";
 import { buildCodexApprovalArgs, resolveClaudePermissionMode, resolveClaudeToolLists, resolveEffectiveSandbox } from "./runners/permission-mapping.js";
@@ -2071,6 +2072,21 @@ class RunManager extends EventEmitter {
 
   private persistTimer: NodeJS.Timeout | null = null;
 
+  /**
+   * This process's own "controller generation" -- see
+   * docs/architecture/event-generation-fencing.md. Every run this process
+   * spawns is stamped with this value (RunRecord.ownerGeneration); the
+   * asynchronous mutations that follow from spawning a run (process
+   * exit/error, timeout escalation) are only applied if the run's
+   * currently-persisted ownerGeneration still matches the value captured
+   * when that specific spawn happened -- see updateRunIfCurrentGeneration.
+   * Set for real in loadPersisted(), always strictly higher than any
+   * generation already seen in the persisted runs it loads, so a fresh
+   * process can never reuse a generation number an earlier process (whose
+   * runs.json it inherited) already used.
+   */
+  private controllerGeneration = 1;
+
   constructor(private codexPath: string) {
     super();
   }
@@ -2088,6 +2104,7 @@ class RunManager extends EventEmitter {
   loadPersisted(runs: RunRecord[], approvals: ApprovalQueueItem[]): void {
     const now = Date.now();
     const staleRunIds = new Set<string>();
+    this.controllerGeneration = computeNextControllerGeneration(runs.map((run) => run.ownerGeneration));
     for (const run of runs) {
       const staleActiveRun = run.status === "queued" || run.status === "running";
       if (staleActiveRun) staleRunIds.add(run.id);
@@ -2128,6 +2145,13 @@ class RunManager extends EventEmitter {
         events: [],
         lastError: staleActiveRun ? (reconciled?.message ?? null) : run.lastError,
         pid: staleActiveRun ? null : (run.pid ?? null),
+        // A run reconciled here is being claimed by THIS (new) controller
+        // generation right now -- exactly the "ownership transfer after
+        // restart" moment (see event-generation-fencing.md). Any run NOT
+        // reconciled (already terminal before this load) keeps whatever
+        // generation it already had, normalized from undefined (a run
+        // persisted before this field existed) to 0.
+        ownerGeneration: staleActiveRun ? this.controllerGeneration : (run.ownerGeneration ?? 0),
         sessionId: typeof run.sessionId === "string"
           ? run.sessionId
           : typeof run.threadId === "string"
@@ -2378,7 +2402,16 @@ class RunManager extends EventEmitter {
       archivedAt: null,
       pid: null,
       usage: null,
+      ownerGeneration: this.controllerGeneration,
     };
+    // Captured once, here, rather than re-read from `record`/`this.runs`
+    // inside each closure below -- those closures must compare against
+    // the generation THIS specific spawn attempt was created under, not
+    // whatever this process's controllerGeneration happens to be by the
+    // time they eventually fire (which, within one process's own
+    // lifetime, is always the same value anyway; the distinction matters
+    // if this code is ever refactored to reuse a runId across attempts).
+    const runGeneration: number = this.controllerGeneration;
 
     this.runs.set(runId, record);
     this.audit("run.created", runId, {
@@ -2440,7 +2473,7 @@ class RunManager extends EventEmitter {
     const knownSecretValues = Object.values(credentialEnv).filter((v): v is string => Boolean(v));
 
     if (effectiveConfig.runner === "claude") {
-      this.startClaudeExecution(runId, effectiveConfig, prompt, credentialEnv);
+      this.startClaudeExecution(runId, effectiveConfig, prompt, credentialEnv, runGeneration);
       this.persistState();
       return record;
     }
@@ -2451,7 +2484,7 @@ class RunManager extends EventEmitter {
       // spawn body handles both outcomes (updateRun/audit/emitSse) itself,
       // exactly like the synchronous resolveExecutableForSpawn failure
       // branch in startClaudeExecution does for its own failure mode.
-      void this.startQwythosExecution(runId, effectiveConfig, prompt, credentialEnv);
+      void this.startQwythosExecution(runId, effectiveConfig, prompt, credentialEnv, runGeneration);
       this.persistState();
       return record;
     }
@@ -2542,7 +2575,7 @@ class RunManager extends EventEmitter {
       const message = error instanceof Error ? error.message : "Failed to start Codex CLI";
       this.appendEvent(runId, { source: "stderr", text: `${message}\n` });
       this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${message}\n` } });
-      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "failed", lastError: message.slice(0, 600), pid: null });
       this.audit("run.spawn_failed", runId, { runner: "codex", stage: "process_error", message });
     });
 
@@ -2558,7 +2591,7 @@ class RunManager extends EventEmitter {
       approveForMe: effectiveConfig.sandbox === "workspace-write" && !effectiveConfig.sessionId,
       fullAccessEscalation: effectiveConfig.sandbox === "danger-full-access",
     });
-    this.scheduleRunTimeout(runId);
+    this.scheduleRunTimeout(runId, runGeneration);
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
     const startedRun = this.runs.get(runId);
     if (startedRun) {
@@ -2603,7 +2636,7 @@ class RunManager extends EventEmitter {
       if (!run) return;
 
       if (stopRequested) {
-        this.updateRun(runId, { status: "stopped", pid: null });
+        this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "stopped", pid: null });
         this.emitSse({ kind: "run.stopped", runId, at: Date.now() });
         const stoppedRun = this.runs.get(runId);
         if (stoppedRun) {
@@ -2618,14 +2651,14 @@ class RunManager extends EventEmitter {
         // completed). A stale error from a recovered failure must not
         // survive onto a run whose actual outcome was success -- a caller
         // reading lastError on a "completed" run should never see it.
-        this.updateRun(runId, { status: "completed", pid: null, lastError: null });
+        this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "completed", pid: null, lastError: null });
         this.emitSse({ kind: "run.completed", runId, at: Date.now() });
         const completedRun = this.runs.get(runId);
         if (completedRun) {
           this.emit("run.lifecycle", { kind: "completed", run: completedRun, previous: run } as RunLifecycleEvent);
         }
       } else if (run.status !== "stopped") {
-        this.updateRun(runId, { status: "failed", pid: null });
+        this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "failed", pid: null });
         this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code } });
         const failedRun = this.runs.get(runId);
         if (failedRun) {
@@ -2647,7 +2680,7 @@ class RunManager extends EventEmitter {
     return record;
   }
 
-  private startClaudeExecution(runId: string, effectiveConfig: RunConfig, prompt: string, credentialEnv: Record<string, string> = {}): void {
+  private startClaudeExecution(runId: string, effectiveConfig: RunConfig, prompt: string, credentialEnv: Record<string, string> = {}, runGeneration: number): void {
     const executable = CLAUDE_CODE_EXECUTABLE || "claude";
     const effort = resolveClaudeCliEffort(effectiveConfig.reasoningEffort);
     const supportsEffort = claudeCliSupportsEffort(executable);
@@ -2736,7 +2769,7 @@ class RunManager extends EventEmitter {
       permissionMode,
       fullAccessEscalation: permissionMode === "bypassPermissions",
     });
-    this.scheduleRunTimeout(runId);
+    this.scheduleRunTimeout(runId, runGeneration);
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
     const startedRun = this.runs.get(runId);
     if (startedRun) {
@@ -2779,12 +2812,12 @@ class RunManager extends EventEmitter {
       const message = error instanceof Error ? error.message : "Failed to start Claude CLI";
       this.appendEvent(runId, { source: "stderr", text: `${message}\n` });
       this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${message}\n` } });
-      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "failed", lastError: message.slice(0, 600), pid: null });
       this.audit("run.spawn_failed", runId, { runner: "claude", stage: "process_error", message });
     });
 
     child.on("exit", (code) => {
-      this.finishClaudeExecution(runId, code);
+      this.finishClaudeExecution(runId, code, runGeneration);
     });
 
     this.persistState();
@@ -2808,14 +2841,22 @@ class RunManager extends EventEmitter {
     effectiveConfig: RunConfig,
     prompt: string,
     credentialEnv: Record<string, string> = {},
+    runGeneration: number,
   ): Promise<void> {
+    // Unlike the codex/claude blocks in startRun (fully synchronous from
+    // record-creation through spawn), this function awaits the health
+    // check before doing anything else -- a real async gap between the
+    // run's creation and its first mutation, so every mutation below is
+    // fenced even though a controller restart would end this whole
+    // process (and thus this await) anyway; defense in depth for the one
+    // genuinely async pre-spawn path.
     const health = await checkQwythosEndpointReachable();
     if (!health.ok) {
       const message =
         `QWYTHOS_LOCAL_UNAVAILABLE: local Qwythos endpoint ${QWYTHOS_ENDPOINT} is not reachable (${health.reason}). ` +
         `Qwythos is a local-only runner and does not fall back to any other provider. Start the frozen Qwythos ` +
         `server (C:\\Users\\it hp\\qwythos-stack\\scripts\\start-qwythos-server.ps1) and retry.`;
-      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "failed", lastError: message.slice(0, 600), pid: null });
       this.audit("run.spawn_failed", runId, { runner: "qwythos", stage: "health_check", endpoint: QWYTHOS_ENDPOINT, reason: health.reason });
       this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code: null } });
       this.persistState();
@@ -2875,7 +2916,7 @@ class RunManager extends EventEmitter {
       resolvedQwythos = resolveExecutableForSpawn(executable);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to resolve openclaude executable";
-      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "failed", lastError: message.slice(0, 600), pid: null });
       this.audit("run.spawn_failed", runId, { runner: "qwythos", stage: "resolve", message });
       this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code: null } });
       this.persistState();
@@ -2902,7 +2943,7 @@ class RunManager extends EventEmitter {
       stopRequested: false,
     };
     this.activeRuns.set(runId, active);
-    this.updateRun(runId, { status: "running", pid: child.pid ?? null });
+    this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "running", pid: child.pid ?? null });
     this.audit("run.process_started", runId, {
       runner: "qwythos",
       pid: child.pid ?? null,
@@ -2913,7 +2954,7 @@ class RunManager extends EventEmitter {
       fullAccessEscalation: permissionMode === "bypassPermissions",
       endpoint: QWYTHOS_ENDPOINT,
     });
-    this.scheduleRunTimeout(runId);
+    this.scheduleRunTimeout(runId, runGeneration);
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
     const startedRun = this.runs.get(runId);
     if (startedRun) {
@@ -2956,18 +2997,18 @@ class RunManager extends EventEmitter {
       const message = error instanceof Error ? error.message : "Failed to start openclaude";
       this.appendEvent(runId, { source: "stderr", text: `${message}\n` });
       this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${message}\n` } });
-      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600), pid: null });
+      this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "failed", lastError: message.slice(0, 600), pid: null });
       this.audit("run.spawn_failed", runId, { runner: "qwythos", stage: "process_error", message });
     });
 
     child.on("exit", (code) => {
-      this.finishClaudeExecution(runId, code);
+      this.finishClaudeExecution(runId, code, runGeneration);
     });
 
     this.persistState();
   }
 
-  private finishClaudeExecution(runId: string, code: number | null): void {
+  private finishClaudeExecution(runId: string, code: number | null, runGeneration: number): void {
     const active = this.activeRuns.get(runId);
     const stopRequested = Boolean(active?.stopRequested);
     if (isClaudeProtocolRun(active)) {
@@ -2982,7 +3023,7 @@ class RunManager extends EventEmitter {
     if (!run) return;
 
     if (stopRequested) {
-      this.updateRun(runId, { status: "stopped", pid: null });
+      this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "stopped", pid: null });
       this.emitSse({ kind: "run.stopped", runId, at: Date.now() });
       const stoppedRun = this.runs.get(runId);
       if (stoppedRun) {
@@ -2992,14 +3033,14 @@ class RunManager extends EventEmitter {
       // See the matching comment in the Codex exit handler: a completed
       // run must not carry over a stale lastError from a mid-session
       // failure the agent already recovered from.
-      this.updateRun(runId, { status: "completed", pid: null, lastError: null });
+      this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "completed", pid: null, lastError: null });
       this.emitSse({ kind: "run.completed", runId, at: Date.now() });
       const completedRun = this.runs.get(runId);
       if (completedRun) {
         this.emit("run.lifecycle", { kind: "completed", run: completedRun, previous: run } as RunLifecycleEvent);
       }
     } else if (run.status !== "stopped") {
-      this.updateRun(runId, { status: "failed", pid: null });
+      this.updateRunIfCurrentGeneration(runId, runGeneration, { status: "failed", pid: null });
       this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code } });
       const failedRun = this.runs.get(runId);
       if (failedRun) {
@@ -3278,7 +3319,7 @@ class RunManager extends EventEmitter {
    * Called once per run, right after it starts, for both runners identically
    * -- the same cap applies regardless of which CLI is running.
    */
-  private scheduleRunTimeout(runId: string): void {
+  private scheduleRunTimeout(runId: string, runGeneration: number): void {
     if (!(MAX_RUN_DURATION_MS > 0)) return;
     const timer = setTimeout(() => {
       const active = this.activeRuns.get(runId);
@@ -3289,10 +3330,14 @@ class RunManager extends EventEmitter {
         pid: active.process.pid ?? null,
         maxDurationMs: MAX_RUN_DURATION_MS,
       });
-      this.updateRun(runId, {
+      const applied = this.updateRunIfCurrentGeneration(runId, runGeneration, {
         lastError: `Run exceeded the maximum duration of ${seconds}s and was stopped automatically.`,
       });
-      this.stopRun(runId);
+      // Only escalate to killing the process tree if this timeout still
+      // owns the run -- a stale timeout from a generation that no longer
+      // owns it must not stop whatever the CURRENT generation is doing
+      // with that pid.
+      if (applied) this.stopRun(runId);
     }, MAX_RUN_DURATION_MS);
     // Never keep the whole Node process alive solely for this timer, e.g.
     // during a clean server shutdown while a run happens to be active.
@@ -3456,6 +3501,50 @@ class RunManager extends EventEmitter {
     this.runs.set(runId, next);
     this.emit("run.lifecycle", { kind: "updated", run: next, previous: run } as RunLifecycleEvent);
     this.persistState();
+  }
+
+  /**
+   * Same as updateRun(), except the mutation is only applied if `runId`'s
+   * CURRENTLY-persisted ownerGeneration still equals `expectedGeneration`
+   * -- see docs/architecture/event-generation-fencing.md. `expectedGeneration`
+   * must be the value captured at the moment the specific spawn attempt
+   * that produced this event started (a local const in startRun), never
+   * re-read from the run at call time (that would just compare a value to
+   * itself and could never detect staleness).
+   *
+   * Re-reads `this.runs.get(runId)` fresh -- not a value closed over
+   * earlier -- so the comparison is always against the true current state.
+   * Node's single-threaded event loop makes this check-then-set atomic
+   * within this process: nothing else can observe or mutate `this.runs`
+   * between the read below and updateRun()'s own read+write, since no
+   * `await` separates them.
+   *
+   * Guards only the ownership-defining, state-changing mutations listed in
+   * event-generation-fencing.md (completion, failure, timeout escalation)
+   * -- NOT the high-frequency, low-risk progress updates (streamed
+   * summary/changedFiles/usage) a run also produces, which stay on the
+   * plain updateRun() path deliberately: fencing every call here would add
+   * a comparison per streamed token for no real safety benefit.
+   *
+   * Returns whether the mutation was applied. A caller that only cares
+   * about "did I get to record the outcome" can ignore the return value;
+   * one that would otherwise take a further action (e.g. stopRun, an SSE
+   * broadcast) on the assumption the mutation landed should check it.
+   */
+  private updateRunIfCurrentGeneration(runId: string, expectedGeneration: number, patch: Partial<RunRecord>): boolean {
+    const run = this.runs.get(runId);
+    if (!run) return false;
+    const currentGeneration = run.ownerGeneration ?? 0;
+    if (!shouldApplyEvent(currentGeneration, expectedGeneration)) {
+      this.audit("run.stale_event_rejected", runId, {
+        expectedGeneration,
+        currentGeneration,
+        attemptedPatchKeys: Object.keys(patch),
+      });
+      return false;
+    }
+    this.updateRun(runId, patch);
+    return true;
   }
 
   private emitSse(evt: SseEvent): void {

@@ -338,6 +338,21 @@ export type RunRecord = {
     outputTokens?: number;
     cachedInputTokens?: number;
   } | null;
+  /**
+   * Which controller-process "generation" currently owns this run, i.e. is
+   * allowed to apply the asynchronous, ownership-defining mutations that
+   * follow from spawning it (process exit/error, timeout escalation --
+   * see RunManager.updateRunIfCurrentGeneration in index.ts). Set once at
+   * spawn time to that process's own generation counter and never changed
+   * by the run's own lifecycle; only restart-time reconciliation
+   * (RunManager.loadPersisted -- the moment a NEW controller process
+   * actually claims an orphaned/stale run) legitimately advances it.
+   * Optional so pre-existing persisted runs (created before this field
+   * existed) load without a migration; RunManager normalizes a missing
+   * value to 0 at load time, which every real process's own generation
+   * (>= 1) is guaranteed to be strictly newer than.
+   */
+  ownerGeneration?: number;
 };
 
 /**
