@@ -137,6 +137,13 @@ const RUN_MESSAGE_PAGE_SIZE = 30;
 const SESSION_LIST_PAGE_DEFAULT = Number(process.env.SESSION_LIST_PAGE_DEFAULT || 60);
 const SESSION_LIST_PAGE_MAX = Number(process.env.SESSION_LIST_PAGE_MAX || 200);
 const SESSION_MESSAGE_PAGE_SIZE = 30;
+/** Above this size, latest-page reads use a tail scan instead of full JSONL hydrate. */
+const MESSAGE_LOG_FAST_PATH_BYTES = Math.max(64 * 1024, Number(process.env.MESSAGE_LOG_FAST_PATH_BYTES || 256 * 1024));
+/** Chunk size when scanning a message log from the end. */
+const MESSAGE_LOG_TAIL_CHUNK_BYTES = Math.max(32 * 1024, Number(process.env.MESSAGE_LOG_TAIL_CHUNK_BYTES || 256 * 1024));
+/** Cap tool/text payload size returned in paged message APIs (full text stays on disk). */
+const MESSAGE_PAGE_TEXT_MAX_CHARS = Math.max(1000, Number(process.env.MESSAGE_PAGE_TEXT_MAX_CHARS || 6000));
+const MESSAGE_PAGE_BEFORE_ID_PREFIX = "id:";
 const STORED_EVENT_TEXT_MAX_CHARS = Number(process.env.STORED_EVENT_TEXT_MAX_CHARS || 24000);
 const RUNS_PERSIST_DEBOUNCE_MS = Number(process.env.RUNS_PERSIST_DEBOUNCE_MS || 750);
 const SESSION_INDEX_PERSIST_DEBOUNCE_MS = Number(process.env.SESSION_INDEX_PERSIST_DEBOUNCE_MS || 500);
@@ -5285,7 +5292,8 @@ function markScheduledSessionListItems(items: SessionListItem[]): SessionListIte
 }
 
 function readSessionListItems(includeHistory: boolean): SessionListItem[] {
-  messageStore.reconcileWithRuns(runManager.getRuns(false));
+  // Read path must stay O(index): never reconcile/scan runs or message jsonl here.
+  // Index freshness comes from write-time updates + startup/repair reconcile.
   const localItems = markScheduledSessionListItems(messageStore.listLocalSessions());
   if (!includeHistory) return localItems;
 
@@ -5297,6 +5305,15 @@ function readSessionListItems(includeHistory: boolean): SessionListItem[] {
   return markScheduledSessionListItems([...localItems, ...historyItems]).sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+function repairSessionIndexFromRuns(): { sessionCount: number; durationMs: number } {
+  const startedAt = Date.now();
+  messageStore.reconcileWithRuns(runManager.getRuns(false));
+  return {
+    sessionCount: messageStore.listLocalSessions().length,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 function messageLogPath(sessionId: string): string {
   return path.join(MESSAGE_LOG_DIR, `${encodeURIComponent(sessionId)}.jsonl`);
 }
@@ -5305,6 +5322,39 @@ function clearMessageErrorMeta(meta: ChatMessage["meta"] | undefined): ChatMessa
   if (!meta) return undefined;
   const { errorMessage, ...rest } = meta;
   return Object.keys(rest).length > 0 ? rest : undefined;
+}
+
+function normalizeMessageLogRow(row: ChatMessage): ChatMessage | null {
+  if (typeof row.id !== "string" || typeof row.sessionId !== "string") return null;
+  return {
+    ...row,
+    clientMessageId: typeof row.clientMessageId === "string" ? row.clientMessageId : null,
+    runId: typeof row.runId === "string" ? row.runId : null,
+    title: typeof row.title === "string" ? row.title : undefined,
+    attachments: normalizeAttachmentRefs(row.attachments),
+    meta: isRecord(row.meta) ? { ...row.meta } : undefined,
+  };
+}
+
+function messageCountsTowardPageLimit(message: ChatMessage): boolean {
+  return message.kind !== "tool" && message.role !== "tool";
+}
+
+function slimMessageForPage(message: ChatMessage): ChatMessage {
+  const text = typeof message.text === "string" ? truncateText(message.text, MESSAGE_PAGE_TEXT_MAX_CHARS) : message.text;
+  const meta = message.meta ? { ...message.meta } : undefined;
+  if (meta && typeof meta.output === "string") {
+    meta.output = truncateText(meta.output, MESSAGE_PAGE_TEXT_MAX_CHARS);
+  }
+  if (meta && typeof meta.command === "string" && meta.command.length > MESSAGE_PAGE_TEXT_MAX_CHARS) {
+    meta.command = truncateText(meta.command, MESSAGE_PAGE_TEXT_MAX_CHARS);
+  }
+  return {
+    ...message,
+    text,
+    attachments: normalizeAttachmentRefs(message.attachments),
+    meta,
+  };
 }
 
 function readMessageLog(sessionId: string): ChatMessage[] {
@@ -5318,15 +5368,8 @@ function readMessageLog(sessionId: string): ChatMessage[] {
   for (const line of lines) {
     if (!line.trim()) continue;
     const row = safeJsonParse<ChatMessage>(line, null as unknown as ChatMessage);
-    if (!row || typeof row.id !== "string" || typeof row.sessionId !== "string") continue;
-    const normalized: ChatMessage = {
-      ...row,
-      clientMessageId: typeof row.clientMessageId === "string" ? row.clientMessageId : null,
-      runId: typeof row.runId === "string" ? row.runId : null,
-      title: typeof row.title === "string" ? row.title : undefined,
-      attachments: normalizeAttachmentRefs(row.attachments),
-      meta: isRecord(row.meta) ? { ...row.meta } : undefined,
-    };
+    const normalized = row ? normalizeMessageLogRow(row) : null;
+    if (!normalized) continue;
 
     const existingIndex = indexById.get(normalized.id);
     if (existingIndex === undefined) {
@@ -5338,6 +5381,79 @@ function readMessageLog(sessionId: string): ChatMessage[] {
   }
 
   return ordered.sort((a, b) => a.sequence - b.sequence || a.createdAt - b.createdAt);
+}
+
+/**
+ * Read only the end of a JSONL message log to build the latest page.
+ * Append-only upserts mean the newest version of each id is near the end,
+ * so a reverse scan with first-seen-wins dedupe is enough for open-chat.
+ */
+function readMessageLogTail(
+  sessionId: string,
+  minCountedMessages: number,
+): { messages: ChatMessage[]; reachedStart: boolean; fileSize: number } {
+  const filePath = messageLogPath(sessionId);
+  if (!fs.existsSync(filePath)) return { messages: [], reachedStart: true, fileSize: 0 };
+
+  const fileSize = fs.statSync(filePath).size;
+  if (fileSize <= 0) return { messages: [], reachedStart: true, fileSize };
+
+  const fd = fs.openSync(filePath, "r");
+  try {
+    let position = fileSize;
+    let leadingPartial = "";
+    const newestFirst: ChatMessage[] = [];
+    const seenIds = new Set<string>();
+    let counted = 0;
+    // Pull extra tool rows that sit between counted messages in the window.
+    const maxRows = Math.max(minCountedMessages * 8, minCountedMessages + 40);
+
+    while (position > 0 && counted < minCountedMessages && newestFirst.length < maxRows) {
+      const readSize = Math.min(MESSAGE_LOG_TAIL_CHUNK_BYTES, position);
+      position -= readSize;
+      const buffer = Buffer.allocUnsafe(readSize);
+      fs.readSync(fd, buffer, 0, readSize, position);
+      const chunk = `${buffer.toString("utf8")}${leadingPartial}`;
+      const lines = chunk.split(/\r?\n/);
+      if (position > 0) {
+        leadingPartial = lines.shift() || "";
+      } else {
+        leadingPartial = "";
+      }
+
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = lines[index];
+        if (!line.trim()) continue;
+        const row = safeJsonParse<ChatMessage>(line, null as unknown as ChatMessage);
+        const normalized = row ? normalizeMessageLogRow(row) : null;
+        if (!normalized || seenIds.has(normalized.id)) continue;
+        seenIds.add(normalized.id);
+        newestFirst.push(normalized);
+        if (messageCountsTowardPageLimit(normalized)) counted += 1;
+        if (counted >= minCountedMessages && newestFirst.length >= minCountedMessages) {
+          // Keep scanning a little for trailing tool rows already in this chunk.
+          if (newestFirst.length >= maxRows) break;
+        }
+      }
+    }
+
+    const reachedStart = position <= 0 && !leadingPartial.trim();
+    if (position <= 0 && leadingPartial.trim()) {
+      const row = safeJsonParse<ChatMessage>(leadingPartial, null as unknown as ChatMessage);
+      const normalized = row ? normalizeMessageLogRow(row) : null;
+      if (normalized && !seenIds.has(normalized.id)) {
+        newestFirst.push(normalized);
+      }
+    }
+
+    const messages = newestFirst
+      .slice()
+      .reverse()
+      .sort((a, b) => a.sequence - b.sequence || a.createdAt - b.createdAt);
+    return { messages, reachedStart: position <= 0, fileSize };
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function previewText(text: string): string {
@@ -5423,56 +5539,12 @@ class MessageStore {
       sourceRaw: "in-app",
     });
 
-    // Cold sessions: update index metadata only. Rebuilding from every run's event
-    // jsonl at startup was loading ~100MB+ into RAM for no interactive benefit.
-    if (!state.messagesHydrated) {
-      const nextUpdatedAt = Math.max(
-        state.item.updatedAt,
-        latestRun ? (latestRun.updatedAt || latestRun.createdAt) : 0,
-      );
-      const metadataChanged =
-        state.item.status !== (latestRun?.status || state.item.status)
-        || state.item.runner !== normalizeRunRunner(latestRun?.config.runner || state.item.runner)
-        || state.item.model !== (latestRun?.config.model || state.item.model)
-        || state.item.reasoningEffort !== (latestRun ? normalizeReasoningEffort(latestRun.config.reasoningEffort) : state.item.reasoningEffort)
-        || state.item.workspace !== (latestRun?.config.workspace || state.item.workspace)
-        || state.item.latestRunId !== (latestRun?.id || state.item.latestRunId)
-        || state.item.updatedAt !== nextUpdatedAt
-        || (!state.item.title.trim() && titleFallback !== state.item.title);
-
-      if (!metadataChanged) return;
-
-      state.item.status = latestRun?.status || state.item.status;
-      state.item.runner = normalizeRunRunner(latestRun?.config.runner || state.item.runner);
-      state.item.model = latestRun?.config.model || state.item.model;
-      state.item.reasoningEffort = latestRun ? normalizeReasoningEffort(latestRun.config.reasoningEffort) : state.item.reasoningEffort;
-      state.item.workspace = latestRun?.config.workspace || state.item.workspace;
-      state.item.latestRunId = latestRun?.id || state.item.latestRunId;
-      state.item.updatedAt = nextUpdatedAt;
-      if (!state.item.title.trim()) state.item.title = titleFallback;
-      this.syncSessionSource(state);
-      this.scheduleSnapshot();
-      this.emitSessionUpsert(state.item);
-      return;
-    }
-
-    const projectedMessages = buildSessionMessageEntries(runs)
-      .map((entry, index) => timelineEntryToChatMessage(sessionId, entry, index + 1));
-    const normalizedMessages = normalizeSessionMessages([...state.messages, ...projectedMessages]).map((message, index) => ({
-      ...message,
-      sessionId,
-      sequence: index + 1,
-    }));
-
-    const previousSerialized = state.messages.map((message) => JSON.stringify(message)).join("\n");
-    const nextSerialized = normalizedMessages.map((message) => JSON.stringify(message)).join("\n");
-    const messagesChanged = previousSerialized !== nextSerialized;
+    // Reconcile is metadata-only. Message bodies stay owned by the write path /
+    // jsonl hydrate; never rebuild or rewrite them during startup/repair.
     const nextUpdatedAt = Math.max(
       state.item.updatedAt,
       latestRun ? (latestRun.updatedAt || latestRun.createdAt) : 0,
-      normalizedMessages[normalizedMessages.length - 1]?.createdAt || 0,
     );
-    const nextPreview = previewText(normalizedMessages[normalizedMessages.length - 1]?.text || state.item.lastMessagePreview || "");
     const metadataChanged =
       state.item.status !== (latestRun?.status || state.item.status)
       || state.item.runner !== normalizeRunRunner(latestRun?.config.runner || state.item.runner)
@@ -5480,16 +5552,11 @@ class MessageStore {
       || state.item.reasoningEffort !== (latestRun ? normalizeReasoningEffort(latestRun.config.reasoningEffort) : state.item.reasoningEffort)
       || state.item.workspace !== (latestRun?.config.workspace || state.item.workspace)
       || state.item.latestRunId !== (latestRun?.id || state.item.latestRunId)
-      || state.item.messageCount !== normalizedMessages.length
-      || state.item.lastMessagePreview !== nextPreview
       || state.item.updatedAt !== nextUpdatedAt
       || (!state.item.title.trim() && titleFallback !== state.item.title);
 
-    if (!messagesChanged && !metadataChanged) return;
+    if (!metadataChanged) return;
 
-    state.messages = normalizedMessages;
-    state.messageIds = new Map(normalizedMessages.map((message, index) => [message.id, index]));
-    state.nextSequence = normalizedMessages.length + 1;
     state.item.status = latestRun?.status || state.item.status;
     state.item.runner = normalizeRunRunner(latestRun?.config.runner || state.item.runner);
     state.item.model = latestRun?.config.model || state.item.model;
@@ -5497,19 +5564,8 @@ class MessageStore {
     state.item.workspace = latestRun?.config.workspace || state.item.workspace;
     state.item.latestRunId = latestRun?.id || state.item.latestRunId;
     state.item.updatedAt = nextUpdatedAt;
-    state.item.messageCount = normalizedMessages.length;
-    state.item.lastMessagePreview = nextPreview;
     if (!state.item.title.trim()) state.item.title = titleFallback;
     this.syncSessionSource(state);
-
-    if (messagesChanged) {
-      this.enqueueWrite(async () => {
-        await fs.promises.mkdir(MESSAGE_LOG_DIR, { recursive: true });
-        const fileContent = normalizedMessages.map((message) => JSON.stringify(message)).join("\n");
-        await fs.promises.writeFile(messageLogPath(sessionId), `${fileContent}${fileContent ? "\n" : ""}`);
-      });
-    }
-
     this.scheduleSnapshot();
     this.emitSessionUpsert(state.item);
   }
@@ -5526,6 +5582,53 @@ class MessageStore {
   getMessagesPage(sessionId: string, beforeCursor: string | null, limit = SESSION_MESSAGE_PAGE_SIZE): SessionMessagesResponse | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
+
+    const beforeId = typeof beforeCursor === "string" && beforeCursor.startsWith(MESSAGE_PAGE_BEFORE_ID_PREFIX)
+      ? beforeCursor.slice(MESSAGE_PAGE_BEFORE_ID_PREFIX.length)
+      : null;
+
+    // Latest-page fast path: avoid full JSONL hydrate for large cold sessions.
+    if (!state.messagesHydrated && !beforeCursor) {
+      const filePath = messageLogPath(sessionId);
+      let fileSize = 0;
+      try {
+        fileSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+      } catch {
+        fileSize = 0;
+      }
+
+      if (fileSize >= MESSAGE_LOG_FAST_PATH_BYTES) {
+        const startedAt = Date.now();
+        const tail = readMessageLogTail(sessionId, limit);
+        const normalizedMessages = normalizeSessionMessages(tail.messages).map((message, index) => ({
+          ...message,
+          sessionId,
+          sequence: message.sequence || index + 1,
+        }));
+        const { start, end: safeEnd } = resolveCountedPageWindow(
+          normalizedMessages,
+          null,
+          limit,
+          messageCountsTowardPageLimit,
+        );
+        const page = normalizedMessages.slice(start, safeEnd).map(slimMessageForPage);
+        const hasOlder = !tail.reachedStart || start > 0;
+        if (process.env.MESSAGE_PERF_LOG === "1") {
+          // eslint-disable-next-line no-console
+          console.log(
+            `[luma-assistant/message-perf] sessions.messages.fast-path durationMs=${Date.now() - startedAt} fileBytes=${fileSize} pageMessages=${page.length}`,
+          );
+        }
+
+        return {
+          sessionId,
+          messages: page,
+          nextCursor: hasOlder && page[0] ? `${MESSAGE_PAGE_BEFORE_ID_PREFIX}${page[0].id}` : null,
+          latestRunId: state.item.latestRunId,
+        };
+      }
+    }
+
     this.ensureMessagesLoaded(state);
 
     const normalizedMessages = normalizeSessionMessages(state.messages).map((message, index) => ({
@@ -5547,20 +5650,34 @@ class MessageStore {
       this.scheduleSnapshot();
     }
 
+    let endCursor: string | null = beforeCursor;
+    if (beforeId) {
+      const endIndex = state.messages.findIndex((message) => message.id === beforeId);
+      if (endIndex < 0) {
+        return {
+          sessionId,
+          messages: [],
+          nextCursor: null,
+          latestRunId: state.item.latestRunId,
+        };
+      }
+      endCursor = encodeCursor(endIndex);
+    }
+
     const { start, end: safeEnd } = resolveCountedPageWindow(
       state.messages,
-      beforeCursor,
+      endCursor,
       limit,
-      (message) => message.kind !== "tool" && message.role !== "tool",
+      messageCountsTowardPageLimit,
     );
     return {
       sessionId,
-      messages: state.messages.slice(start, safeEnd).map((message) => ({
-        ...message,
-        attachments: normalizeAttachmentRefs(message.attachments),
-        meta: message.meta ? { ...message.meta } : undefined,
-      })),
-      nextCursor: start > 0 ? encodeCursor(start) : null,
+      messages: state.messages.slice(start, safeEnd).map(slimMessageForPage),
+      nextCursor: start > 0
+        ? (state.messages[start]
+          ? `${MESSAGE_PAGE_BEFORE_ID_PREFIX}${state.messages[start].id}`
+          : encodeCursor(start))
+        : null,
       latestRunId: state.item.latestRunId,
     };
   }
@@ -7403,6 +7520,11 @@ app.get("/api/sessions/list", (req, res) => {
     console.log(`[luma-assistant/message-perf] sessions.list durationMs=${Date.now() - startedAt} payloadBytes=${Buffer.byteLength(JSON.stringify(response))}`);
   }
   res.json(apiOk(response));
+});
+
+app.post("/api/sessions/repair", (_req, res) => {
+  const result = repairSessionIndexFromRuns();
+  res.json(apiOk(result));
 });
 
 app.get("/api/runs/list", (req, res) => {

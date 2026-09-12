@@ -2180,6 +2180,7 @@ export function App(): JSX.Element {
   const isDraftSessionRef = useRef(isDraftSession);
   const lastEventAtRef = useRef<number>(Date.now());
   const autoRefreshInFlightRef = useRef(false);
+  const messagesByRunIdRef = useRef(messagesByRunId);
   const previousTimelineStateRef = useRef<{ sessionKey: string; length: number }>({
     sessionKey: draftSessionKey,
     length: 0,
@@ -2194,6 +2195,10 @@ export function App(): JSX.Element {
   useEffect(() => {
     selectedSessionIdRef.current = selectedSessionId;
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    messagesByRunIdRef.current = messagesByRunId;
+  }, [messagesByRunId]);
 
   useEffect(() => {
     showAllHistoryRef.current = showAllHistory;
@@ -2412,7 +2417,12 @@ export function App(): JSX.Element {
     const refreshSelectedSessionState = () => {
       const currentSelectedSessionId = selectedSessionIdRef.current;
       if (currentSelectedSessionId) {
-        void loadRunMessagesPage(currentSelectedSessionId, { reset: true });
+        // Avoid full message reload when the timeline is already warm (common on
+        // mobile focus/SSE reconnect). SSE upserts keep it current.
+        const existing = messagesByRunIdRef.current[currentSelectedSessionId];
+        if (!existing || existing.length === 0) {
+          void loadRunMessagesPage(currentSelectedSessionId, { reset: true });
+        }
       }
       const currentSelectedRunId = selectedRunIdRef.current;
       if (currentSelectedRunId) {
@@ -2564,10 +2574,13 @@ export function App(): JSX.Element {
   useEffect(() => {
     if (!authReady || !isAuthenticated) return;
 
+    // Poll only when SSE looks stale. Healthy event streams already push
+    // session.upsert / message / run events into local state.
     const timer = window.setInterval(() => {
       if (autoRefreshInFlightRef.current) return;
       if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
       if (typeof navigator !== "undefined" && "onLine" in navigator && !navigator.onLine) return;
+      if (Date.now() - lastEventAtRef.current <= eventStreamHeartbeatStaleMs) return;
 
       autoRefreshInFlightRef.current = true;
       void (async () => {
