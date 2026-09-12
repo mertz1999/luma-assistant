@@ -10,6 +10,7 @@ import dotenv from "dotenv";
 import express from "express";
 import jwt from "jsonwebtoken";
 import type { IPty } from "node-pty";
+import { openMessageDatabase, type MessageDatabase } from "./message-db.js";
 import {
   approvalPolicySchema,
   attachmentRefSchema,
@@ -100,6 +101,7 @@ const SESSION_INDEX_PATH = path.resolve(rootDir, "data/session-index.json");
 const MESSAGE_STORE_META_PATH = path.resolve(rootDir, "data/message-store-meta.json");
 const MESSAGE_OUTBOX_PATH = path.resolve(rootDir, "data/message-outbox.json");
 const MESSAGE_LOG_DIR = path.resolve(rootDir, "data/messages");
+const MESSAGE_DB_PATH = path.resolve(rootDir, "data/messages.sqlite");
 const TASK_MANAGER_DATA_PATH = path.resolve(rootDir, "data/taskmanager/state.json");
 const SESSION_IMAGE_DIR = path.resolve(rootDir, "data/session-images");
 
@@ -154,7 +156,7 @@ const RUN_EVENTS_MEMORY_CAP = Math.max(100, Number(process.env.RUN_EVENTS_MEMORY
 /** Auto-archive completed/failed/stopped runs older than this many days (0 disables). */
 const RUN_RETENTION_DAYS = Math.max(0, Number(process.env.RUN_RETENTION_DAYS || 45));
 const MESSAGE_OUTBOX_RETRY_DELAYS_MS = [1000, 3000, 10000];
-const MESSAGE_STORE_SCHEMA_VERSION = 1;
+const MESSAGE_STORE_SCHEMA_VERSION = 2;
 const TEHRAN_TIMEZONE = "Asia/Tehran";
 const LOCAL_SESSION_SOURCE = "luma-assistant";
 const LEGACY_LOCAL_SESSION_SOURCE = "agentic-cli";
@@ -5470,19 +5472,52 @@ class MessageStore {
   /** LRU order of session ids that currently hold message bodies in RAM. */
   private hotSessionOrder: string[] = [];
 
-  constructor(private readonly emitEvent: (event: SseEvent) => void) {}
+  constructor(
+    private readonly messageDb: MessageDatabase,
+    private readonly emitEvent: (event: SseEvent) => void,
+  ) {}
 
   loadOrBackfill(runs: RunRecord[]): void {
     fs.mkdirSync(MESSAGE_LOG_DIR, { recursive: true });
+    this.migrateJsonlToSqlite();
     const meta = this.loadMeta();
-    if (meta?.schemaVersion === MESSAGE_STORE_SCHEMA_VERSION && fs.existsSync(SESSION_INDEX_PATH)) {
+    if (fs.existsSync(SESSION_INDEX_PATH)) {
       this.loadFromDisk();
       this.reconcileWithRuns(runs.filter((run) => run.archivedAt === null));
+      if (meta?.schemaVersion !== MESSAGE_STORE_SCHEMA_VERSION) {
+        this.persistMetaSync();
+      }
       return;
     }
 
     this.backfillFromRuns(runs.filter((run) => run.archivedAt === null));
     this.persistMetaSync();
+  }
+
+  private migrateJsonlToSqlite(): void {
+    if (this.messageDb.getMeta("jsonl_migrated") === "1") return;
+    const startedAt = Date.now();
+    let fileCount = 0;
+    let messageCount = 0;
+    if (fs.existsSync(MESSAGE_LOG_DIR)) {
+      for (const name of fs.readdirSync(MESSAGE_LOG_DIR)) {
+        if (!name.endsWith(".jsonl")) continue;
+        const sessionId = decodeURIComponent(name.slice(0, -".jsonl".length));
+        const filePath = path.join(MESSAGE_LOG_DIR, name);
+        messageCount += this.messageDb.importJsonlFile(sessionId, filePath);
+        fileCount += 1;
+        try {
+          fs.renameSync(filePath, `${filePath}.migrated`);
+        } catch {
+          // keep original if rename fails; import is idempotent via replace
+        }
+      }
+    }
+    this.messageDb.setMeta("jsonl_migrated", "1");
+    // eslint-disable-next-line no-console
+    console.log(
+      `[luma-assistant/message-db] migrated ${fileCount} jsonl files (${messageCount} messages) in ${Date.now() - startedAt}ms`,
+    );
   }
 
   listLocalSessions(): SessionListItem[] {
@@ -5586,49 +5621,36 @@ class MessageStore {
     const beforeId = typeof beforeCursor === "string" && beforeCursor.startsWith(MESSAGE_PAGE_BEFORE_ID_PREFIX)
       ? beforeCursor.slice(MESSAGE_PAGE_BEFORE_ID_PREFIX.length)
       : null;
+    const legacyOffset = beforeId ? null : decodeCursor(beforeCursor);
 
-    // Latest-page fast path: avoid full JSONL hydrate for large cold sessions.
-    if (!state.messagesHydrated && !beforeCursor) {
-      const filePath = messageLogPath(sessionId);
-      let fileSize = 0;
-      try {
-        fileSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
-      } catch {
-        fileSize = 0;
-      }
-
-      if (fileSize >= MESSAGE_LOG_FAST_PATH_BYTES) {
-        const startedAt = Date.now();
-        const tail = readMessageLogTail(sessionId, limit);
-        const normalizedMessages = normalizeSessionMessages(tail.messages).map((message, index) => ({
-          ...message,
-          sessionId,
-          sequence: message.sequence || index + 1,
-        }));
-        const { start, end: safeEnd } = resolveCountedPageWindow(
-          normalizedMessages,
-          null,
-          limit,
-          messageCountsTowardPageLimit,
-        );
-        const page = normalizedMessages.slice(start, safeEnd).map(slimMessageForPage);
-        const hasOlder = !tail.reachedStart || start > 0;
+    // Primary path: true SQLite paging (no full-session hydrate).
+    if (beforeId !== null || legacyOffset === null) {
+      const startedAt = Date.now();
+      const page = this.messageDb.getMessagesPage({
+        sessionId,
+        beforeId,
+        limit,
+      });
+      if (page.totalCount > 0 || this.messageDb.getMeta("jsonl_migrated") === "1" || !fs.existsSync(messageLogPath(sessionId))) {
+        if (page.totalCount && state.item.messageCount !== page.totalCount) {
+          state.item.messageCount = page.totalCount;
+        }
         if (process.env.MESSAGE_PERF_LOG === "1") {
           // eslint-disable-next-line no-console
           console.log(
-            `[luma-assistant/message-perf] sessions.messages.fast-path durationMs=${Date.now() - startedAt} fileBytes=${fileSize} pageMessages=${page.length}`,
+            `[luma-assistant/message-perf] sessions.messages.sqlite durationMs=${Date.now() - startedAt} pageMessages=${page.messages.length} total=${page.totalCount}`,
           );
         }
-
         return {
           sessionId,
-          messages: page,
-          nextCursor: hasOlder && page[0] ? `${MESSAGE_PAGE_BEFORE_ID_PREFIX}${page[0].id}` : null,
+          messages: page.messages.map(slimMessageForPage),
+          nextCursor: page.nextBeforeId ? `${MESSAGE_PAGE_BEFORE_ID_PREFIX}${page.nextBeforeId}` : null,
           latestRunId: state.item.latestRunId,
         };
       }
     }
 
+    // Legacy offset cursor or unmigrated jsonl fallback.
     this.ensureMessagesLoaded(state);
 
     const normalizedMessages = normalizeSessionMessages(state.messages).map((message, index) => ({
@@ -5648,35 +5670,20 @@ class MessageStore {
       state.item.lastMessagePreview = previewText(normalizedMessages[normalizedMessages.length - 1]?.text || "");
       this.syncSessionSource(state);
       this.scheduleSnapshot();
-    }
-
-    let endCursor: string | null = beforeCursor;
-    if (beforeId) {
-      const endIndex = state.messages.findIndex((message) => message.id === beforeId);
-      if (endIndex < 0) {
-        return {
-          sessionId,
-          messages: [],
-          nextCursor: null,
-          latestRunId: state.item.latestRunId,
-        };
-      }
-      endCursor = encodeCursor(endIndex);
+      this.messageDb.replaceSessionMessages(sessionId, state.messages);
     }
 
     const { start, end: safeEnd } = resolveCountedPageWindow(
       state.messages,
-      endCursor,
+      beforeCursor,
       limit,
       messageCountsTowardPageLimit,
     );
     return {
       sessionId,
       messages: state.messages.slice(start, safeEnd).map(slimMessageForPage),
-      nextCursor: start > 0
-        ? (state.messages[start]
-          ? `${MESSAGE_PAGE_BEFORE_ID_PREFIX}${state.messages[start].id}`
-          : encodeCursor(start))
+      nextCursor: start > 0 && state.messages[start]
+        ? `${MESSAGE_PAGE_BEFORE_ID_PREFIX}${state.messages[start].id}`
         : null,
       latestRunId: state.item.latestRunId,
     };
@@ -5871,12 +5878,7 @@ class MessageStore {
     this.sessions.set(nextSessionId, nextState);
     this.touchHotSession(nextSessionId);
     this.enqueueWrite(async () => {
-      await fs.promises.mkdir(MESSAGE_LOG_DIR, { recursive: true });
-      const fileContent = deduped.map((message) => JSON.stringify(message)).join("\n");
-      await fs.promises.writeFile(messageLogPath(nextSessionId), `${fileContent}${fileContent ? "\n" : ""}`);
-      if (fs.existsSync(messageLogPath(previousSessionId))) {
-        await fs.promises.rm(messageLogPath(previousSessionId), { force: true });
-      }
+      this.messageDb.renameSession(previousSessionId, nextSessionId, deduped);
     });
     this.scheduleSnapshot();
     this.emitSessionUpsert(nextState.item, previousSessionId);
@@ -5887,9 +5889,7 @@ class MessageStore {
     this.sessions.delete(sessionId);
     this.hotSessionOrder = this.hotSessionOrder.filter((id) => id !== sessionId);
     this.enqueueWrite(async () => {
-      if (fs.existsSync(messageLogPath(sessionId))) {
-        await fs.promises.rm(messageLogPath(sessionId), { force: true });
-      }
+      this.messageDb.deleteSession(sessionId);
     });
     this.scheduleSnapshot();
   }
@@ -5984,8 +5984,7 @@ class MessageStore {
         messagesHydrated: false,
       };
       this.sessions.set(sessionId, state);
-      const fileContent = messages.map((message) => JSON.stringify(message)).join("\n");
-      fs.writeFileSync(messageLogPath(sessionId), `${fileContent}${fileContent ? "\n" : ""}`);
+      this.messageDb.replaceSessionMessages(sessionId, messages);
     }
 
     writeJsonAtomicSync(SESSION_INDEX_PATH, this.listLocalSessions());
@@ -6031,11 +6030,25 @@ class MessageStore {
       return;
     }
 
-    const messages = normalizeSessionMessages(readMessageLog(state.item.id)).map((message, index) => ({
-      ...message,
-      sessionId: state.item.id,
-      sequence: message.sequence || index + 1,
-    }));
+    let messages = this.messageDb.loadSessionMessages(state.item.id);
+    if (messages.length === 0) {
+      // Fallback for any leftover unmigrated jsonl.
+      messages = normalizeSessionMessages(readMessageLog(state.item.id)).map((message, index) => ({
+        ...message,
+        sessionId: state.item.id,
+        sequence: message.sequence || index + 1,
+      }));
+      if (messages.length > 0) {
+        this.messageDb.replaceSessionMessages(state.item.id, messages);
+      }
+    } else {
+      messages = normalizeSessionMessages(messages).map((message, index) => ({
+        ...message,
+        sessionId: state.item.id,
+        sequence: message.sequence || index + 1,
+      }));
+    }
+
     state.messages = messages;
     state.messageIds = new Map(messages.map((message, index) => [message.id, index]));
     state.nextSequence = messages.reduce((max, message) => Math.max(max, message.sequence), 0) + 1;
@@ -6131,10 +6144,7 @@ class MessageStore {
       state.item.title = normalizeRunListName(message.text, "Session");
     }
 
-    this.enqueueWrite(async () => {
-      await fs.promises.mkdir(MESSAGE_LOG_DIR, { recursive: true });
-      await fs.promises.appendFile(messageLogPath(message.sessionId), `${JSON.stringify(message)}\n`);
-    });
+    this.messageDb.upsertMessage(message);
     this.scheduleSnapshot();
     if (options?.emitMessage !== false) {
       this.emitEvent({
@@ -6221,11 +6231,7 @@ class MessageStore {
     this.sessions.set(sessionId, nextState);
     this.touchHotSession(sessionId);
     this.evictColdSessions();
-    this.enqueueWrite(async () => {
-      await fs.promises.mkdir(MESSAGE_LOG_DIR, { recursive: true });
-      const fileContent = normalizedMessages.map((message) => JSON.stringify(message)).join("\n");
-      await fs.promises.writeFile(messageLogPath(sessionId), `${fileContent}${fileContent ? "\n" : ""}`);
-    });
+    this.messageDb.replaceSessionMessages(sessionId, normalizedMessages);
     this.scheduleSnapshot();
     this.emitSessionUpsert(nextItem);
   }
@@ -7044,7 +7050,8 @@ function broadcastSse(event: SseEvent): void {
   for (const client of sseClients) client.write(data);
 }
 
-const messageStore = new MessageStore((event) => broadcastSse(event));
+const messageDb = openMessageDatabase(MESSAGE_DB_PATH);
+const messageStore = new MessageStore(messageDb, (event) => broadcastSse(event));
 messageStore.loadOrBackfill(runManager.getRuns(false));
 
 let outboxProcessor: OutboxProcessor | null = null;
