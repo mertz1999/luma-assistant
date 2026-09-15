@@ -5,7 +5,7 @@
 <h1 align="center">Luma Assistant</h1>
 
 <p align="center">
-  Self-hosted web application for Codex and Claude Code with remote URL access, cron-style jobs, sandbox terminals, offline voice-to-text, MCP, plan mode, agents, skills, and persistent session history.
+  Self-hosted web application for Codex and Claude Code with remote URL access, scheduled agents, per-session terminals, browser voice input, MCP integrations, plan mode, reusable skills, Luma Tasks, and persistent session history.
 </p>
 
 ## What It Is
@@ -14,32 +14,69 @@ Luma Assistant connects to Codex and Claude Code on your machine or server and g
 
 It keeps the core coding-agent workflow available in the app: runner selection, model and thinking controls, plan mode, MCP tools, workspace instructions such as `AGENTS.md`, agents, skills, terminal access, voice input, inline tool output, and session history.
 
-## Capabilities
+## Features
 
-- `Choose Codex or Claude Code`: create each new session with the runner you want, while keeping live output, plan mode, MCP, and session history visible.
-- `Claude-like workspace`: use a compact dark coding UI with centered messages, right-aligned user bubbles, collapsible left navigation, and a right dock that opens only when Terminal or Context is selected.
-- `Runner controls`: change runner, model, and thinking effort from the new-session flow and composer strip. Codex and Claude use their own defaults.
-- `Use it anywhere by URL`: deploy Luma Assistant on a server and access your workspace from desktop, phone, or another machine.
-- `Cron-style jobs`: schedule specific assistant work for specific moments and inspect each run as a normal Codex session.
-- `Browser terminal`: open a controlled terminal from the browser, type directly in the terminal surface, interrupt commands, and close the dock when you are done.
-- `Offline voice-to-text`: dictate prompts into the assistant without relying on a remote transcription service.
-- `Luma Tasks`: use the standalone `/taskmanager` PWA for projects, task lists, priorities, deadlines, timezone-aware Today views, admin-managed users, and Telegram-ready reports.
-- `Agents and instructions`: use Codex workspace instructions such as `AGENTS.md`, plus repo-owned scheduled agents from `agents/<slug>/AGENT.md`; the Agents area is available from the left navigation.
-- `Inline tool transcript`: surface MCP calls, web searches, shell commands, file changes, and run status as compact rows like `Ran 5 commands`, expandable inline instead of opening a modal.
-- `Image render MCP`: let agents call `luma-images.show_image` to attach validated local or HTTP(S) images to the current chat; the web UI lazy-loads image bytes only after the user clicks `Load image`.
-- `Repo skill sync`: copy managed repo skills from `skills/**/SKILL.md` into `~/.codex/skills` and `~/.claude/skills` without overwriting unmanaged global skills.
-- `Telegram MCP`: run a local Telegram MCP server for sending rendered Markdown messages and generated files to Telegram topics.
-- `Luma Tasks MCP`: inspect, search, create, assign, update, and report on Luma Tasks directly from prompts and scheduled agents.
-- `Auth and history`: protect the browser UI with a password and keep local runtime data under `data/`.
+### Assistant Workspace
+
+- `Codex and Claude Code runners`: choose a runner for each new session. Existing sessions retain their runner, model, and thinking configuration when reopened.
+- `Runner-specific controls`: select built-in or custom model IDs, set Codex or Claude thinking effort, choose a workspace, and configure sandbox and approval behavior.
+- `Real-time conversations`: stream run state and output over SSE, render Markdown and code, group live activity in chronological order, and recover the UI when the connection is interrupted.
+- `Responsive Claude-like interface`: use collapsible navigation and Terminal/Context docks on desktop, mobile drawers on smaller screens, light and dark themes, and installable PWA icons for home-screen use.
+- `English and Farsi rendering`: detect right-to-left Farsi messages, including mixed Farsi/English replies and messages that begin with code paths, while keeping code and Latin content readable.
+- `Workspace-aware sessions`: switch among configured repositories, start a clean draft, and see each session's workspace, runner, source, model, effort, status, and last update.
+- `Session history and management`: browse local and imported Codex CLI history, filter by run status, reveal scheduled sessions or all history, page through older chats, inspect token usage, and archive or permanently delete local sessions.
+- `Reliable message delivery`: acknowledge sends immediately, persist pending messages in a server-side outbox, retry transient failures, expose retry for failed messages, and preserve per-session browser queues across reloads.
+- `Run controls`: stop an active run, rerun a completed or failed request, and keep subsequent prompts queued behind the active run for that session.
+- `Rich transcript controls`: copy assistant or user messages and expand grouped shell commands, MCP calls, web searches, file changes, reasoning/plan entries, and tool output inline.
+- `File attachments`: select or drag and drop as many as 10 image or text/code files per message. Attachments are scoped to the selected workspace; images can be previewed, opened in a lightbox, or downloaded.
+- `Browser voice input`: dictate into the composer with the browser's Web Speech API, with recording state, elapsed time, and a `/speech` compatibility check. Availability and whether recognition is local or remote depend on the browser.
+- `Slash commands`: use `/plan`, `/status`, `/account`, `/mcp`, `/speech`, and `/help` for planning and local runtime diagnostics.
+
+### Agentic Workflows
+
+- `Protected plan mode`: arm planning with `/plan`, keep discovery read-only, answer structured clarification questions in the chat, review the proposed plan, request changes, and explicitly approve implementation.
+- `Prompt agents`: discover repo-owned definitions from `agents/<slug>/AGENT.md`, select them from the composer, and inject their instructions into an individual turn.
+- `Scheduled agents`: create daily schedules with a runner, model, effort, workspace, sandbox, approval policy, and selected skills; pause, resume, delete, or run a schedule immediately and open every execution as a normal session.
+- `Reusable skills`: discover workspace and managed skills, select them from the composer, reload the catalog, and synchronize repo-managed skill folders to both Codex and Claude without overwriting unmanaged global skills.
+- `Workspace instructions`: retain the normal Codex CLI instruction hierarchy, including repository `AGENTS.md` files in the selected workspace.
+- `Per-session terminal`: start an isolated PTY-backed shell in the session workspace, type or paste commands, recall command history, send interrupts, stop the shell, and follow output live from the browser.
+- `Operational status`: inspect Codex login/quota details, configured MCP servers, backend connectivity, deployment location, run diagnostics, and debug logs from the interface.
+
+### Built-In Integrations
+
+- `Telegram MCP (luma-tel)`: send Markdown or plain-text messages and generated files to Telegram chats/topics, and retrieve the latest user-uploaded document. A self-hosted Telegram Bot API endpoint can be used for downloads above Telegram's hosted 20 MB limit.
+- `Luma Tasks MCP (luma-tasks)`: test connectivity, produce Today reports, list users/projects/tasks, search tasks, create projects and tasks, update or complete tasks, assign work, and add comments. The service is opt-in so the task web app can run without its MCP process.
+- `Image render MCP (luma-images)`: publish validated PNG, JPEG, WebP, or GIF files from local paths or public HTTP(S) URLs into the active chat. Images use size, height, content-type, and private-network guardrails, then lazy-load on demand.
+- `Cross-runner MCP setup`: development and deployment commands register supported local MCP services for Codex and Claude Code; the Tasks MCP is registered when enabled.
+
+### Luma Tasks
+
+- `Separate task workspace`: open `/taskmanager` as its own responsive, installable PWA with independent login, light/dark mode, mobile navigation, desktop sidebar layouts, automatic background refresh, and a manual refresh control.
+- `Projects and access`: create color-coded projects, control per-project user access, archive or delete projects, filter task views by project, and reorder mobile project chips.
+- `Complete task records`: manage title, description, to-do/in-progress/completed status, priority, assignee, project, labels, due date and optional time, deadline flag, checklist items, comments, and activity history.
+- `Focused views`: work from All Tasks, Today, Upcoming, Completed, Admin, or Settings; admins can filter team work by user or show only their own tasks.
+- `Task organization`: use manual ordering or priority-and-due-date sorting, move tasks up or down, and use card actions to complete, reopen, move to today/tomorrow/another date, remove a date, edit, or delete work.
+- `Users and timezones`: let admins add users, change roles, deactivate or reactivate accounts, and reset passwords, while each user controls their own IANA timezone for due-date and Today calculations.
+- `Reports and automation`: generate a Telegram-ready plain-text Today report through the HTTP API or Tasks MCP for manual use and scheduled agents.
+
+### Persistence, Deployment, and Operations
+
+- `Durable history`: store chat messages in SQLite with indexed page seeks, migrate older JSONL message logs automatically, keep run events in append-only JSONL files, and maintain a small session index for fast startup and chat opening.
+- `Long-running server safeguards`: cap hot in-memory sessions and active-run event buffers, limit concurrent runs, auto-archive old finished runs, and suppress benign Codex warnings that should not fail a run.
+- `Authentication`: protect the assistant with password/JWT login, browser-persisted sessions, expiration handling, and sign-out; Luma Tasks uses separate users and tokens with an initial admin configured from the environment.
+- `Safe migrations`: run idempotent persistence migrations during deployment and write backups before changing existing task-manager data.
+- `Production tooling`: build and run all services with npm workspaces and Make targets, manage processes with PM2, and use the included Nginx HTTPS/SSE reverse-proxy example.
+- `Public landing site`: build and deploy the independent React/Vite landing page to GitHub Pages without exposing private runtime conversations.
 
 ## Stack
 
 - `Root package`: `luma-assistant`
-- `Server`: Express, TypeScript, `node-pty`, JWT auth, SSE
+- `Server`: Express, TypeScript, `node-pty`, JWT auth, SSE, SQLite (`better-sqlite3`)
 - `Web`: React, Vite, TypeScript, Tailwind-style UI utilities
 - `Shared types`: `@luma/shared`
 - `Telegram MCP`: `@luma/telegram-mcp`
 - `Luma Tasks MCP`: `@luma/taskmanager-mcp`
+- `Image render MCP`: `@luma/image-mcp`
 - `Process management`: PM2
 - `Proxy`: Nginx example config
 - `Landing page`: independent Vite + React + Tailwind app in `landing-page/`
@@ -126,7 +163,7 @@ Important variables:
 - `IMAGE_MCP_PORT` / `IMAGE_MCP_NAME`: local MCP server used by agents to render images in chat.
 - `IMAGE_MCP_MAX_BYTES`: max image size accepted by the image MCP and server-side image renderer. Defaults to 3 MB.
 - `IMAGE_MCP_MAX_HEIGHT`: max image height accepted by the image MCP and server-side image renderer. Defaults to 1200 px.
-- `MAX_CONCURRENT_RUNS`: server-side cap for active Codex runs.
+- `MAX_CONCURRENT_RUNS`: server-side cap for active assistant runs.
 - `MESSAGE_STORE_HOT_SESSIONS`: max chat sessions that keep full message bodies in RAM (default `48`). Others stay index-only until opened.
 - `RUN_EVENTS_MEMORY_CAP`: max stdout/stderr events kept in RAM per *active* run (default `400`). Full history remains on disk under `data/runs/`.
 - `RUN_RETENTION_DAYS`: auto-archive finished runs older than this many days on startup (default `45`; set `0` to disable).
@@ -180,11 +217,11 @@ npm run migrate
 
 Migrations are idempotent. When a data file needs changes, a backup is written under `data/backups/` before the file is updated.
 
-## Cron-Style Jobs
+## Scheduled Agents
 
-Scheduled jobs let Luma Assistant run specific assistant work at specific moments. Each execution creates a new Codex session, records status, and can be opened in the normal chat viewer.
+Scheduled agents let Luma Assistant run specific work every day at a configured time. Each execution uses its selected Codex or Claude runner, creates a normal session, records its status, and can be opened in the chat viewer.
 
-Schedule creation snapshots the selected workspace, model, sandbox, approval policy, and selected skills. The agent prompt body is read at run time, so updating the agent file changes future executions.
+Schedule creation snapshots the selected runner, workspace, model, thinking effort, sandbox, approval policy, and skills. The agent prompt body is read at run time, so updating the agent file changes future executions.
 
 ## Luma Tasks
 
@@ -204,7 +241,7 @@ Current task-manager capabilities include:
 - Mobile-friendly project chips with one-project-at-a-time task browsing.
 - Admin-only user management and per-project user access.
 - Tasks with status, priority, assignee, due date, optional time, deadline flag, checklist, comments, and activity.
-- Views for My Tasks, Today, Upcoming, Completed, Admin, and Settings.
+- Views for All Tasks, Today, Upcoming, Completed, Admin, and Settings.
 - Timezone-aware date handling, defaulting to `Asia/Tehran`.
 - Desktop collapsed sidebar icons, mobile drawer navigation, refresh control, and light/dark mode.
 - Separate PWA metadata for installing Luma Tasks apart from the main Luma Assistant app.
@@ -239,6 +276,15 @@ Use the configured MCP tools and prepare today's plan.
 
 The Markdown body after frontmatter is the exact prompt used for scheduled jobs.
 
+The repository currently includes ready-to-use agents for:
+
+- Creating new repo-owned agents.
+- Producing AI transformation opportunity reports.
+- Sending daily article digests to Telegram.
+- Pruning unused Docker resources and warning about high disk usage.
+- Sending the Luma Tasks Today report to Telegram.
+- Building a TickTick briefing for overdue work, today's tasks, and upcoming meetings.
+
 Codex workspace instructions such as `AGENTS.md` remain part of the normal Codex CLI workflow and are honored by Codex in the selected workspace.
 
 ## Skills
@@ -257,6 +303,8 @@ On server startup and manual skill reload, Luma Assistant copies each skill fold
 ```
 
 Managed copies include a marker file and can be updated safely. If a destination folder already exists without the managed marker, it is reported as a conflict and is not overwritten. Claude Code reads `~/.claude/skills`, so Claude runner sessions can discover the same repo-managed skills natively; selected skills are also injected into the prompt for the active turn.
+
+Bundled skills currently cover repo-owned agent creation, screen-recordable SaaS demo pages, and exporting a website plus same-site pages into a single Markdown file.
 
 ## Telegram MCP
 
@@ -442,14 +490,14 @@ sudo systemctl reload nginx
 
 ## Data And Security
 
-Runtime state stays under `data/`, including session metadata, message history, schedules, PM2 logs, and generated app state. Treat `data/` as private runtime state and do not delete it during upgrades unless you intentionally want to reset local history.
+Runtime state stays under `data/`, including the SQLite message database, session metadata, run-event logs, schedules, PM2 logs, and generated app state. Treat `data/` as private runtime state and do not delete it during upgrades unless you intentionally want to reset local history.
 
 Security notes:
 
 - Change `PASSWORD` and `JWT_SECRET` before exposing the app.
 - Put the app behind HTTPS when reachable outside localhost.
 - Review `DEFAULT_SANDBOX`; `danger-full-access` is convenient for trusted personal hosts but high trust.
-- Codex runs with access to the selected workspace and enabled MCP tools.
+- Codex and Claude runs have access to the selected workspace and enabled MCP tools according to their configured permission mode.
 - Telegram credentials grant bot access to configured chats and topics.
 
 ## Repository Layout
