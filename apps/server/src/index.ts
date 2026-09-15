@@ -2032,6 +2032,7 @@ class RunManager extends EventEmitter {
   loadPersisted(runs: RunRecord[], approvals: ApprovalQueueItem[]): void {
     const now = Date.now();
     const staleRunIds = new Set<string>();
+    let healedBenignFailures = 0;
     for (const run of runs) {
       const staleActiveRun = run.status === "queued" || run.status === "running";
       if (staleActiveRun) staleRunIds.add(run.id);
@@ -2044,9 +2045,11 @@ class RunManager extends EventEmitter {
           text: restartMessage,
         });
       }
+      const healedFromSkillsWarning = !staleActiveRun && shouldHealBenignSkillsBudgetFailure(run);
+      if (healedFromSkillsWarning) healedBenignFailures += 1;
       this.runs.set(run.id, {
         ...run,
-        status: staleActiveRun ? "failed" : run.status,
+        status: staleActiveRun ? "failed" : healedFromSkillsWarning ? "completed" : run.status,
         updatedAt: staleActiveRun ? now : run.updatedAt,
         config: {
           ...run.config,
@@ -2058,7 +2061,11 @@ class RunManager extends EventEmitter {
         },
         // Events stay on disk; only active runs accumulate a short in-memory window.
         events: [],
-        lastError: staleActiveRun ? restartMessage : run.lastError,
+        lastError: staleActiveRun
+          ? restartMessage
+          : healedFromSkillsWarning
+            ? null
+            : run.lastError,
         sessionId: typeof run.sessionId === "string"
           ? run.sessionId
           : typeof run.threadId === "string"
@@ -2071,7 +2078,11 @@ class RunManager extends EventEmitter {
       if (staleRunIds.has(item.runId)) continue;
       this.approvals.set(item.id, item);
     }
-    if (staleRunIds.size > 0) this.persistState();
+    if (staleRunIds.size > 0 || healedBenignFailures > 0) this.persistState();
+    if (healedBenignFailures > 0) {
+      // eslint-disable-next-line no-console
+      console.log(`[luma-assistant/server] healed ${healedBenignFailures} runs falsely failed by skills budget warning`);
+    }
     this.applyRetentionPolicy();
   }
 
@@ -2304,8 +2315,12 @@ class RunManager extends EventEmitter {
         if (stoppedRun) {
           this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous: run } as RunLifecycleEvent);
         }
-      } else if (code === 0 && run.status !== "failed") {
-        this.updateRun(runId, { status: "completed" });
+      } else if (code === 0 && run.status !== "stopped") {
+        // A clean process exit wins over soft mid-stream error items (e.g. skills budget warnings).
+        this.updateRun(runId, {
+          status: "completed",
+          ...(run.lastError && isBenignCodexErrorItemText(run.lastError) ? { lastError: null } : {}),
+        });
         this.emitSse({ kind: "run.completed", runId, at: Date.now() });
         const completedRun = this.runs.get(runId);
         if (completedRun) {
@@ -2462,8 +2477,11 @@ class RunManager extends EventEmitter {
       if (stoppedRun) {
         this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous: run } as RunLifecycleEvent);
       }
-    } else if (code === 0 && run.status !== "failed" && run.status !== "stopped") {
-      this.updateRun(runId, { status: "completed" });
+    } else if (code === 0 && run.status !== "stopped") {
+      this.updateRun(runId, {
+        status: "completed",
+        ...(run.lastError && isBenignCodexErrorItemText(run.lastError) ? { lastError: null } : {}),
+      });
       this.emitSse({ kind: "run.completed", runId, at: Date.now() });
       const completedRun = this.runs.get(runId);
       if (completedRun) {
@@ -2827,8 +2845,10 @@ class RunManager extends EventEmitter {
 
       if (itemType === "error") {
         const message = typeof item?.message === "string" ? item.message : "Unknown error";
-        this.updateRun(runId, { lastError: message, status: "failed" });
-        this.checkApprovalSignal(runId, message, item || null);
+        if (!isBenignCodexErrorItemText(message)) {
+          this.updateRun(runId, { lastError: message, status: "failed" });
+          this.checkApprovalSignal(runId, message, item || null);
+        }
       }
     }
 
@@ -4893,7 +4913,7 @@ function buildRunMessageEntries(runInput: RunRecord): RunMessageEntry[] {
 
     if (itemType === "error") {
       const message = typeof item?.message === "string" ? item.message : raw;
-      if (isMissingLocalImageReadErrorText(message)) continue;
+      if (isSuppressedCodexErrorText(message)) continue;
       entries.push({
         key: `${run.id}_${itemId}_error`,
         role: "error",
@@ -5021,8 +5041,37 @@ function isMissingLocalImageReadErrorText(text: string): boolean {
     && normalized.includes("os error 2");
 }
 
+/** Codex emits this as item.type=error, but it is only a skills-context warning. */
+function isBenignCodexErrorItemText(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  return normalized.includes("skill descriptions were shortened to fit the skills context budget");
+}
+
+function isSuppressedCodexErrorText(text: string): boolean {
+  return isMissingLocalImageReadErrorText(text) || isBenignCodexErrorItemText(text);
+}
+
+/**
+ * Codex 0.154+ emits a skills-budget warning as item.type=error. Older Luma builds
+ * marked those runs failed even when the turn finished successfully.
+ */
+function shouldHealBenignSkillsBudgetFailure(run: RunRecord): boolean {
+  if (run.status !== "failed") return false;
+  if (run.lastError && isBenignCodexErrorItemText(run.lastError)) return true;
+
+  const eventsPath = runEventsPath(run.id);
+  if (!fs.existsSync(eventsPath)) return false;
+  try {
+    const text = fs.readFileSync(eventsPath, "utf8");
+    if (!text.includes("Skill descriptions were shortened to fit the skills context budget")) return false;
+    return text.includes("\"type\":\"turn.completed\"") || Boolean(run.summary && run.summary.trim());
+  } catch {
+    return false;
+  }
+}
+
 function buildTranscriptMessageEntries(transcript: SessionTranscriptResponse): RunMessageEntry[] {
-  return transcript.entries.filter((entry) => !isMissingLocalImageReadErrorText(entry.text)).map((entry) => ({
+  return transcript.entries.filter((entry) => !isSuppressedCodexErrorText(entry.text)).map((entry) => ({
     key: `history_${entry.key}`,
     role: entry.role,
     title: entry.role === "user" ? "You" : "Assistant",
@@ -5258,7 +5307,7 @@ function normalizeSessionMessages(messages: ChatMessage[]): ChatMessage[] {
 
 function transcriptToChatMessages(sessionId: string, transcript: SessionTranscriptResponse): ChatMessage[] {
   return transcript.entries
-    .filter((entry) => !isMissingLocalImageReadErrorText(entry.text))
+    .filter((entry) => !isSuppressedCodexErrorText(entry.text))
     .map((entry, index) => transcriptEntryToChatMessage(sessionId, entry, index + 1));
 }
 
@@ -5643,7 +5692,9 @@ class MessageStore {
         }
         return {
           sessionId,
-          messages: page.messages.map(slimMessageForPage),
+          messages: page.messages
+            .filter((message) => !(message.role === "error" && isSuppressedCodexErrorText(message.text || message.meta?.errorMessage || "")))
+            .map(slimMessageForPage),
           nextCursor: page.nextBeforeId ? `${MESSAGE_PAGE_BEFORE_ID_PREFIX}${page.nextBeforeId}` : null,
           latestRunId: state.item.latestRunId,
         };
@@ -5681,7 +5732,10 @@ class MessageStore {
     );
     return {
       sessionId,
-      messages: state.messages.slice(start, safeEnd).map(slimMessageForPage),
+      messages: state.messages
+        .slice(start, safeEnd)
+        .filter((message) => !(message.role === "error" && isSuppressedCodexErrorText(message.text || message.meta?.errorMessage || "")))
+        .map(slimMessageForPage),
       nextCursor: start > 0 && state.messages[start]
         ? `${MESSAGE_PAGE_BEFORE_ID_PREFIX}${state.messages[start].id}`
         : null,
@@ -6761,6 +6815,7 @@ class MessageProjector {
 
     if (itemType === "error") {
       const message = typeof item?.message === "string" ? item.message : "Unknown error";
+      if (isSuppressedCodexErrorText(message)) return;
       this.messageStore.upsertGeneratedMessage(sessionId, {
         id: `${event.run.id}_${itemId}_error`,
         clientMessageId: null,
