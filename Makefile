@@ -19,7 +19,7 @@ PROJECT_PORTS := $(API_PORT) $(WEB_PORT) $(TELEGRAM_MCP_PORT) $(TASK_MANAGER_MCP
 PM2_BIN := npx pm2
 PM2_ECOSYSTEM := scripts/pm2/ecosystem.config.cjs
 
-.PHONY: install install-if-needed install-pm2 stop-dev-processes kill-ports stop-pm2-apps ensure-telegram-mcp ensure-taskmanager-mcp ensure-image-mcp ensure-mcps migrate run deploy-start deploy-stop deploy-status deploy-logs
+.PHONY: install install-if-needed install-pm2 stop-dev-processes kill-ports stop-pm2-apps ensure-telegram-mcp ensure-taskmanager-mcp ensure-image-mcp ensure-cursor-mcp ensure-mcps migrate run deploy-start deploy-stop deploy-status deploy-logs
 
 install:
 	npm install --include=optional --no-audit --no-fund
@@ -105,7 +105,10 @@ ensure-taskmanager-mcp:
 ensure-image-mcp:
 	node scripts/ensure-image-mcp.cjs
 
-ensure-mcps: ensure-telegram-mcp ensure-taskmanager-mcp ensure-image-mcp
+ensure-cursor-mcp:
+	node scripts/ensure-cursor-mcp.cjs
+
+ensure-mcps: ensure-telegram-mcp ensure-taskmanager-mcp ensure-image-mcp ensure-cursor-mcp
 
 migrate:
 	npm run migrate

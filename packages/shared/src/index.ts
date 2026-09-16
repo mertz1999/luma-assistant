@@ -12,8 +12,11 @@ export type ApprovalPolicy = z.infer<typeof approvalPolicySchema>;
 export const runSourceTagSchema = z.enum(["in-app", "vscode", "cli", "exec", "other"]);
 export type RunSourceTag = z.infer<typeof runSourceTagSchema>;
 
-export const runRunnerSchema = z.enum(["codex", "claude"]);
+export const runRunnerSchema = z.enum(["codex", "claude", "cursor"]);
 export type RunRunner = z.infer<typeof runRunnerSchema>;
+
+export const cursorAgentModeSchema = z.enum(["agent", "plan", "ask"]);
+export type CursorAgentMode = z.infer<typeof cursorAgentModeSchema>;
 
 export const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
@@ -104,6 +107,8 @@ export const agentScheduleSchema = z.object({
     reasoningEffort: reasoningEffortSchema.default("high"),
     sandbox: sandboxSchema,
     approvalPolicy: approvalPolicySchema,
+    planMode: z.boolean().default(false).optional(),
+    askMode: z.boolean().default(false).optional(),
     skills: z.array(selectedSkillRefSchema).max(20).default([]),
   }),
 });
@@ -134,6 +139,8 @@ export const createAgentScheduleSchema = z.object({
   reasoningEffort: reasoningEffortSchema.default("high"),
   sandbox: sandboxSchema,
   approvalPolicy: approvalPolicySchema,
+  planMode: z.boolean().default(false).optional(),
+  askMode: z.boolean().default(false).optional(),
   skills: z.array(selectedSkillRefSchema).max(20).default([]),
 });
 export type CreateAgentScheduleInput = z.infer<typeof createAgentScheduleSchema>;
@@ -172,6 +179,7 @@ export const runConfigSchema = z.object({
   sandbox: sandboxSchema,
   approvalPolicy: approvalPolicySchema,
   planMode: z.boolean().default(false),
+  askMode: z.boolean().default(false),
   sessionId: z.string().optional(),
   attachments: z.array(attachmentRefSchema).max(10).default([]),
   skills: z.array(selectedSkillRefSchema).max(20).default([]),
@@ -188,6 +196,7 @@ export const startRunSchema = z.object({
   sandbox: sandboxSchema.default("read-only"),
   approvalPolicy: approvalPolicySchema.default("on-request"),
   planMode: z.boolean().default(false),
+  askMode: z.boolean().default(false),
   sessionId: z.string().optional(),
   attachments: z.array(attachmentRefSchema).max(10).default([]),
   skills: z.array(selectedSkillRefSchema).max(20).default([]),
@@ -206,6 +215,7 @@ export const sendMessageSchema = z.object({
   sandbox: sandboxSchema.default("read-only"),
   approvalPolicy: approvalPolicySchema.default("on-request"),
   planMode: z.boolean().default(false),
+  askMode: z.boolean().default(false),
   attachments: z.array(attachmentRefSchema).max(10).default([]),
   skills: z.array(selectedSkillRefSchema).max(20).default([]),
   agents: z.array(selectedAgentRefSchema).max(10).default([]),
@@ -450,13 +460,22 @@ export type TerminalSessionSnapshot = {
   output: string;
 };
 
+export type CursorModelInfo = {
+  id: string;
+  displayName?: string;
+  supportsEffort?: boolean;
+};
+
 export type AppBootstrap = {
   defaults: {
     runner: RunRunner;
     model: string;
     codexModel: string;
     claudeModel: string;
+    cursorModel: string;
     claudeEffortFlagSupported: boolean;
+    cursorAvailable: boolean;
+    cursorModels: CursorModelInfo[];
     reasoningEffort: ReasoningEffort;
     sandbox: SandboxMode;
   };
@@ -472,7 +491,10 @@ export type AppBootstrapLite = {
     model: string;
     codexModel: string;
     claudeModel: string;
+    cursorModel: string;
     claudeEffortFlagSupported: boolean;
+    cursorAvailable: boolean;
+    cursorModels: CursorModelInfo[];
     reasoningEffort: ReasoningEffort;
     sandbox: SandboxMode;
   };

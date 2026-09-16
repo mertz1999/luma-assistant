@@ -235,6 +235,15 @@ export function getBootstrapLite(): Promise<AppBootstrapLite> {
   return request<AppBootstrapLite>("/api/bootstrap-lite");
 }
 
+export function getCursorModels(): Promise<{
+  available: boolean;
+  executable: string;
+  defaultModel: string;
+  models: import("@luma/shared").CursorModelInfo[];
+}> {
+  return request("/api/cursor/models");
+}
+
 export function getRuns(): Promise<{ runs: RunRecord[]; approvals: ApprovalQueueItem[] }> {
   return request("/api/runs");
 }

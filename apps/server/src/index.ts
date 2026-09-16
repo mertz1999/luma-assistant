@@ -60,6 +60,7 @@ import {
   type SelectedSkillRef,
   type SendMessageAccepted,
   type SendMessageInput,
+  type CursorModelInfo,
   type SessionListItem,
   type SessionHistoryEntry,
   type SessionListResponse,
@@ -109,12 +110,30 @@ const API_PORT = Number(process.env.API_PORT || 9001);
 const WEB_PORT = Number(process.env.WEB_PORT || 5175);
 const HOST = process.env.HOST || "0.0.0.0";
 const CODEX_PATH = process.env.CODEX_PATH || "codex";
-const DEFAULT_RUNNER: RunRunner = process.env.DEFAULT_RUNNER === "claude" ? "claude" : "codex";
+const DEFAULT_RUNNER: RunRunner = normalizeDefaultRunner(process.env.DEFAULT_RUNNER);
 const DEFAULT_CODEX_MODEL = process.env.DEFAULT_MODEL || process.env.CODEX_DEFAULT_MODEL || "gpt-5.6-sol";
 const DEFAULT_CLAUDE_MODEL = process.env.CLAUDE_DEFAULT_MODEL || "sonnet";
-const DEFAULT_MODEL = DEFAULT_RUNNER === "claude" ? DEFAULT_CLAUDE_MODEL : DEFAULT_CODEX_MODEL;
+const DEFAULT_CURSOR_MODEL = process.env.DEFAULT_CURSOR_MODEL || process.env.CURSOR_DEFAULT_MODEL || "composer-2.5";
+const DEFAULT_MODEL = DEFAULT_RUNNER === "claude"
+  ? DEFAULT_CLAUDE_MODEL
+  : DEFAULT_RUNNER === "cursor"
+    ? DEFAULT_CURSOR_MODEL
+    : DEFAULT_CODEX_MODEL;
 const CLAUDE_AUTH_MODE = process.env.CLAUDE_AUTH_MODE === "api_key" ? "api_key" : "oauth";
 const CLAUDE_CODE_EXECUTABLE = resolveClaudeCodeExecutable(process.env.CLAUDE_CODE_EXECUTABLE);
+const CURSOR_EXECUTABLE = resolveCursorExecutable(process.env.CURSOR_PATH || process.env.CURSOR_EXECUTABLE);
+const CURSOR_API_KEY = (process.env.CURSOR_API_KEY || process.env.CURSOR_AUTH_TOKEN || "").trim();
+const CURSOR_FORCE = process.env.CURSOR_FORCE !== "0";
+const CURSOR_APPROVE_MCPS = process.env.CURSOR_APPROVE_MCPS !== "0";
+const CURSOR_WORKTREE = process.env.CURSOR_WORKTREE === "1";
+const DEFAULT_CURSOR_MODELS: CursorModelInfo[] = [
+  { id: "composer-2.5", displayName: "Composer 2.5", supportsEffort: false },
+  { id: "auto", displayName: "Auto", supportsEffort: false },
+  { id: "gpt-5.3-codex", displayName: "GPT-5.3 Codex", supportsEffort: true },
+  { id: "claude-opus-4-6", displayName: "Claude Opus 4.6", supportsEffort: true },
+  { id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6", supportsEffort: true },
+  { id: "gemini-3.1-pro", displayName: "Gemini 3.1 Pro", supportsEffort: true },
+];
 const DEFAULT_REASONING_EFFORT = normalizeReasoningEffort(process.env.DEFAULT_REASONING_EFFORT);
 const DEFAULT_SANDBOX = resolveDefaultSandboxMode();
 const MAX_CONCURRENT_RUNS = Number(process.env.MAX_CONCURRENT_RUNS || 8);
@@ -282,7 +301,17 @@ type ClaudeActiveRun = {
   stopRequested: boolean;
 };
 
-type ActiveRun = CodexActiveRun | ClaudeActiveRun;
+type CursorActiveRun = {
+  runner: "cursor";
+  process: ChildProcess;
+  stdoutBuffer: string;
+  stderrBuffer: string;
+  stopRequested: boolean;
+  sawResult: boolean;
+  streamText: string;
+};
+
+type ActiveRun = CodexActiveRun | ClaudeActiveRun | CursorActiveRun;
 
 type ClaudeToolUseInfo = {
   itemType: "command_execution" | "mcp_tool_call";
@@ -329,6 +358,7 @@ type MessageOutboxItem = {
   sandbox: RunConfig["sandbox"];
   approvalPolicy: RunConfig["approvalPolicy"];
   planMode: boolean;
+  askMode: boolean;
   skills: SelectedSkillRef[];
   agents: SelectedAgentRef[];
   attempts: number;
@@ -419,7 +449,12 @@ function runSessionId(run: RunRecord): string {
 }
 
 function normalizeRunRunner(input: unknown): RunRunner {
-  return input === "claude" ? "claude" : "codex";
+  if (input === "claude" || input === "cursor") return input;
+  return "codex";
+}
+
+function normalizeDefaultRunner(input: unknown): RunRunner {
+  return normalizeRunRunner(input);
 }
 
 function normalizeReasoningEffort(input: unknown): ReasoningEffort {
@@ -1481,8 +1516,10 @@ function getSkillRoots(workspace: string): Array<{ root: string; source: string;
   return [
     { root: path.join(os.homedir(), ".codex", "skills"), source: "codex", scope: "user" },
     { root: path.join(os.homedir(), ".claude", "skills"), source: "claude", scope: "user" },
+    { root: path.join(os.homedir(), ".cursor", "skills-cursor"), source: "cursor", scope: "user" },
     { root: path.join(workspace, ".codex", "skills"), source: "codex repo", scope: "repo" },
     { root: path.join(workspace, ".claude", "skills"), source: "claude repo", scope: "repo" },
+    { root: path.join(workspace, ".cursor", "skills"), source: "cursor repo", scope: "repo" },
   ];
 }
 
@@ -1956,6 +1993,117 @@ function resolveClaudeCodeExecutable(configured: string | undefined): string {
   return resolveCommandPath("claude");
 }
 
+function resolveCursorExecutable(configured: string | undefined): string {
+  const explicit = (configured || "").trim();
+  if (explicit) return explicit;
+  const fromPath = resolveCommandPath("cursor");
+  if (fromPath) return fromPath;
+  const macApp = "/Applications/Cursor.app/Contents/Resources/app/bin/cursor";
+  if (fs.existsSync(macApp)) return macApp;
+  const linuxApp = path.join(os.homedir(), ".local/bin/cursor");
+  if (fs.existsSync(linuxApp)) return linuxApp;
+  return "cursor";
+}
+
+function cursorCliAvailable(): boolean {
+  const executable = CURSOR_EXECUTABLE || "cursor";
+  if (executable.includes(path.sep)) return fs.existsSync(executable);
+  return commandExists(executable);
+}
+
+function mapCursorSandbox(sandbox: RunConfig["sandbox"]): "enabled" | "disabled" {
+  return sandbox === "danger-full-access" ? "disabled" : "enabled";
+}
+
+function mapCursorEffort(effort: ReasoningEffort): "low" | "medium" | "high" {
+  if (effort === "low" || effort === "medium") return effort;
+  return "high";
+}
+
+function cursorModelSupportsEffort(model: string, catalog: CursorModelInfo[] = DEFAULT_CURSOR_MODELS): boolean {
+  const base = model.replace(/\[[^\]]*\]\s*$/, "").trim().toLowerCase();
+  const known = catalog.find((item) => item.id.toLowerCase() === base);
+  if (known) return Boolean(known.supportsEffort);
+  if (/^(auto|composer)/i.test(base)) return false;
+  return true;
+}
+
+/** Encode Luma effort into Cursor CLI model bracket params when supported. */
+function resolveCursorModelArg(model: string, effort: ReasoningEffort, catalog?: CursorModelInfo[]): string {
+  const trimmed = model.trim();
+  if (!trimmed) return DEFAULT_CURSOR_MODEL;
+  if (/\[[^\]]*\]/.test(trimmed)) return trimmed;
+  if (!cursorModelSupportsEffort(trimmed, catalog)) return trimmed;
+  return `${trimmed}[effort=${mapCursorEffort(effort)}]`;
+}
+
+function buildCursorEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (CURSOR_API_KEY) {
+    env.CURSOR_API_KEY = CURSOR_API_KEY;
+    env.CURSOR_AUTH_TOKEN = CURSOR_API_KEY;
+  }
+  return env;
+}
+
+function listCursorModelsFromCli(): CursorModelInfo[] {
+  if (!cursorCliAvailable()) return [...DEFAULT_CURSOR_MODELS];
+  const args = ["agent", "--list-models"];
+  const result = spawnSync(CURSOR_EXECUTABLE || "cursor", args, {
+    encoding: "utf8",
+    env: buildCursorEnvironment(),
+    timeout: 20_000,
+  });
+  const output = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+  if (result.status !== 0 || !output) return [...DEFAULT_CURSOR_MODELS];
+
+  const models: CursorModelInfo[] = [];
+  const seen = new Set<string>();
+  for (const line of output.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || /^error\b/i.test(trimmed) || /^usage:/i.test(trimmed)) continue;
+    // Formats vary: "composer-2.5", "composer-2.5 - Composer 2.5", JSON lines, etc.
+    let id = "";
+    let displayName: string | undefined;
+    if (trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+        id = typeof parsed.id === "string" ? parsed.id : typeof parsed.model === "string" ? parsed.model : "";
+        displayName = typeof parsed.displayName === "string"
+          ? parsed.displayName
+          : typeof parsed.name === "string"
+            ? parsed.name
+            : undefined;
+      } catch {
+        continue;
+      }
+    } else {
+      const parts = trimmed.split(/\s+-\s+|\s{2,}/);
+      id = (parts[0] || "").replace(/[,:]$/, "").trim();
+      displayName = parts.slice(1).join(" - ").trim() || undefined;
+    }
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    models.push({
+      id,
+      displayName,
+      supportsEffort: cursorModelSupportsEffort(id),
+    });
+  }
+  return models.length > 0 ? models : [...DEFAULT_CURSOR_MODELS];
+}
+
+let cachedCursorModels: { at: number; models: CursorModelInfo[] } | null = null;
+function getCursorModels(force = false): CursorModelInfo[] {
+  const now = Date.now();
+  if (!force && cachedCursorModels && now - cachedCursorModels.at < 5 * 60_000) {
+    return cachedCursorModels.models;
+  }
+  const models = listCursorModelsFromCli();
+  cachedCursorModels = { at: now, models };
+  return models;
+}
+
 const claudeEffortSupportCache = new Map<string, boolean>();
 
 function claudeCliSupportsEffort(executable: string): boolean {
@@ -2217,6 +2365,12 @@ class RunManager extends EventEmitter {
       return record;
     }
 
+    if (effectiveConfig.runner === "cursor") {
+      this.startCursorExecution(runId, effectiveConfig, prompt);
+      this.persistState();
+      return record;
+    }
+
     const args = effectiveConfig.sessionId
       ? [
           "exec",
@@ -2341,6 +2495,327 @@ class RunManager extends EventEmitter {
 
     this.persistState();
     return record;
+  }
+
+  private startCursorExecution(runId: string, effectiveConfig: RunConfig, prompt: string): void {
+    const executable = CURSOR_EXECUTABLE || "cursor";
+    if (!cursorCliAvailable()) {
+      const message = `Cursor CLI not found (looked for '${executable}'). Install Cursor CLI or set CURSOR_PATH.`;
+      this.updateRun(runId, { status: "failed", lastError: message });
+      this.appendEvent(runId, { source: "stderr", text: `${message}\n` });
+      this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { message } });
+      const failedRun = this.runs.get(runId);
+      if (failedRun) {
+        this.emit("run.lifecycle", { kind: "failed", run: failedRun, previous: failedRun } as RunLifecycleEvent);
+      }
+      return;
+    }
+
+    const modelArg = resolveCursorModelArg(effectiveConfig.model, effectiveConfig.reasoningEffort, getCursorModels());
+    const args = [
+      "agent",
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--stream-partial-output",
+      "--trust",
+      "--workspace",
+      effectiveConfig.workspace,
+      "--model",
+      modelArg,
+      "--sandbox",
+      mapCursorSandbox(effectiveConfig.sandbox),
+    ];
+
+    if (CURSOR_APPROVE_MCPS) args.push("--approve-mcps");
+    if (
+      CURSOR_FORCE
+      || effectiveConfig.approvalPolicy === "never"
+      || effectiveConfig.sandbox === "danger-full-access"
+    ) {
+      args.push("--force");
+    }
+    if (effectiveConfig.planMode) {
+      args.push("--plan");
+    } else if (effectiveConfig.askMode) {
+      args.push("--mode", "ask");
+    }
+    if (CURSOR_WORKTREE) args.push("--worktree");
+    if (effectiveConfig.sessionId) {
+      args.push("--resume", effectiveConfig.sessionId);
+    }
+    args.push(prompt);
+
+    const child = spawn(executable, args, {
+      cwd: effectiveConfig.workspace,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: buildCursorEnvironment(),
+    });
+
+    if (!child.stdout || !child.stderr) {
+      throw new Error("Failed to initialize Cursor CLI process streams");
+    }
+
+    const active: CursorActiveRun = {
+      runner: "cursor",
+      process: child,
+      stdoutBuffer: "",
+      stderrBuffer: "",
+      stopRequested: false,
+      sawResult: false,
+      streamText: "",
+    };
+    this.activeRuns.set(runId, active);
+    this.updateRun(runId, { status: "running" });
+    this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
+    const startedRun = this.runs.get(runId);
+    if (startedRun) {
+      this.emit("run.lifecycle", { kind: "started", run: startedRun, previous: null } as RunLifecycleEvent);
+    }
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      const current = this.activeRuns.get(runId);
+      if (!current || current.runner !== "cursor") return;
+      current.stdoutBuffer += chunk.toString("utf8");
+      let idx = current.stdoutBuffer.indexOf("\n");
+      while (idx >= 0) {
+        const line = current.stdoutBuffer.slice(0, idx).trim();
+        current.stdoutBuffer = current.stdoutBuffer.slice(idx + 1);
+        if (line.length > 0) this.handleCursorStdoutLine(runId, line);
+        idx = current.stdoutBuffer.indexOf("\n");
+      }
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      const current = this.activeRuns.get(runId);
+      if (!current || current.runner !== "cursor") return;
+      current.stderrBuffer += chunk.toString("utf8");
+      let idx = current.stderrBuffer.search(/\r?\n/);
+      while (idx >= 0) {
+        const line = current.stderrBuffer.slice(0, idx).trim();
+        current.stderrBuffer = current.stderrBuffer.slice(
+          idx + (current.stderrBuffer[idx] === "\r" && current.stderrBuffer[idx + 1] === "\n" ? 2 : 1),
+        );
+        if (line.length > 0) {
+          const rendered = truncateText(`${line}\n`, STORED_EVENT_TEXT_MAX_CHARS);
+          this.appendEvent(runId, { source: "stderr", text: rendered });
+          this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: rendered } });
+        }
+        idx = current.stderrBuffer.search(/\r?\n/);
+      }
+    });
+
+    child.on("error", (error) => {
+      const message = error instanceof Error ? error.message : "Failed to start Cursor CLI";
+      this.appendEvent(runId, { source: "stderr", text: `${message}\n` });
+      this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: `${message}\n` } });
+      this.updateRun(runId, { status: "failed", lastError: message.slice(0, 600) });
+    });
+
+    child.on("exit", (code) => {
+      this.finishCursorExecution(runId, code);
+    });
+
+    this.persistState();
+  }
+
+  private finishCursorExecution(runId: string, code: number | null): void {
+    const active = this.activeRuns.get(runId);
+    const stopRequested = Boolean(active?.stopRequested);
+    if (active?.runner === "cursor") {
+      const trailingStdout = active.stdoutBuffer.trim();
+      const trailingStderr = active.stderrBuffer.trim();
+      if (trailingStdout) this.handleCursorStdoutLine(runId, trailingStdout);
+      if (trailingStderr) {
+        const rendered = truncateText(`${trailingStderr}\n`, STORED_EVENT_TEXT_MAX_CHARS);
+        this.appendEvent(runId, { source: "stderr", text: rendered });
+      }
+    }
+    this.activeRuns.delete(runId);
+
+    const run = this.runs.get(runId);
+    if (!run) return;
+
+    if (stopRequested) {
+      this.updateRun(runId, { status: "stopped" });
+      this.emitSse({ kind: "run.stopped", runId, at: Date.now() });
+      const stoppedRun = this.runs.get(runId);
+      if (stoppedRun) {
+        this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous: run } as RunLifecycleEvent);
+      }
+    } else if (code === 0 && run.status !== "stopped") {
+      this.updateRun(runId, {
+        status: "completed",
+        ...(run.lastError && isBenignCodexErrorItemText(run.lastError) ? { lastError: null } : {}),
+      });
+      this.emitSse({ kind: "run.completed", runId, at: Date.now() });
+      const completedRun = this.runs.get(runId);
+      if (completedRun) {
+        this.emit("run.lifecycle", { kind: "completed", run: completedRun, previous: run } as RunLifecycleEvent);
+      }
+    } else if (run.status !== "stopped") {
+      this.updateRun(runId, { status: "failed" });
+      this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code } });
+      const failedRun = this.runs.get(runId);
+      if (failedRun) {
+        this.emit("run.lifecycle", { kind: "failed", run: failedRun, previous: run } as RunLifecycleEvent);
+      }
+    }
+
+    this.releaseCachedEvents(runId);
+    this.persistState();
+  }
+
+  private handleCursorStdoutLine(runId: string, line: string): void {
+    const storedLine = truncateText(line, STORED_EVENT_TEXT_MAX_CHARS);
+    this.appendEvent(runId, { source: "stdout", text: storedLine });
+    this.emitSse({ kind: "run.stdout", runId, at: Date.now(), payload: { text: storedLine } });
+
+    let message: Record<string, unknown>;
+    try {
+      message = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+
+    this.handleCursorMessage(runId, message);
+  }
+
+  private handleCursorMessage(runId: string, message: Record<string, unknown>): void {
+    const type = typeof message.type === "string" ? message.type : "";
+    this.trackCursorSessionId(runId, message);
+
+    switch (type) {
+      case "system":
+        return;
+      case "user":
+        return;
+      case "assistant":
+        this.handleCursorAssistantMessage(runId, message);
+        return;
+      case "tool_call":
+        this.handleCursorToolCallMessage(runId, message);
+        return;
+      case "result":
+        this.handleCursorResultMessage(runId, message);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private trackCursorSessionId(runId: string, message: Record<string, unknown>): void {
+    const sessionId = typeof message.session_id === "string" ? message.session_id : "";
+    if (!sessionId) return;
+    const run = this.runs.get(runId);
+    if (!run) return;
+    const patch: Partial<RunRecord> = { threadId: sessionId };
+    if (!run.sessionId) patch.sessionId = sessionId;
+    this.updateRun(runId, patch);
+    this.emitClaudeParsed(runId, { type: "thread.started", thread_id: sessionId });
+  }
+
+  private handleCursorAssistantMessage(runId: string, message: Record<string, unknown>): void {
+    // Skip duplicate flushes when streaming partial output (see Cursor CLI docs).
+    const hasTimestamp = typeof message.timestamp_ms === "number";
+    const hasModelCallId = typeof message.model_call_id === "string" && message.model_call_id.length > 0;
+    if (hasModelCallId) return;
+    if (!hasTimestamp && Object.prototype.hasOwnProperty.call(message, "timestamp_ms") === false) {
+      // Non-partial complete segment (no streaming fields).
+    } else if (!hasTimestamp) {
+      // Final flush at end of turn without timestamp — duplicate of streamed text.
+      return;
+    }
+
+    const text = readCursorAssistantText(message);
+    if (!text.trim()) return;
+
+    const active = this.activeRuns.get(runId);
+    const streamId = `cursor_stream_${runId}`;
+
+    if (hasTimestamp && active?.runner === "cursor") {
+      active.streamText += text;
+      const full = active.streamText;
+      this.updateRun(runId, { summary: full.slice(0, 240) });
+      this.emitClaudeParsed(runId, {
+        type: "item.completed",
+        item: {
+          id: streamId,
+          type: "agent_message",
+          text: full,
+        },
+      });
+      return;
+    }
+
+    if (active?.runner === "cursor") active.streamText = "";
+
+    const itemId = typeof message.session_id === "string"
+      ? `cursor_assistant_${message.session_id}_${Date.now()}`
+      : `cursor_assistant_${Date.now()}`;
+    this.updateRun(runId, { summary: text.slice(0, 240) });
+    this.emitClaudeParsed(runId, {
+      type: "item.completed",
+      item: {
+        id: itemId,
+        type: "agent_message",
+        text,
+      },
+    });
+  }
+
+  private handleCursorToolCallMessage(runId: string, message: Record<string, unknown>): void {
+    const active = this.activeRuns.get(runId);
+    if (active?.runner === "cursor") active.streamText = "";
+
+    const subtype = typeof message.subtype === "string" ? message.subtype : "";
+    const callId = typeof message.call_id === "string" ? message.call_id : `cursor_tool_${Date.now()}`;
+    const toolCall = isRecord(message.tool_call) ? message.tool_call : {};
+    const mapped = mapCursorToolCall(callId, toolCall, subtype === "completed");
+    if (!mapped) return;
+    this.emitClaudeParsed(runId, {
+      type: subtype === "completed" ? "item.completed" : "item.started",
+      item: mapped,
+    });
+    if (mapped.type === "file_change" && Array.isArray(mapped.changes)) {
+      const run = this.runs.get(runId);
+      if (run) {
+        const current = new Set(run.changedFiles);
+        for (const change of mapped.changes) {
+          const row = change as Record<string, unknown>;
+          if (typeof row.path === "string") current.add(row.path);
+        }
+        this.updateRun(runId, { changedFiles: [...current] });
+      }
+    }
+  }
+
+  private handleCursorResultMessage(runId: string, message: Record<string, unknown>): void {
+    const active = this.activeRuns.get(runId);
+    if (active?.runner === "cursor") active.sawResult = true;
+
+    const subtype = typeof message.subtype === "string" ? message.subtype : "";
+    const isError = subtype !== "success" || message.is_error === true;
+    const resultText = typeof message.result === "string" ? message.result : "";
+    if (resultText.trim()) this.updateRun(runId, { summary: resultText.slice(0, 240) });
+
+    if (isError) {
+      const errorText = resultText || "Cursor agent run failed";
+      this.updateRun(runId, { status: "failed", lastError: errorText.slice(0, 600) });
+      this.emitClaudeParsed(runId, {
+        type: "item.completed",
+        item: {
+          id: typeof message.request_id === "string" ? message.request_id : `cursor_result_error_${Date.now()}`,
+          type: "error",
+          message: errorText,
+        },
+      });
+    }
+
+    this.emitClaudeParsed(runId, {
+      type: "turn.completed",
+      usage: null,
+    });
   }
 
   private startClaudeExecution(runId: string, effectiveConfig: RunConfig, prompt: string): void {
@@ -3706,23 +4181,19 @@ function resolveEffectiveRunConfig(config: RunConfig): RunConfig {
   const attachments = normalizeAttachmentRefs(config.attachments);
   const skills = normalizeSelectedSkillRefs(config.skills);
   const agents = normalizeSelectedAgentRefs(config.agents);
-  if (!config.planMode) {
-    return {
-      ...config,
-      runner: normalizeRunRunner(config.runner),
-      reasoningEffort: normalizeReasoningEffort(config.reasoningEffort),
-      attachments,
-      skills,
-      agents,
-    };
-  }
-  return {
+  const askMode = Boolean(config.askMode) && !config.planMode;
+  const base = {
     ...config,
     runner: normalizeRunRunner(config.runner),
     reasoningEffort: normalizeReasoningEffort(config.reasoningEffort),
+    askMode,
     attachments,
     skills,
     agents,
+  };
+  if (!config.planMode && !askMode) return base;
+  return {
+    ...base,
     sandbox: "read-only",
     approvalPolicy: "never",
   };
@@ -3784,6 +4255,107 @@ function readClaudeAssistantText(message: Record<string, unknown>): string {
     .filter(Boolean)
     .join("\n\n")
     .trim();
+}
+
+function readCursorAssistantText(message: Record<string, unknown>): string {
+  return readClaudeAssistantText(message);
+}
+
+function mapCursorToolCall(
+  callId: string,
+  toolCall: Record<string, unknown>,
+  completed: boolean,
+): Record<string, unknown> | null {
+  if (isRecord(toolCall.readToolCall)) {
+    const args = isRecord(toolCall.readToolCall.args) ? toolCall.readToolCall.args : {};
+    const pathValue = typeof args.path === "string" ? args.path : "file";
+    const result = isRecord(toolCall.readToolCall.result) ? toolCall.readToolCall.result : {};
+    const success = isRecord(result.success) ? result.success : {};
+    const output = typeof success.content === "string" ? success.content : "";
+    return {
+      id: callId,
+      type: "command_execution",
+      command: `read ${pathValue}`,
+      description: `Read ${pathValue}`,
+      status: completed ? "completed" : "in_progress",
+      aggregated_output: output,
+      exit_code: completed ? 0 : null,
+    };
+  }
+
+  if (isRecord(toolCall.writeToolCall)) {
+    const args = isRecord(toolCall.writeToolCall.args) ? toolCall.writeToolCall.args : {};
+    const pathValue = typeof args.path === "string" ? args.path : "file";
+    const result = isRecord(toolCall.writeToolCall.result) ? toolCall.writeToolCall.result : {};
+    const success = isRecord(result.success) ? result.success : {};
+    const absolutePath = typeof success.path === "string" ? success.path : pathValue;
+    return {
+      id: callId,
+      type: "file_change",
+      status: completed ? "completed" : "in_progress",
+      path: absolutePath,
+      changes: [{ path: absolutePath, kind: "write" }],
+    };
+  }
+
+  if (isRecord(toolCall.function)) {
+    const name = typeof toolCall.function.name === "string" ? toolCall.function.name : "tool";
+    const rawArgs = toolCall.function.arguments;
+    const argsText = typeof rawArgs === "string" ? rawArgs : rawArgs != null ? JSON.stringify(rawArgs) : "";
+    const isMcp = name.includes(".") || name.toLowerCase().includes("mcp");
+    if (isMcp) {
+      const [server, tool] = name.includes(".") ? name.split(".", 2) : ["mcp", name];
+      return {
+        id: callId,
+        type: "mcp_tool_call",
+        server,
+        tool: tool || name,
+        status: completed ? "completed" : "in_progress",
+        arguments: argsText,
+        description: `MCP ${name}`,
+      };
+    }
+    return {
+      id: callId,
+      type: "command_execution",
+      command: argsText ? `${name} ${argsText}` : name,
+      description: name,
+      status: completed ? "completed" : "in_progress",
+      aggregated_output: "",
+      exit_code: completed ? 0 : null,
+    };
+  }
+
+  // Generic fallback for other Cursor tool shapes (shell, grep, etc.)
+  const keys = Object.keys(toolCall);
+  if (keys.length === 0) return null;
+  const key = keys[0] || "tool";
+  const body = isRecord(toolCall[key]) ? toolCall[key] : {};
+  const args = isRecord(body.args) ? body.args : {};
+  const command = typeof args.command === "string"
+    ? args.command
+    : typeof args.query === "string"
+      ? args.query
+      : key.replace(/ToolCall$/, "");
+  const result = isRecord(body.result) ? body.result : {};
+  const success = isRecord(result.success) ? result.success : result;
+  const output = typeof success.output === "string"
+    ? success.output
+    : typeof success.content === "string"
+      ? success.content
+      : typeof result.error === "string"
+        ? result.error
+        : "";
+  const failed = Boolean(result.error) || Boolean(result.failure);
+  return {
+    id: callId,
+    type: "command_execution",
+    command,
+    description: key.replace(/ToolCall$/, ""),
+    status: completed ? (failed ? "failed" : "completed") : "in_progress",
+    aggregated_output: output,
+    exit_code: completed ? (failed ? 1 : 0) : null,
+  };
 }
 
 function readClaudeAssistantThinking(message: Record<string, unknown>): string {
@@ -6435,6 +7007,8 @@ class OutboxProcessor {
       ...item,
       runner: normalizeRunRunner(item.runner),
       reasoningEffort: normalizeReasoningEffort(item.reasoningEffort),
+      planMode: Boolean(item.planMode),
+      askMode: Boolean(item.askMode),
       attachments: normalizeAttachmentRefs(item.attachments),
       skills: normalizeSelectedSkillRefs(item.skills),
       agents: normalizeSelectedAgentRefs(item.agents),
@@ -6518,6 +7092,7 @@ class OutboxProcessor {
           sandbox: item.sandbox,
           approvalPolicy: item.approvalPolicy,
           planMode: item.planMode,
+          askMode: item.askMode,
           sessionId: item.provisionalSession ? undefined : item.sessionId,
           attachments: item.attachments,
           skills: item.skills,
@@ -7143,6 +7718,7 @@ const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, pro
     approvalPolicy: schedule.runConfig.approvalPolicy,
     reasoningEffort: schedule.runConfig.reasoningEffort,
     planMode: false,
+    askMode: false,
     attachments: [],
     skills: schedule.runConfig.skills,
     agents: [],
@@ -7157,7 +7733,8 @@ const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, pro
       reasoningEffort: schedule.runConfig.reasoningEffort,
       sandbox: schedule.runConfig.sandbox,
       approvalPolicy: schedule.runConfig.approvalPolicy,
-      planMode: false,
+      planMode: Boolean(schedule.runConfig.planMode),
+      askMode: Boolean(schedule.runConfig.askMode),
       attachments: [],
       skills: schedule.runConfig.skills,
       agents: [],
@@ -7329,13 +7906,17 @@ function getWorkspaces(): WorkspaceOption[] {
 }
 
 app.get("/api/bootstrap", (_req, res) => {
+  const cursorModels = getCursorModels();
   const payload: AppBootstrap = {
     defaults: {
       runner: DEFAULT_RUNNER,
       model: DEFAULT_MODEL,
       codexModel: DEFAULT_CODEX_MODEL,
       claudeModel: DEFAULT_CLAUDE_MODEL,
+      cursorModel: DEFAULT_CURSOR_MODEL,
       claudeEffortFlagSupported: claudeCliSupportsEffort(CLAUDE_CODE_EXECUTABLE || "claude"),
+      cursorAvailable: cursorCliAvailable(),
+      cursorModels,
       reasoningEffort: DEFAULT_REASONING_EFFORT,
       sandbox: DEFAULT_SANDBOX as "read-only" | "workspace-write" | "danger-full-access",
     },
@@ -7348,13 +7929,17 @@ app.get("/api/bootstrap", (_req, res) => {
 });
 
 app.get("/api/bootstrap-lite", (_req, res) => {
+  const cursorModels = getCursorModels();
   const payload: AppBootstrapLite = {
     defaults: {
       runner: DEFAULT_RUNNER,
       model: DEFAULT_MODEL,
       codexModel: DEFAULT_CODEX_MODEL,
       claudeModel: DEFAULT_CLAUDE_MODEL,
+      cursorModel: DEFAULT_CURSOR_MODEL,
       claudeEffortFlagSupported: claudeCliSupportsEffort(CLAUDE_CODE_EXECUTABLE || "claude"),
+      cursorAvailable: cursorCliAvailable(),
+      cursorModels,
       reasoningEffort: DEFAULT_REASONING_EFFORT,
       sandbox: DEFAULT_SANDBOX as "read-only" | "workspace-write" | "danger-full-access",
     },
@@ -7363,6 +7948,16 @@ app.get("/api/bootstrap-lite", (_req, res) => {
     approvals: runManager.getApprovals(),
   };
   res.json(apiOk(payload));
+});
+
+app.get("/api/cursor/models", (_req, res) => {
+  const models = getCursorModels(true);
+  res.json(apiOk({
+    available: cursorCliAvailable(),
+    executable: CURSOR_EXECUTABLE || "cursor",
+    defaultModel: DEFAULT_CURSOR_MODEL,
+    models,
+  }));
 });
 
 app.get("/api/skills", (req, res) => {
@@ -7819,6 +8414,7 @@ app.post("/api/messages/send", (req, res) => {
     sandbox: parsed.data.sandbox,
     approvalPolicy: parsed.data.approvalPolicy,
     planMode: parsed.data.planMode,
+    askMode: Boolean(parsed.data.askMode),
     skills: selectedSkills,
     agents: selectedAgents,
   });
@@ -7882,6 +8478,7 @@ app.post("/api/runs/start", (req, res) => {
       sandbox: parsed.data.sandbox,
       approvalPolicy: parsed.data.approvalPolicy,
       planMode: parsed.data.planMode,
+      askMode: Boolean(parsed.data.askMode),
       sessionId: parsed.data.sessionId,
       attachments: parsed.data.attachments,
       skills: parsed.data.skills,

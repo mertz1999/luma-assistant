@@ -152,11 +152,17 @@ Important variables:
 - `TASK_MANAGER_TOKEN_TTL_SECONDS`: task-manager login lifetime in seconds.
 - `TASK_MANAGER_DEFAULT_TIME_ZONE`: default timezone for new task-manager users. Users can change their own timezone from `/taskmanager/settings`.
 - `CODEX_PATH`: path to the Codex executable if it is not simply `codex`.
-- `DEFAULT_RUNNER`: default runner for new sessions. Use `codex` or `claude`.
+- `DEFAULT_RUNNER`: default runner for new sessions. Use `codex`, `claude`, or `cursor`.
 - `DEFAULT_MODEL`: default Codex model for new sessions and new scheduled jobs.
 - `CLAUDE_DEFAULT_MODEL`: default Claude model when the Claude Code runner is selected.
-- `DEFAULT_REASONING_EFFORT`: default thinking effort for new sessions. Use `low`, `medium`, `high`, or `xhigh` (Codex extra high). Claude also accepts `max`. It can be changed in the new-session dialog and composer.
+- `DEFAULT_CURSOR_MODEL`: default Cursor model when the Cursor runner is selected (default `composer-2.5`).
+- `DEFAULT_REASONING_EFFORT`: default thinking effort for new sessions. Use `low`, `medium`, `high`, or `xhigh` (Codex extra high). Claude also accepts `max`. Cursor encodes effort as a model bracket when the model supports it.
 - `CLAUDE_CODE_EXECUTABLE`: optional path to the Claude Code CLI. If omitted, Luma uses `claude` from `PATH`.
+- `CURSOR_PATH` / `CURSOR_EXECUTABLE`: optional path to the Cursor CLI. If omitted, Luma looks for `cursor` on `PATH` (and the macOS app bundle path).
+- `CURSOR_API_KEY` / `CURSOR_AUTH_TOKEN`: Cursor authentication for headless Agent CLI runs.
+- `CURSOR_FORCE`: pass `--force` on Cursor runs (default on). Set `0` to disable unless approval policy requires it.
+- `CURSOR_APPROVE_MCPS`: pass `--approve-mcps` on Cursor runs (default on).
+- `CURSOR_WORKTREE`: set `1` to pass `--worktree` on every Cursor run.
 - `CLAUDE_AUTH_MODE`: Claude auth mode. Defaults to `oauth`, which uses your logged-in Claude Code account and strips inherited Anthropic API-key variables from the Claude subprocess. Set `api_key` to intentionally use `ANTHROPIC_API_KEY`.
 - `DEFAULT_SANDBOX`: default sandbox mode for new sessions.
 - `ATTACHMENT_MAX_BYTES`: max browser attachment upload size in bytes. Defaults to 15 MB.
@@ -189,6 +195,20 @@ More implementation notes are in:
 
 ```text
 docs/claude-cli.md
+```
+
+## Cursor Agent Runner
+
+Luma Assistant includes Cursor Agent as a third runner by spawning the Cursor CLI (`cursor agent -p --output-format stream-json`). Select `Cursor` in the new-session dialog or composer before creating a session. Existing sessions keep their original runner.
+
+Auth uses `CURSOR_API_KEY` (or a prior `cursor agent login` on the host). Models are loaded from `cursor agent --list-models` when available (`GET /api/cursor/models`). Effort is encoded as a model bracket (for example `claude-opus-4-6[effort=high]`) when the selected model supports it. Plan mode maps to `--plan`; Cursor also has an Ask toggle that maps to `--mode ask`.
+
+MCP servers for Luma telegram/images/(optional tasks) are written into `~/.cursor/mcp.json` by `make ensure-cursor-mcp`. Selected skills/agents are still injected into the prompt; Luma also discovers `~/.cursor/skills-cursor` when present.
+
+More implementation notes are in:
+
+```text
+docs/cursor-cli.md
 ```
 
 ## Web Interface
@@ -370,7 +390,7 @@ LUMA_TASKS_AUTH_TOKEN=
 
 If `LUMA_TASKS_PASSWORD` is omitted, the MCP server falls back to `TASK_MANAGER_ADMIN_PASSWORD`, then `PASSWORD`. `LUMA_TASKS_AUTH_TOKEN` is optional and can be used instead of username/password, but normal username/password login is preferred because task-manager tokens expire.
 
-`make run` and `make deploy-start` ensure the local MCP entries for `luma-tel` and `luma-images` for both Codex and Claude Code (Claude uses user-scope registration so every workspace cwd can see them). `luma-tasks` is registered only when `ENABLE_TASK_MANAGER_MCP=1`. For local development without PM2, run `npm run dev:taskmanager` in a separate terminal when you need the MCP.
+`make run` and `make deploy-start` ensure the local MCP entries for `luma-tel` and `luma-images` for Codex, Claude Code, and Cursor (Claude uses user-scope registration; Cursor merges into `~/.cursor/mcp.json`). `luma-tasks` is registered only when `ENABLE_TASK_MANAGER_MCP=1`. For local development without PM2, run `npm run dev:taskmanager` in a separate terminal when you need the MCP.
 
 ## Luma Images MCP
 

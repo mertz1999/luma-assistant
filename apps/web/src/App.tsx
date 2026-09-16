@@ -32,6 +32,7 @@ import {
   RefreshCw,
   Send,
   Settings,
+  Sparkles,
   Sun,
   Terminal,
   Trash2,
@@ -54,6 +55,7 @@ import type {
   SessionListItem,
   SkillListItem,
   SelectedSkillRef,
+  CursorModelInfo,
   TerminalSessionSnapshot,
   TokenUsageSummary,
   WorkspaceOption,
@@ -70,6 +72,7 @@ import {
   getAgentSchedules,
   getAccountStatus,
   getBootstrapLite,
+  getCursorModels,
   getMcpStatus,
   getSkills,
   getSessionList,
@@ -166,20 +169,57 @@ type SessionCard = {
 type PlanSessionState = "idle" | "armed" | "active";
 
 const sandboxOptions: SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
-const runnerOptions: RunRunner[] = ["codex", "claude"];
+const runnerOptions: RunRunner[] = ["codex", "claude", "cursor"];
 const codexModelOptions = ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4"];
 const claudeModelOptions = ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-4-1"];
+const defaultCursorModelOptions = ["composer-2.5", "auto", "gpt-5.3-codex", "claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro"];
 const codexReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 const claudeReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
-function modelOptionsForRunner(runner: RunRunner): string[] {
-  return runner === "claude" ? claudeModelOptions : codexModelOptions;
+const cursorReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high"];
+
+function normalizeRunRunnerValue(input: unknown): RunRunner {
+  if (input === "claude" || input === "cursor") return input;
+  return "codex";
 }
+
+function defaultModelForRunner(
+  runner: RunRunner,
+  defaults: { codex: string; claude: string; cursor: string },
+): string {
+  if (runner === "claude") return defaults.claude;
+  if (runner === "cursor") return defaults.cursor;
+  return defaults.codex;
+}
+
+function modelOptionsForRunner(runner: RunRunner, cursorModels: CursorModelInfo[] = []): string[] {
+  if (runner === "claude") return claudeModelOptions;
+  if (runner === "cursor") {
+    const ids = cursorModels.map((item) => item.id).filter(Boolean);
+    return ids.length > 0 ? ids : defaultCursorModelOptions;
+  }
+  return codexModelOptions;
+}
+
 function reasoningEffortOptionsForRunner(runner: RunRunner): ReasoningEffort[] {
-  return runner === "claude" ? claudeReasoningEffortOptions : codexReasoningEffortOptions;
+  if (runner === "claude") return claudeReasoningEffortOptions;
+  if (runner === "cursor") return cursorReasoningEffortOptions;
+  return codexReasoningEffortOptions;
 }
+
 function runnerLabel(runner: RunRunner): string {
-  return runner === "claude" ? "Claude Code" : "Codex";
+  if (runner === "claude") return "Claude Code";
+  if (runner === "cursor") return "Cursor";
+  return "Codex";
 }
+
+function cursorModelSupportsEffort(model: string, cursorModels: CursorModelInfo[]): boolean {
+  const base = model.replace(/\[[^\]]*\]\s*$/, "").trim().toLowerCase();
+  const known = cursorModels.find((item) => item.id.toLowerCase() === base);
+  if (known) return Boolean(known.supportsEffort);
+  if (/^(auto|composer)/i.test(base)) return false;
+  return true;
+}
+
 function reasoningEffortLabel(effort: ReasoningEffort): string {
   if (effort === "xhigh") return "extra high";
   if (effort === "max") return "max";
@@ -248,6 +288,7 @@ type QueuedMessage = {
   sandbox: SandboxMode;
   approvalPolicy: ApprovalPolicy;
   planMode: boolean;
+  askMode: boolean;
   skills: SelectedSkillRef[];
   agents: SelectedAgentRef[];
 };
@@ -545,11 +586,12 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
         const id = typeof item.id === "string" ? item.id : "";
         const prompt = typeof item.prompt === "string" ? item.prompt : "";
         const workspace = typeof item.workspace === "string" ? item.workspace : "";
-        const runner: RunRunner = item.runner === "claude" ? "claude" : "codex";
+        const runner = normalizeRunRunnerValue(item.runner);
         const model = typeof item.model === "string" ? item.model : "";
         const reasoningEffort: ReasoningEffort = isReasoningEffort(item.reasoningEffort) ? item.reasoningEffort : "high";
         const createdAt = typeof item.createdAt === "number" ? item.createdAt : Date.now();
         const planMode = typeof item.planMode === "boolean" ? item.planMode : false;
+        const askMode = typeof item.askMode === "boolean" ? item.askMode : false;
         const attachments = readAttachmentRefs(item.attachments);
         const skills = readSelectedSkillRefs(item.skills);
         const agents = readSelectedAgentRefs(item.agents);
@@ -571,6 +613,7 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
           sandbox: item.sandbox,
           approvalPolicy: item.approvalPolicy,
           planMode,
+          askMode,
           skills,
           agents,
         });
@@ -601,15 +644,22 @@ function describeSessionMeta(session: SessionCard): string {
 
 function getSessionSourceBadge(session: SessionCard): { label: string; className: string } {
   if (session.sourceTag === "in-app") {
-    return session.runner === "claude"
-      ? {
-          label: "Claude",
-          className: "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-200",
-        }
-      : {
-          label: "Codex",
-          className: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200",
-        };
+    if (session.runner === "claude") {
+      return {
+        label: "Claude",
+        className: "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-200",
+      };
+    }
+    if (session.runner === "cursor") {
+      return {
+        label: "Cursor",
+        className: "bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-200",
+      };
+    }
+    return {
+      label: "Codex",
+      className: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200",
+    };
   }
   if (session.sourceTag === "vscode") {
     return {
@@ -654,7 +704,7 @@ function buildSessionCards(items: SessionListItem[]): SessionCard[] {
     summary: item.title,
     status: item.status,
     updatedAt: item.updatedAt,
-    runner: item.runner === "claude" ? "claude" : "codex",
+    runner: normalizeRunRunnerValue(item.runner),
     model: item.model,
     reasoningEffort: item.reasoningEffort,
     sourceTag: item.sourceTag,
@@ -1197,7 +1247,8 @@ function skillCanonicalRank(skill: SkillListItem): number {
   if (skill.scope === "repo") return skill.source.includes("codex") ? 0 : 1;
   if (skill.source === "codex") return 2;
   if (skill.source === "claude") return 3;
-  return 4;
+  if (skill.source === "cursor") return 4;
+  return 5;
 }
 
 function chooseCanonicalSkill(current: SkillListItem, candidate: SkillListItem): SkillListItem {
@@ -1295,7 +1346,7 @@ function readSessionListItem(input: unknown): SessionListItem | null {
         title: input.title,
         status: input.status as SessionListItem["status"],
         updatedAt: input.updatedAt,
-        runner: input.runner === "claude" ? "claude" : "codex",
+        runner: normalizeRunRunnerValue(input.runner),
         model: typeof input.model === "string" ? input.model : undefined,
         reasoningEffort: isReasoningEffort(input.reasoningEffort) ? input.reasoningEffort : undefined,
         sourceTag: input.sourceTag as RunSourceTag,
@@ -2133,7 +2184,11 @@ export function App(): JSX.Element {
   const [model, setModel] = useState("gpt-5.6-sol");
   const [defaultCodexModel, setDefaultCodexModel] = useState("gpt-5.6-sol");
   const [defaultClaudeModel, setDefaultClaudeModel] = useState("sonnet");
+  const [defaultCursorModel, setDefaultCursorModel] = useState("composer-2.5");
   const [claudeEffortFlagSupported, setClaudeEffortFlagSupported] = useState(true);
+  const [cursorAvailable, setCursorAvailable] = useState(false);
+  const [cursorModels, setCursorModels] = useState<CursorModelInfo[]>([]);
+  const [askMode, setAskMode] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("high");
   const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
   const approvalPolicy: ApprovalPolicy = "never";
@@ -2941,7 +2996,10 @@ export function App(): JSX.Element {
       setRunnerState(payload.defaults.runner);
       setDefaultCodexModel(payload.defaults.codexModel);
       setDefaultClaudeModel(payload.defaults.claudeModel);
+      setDefaultCursorModel(payload.defaults.cursorModel || "composer-2.5");
       setClaudeEffortFlagSupported(payload.defaults.claudeEffortFlagSupported);
+      setCursorAvailable(Boolean(payload.defaults.cursorAvailable));
+      setCursorModels(Array.isArray(payload.defaults.cursorModels) ? payload.defaults.cursorModels : []);
       setModel(payload.defaults.model);
       setReasoningEffort(payload.defaults.reasoningEffort);
       setSandbox(payload.defaults.sandbox);
@@ -3262,9 +3320,14 @@ export function App(): JSX.Element {
 
   function setRunner(nextRunner: RunRunner): void {
     setRunnerState(nextRunner);
+    if (nextRunner !== "cursor") setAskMode(false);
     setModel((current) => {
-      if (modelOptionsForRunner(nextRunner).includes(current)) return current;
-      return nextRunner === "claude" ? defaultClaudeModel : defaultCodexModel;
+      if (modelOptionsForRunner(nextRunner, cursorModels).includes(current)) return current;
+      return defaultModelForRunner(nextRunner, {
+        codex: defaultCodexModel,
+        claude: defaultClaudeModel,
+        cursor: defaultCursorModel,
+      });
     });
     setReasoningEffort((current) => {
       if (reasoningEffortOptionsForRunner(nextRunner).includes(current)) return current;
@@ -3274,10 +3337,15 @@ export function App(): JSX.Element {
 
   function applyRunConfigToControls(nextRunner: RunRunner, nextModel?: string, nextReasoningEffort?: ReasoningEffort): void {
     setRunnerState(nextRunner);
+    if (nextRunner !== "cursor") setAskMode(false);
     if (nextModel?.trim()) {
       setModel(nextModel);
     } else {
-      setModel(nextRunner === "claude" ? defaultClaudeModel : defaultCodexModel);
+      setModel(defaultModelForRunner(nextRunner, {
+        codex: defaultCodexModel,
+        claude: defaultClaudeModel,
+        cursor: defaultCursorModel,
+      }));
     }
     setReasoningEffort((current) => {
       const nextEffort = nextReasoningEffort && reasoningEffortOptionsForRunner(nextRunner).includes(nextReasoningEffort)
@@ -3288,8 +3356,8 @@ export function App(): JSX.Element {
   }
 
   useEffect(() => {
-    setNewSessionUseCustomModel(!modelOptionsForRunner(runner).includes(model));
-  }, [model, runner]);
+    setNewSessionUseCustomModel(!modelOptionsForRunner(runner, cursorModels).includes(model));
+  }, [model, runner, cursorModels]);
 
   useEffect(() => {
     if (isDraftSession || !selectedRunRecord) return;
@@ -3304,6 +3372,7 @@ export function App(): JSX.Element {
     overrides?: {
       attachments?: AttachmentRef[];
       planMode?: boolean;
+      askMode?: boolean;
       sandbox?: SandboxMode;
       approvalPolicy?: ApprovalPolicy;
       skills?: SelectedSkillRef[];
@@ -3311,6 +3380,7 @@ export function App(): JSX.Element {
     },
   ): QueuedMessage {
     const planMode = overrides?.planMode ?? shouldUsePlanMode(sessionKey);
+    const nextAskMode = Boolean(overrides?.askMode ?? (sessionKey === draftSessionKey ? askMode : false)) && !planMode;
     const existingSession = allSessions.find((session) => session.id === sessionKey);
     const requestRunner = sessionKey === draftSessionKey ? runner : (existingSession?.runner || runner);
     const requestModel =
@@ -3320,9 +3390,11 @@ export function App(): JSX.Element {
           ? existingSession.model
           : selectedRunRecord?.config.runner === requestRunner && selectedRunRecord.config.model
             ? selectedRunRecord.config.model
-            : requestRunner === "claude"
-              ? defaultClaudeModel
-              : defaultCodexModel;
+            : defaultModelForRunner(requestRunner, {
+              codex: defaultCodexModel,
+              claude: defaultClaudeModel,
+              cursor: defaultCursorModel,
+            });
     const requestReasoningEffort =
       requestRunner === runner && reasoningEffortOptionsForRunner(requestRunner).includes(reasoningEffort)
         ? reasoningEffort
@@ -3341,9 +3413,10 @@ export function App(): JSX.Element {
       runner: requestRunner,
       model: requestModel,
       reasoningEffort: requestReasoningEffort,
-      sandbox: overrides?.sandbox ?? (planMode ? "read-only" : sandbox),
-      approvalPolicy: overrides?.approvalPolicy ?? (planMode ? "never" : approvalPolicy),
+      sandbox: overrides?.sandbox ?? (planMode || nextAskMode ? "read-only" : sandbox),
+      approvalPolicy: overrides?.approvalPolicy ?? (planMode || nextAskMode ? "never" : approvalPolicy),
       planMode,
+      askMode: nextAskMode,
       skills: readSelectedSkillRefs(overrides?.skills ?? selectedSkills.map(selectedSkillRef)),
       agents: readSelectedAgentRefs(overrides?.agents ?? selectedPromptAgents.map(selectedAgentRef)),
     };
@@ -3399,6 +3472,7 @@ export function App(): JSX.Element {
       sandbox: request.sandbox,
       approvalPolicy: request.approvalPolicy,
       planMode: request.planMode,
+      askMode: request.askMode,
       skills: request.skills,
       agents: request.agents,
       sessionId: request.sessionKey === draftSessionKey ? undefined : request.sessionKey,
@@ -3488,6 +3562,7 @@ export function App(): JSX.Element {
       sessionKey?: string;
       attachments?: AttachmentRef[];
       planMode?: boolean;
+      askMode?: boolean;
       sandbox?: SandboxMode;
       approvalPolicy?: ApprovalPolicy;
       skills?: SelectedSkillRef[];
@@ -3503,6 +3578,7 @@ export function App(): JSX.Element {
     const request = buildQueuedMessage(sessionKey, promptValue, {
       attachments: options?.attachments,
       planMode: options?.planMode,
+      askMode: options?.askMode,
       sandbox: options?.sandbox,
       approvalPolicy: options?.approvalPolicy,
       skills: options?.skills,
@@ -4455,6 +4531,9 @@ export function App(): JSX.Element {
             reasoningEffort={reasoningEffort}
             setReasoningEffort={setReasoningEffort}
             claudeEffortFlagSupported={claudeEffortFlagSupported}
+            cursorModels={cursorModels}
+            askMode={askMode}
+            setAskMode={setAskMode}
             rightPanelTab={rightPanelTab}
             rightDockOpen={rightDockOpen}
             onOpenRightPanel={(tab) => {
@@ -4539,6 +4618,7 @@ export function App(): JSX.Element {
             setModel={setModel}
             reasoningEffort={reasoningEffort}
             setReasoningEffort={setReasoningEffort}
+            cursorModels={cursorModels}
             sandbox={sandbox}
             setSandbox={setSandbox}
             theme={theme}
@@ -4585,7 +4665,7 @@ export function App(): JSX.Element {
               </Button>
             </div>
 
-            <div className="grid gap-2 sm:grid-cols-2">
+            <div className="grid gap-2 sm:grid-cols-3">
               <Button
                 type="button"
                 variant={runner === "codex" ? "primary" : "ghost"}
@@ -4610,11 +4690,47 @@ export function App(): JSX.Element {
                   <span className="block truncate text-xs opacity-70">{runner === "claude" ? model : defaultClaudeModel}</span>
                 </span>
               </Button>
+              <Button
+                type="button"
+                variant={runner === "cursor" ? "primary" : "ghost"}
+                className="h-16 justify-start gap-3 rounded-md border border-card-border px-3 text-left"
+                onClick={() => setRunner("cursor")}
+                disabled={!cursorAvailable && cursorModels.length === 0}
+                title={cursorAvailable ? "Cursor Agent CLI" : "Cursor CLI not detected on server; you can still select it if the host will install it"}
+              >
+                <Sparkles className="h-5 w-5 shrink-0" />
+                <span className="min-w-0">
+                  <span className="block text-sm font-semibold">Cursor</span>
+                  <span className="block truncate text-xs opacity-70">{runner === "cursor" ? model : defaultCursorModel}</span>
+                </span>
+              </Button>
             </div>
 
             <div className="mt-4 space-y-3">
               <div>
-                <label className="mb-1 block text-xs font-semibold text-foreground/75">Model</label>
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <label className="block text-xs font-semibold text-foreground/75">Model</label>
+                  {runner === "cursor" ? (
+                    <button
+                      type="button"
+                      className="text-[11px] text-brand hover:underline"
+                      onClick={() => {
+                        void (async () => {
+                          try {
+                            const payload = await getCursorModels();
+                            setCursorAvailable(payload.available);
+                            setCursorModels(payload.models);
+                            setDefaultCursorModel(payload.defaultModel || defaultCursorModel);
+                          } catch {
+                            // ignore refresh errors in dialog
+                          }
+                        })();
+                      }}
+                    >
+                      Refresh models
+                    </button>
+                  ) : null}
+                </div>
                 <select
                   className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
                   value={newSessionUseCustomModel ? "__custom__" : model}
@@ -4628,7 +4744,7 @@ export function App(): JSX.Element {
                     setModel(next);
                   }}
                 >
-                  {modelOptionsForRunner(runner).map((modelOption) => (
+                  {modelOptionsForRunner(runner, cursorModels).map((modelOption) => (
                     <option key={modelOption} value={modelOption}>
                       {modelOption}
                     </option>
@@ -4640,7 +4756,13 @@ export function App(): JSX.Element {
                     className="mt-2 h-9 w-full rounded-md border border-card-border bg-control px-3 text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
                     value={model}
                     onChange={(event) => setModel(event.target.value)}
-                    placeholder={runner === "claude" ? "Enter Claude model id" : "Enter Codex model id"}
+                    placeholder={
+                      runner === "claude"
+                        ? "Enter Claude model id"
+                        : runner === "cursor"
+                          ? "Enter Cursor model id"
+                          : "Enter Codex model id"
+                    }
                   />
                 ) : null}
               </div>
@@ -4653,10 +4775,16 @@ export function App(): JSX.Element {
                       env fallback
                     </span>
                   ) : null}
+                  {runner === "cursor" && !cursorModelSupportsEffort(model, cursorModels) ? (
+                    <span className="text-[11px] text-foreground/55" title="This Cursor model has no effort control.">
+                      not supported
+                    </span>
+                  ) : null}
                 </div>
                 <select
-                  className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                  className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 disabled:opacity-50"
                   value={reasoningEffort}
+                  disabled={runner === "cursor" && !cursorModelSupportsEffort(model, cursorModels)}
                   onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}
                 >
                   {reasoningEffortOptionsForRunner(runner).map((option) => (
@@ -4729,6 +4857,7 @@ export function App(): JSX.Element {
                 setModel={setModel}
                 reasoningEffort={reasoningEffort}
                 setReasoningEffort={setReasoningEffort}
+                cursorModels={cursorModels}
                 sandbox={sandbox}
                 setSandbox={setSandbox}
                 theme={theme}
@@ -5264,6 +5393,9 @@ type CenterPanelProps = {
   reasoningEffort: ReasoningEffort;
   setReasoningEffort: (value: ReasoningEffort) => void;
   claudeEffortFlagSupported: boolean;
+  cursorModels: CursorModelInfo[];
+  askMode: boolean;
+  setAskMode: (value: boolean) => void;
   rightPanelTab: DockTab;
   rightDockOpen: boolean;
   onOpenRightPanel: (tab: DockTab) => void;
@@ -5355,10 +5487,11 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
   };
   const selectedSessionBusy = Boolean(props.selectedSession && !props.selectedSession.historyOnly && (props.selectedSession.status === "queued" || props.selectedSession.status === "running"));
   const attachmentDropDisabled = props.submitting || props.isUploadingAttachments;
-  const composerModelOptions = modelOptionsForRunner(props.runner);
+  const composerModelOptions = modelOptionsForRunner(props.runner, props.cursorModels);
   const composerModelSelectOptions = composerModelOptions.includes(props.model)
     ? composerModelOptions
     : [props.model, ...composerModelOptions];
+  const composerEffortSupported = props.runner !== "cursor" || cursorModelSupportsEffort(props.model, props.cursorModels);
   const composerRunnerLabel = runnerLabel(props.runner);
   const composerDirection = useMemo(
     () => (props.prompt.trim() ? resolveTextDirection(props.prompt) : "auto"),
@@ -5749,12 +5882,13 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               ))}
             </select>
             <select
-              className="h-6 appearance-none rounded-md border-0 bg-control px-2 text-xs text-foreground outline-none hover:bg-control-hover focus:ring-2 focus:ring-brand/20"
+              className="h-6 appearance-none rounded-md border-0 bg-control px-2 text-xs text-foreground outline-none hover:bg-control-hover focus:ring-2 focus:ring-brand/20 disabled:opacity-50"
               style={{ width: compactSelectWidth(reasoningEffortLabel(props.reasoningEffort)) }}
               value={props.reasoningEffort}
+              disabled={!composerEffortSupported}
               onChange={(event) => props.setReasoningEffort(event.target.value as ReasoningEffort)}
               aria-label="Thinking effort"
-              title="Thinking effort"
+              title={composerEffortSupported ? "Thinking effort" : "This Cursor model has no effort control"}
             >
               {reasoningEffortOptionsForRunner(props.runner).map((option) => (
                 <option key={option} value={option}>
@@ -5767,7 +5901,37 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                 env fallback
               </span>
             ) : null}
+            {props.runner === "cursor" ? (
+              <button
+                type="button"
+                className={cn(
+                  "h-6 rounded-md px-2 text-[11px] font-medium outline-none transition focus:ring-2 focus:ring-brand/20",
+                  props.askMode
+                    ? "bg-sky-500/15 text-sky-700 dark:text-sky-300"
+                    : "bg-control text-foreground/70 hover:bg-control-hover",
+                )}
+                onClick={() => props.setAskMode(!props.askMode)}
+                title="Cursor ask mode: read-only Q&A without edits"
+              >
+                Ask
+              </button>
+            ) : null}
           </div>
+
+          {props.askMode && props.runner === "cursor" && props.planSessionState === "idle" ? (
+            <div className="mb-2 flex items-start justify-between gap-3 rounded-md border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-sm text-foreground/80">
+              <span className="min-w-0">Ask mode is on. Cursor will answer in read-only mode without editing files.</span>
+              <button
+                type="button"
+                className="shrink-0 rounded-full p-1 text-foreground/60 transition hover:bg-black/5 hover:text-foreground focus:outline-none focus:ring-2 focus:ring-brand/30 dark:hover:bg-control-hover/70"
+                onClick={() => props.setAskMode(false)}
+                aria-label="Disable ask mode"
+                title="Disable ask mode"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          ) : null}
 
           {props.planSessionState !== "idle" ? (
             <div className="mb-2 flex items-start justify-between gap-3 rounded-md border border-brand/30 bg-brand-soft/40 px-3 py-2 text-sm text-foreground/80">
@@ -6163,6 +6327,7 @@ type ClaudeRightPanelProps = {
   setModel: (value: string) => void;
   reasoningEffort: ReasoningEffort;
   setReasoningEffort: (value: ReasoningEffort) => void;
+  cursorModels: CursorModelInfo[];
   sandbox: SandboxMode;
   setSandbox: (value: SandboxMode) => void;
   theme: "light" | "dark";
@@ -6192,10 +6357,11 @@ type ClaudeRightPanelProps = {
 };
 
 function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
-  const activeModelOptions = modelOptionsForRunner(props.runner);
+  const activeModelOptions = modelOptionsForRunner(props.runner, props.cursorModels);
   const [useCustomModel, setUseCustomModel] = useState(() => !activeModelOptions.includes(props.model));
   const [terminalHistoryCursor, setTerminalHistoryCursor] = useState<number | null>(null);
   const terminalRunning = props.selectedTerminal?.status === "running";
+  const effortSupported = props.runner !== "cursor" || cursorModelSupportsEffort(props.model, props.cursorModels);
   const terminalBusy = props.terminalAction === "starting" || props.terminalAction === "stopping";
   const selectedSessionSourceBadge = props.selectedSession ? getSessionSourceBadge(props.selectedSession) : null;
   const activeTabLabel = {
@@ -6204,10 +6370,10 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
   }[props.rightPanelTab];
 
   useEffect(() => {
-    if (!modelOptionsForRunner(props.runner).includes(props.model)) {
+    if (!modelOptionsForRunner(props.runner, props.cursorModels).includes(props.model)) {
       setUseCustomModel(true);
     }
-  }, [props.model, props.runner]);
+  }, [props.model, props.runner, props.cursorModels]);
 
   useEffect(() => {
     if (props.rightPanelTab !== "terminal") return;
@@ -6434,7 +6600,7 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
                 <>
                   <p className="mb-2 truncate font-mono text-[11px] text-foreground/65" title={props.selectedSession.sessionId}>{props.selectedSession.sessionId}</p>
                   <p className="mb-2 text-xs text-foreground/70">{describeSessionMeta(props.selectedSession)}</p>
-                  <p className="mb-2 text-xs text-foreground/60">runner: {props.selectedSession.runner === "claude" ? "Claude Code" : "Codex"} | source: {props.selectedSession.sourceRaw || props.selectedSession.sourceTag}</p>
+                  <p className="mb-2 text-xs text-foreground/60">runner: {runnerLabel(props.selectedSession.runner)} | source: {props.selectedSession.sourceRaw || props.selectedSession.sourceTag}</p>
                   <div className="mb-3 flex flex-wrap gap-2">
                     <Button size="sm" variant="ghost" disabled={props.tokenUsageLoading} onClick={() => void props.onLoadTokenUsage(props.selectedSession!.sessionId)}>
                       {props.tokenUsageLoading ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
@@ -6471,7 +6637,7 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
               <h3 className="mb-2 text-sm font-semibold">Run defaults</h3>
               <div className="space-y-2">
                 <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.runner} onChange={(event) => props.setRunner(event.target.value as RunRunner)}>
-                  {runnerOptions.map((runnerOption) => <option key={runnerOption} value={runnerOption}>{runnerOption === "claude" ? "Claude Code" : "Codex"}</option>)}
+                  {runnerOptions.map((runnerOption) => <option key={runnerOption} value={runnerOption}>{runnerLabel(runnerOption)}</option>)}
                 </select>
                 <select
                   className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none"
@@ -6490,7 +6656,7 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
                   <option value="__custom__">Custom model...</option>
                 </select>
                 {useCustomModel ? <input className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.model} onChange={(event) => props.setModel(event.target.value)} placeholder="Custom model id" /> : null}
-                <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.reasoningEffort} onChange={(event) => props.setReasoningEffort(event.target.value as ReasoningEffort)}>
+                <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none disabled:opacity-50" value={props.reasoningEffort} disabled={!effortSupported} onChange={(event) => props.setReasoningEffort(event.target.value as ReasoningEffort)}>
                   {reasoningEffortOptionsForRunner(props.runner).map((option) => <option key={option} value={option}>{reasoningEffortLabel(option)}</option>)}
                 </select>
                 <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.sandbox} onChange={(event) => props.setSandbox(event.target.value as SandboxMode)}>
