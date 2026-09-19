@@ -212,8 +212,14 @@ function runnerLabel(runner: RunRunner): string {
   return "Codex";
 }
 
+function cursorModelIdIncludesEffort(model: string): boolean {
+  const base = model.replace(/\[[^\]]*\]\s*$/, "").trim().toLowerCase();
+  return /(?:^|-)(?:none|minimal|low|medium|high|xhigh|extra-high|max)(?:-fast)?$/.test(base);
+}
+
 function cursorModelSupportsEffort(model: string, cursorModels: CursorModelInfo[]): boolean {
   const base = model.replace(/\[[^\]]*\]\s*$/, "").trim().toLowerCase();
+  if (cursorModelIdIncludesEffort(base)) return false;
   const known = cursorModels.find((item) => item.id.toLowerCase() === base);
   if (known) return Boolean(known.supportsEffort);
   if (/^(auto|composer)/i.test(base)) return false;

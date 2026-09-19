@@ -2020,20 +2020,33 @@ function mapCursorEffort(effort: ReasoningEffort): "low" | "medium" | "high" {
   return "high";
 }
 
+/** Current Cursor CLI ids already encode effort, e.g. `gpt-5.6-sol-high-fast`. */
+function cursorModelIdIncludesEffort(model: string): boolean {
+  const base = model.replace(/\[[^\]]*\]\s*$/, "").trim().toLowerCase();
+  return /(?:^|-)(?:none|minimal|low|medium|high|xhigh|extra-high|max)(?:-fast)?$/.test(base);
+}
+
 function cursorModelSupportsEffort(model: string, catalog: CursorModelInfo[] = DEFAULT_CURSOR_MODELS): boolean {
   const base = model.replace(/\[[^\]]*\]\s*$/, "").trim().toLowerCase();
+  if (cursorModelIdIncludesEffort(base)) return false;
   const known = catalog.find((item) => item.id.toLowerCase() === base);
   if (known) return Boolean(known.supportsEffort);
   if (/^(auto|composer)/i.test(base)) return false;
   return true;
 }
 
-/** Encode Luma effort into Cursor CLI model bracket params when supported. */
+/**
+ * Pass `--list-models` ids through unchanged. Bracket params such as
+ * `model[effort=high]` are only for legacy base ids that are not themselves listed.
+ */
 function resolveCursorModelArg(model: string, effort: ReasoningEffort, catalog?: CursorModelInfo[]): string {
   const trimmed = model.trim();
   if (!trimmed) return DEFAULT_CURSOR_MODEL;
   if (/\[[^\]]*\]/.test(trimmed)) return trimmed;
-  if (!cursorModelSupportsEffort(trimmed, catalog)) return trimmed;
+  const models = catalog ?? DEFAULT_CURSOR_MODELS;
+  const listed = models.some((item) => item.id.toLowerCase() === trimmed.toLowerCase());
+  if (listed || cursorModelIdIncludesEffort(trimmed)) return trimmed;
+  if (!cursorModelSupportsEffort(trimmed, models)) return trimmed;
   return `${trimmed}[effort=${mapCursorEffort(effort)}]`;
 }
 
