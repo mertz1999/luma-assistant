@@ -1,0 +1,22 @@
+name: PI Clarification checks
+on:
+  pull_request:
+  push:
+    branches: [main, 'feature/pi-clarification-*']
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --include=dev
+      - run: npm run test:pi
+      - run: npm run demo:pi
+      - run: npm run demo:pi -- --ppo
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:pi:browser

@@ -1,4 +1,4 @@
-import { isValidElement, useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { lazy, Suspense, isValidElement, useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import Convert from "ansi-to-html";
 import ReactMarkdown from "react-markdown";
@@ -108,7 +108,9 @@ import { TaskManager } from "@/TaskManager";
 type StatusFilter = "all" | "running" | "completed" | "failed" | "stopped";
 type SessionFilterValue = StatusFilter | "all-history";
 type DockTab = "terminal" | "context";
-type SidebarMode = "code" | "agents";
+const PIClarification = lazy(() => import("./components/cowork/pi-clarification/PIClarification").then(module => ({ default: module.PIClarification })));
+
+type SidebarMode = "code" | "agents" | "cowork";
 type BackendConnectionStatus = "connecting" | "connected" | "disconnected";
 
 type DebugLogEntry = {
@@ -4525,7 +4527,7 @@ export function App(): JSX.Element {
         ) : null}
 
         <main className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-background lg:rounded-lg">
-          <CenterPanel
+          {sidebarMode === "cowork" ? <Suspense fallback={<p className="p-6 text-sm">Loading Cowork…</p>}><PIClarification /></Suspense> : <CenterPanel
             loading={loading || Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId] && timeline.length === 0)}
             loadingOlderMessages={Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId] && timeline.length > 0)}
             selectedSession={selectedSession}
@@ -4606,7 +4608,7 @@ export function App(): JSX.Element {
             onAnswerPlanQuestions={onAnswerPlanQuestions}
             onApprovePlanImplementation={onApprovePlanImplementation}
             onSubmitPlanFeedback={onSubmitPlanFeedback}
-          />
+          />}
         </main>
 
         {rightDockOpen ? (
@@ -5014,7 +5016,7 @@ function SessionsPanel({
             >
               <Bot className="h-3.5 w-3.5" /> Agents
             </button>
-            <button type="button" className="flex h-8 items-center justify-center gap-1.5 rounded px-2 text-foreground/60 hover:bg-control-hover">
+            <button type="button" onClick={() => setMode("cowork")} className={cn("flex h-8 items-center justify-center gap-1.5 rounded px-2 hover:bg-control-hover", mode === "cowork" ? "bg-control-hover font-medium text-foreground" : "text-foreground/60")}>
               <Bot className="h-3.5 w-3.5" /> Cowork
             </button>
             <button
@@ -5041,7 +5043,7 @@ function SessionsPanel({
           </Button>
         </div>
 
-        {mode === "code" ? (
+        {mode === "cowork" ? <div className="mt-4 rounded-md bg-surface-2 p-3 text-sm"><p className="font-medium">PI Clarification</p><p className="mt-2 text-xs text-foreground/60">Cases, specifications, scope approvals and test mode</p></div> : mode === "code" ? (
           <nav className="mt-3 space-y-1 text-sm">
             <button type="button" onClick={onNewSession} className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-foreground/85 hover:bg-control-hover">
               <span className="text-lg leading-none">+</span> New session

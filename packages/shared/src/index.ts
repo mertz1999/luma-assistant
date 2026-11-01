@@ -750,3 +750,7 @@ export type SseEvent = {
   sessionId?: string;
   payload?: Record<string, unknown>;
 };
+
+export * from "./pi-clarification.js";
+
+export * from "./pi-clarification-json.js";

@@ -133,3 +133,14 @@ deploy-status: install-pm2
 
 deploy-logs: install-pm2
 	$(PM2_BIN) logs --lines 150
+
+# Isolated PI test release; preserves the running Luma instance and locks all email sends.
+.PHONY: release-manual
+release-manual:
+	python3 scripts/pi-clarification-release.py prepare
+ifeq ($(PI_PREVIEW_NETWORK_ONLY),1)
+	python3 scripts/pi-clarification-release.py network
+else
+	npm run build
+	python3 scripts/pi-clarification-release.py publish
+endif

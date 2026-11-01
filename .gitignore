@@ -16,3 +16,7 @@ inc/images/Screenshot 2026-05-27 at 11.*
 # Local environment backups and generated audit reports.
 .env.bak*
 reports/
+
+# Browser test artifacts
+/test-results/
+/playwright-report/
