@@ -80,6 +80,8 @@ export class PIStore {
         CREATE TABLE IF NOT EXISTS pi_oauth_states(hash TEXT PRIMARY KEY,expires_at INTEGER NOT NULL);
         INSERT OR IGNORE INTO pi_migrations VALUES(1,strftime('%Y-%m-%dT%H:%M:%fZ','now'));
         INSERT OR IGNORE INTO pi_migrations VALUES(2,strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+        CREATE TABLE IF NOT EXISTS pi_thread_eligibility(mailbox TEXT NOT NULL,thread_id TEXT NOT NULL,required_sender TEXT NOT NULL,anchor_id TEXT NOT NULL,verified_at TEXT NOT NULL,PRIMARY KEY(mailbox,thread_id));
+        INSERT OR IGNORE INTO pi_migrations VALUES(3,strftime('%Y-%m-%dT%H:%M:%fZ','now'));
         CREATE TABLE IF NOT EXISTS pi_job_effects(job_id TEXT PRIMARY KEY,completed_at TEXT NOT NULL);
       `);
       })
@@ -216,7 +218,9 @@ export class PIStore {
   detail(caseId: string): PICaseDetail {
     return {
       case: this.getCase(caseId),
-      messages: this.payloads<PIMessage>("pi_messages", caseId),
+      messages: this.payloads<PIMessage>("pi_messages", caseId).sort((a, b) =>
+        a.date.localeCompare(b.date),
+      ),
       events: this.events(caseId).reverse(),
       specs: this.payloads<PISpecRecord>("pi_specs", caseId),
       approvals: this.payloads<PIApprovalRecord>("pi_approvals", caseId),

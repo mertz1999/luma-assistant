@@ -1,3 +1,4 @@
+import { threadAuthorized } from "./thread-policy.js";
 import {
   PIImplementationTaskSchema,
   type PIImplementationTask,
@@ -16,6 +17,10 @@ export class HandoffService {
   publish(caseId: string, standingId?: string): PIImplementationTask {
     return this.store.tx(() => {
       let c = this.store.getCase(caseId);
+      requirePolicy(
+        c.demo || threadAuthorized(this.store, c.mailbox, c.threadId),
+        "Thread no longer meets the required sender policy",
+      );
       const r = this.workflow.currentSpec(caseId),
         s = this.store.settings();
       const detail = this.store.detail(caseId);
@@ -108,9 +113,9 @@ export class HandoffService {
           "Regression must restore the exact historical approved behavior and test boundaries",
         );
         requirePolicy(
-          detail.messages.every((m) =>
-            (r.sourceMessageIds || []).includes(m.id),
-          ),
+          detail.messages
+            .filter((m) => m.direction !== "outgoing")
+            .every((m) => (r.sourceMessageIds || []).includes(m.id)),
           "New client messages require specification review before standing authorization",
         );
         const evidenceIds = detail.investigations.flatMap((x) =>
@@ -171,11 +176,13 @@ export class HandoffService {
           "Conflicting approval/rejection requires escalation",
         );
         requirePolicy(
-          detail.messages.every(
-            (m) =>
-              (r.sourceMessageIds || []).includes(m.id) ||
-              m.id === approval.approvalReplyGmailMessageId,
-          ),
+          detail.messages
+            .filter((m) => m.direction !== "outgoing")
+            .every(
+              (m) =>
+                (r.sourceMessageIds || []).includes(m.id) ||
+                m.id === approval.approvalReplyGmailMessageId,
+            ),
           "New client messages require specification review before handoff",
         );
         requirePolicy(

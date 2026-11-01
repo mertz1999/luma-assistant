@@ -29,3 +29,7 @@ The source and initial mock-only validation are in PR #3. This follow-up adds th
 ## Verification
 
 The live HTTPS route and existing-password login work; anonymous PI API calls return 401. Read-only Gmail connection and successful metadata checks are visible, and the live case database has no ingested email bodies. Mocked AR replay, complete approved task download, send-lock display, real federation settings and mobile layout are checked in the public preview. The Browser plugin was unavailable, so rendered validation used the repository's Playwright workflow and an additional public-URL Playwright smoke run.
+
+## Current operating state update
+
+The owner subsequently requested the production inbox, the LNQCore sender gate and removal of samples. The same URL now runs receive-only production intake; demo controls/endpoints are disabled and the sample database is deleted. Use [the current live inbox guide](pi-clarification-live-inbox.md), rather than the earlier replay steps above. Sending remains locked.

@@ -170,17 +170,21 @@ export function PIClarification(): JSX.Element {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <button
-            className={buttonClass}
-            disabled={busy}
-            onClick={() => {
-              setSelected(null);
-              setDemo(!demo);
-              setNotice("");
-            }}
-          >
-            {demo ? "Open real mailbox workspace" : "Open test workspace"}
-          </button>
+          {status?.demoAvailable === true ? (
+            <>
+              <button
+                className={buttonClass}
+                disabled={busy}
+                onClick={() => {
+                  setSelected(null);
+                  setDemo(!demo);
+                  setNotice("");
+                }}
+              >
+                {demo ? "Open real mailbox workspace" : "Open test workspace"}
+              </button>
+            </>
+          ) : null}
           <button
             className={buttonClass}
             disabled={busy || !status}
@@ -226,6 +230,13 @@ export function PIClarification(): JSX.Element {
           available.
         </p>
       ) : null}
+      {status?.requiredThreadSender ? (
+        <p className="mb-3 rounded border border-card-border p-3 text-sm">
+          Production mailbox: only threads containing an actual message from{" "}
+          <strong>{status.requiredThreadSender}</strong> are admitted. To/CC,
+          display names and quoted text do not qualify a thread.
+        </p>
+      ) : null}
       {error ? (
         <div
           role="alert"
@@ -247,7 +258,12 @@ export function PIClarification(): JSX.Element {
         className="mb-5 flex flex-wrap gap-2"
         aria-label="PI workspace views"
       >
-        {["cases", "settings", "test mode", "operations"].map((t) => (
+        {[
+          "cases",
+          "settings",
+          ...(status?.demoAvailable === true ? ["test mode"] : []),
+          "operations",
+        ].map((t) => (
           <button
             key={t}
             aria-current={tab === t ? "page" : undefined}
@@ -369,8 +385,9 @@ export function PIClarification(): JSX.Element {
               <div className="space-y-2">
                 {cases.length === 0 ? (
                   <p className="text-sm text-foreground/65">
-                    No cases match. Configure an allowlisted mailbox or run a
-                    synthetic example in Test mode.
+                    {status?.demoAvailable === false
+                      ? "No qualifying production threads yet. Send from the required sender or reply within an existing qualifying thread, then wait for polling or use Poll Gmail now."
+                      : "No cases match. Configure an allowlisted mailbox or run a synthetic example in Test mode."}
                   </p>
                 ) : (
                   cases.map((c) => (
@@ -399,6 +416,7 @@ export function PIClarification(): JSX.Element {
                 busy={busy}
                 settings={settings}
                 sendLocked={status?.sendLocked !== false}
+                receiveOnly={status?.receiveOnly === true}
                 act={act}
               />
             ) : (
@@ -515,6 +533,7 @@ function CaseDetail({
   busy,
   settings,
   sendLocked,
+  receiveOnly,
   act,
 }: {
   detail: PICaseDetail;
@@ -522,6 +541,7 @@ function CaseDetail({
   busy: boolean;
   settings: PISettings | null;
   sendLocked: boolean;
+  receiveOnly: boolean;
   act: Act;
 }) {
   const [view, setView] = useState("thread"),
@@ -602,7 +622,11 @@ function CaseDetail({
               className="rounded border border-card-border p-3"
             >
               <p className="text-xs text-foreground/60">
-                {m.from} · {new Date(m.date).toLocaleString()} ·{" "}
+                {m.from} ·{" "}
+                {m.direction === "outgoing"
+                  ? "Mailbox sent / context"
+                  : "Incoming"}{" "}
+                · {new Date(m.date).toLocaleString()} ·{" "}
                 {m.identityVerified
                   ? "Transport identity verified"
                   : "Identity unverified"}
@@ -757,8 +781,9 @@ function CaseDetail({
             </>
           ) : (
             <p className="text-sm">
-              No specification yet. Request a draft after the evidence is
-              sufficient.
+              {receiveOnly
+                ? "Emails are received locally. AI specification drafting is disabled in receive-only mode."
+                : "No specification yet. Request a draft after the evidence is sufficient."}
             </p>
           )}
         </div>
@@ -946,7 +971,7 @@ function CaseDetail({
         <div className="space-y-3">
           <button
             className={buttonClass}
-            disabled={busy}
+            disabled={busy || receiveOnly}
             onClick={() =>
               void act(
                 () => piRequest(`/cases/${d.case.id}/run`, mutation(), demo),

@@ -118,8 +118,11 @@ export function registerPI(
   app: express.Express,
   options: { root: string; secret: string; authConfigured: boolean },
 ) {
-  const live = new PIService({ root: options.root }),
-    demo = new PIService({ root: options.root, demo: true });
+  const demoEnabled = process.env.PI_CLARIFICATION_DEMO_ENABLED !== "false";
+  const live = new PIService({ root: options.root });
+  const demo = demoEnabled
+    ? new PIService({ root: options.root, demo: true })
+    : null;
   const base = "/api/cowork/pi-clarification";
   // Public delivery is authenticated independently; never exempt the dashboard from owner auth.
   app.post(
@@ -259,7 +262,16 @@ export function registerPI(
     }
     next();
   });
-  const service = (req: Request) => (req.query.demo === "1" ? demo : live);
+  const service = (req: Request): PIService => {
+    if (req.query.demo === "1") {
+      requirePolicy(
+        demo,
+        "Demo workspace is disabled on this production-mail instance",
+      );
+      return demo;
+    }
+    return live;
+  };
   router.get(
     "/schemas",
     wrap((_req, res) => ok(res, PIExternalSchemas)),
@@ -287,6 +299,17 @@ export function registerPI(
             settings.killSwitch &&
             settings.sendDryRun),
         "Deployment send lock prevents autonomous mode or disabling safety switches",
+      );
+      requirePolicy(
+        !process.env.PI_GMAIL_REQUIRED_THREAD_SENDER ||
+          settings.requiredThreadSender ===
+            process.env.PI_GMAIL_REQUIRED_THREAD_SENDER.toLowerCase(),
+        "The required thread sender is locked by deployment configuration",
+      );
+      requirePolicy(
+        process.env.PI_CLARIFICATION_RECEIVE_ONLY !== "true" ||
+          settings.receiveOnly,
+        "Receive-only operation is locked by deployment configuration",
       );
       requirePolicy(!svc.demo, "Demo settings are managed by fixtures");
       ok(res, svc.store.saveSettings(settings, "admin"));
@@ -585,12 +608,20 @@ export function registerPI(
         .object({ scenario: z.enum(["ar", "ppo"]) })
         .strict()
         .parse(_req.body);
+      requirePolicy(
+        demo,
+        "Demo replay is disabled on this production-mail instance",
+      );
       ok(res, await demo.replay(body.scenario));
     }),
   );
   router.post(
     "/simulate-reply",
     wrap(async (req, res) => {
+      requirePolicy(
+        demo,
+        "Demo simulation is disabled on this production-mail instance",
+      );
       requirePolicy(
         service(req) === demo,
         "Simulated replies require demo mode",
@@ -809,7 +840,7 @@ export function registerPI(
     live,
     demo,
     stop: async () => {
-      await Promise.all([live.stop(), demo.stop()]);
+      await Promise.all([live.stop(), demo?.stop()]);
     },
   };
 }

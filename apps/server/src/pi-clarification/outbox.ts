@@ -1,3 +1,4 @@
+import { threadAuthorized } from "./thread-policy.js";
 import type { PIOutboxRecord } from "@luma/shared";
 import { PIStore, id, digest } from "./store.js";
 import {
@@ -24,6 +25,14 @@ export class OutboxService {
     return this.store.tx(() => {
       const c = this.store.getCase(caseId),
         s = this.store.settings();
+      requirePolicy(
+        c.demo || !s.receiveOnly,
+        "Inbox receive-only mode prohibits preparing client emails",
+      );
+      requirePolicy(
+        c.demo || threadAuthorized(this.store, c.mailbox, c.threadId),
+        "Thread does not meet the required sender policy",
+      );
       const recipients = recipientsFor(
         contactIds,
         c.workflow,

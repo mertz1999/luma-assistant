@@ -49,7 +49,11 @@ export function redactTree<T>(value: T): T {
     ) as T;
   return value;
 }
-export function allowedInbound(m: PIMessage, s: PISettings): boolean {
+export function allowedInbound(
+  m: PIMessage,
+  s: PISettings,
+  authorizedThread = false,
+): boolean {
   const from = m.from.toLowerCase();
   if (
     from === s.mailbox.toLowerCase() ||
@@ -67,7 +71,8 @@ export function allowedInbound(m: PIMessage, s: PISettings): boolean {
     return false;
   const domain = from.split("@")[1];
   return (
-    s.allowedSenders.includes(from) ||
+    authorizedThread ||
+    s.allowedSenders.map((x) => x.toLowerCase()).includes(from) ||
     s.allowedDomains.includes(domain) ||
     s.contacts.some((c) => c.active && c.canClarify && c.address === from)
   );
@@ -135,6 +140,10 @@ export function checkSend(
     "Outbound email is locked by the deployment administrator",
   );
   requirePolicy(!c.demo, "Demo messages cannot use live Gmail");
+  requirePolicy(
+    !s.receiveOnly,
+    "Inbox receive-only mode prohibits email sending",
+  );
   requirePolicy(
     s.mode === "autonomous" && !s.paused && !s.killSwitch && !s.sendDryRun,
     "Autonomous sends are disabled",

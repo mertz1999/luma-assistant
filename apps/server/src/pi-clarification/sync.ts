@@ -1,6 +1,10 @@
 import { PIStore } from "./store.js";
 import { GmailError, type GmailClient } from "./gmail.js";
 import { requirePolicy, requirePrivacy } from "./policy.js";
+import {
+  requiredThreadSender,
+  recordThreadEligibility,
+} from "./thread-policy.js";
 import type { PIMessage } from "@luma/shared";
 
 export class GmailSyncWorker {
@@ -11,28 +15,33 @@ export class GmailSyncWorker {
     readonly topic = process.env.PI_GMAIL_PUBSUB_TOPIC || "",
   ) {}
   async sync() {
-    const s = this.store.settings();
+    const s = this.store.settings(),
+      sender = requiredThreadSender(s);
     requirePolicy(
       !s.paused && !["disabled", "replay"].includes(s.mode),
       "Live sync is paused/disabled or replay only",
     );
     const mailbox = this.store.mailbox();
     requirePolicy(mailbox?.connected, "Gmail not connected");
+    const query = sender ? `(${s.gmailQuery}) from:${sender}` : s.gmailQuery;
+    const processed = new Set<string>();
     try {
       if (
-        !s.privacyReviewed ||
-        !s.providerAgreementsConfirmed ||
-        !s.dataPolicyReference ||
-        (!s.allowedSenders.length &&
-          !s.allowedDomains.length &&
-          !s.contacts.some((c) => c.active && c.canClarify))
+        !s.receiveOnly &&
+        (!s.privacyReviewed ||
+          !s.providerAgreementsConfirmed ||
+          !s.dataPolicyReference ||
+          (!sender &&
+            !s.allowedSenders.length &&
+            !s.allowedDomains.length &&
+            !s.contacts.some((c) => c.active && c.canClarify)))
       ) {
         const profile = await this.gmail.profile();
         requirePolicy(
           profile.emailAddress.toLowerCase() === s.mailbox.toLowerCase(),
           "Connected Google account does not match configured mailbox",
         );
-        const ids = await this.gmail.listMessages(s.gmailQuery, s.gmailLabels);
+        const ids = await this.gmail.listMessages(query, s.gmailLabels);
         this.store.db
           .prepare(
             "UPDATE pi_mailboxes SET last_sync=?,last_error=NULL WHERE address=?",
@@ -41,56 +50,96 @@ export class GmailSyncWorker {
         this.store.event(null, "GMAIL_METADATA_CHECK", "sync", {
           mailbox: s.mailbox,
           matchedIdentifiers: ids.messages?.length || 0,
+          requiredThreadSender: sender,
           messageBodiesRead: false,
           modelInvoked: false,
           cursorAdvanced: false,
         });
         return;
       }
-      requirePrivacy(s);
-      let nextCursor = mailbox.cursor;
-      // Initial/recovery profile cursor is captured BEFORE bounded enumeration to avoid missing arrivals during it.
+      if (!s.receiveOnly) requirePrivacy(s);
+      const processThread = async (
+        threadId: string,
+        historyDelivery = false,
+      ) => {
+        if (processed.has(threadId)) return;
+        processed.add(threadId);
+        if (sender) {
+          // Read only headers to decide eligibility. Never fetch an excluded thread's body.
+          const metadata = await this.gmail.getThreadMetadata(threadId);
+          if (!recordThreadEligibility(this.store, metadata, threadId)) return;
+          const messages = await this.gmail.getThread(threadId);
+          for (const message of messages) this.ingest(message);
+          // Preserve older mailbox-sent context after the first incoming message creates the case.
+          for (const message of messages)
+            if (
+              message.from.toLowerCase() === s.mailbox.toLowerCase() ||
+              message.labels.includes("SENT")
+            )
+              this.ingest(message);
+          return;
+        }
+        const messages = await this.gmail.getThread(threadId);
+        const known = this.store.db
+          .prepare("SELECT 1 FROM pi_cases WHERE mailbox=? AND thread_id=?")
+          .get(s.mailbox, threadId);
+        for (const message of messages) {
+          if (!historyDelivery || known) {
+            this.ingest(message);
+            continue;
+          }
+          if (
+            s.gmailLabels.length &&
+            !message.labels.some((l) => s.gmailLabels.includes(l))
+          )
+            continue;
+          const match = await this.gmail.listMessages(
+            `(${s.gmailQuery}) rfc822msgid:${message.rfcMessageId.replace(/[<>]/g, "")}`,
+            s.gmailLabels,
+          );
+          if (match.messages?.some((m) => m.id === message.id))
+            this.ingest(message);
+        }
+      };
       const full = async () => {
         const profile = await this.gmail.profile();
         requirePolicy(
-          profile.emailAddress.toLowerCase() === s.mailbox,
+          profile.emailAddress.toLowerCase() === s.mailbox.toLowerCase(),
           "Connected Google account does not match configured mailbox",
         );
         let page: string | undefined;
         const threads = new Set<string>();
         for (let n = 0; n < 5; n++) {
-          const response = await this.gmail.listMessages(
-            s.gmailQuery,
+          const result = await this.gmail.listMessages(
+            query,
             s.gmailLabels,
             page,
           );
-          for (const message of response.messages || [])
-            threads.add(message.threadId);
-          page = response.nextPageToken;
+          for (const m of result.messages || []) threads.add(m.threadId);
+          page = result.nextPageToken;
           if (!page) break;
         }
         requirePolicy(
           !page,
           "Recovery exceeds 500 messages; narrow Gmail filter before retrying (cursor not advanced)",
         );
-        for (const thread of threads)
-          for (const message of await this.gmail.getThread(thread))
-            this.ingest(message);
+        for (const threadId of threads) await processThread(threadId);
         return profile.historyId;
       };
+      let nextCursor = mailbox.cursor;
       if (!nextCursor) nextCursor = await full();
       else {
         try {
-          let page: string | undefined;
+          let page: string | undefined,
+            exhausted = false;
           const threads = new Set<string>();
-          let exhausted = false;
           for (let n = 0; n < 10; n++) {
-            const response = await this.gmail.history(mailbox.cursor!, page);
-            for (const entry of response.history || [])
+            const result = await this.gmail.history(mailbox.cursor!, page);
+            for (const entry of result.history || [])
               for (const added of entry.messagesAdded || [])
                 threads.add(added.message.threadId);
-            nextCursor = response.historyId;
-            page = response.nextPageToken;
+            nextCursor = result.historyId;
+            page = result.nextPageToken;
             if (!page) {
               exhausted = true;
               break;
@@ -100,30 +149,7 @@ export class GmailSyncWorker {
             exhausted,
             "History exceeds bounded batch; cursor retained, operator intervention required",
           );
-          // Apply search/label filtering to changed threads, including later replies to known cases.
-          for (const thread of threads) {
-            const known = this.store.db
-              .prepare("SELECT 1 FROM pi_cases WHERE mailbox=? AND thread_id=?")
-              .get(s.mailbox, thread);
-            const messages = await this.gmail.getThread(thread);
-            if (known) {
-              for (const message of messages) this.ingest(message);
-            } else {
-              for (const message of messages) {
-                if (
-                  s.gmailLabels.length &&
-                  !message.labels.some((x) => s.gmailLabels.includes(x))
-                )
-                  continue;
-                const match = await this.gmail.listMessages(
-                  `(${s.gmailQuery}) rfc822msgid:${message.rfcMessageId.replace(/[<>]/g, "")}`,
-                  s.gmailLabels,
-                );
-                if (match.messages?.some((x) => x.id === message.id))
-                  this.ingest(message);
-              }
-            }
-          }
+          for (const threadId of threads) await processThread(threadId, true);
         } catch (error) {
           if (error instanceof GmailError && error.status === 404) {
             this.store.event(null, "GMAIL_HISTORY_RECOVERY", "sync", {
@@ -133,13 +159,11 @@ export class GmailSyncWorker {
           } else throw error;
         }
       }
-      // Partial history doesn't support q. Reconcile the bounded query every successful pass as well.
-      const recent = await this.gmail.listMessages(s.gmailQuery, s.gmailLabels);
-      for (const thread of new Set(
+      const recent = await this.gmail.listMessages(query, s.gmailLabels);
+      for (const threadId of new Set(
         (recent.messages || []).map((m) => m.threadId),
       ))
-        for (const message of await this.gmail.getThread(thread))
-          this.ingest(message);
+        await processThread(threadId);
       const renewed = this.store
         .events()
         .find(
@@ -169,11 +193,7 @@ export class GmailSyncWorker {
         .run(nextCursor, this.store.at(), s.mailbox);
     } catch (error) {
       const reason =
-        error instanceof GmailError
-          ? error.message
-          : error instanceof Error
-            ? error.message
-            : "Gmail sync failed";
+        error instanceof Error ? error.message : "Gmail sync failed";
       this.store.db
         .prepare("UPDATE pi_mailboxes SET last_error=? WHERE address=?")
         .run(reason, s.mailbox);

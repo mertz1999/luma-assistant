@@ -33,3 +33,5 @@ Source: LUMA_PI_CLARIFICATION_CODEX_PROMPT.md (November 1, 2026), with the user'
 - No real email, paid model request, production data connection, external task publication, merge or deployment is part of verification.
 
 Follow-up: the user subsequently authorized a test deployment and reuse of the cluster email credentials. The existing Auth0/Google federation is now integrated and read-only Gmail access is live-verified. The test URL, operating mode and remaining policy/model setup are documented in [pi-clarification-test-preview.md](pi-clarification-test-preview.md). Earlier statements about missing Gmail credentials/no test instance describe the initial delivery, not the current verified preview.
+
+Current owner-requested live policy: the production mailbox is in receive-only mode, admits only threads with a real LNQCore@proimagetx.com sender message, has no demo data/replay access, and publishes the developer/client context into the effective prompt. See [the live inbox procedure](pi-clarification-live-inbox.md). Local receipt does not falsely attest model/provider privacy approval and never invokes a live model in this mode.

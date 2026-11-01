@@ -253,6 +253,7 @@ export class ClarificationAgentRuntime {
       thread: detail.messages
         .map((m) => ({
           evidenceId: m.id,
+          direction: m.direction || "incoming",
           body: sanitizeBody(m.body),
           at: m.date,
         }))

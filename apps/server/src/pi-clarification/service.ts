@@ -1,3 +1,4 @@
+import { requiredThreadSender } from "./thread-policy.js";
 import { FederatedGmailCredentials } from "./federation.js";
 import path from "node:path";
 import { type PIMessage, type PIStatus } from "@luma/shared";
@@ -107,6 +108,21 @@ export class PIService {
         },
         "demo-setup",
       );
+    if (!this.demo && process.env.PI_GMAIL_REQUIRED_THREAD_SENDER) {
+      const settings = this.store.settings(),
+        required = process.env.PI_GMAIL_REQUIRED_THREAD_SENDER.toLowerCase();
+      const receiveOnly =
+        process.env.PI_CLARIFICATION_RECEIVE_ONLY === "true" ||
+        settings.receiveOnly;
+      if (
+        settings.requiredThreadSender !== required ||
+        settings.receiveOnly !== receiveOnly
+      )
+        this.store.saveSettings(
+          { ...settings, requiredThreadSender: required, receiveOnly },
+          "deployment",
+        );
+    }
     this.vault = new CredentialVault(this.store);
     if (
       !this.demo &&
@@ -145,6 +161,7 @@ export class PIService {
             this.sendLocked,
             fetch,
             this.federation || undefined,
+            requiredThreadSender(this.store.settings()),
           ));
     this.workflow = new Workflow(this.store);
     this.outbox = new OutboxService(this.store, this.gmail, this.sendLocked);
@@ -220,6 +237,9 @@ export class PIService {
     );
     return {
       enabled: this.enabled || this.demo,
+      demoAvailable: process.env.PI_CLARIFICATION_DEMO_ENABLED !== "false",
+      requiredThreadSender: this.demo ? null : requiredThreadSender(s),
+      receiveOnly: s.receiveOnly,
       sendLocked: this.sendLocked || this.demo,
       paused: s.paused,
       mode: s.mode,
@@ -235,15 +255,17 @@ export class PIService {
         authenticationMode: this.federation ? "federated_readonly" : "oauth",
         processingBlockedReason: this.demo
           ? null
-          : !s.privacyReviewed ||
-              !s.providerAgreementsConfirmed ||
-              !s.dataPolicyReference
-            ? "Metadata-only polling: case processing requires reviewed privacy/provider policy"
-            : !s.allowedSenders.length &&
-                !s.allowedDomains.length &&
-                !s.contacts.some((c) => c.active && c.canClarify)
-              ? "Metadata-only polling: configure authorized PI senders/contacts"
-              : null,
+          : s.receiveOnly
+            ? "Inbox receive-only: eligible threads are stored locally. AI processing and replies are disabled"
+            : !s.privacyReviewed ||
+                !s.providerAgreementsConfirmed ||
+                !s.dataPolicyReference
+              ? "Metadata-only polling: case processing requires reviewed privacy/provider policy"
+              : !s.allowedSenders.length &&
+                  !s.allowedDomains.length &&
+                  !s.contacts.some((c) => c.active && c.canClarify)
+                ? "Metadata-only polling: configure authorized PI senders/contacts"
+                : null,
       },
       promptVersion: this.runtime.prompt().version,
       providerConfigured:

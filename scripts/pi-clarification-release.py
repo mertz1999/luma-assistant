@@ -28,7 +28,7 @@ def prepare():
                 except ValueError:previous[k]=v
     password=os.environ.get('PASSWORD') or previous.get('PASSWORD')
     if not password:raise RuntimeError('Existing Luma owner password is required')
-    settings={**{k:v for k,v in previous.items() if k.startswith(('PI_REASONER_','PI_ANTHROPIC_','PI_INVESTIGATOR_'))},'PASSWORD':password,'JWT_SECRET':previous.get('JWT_SECRET') or secrets.token_hex(32),'HOST':'0.0.0.0','API_PORT':'19091','WEB_PORT':'19075','LUMA_WEB_URL':'https://'+HOST,'PI_CLARIFICATION_ENABLED':'true','PI_CLARIFICATION_MODE':'draft_only','PI_CLARIFICATION_SEND_LOCK':'true','PI_GMAIL_MAILBOX':'admin@proimagetx.ai','PI_GMAIL_POLL_SECONDS':'120','PI_CREDENTIAL_ENCRYPTION_KEY':previous.get('PI_CREDENTIAL_ENCRYPTION_KEY') or secrets.token_hex(32),'PI_GMAIL_FEDERATION_CREDENTIALS_FILE':str(private),'PI_REASONER_PROVIDER':previous.get('PI_REASONER_PROVIDER','json_http'),'PI_GMAIL_ALLOW_DRAFT_WRITES':'false'}
+    settings={**{k:v for k,v in previous.items() if k.startswith(('PI_REASONER_','PI_ANTHROPIC_','PI_INVESTIGATOR_'))},'PASSWORD':password,'JWT_SECRET':previous.get('JWT_SECRET') or secrets.token_hex(32),'HOST':'0.0.0.0','API_PORT':'19091','WEB_PORT':'19075','LUMA_WEB_URL':'https://'+HOST,'PI_CLARIFICATION_ENABLED':'true','PI_CLARIFICATION_MODE':'draft_only','PI_CLARIFICATION_SEND_LOCK':'true','PI_CLARIFICATION_DEMO_ENABLED':'false','PI_CLARIFICATION_RECEIVE_ONLY':'true','PI_GMAIL_REQUIRED_THREAD_SENDER':'lnqcore@proimagetx.com','PI_GMAIL_MAILBOX':'admin@proimagetx.ai','PI_GMAIL_POLL_SECONDS':'120','PI_CREDENTIAL_ENCRYPTION_KEY':previous.get('PI_CREDENTIAL_ENCRYPTION_KEY') or secrets.token_hex(32),'PI_GMAIL_FEDERATION_CREDENTIALS_FILE':str(private),'PI_REASONER_PROVIDER':previous.get('PI_REASONER_PROVIDER','json_http'),'PI_GMAIL_ALLOW_DRAFT_WRITES':'false'}
     target=ROOT/'.env';target.write_text('\n'.join(k+'='+json.dumps(v) for k,v in settings.items())+'\n');target.chmod(0o600)
     selector={'statefulset.kubernetes.io/pod-name':pod['metadata']['name']}
     service={'apiVersion':'v1','kind':'Service','metadata':{'name':NAME,'namespace':NS,'labels':{'app.kubernetes.io/component':'pi-clarification-test'}},'spec':{'selector':selector,'ports':[{'name':'api','port':19091,'targetPort':19091},{'name':'web','port':19075,'targetPort':19075}]}}
@@ -41,12 +41,47 @@ def prepare():
     policy={'apiVersion':'networking.k8s.io/v1','kind':'NetworkPolicy','metadata':{'name':NAME,'namespace':NS},'spec':{'podSelector':{'matchLabels':{key:pod['metadata']['labels'][key] for key in ['app.kubernetes.io/instance','app.kubernetes.io/name']}},'policyTypes':['Ingress'],'ingress':[{'from':[{'namespaceSelector':{'matchLabels':{'kubernetes.io/metadata.name':'ingress-nginx'}},'podSelector':{'matchLabels':{'app.kubernetes.io/component':'controller','app.kubernetes.io/name':'ingress-nginx'}}}],'ports':[{'port':19075,'protocol':'TCP'},{'port':19091,'protocol':'TCP'}]}]}}
     (ROOT/'data/pi-preview-manifests.json').write_text(json.dumps({'apiVersion':'v1','kind':'List','items':[service,ingress,policy]}))
     print('Prepared private read-only credentials, isolated ports, and preview manifests. No secret values displayed.')
+def release_prompt():
+    import urllib.request, time
+    env={k:json.loads(v) for k,v in (line.split('=',1) for line in (ROOT/'.env').read_text().splitlines() if '=' in line)}
+    base='http://127.0.0.1:19091'
+    def request(path,body=None,token=None,method=None):
+        headers={'Content-Type':'application/json'}
+        if token:headers['Authorization']='Bearer '+token
+        req=urllib.request.Request(base+path,data=json.dumps(body).encode() if body is not None else None,headers=headers,method=method)
+        with urllib.request.urlopen(req,timeout=15) as response:
+            result=json.load(response)
+        if not result.get('ok'):raise RuntimeError('Prompt release request was rejected')
+        return result['data']
+    token=None
+    for attempt in range(10):
+        try:token=request('/api/auth/login',{'password':env['PASSWORD']})['token'];break
+        except OSError:
+            if attempt==9:raise
+            time.sleep(1)
+    current=request('/api/cowork/pi-clarification/prompt',token=token)['content']
+    source=(ROOT/'agents/pi-clarification/AGENT.md').read_text()
+    heading='People and responsibilities (owner-provided context):'
+    section=source[source.index(heading):source.index('Execution and inputs:',source.index(heading))]
+    if heading in current and 'Execution and inputs:' in current[current.index(heading):]:
+        start=current.index(heading);end=current.index('Execution and inputs:',start);updated=current[:start]+section+current[end:]
+    elif 'Execution and inputs:' in current:updated=current.replace('Execution and inputs:',section+'Execution and inputs:',1)
+    else:updated=current+'\n\n'+section
+    if updated!=current:request('/api/cowork/pi-clarification/prompt',{'content':updated},token,'PUT')
+    print('Effective agent prompt updated with developer/client roles and sender scope.')
+
 def publish():
     subprocess.run([str(ROOT/'node_modules/.bin/pm2'),'startOrReload',str(ROOT/'scripts/pi-clarification-preview.config.cjs'),'--update-env'],env=SAFE_ENV,check=True)
     subprocess.run([str(ROOT/'node_modules/.bin/pm2'),'save'],env=SAFE_ENV,check=True)
     dump=pathlib.Path(os.environ.get('PM2_HOME',str(pathlib.Path.home()/'.pm2')))/'dump.pm2'
     if dump.exists():dump.chmod(0o600)
+    import time
+    time.sleep(2)
+    for suffix in ['', '-wal', '-shm']:
+        demo_file=ROOT/('data/pi-clarification-demo.sqlite'+suffix)
+        if demo_file.exists():demo_file.unlink()
     network()
+    release_prompt()
     print('Test URL: https://'+HOST+' — use the existing Luma owner password. All sending is locked.')
 def network():
     subprocess.run(KUBE+['apply','-f',str(ROOT/'data/pi-preview-manifests.json')],check=True)
