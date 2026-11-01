@@ -233,7 +233,10 @@ export function PIClarification(): JSX.Element {
       {status?.requiredThreadSender ? (
         <p className="mb-3 rounded border border-card-border p-3 text-sm">
           Production mailbox: only threads containing an actual message from{" "}
-          <strong>{status.requiredThreadSender}</strong> are admitted. To/CC,
+          <strong>
+            {status.requiredThreadSenders?.join(" or ") || status.requiredThreadSender}
+          </strong>{" "}
+          are admitted. To/CC,
           display names and quoted text do not qualify a thread.
         </p>
       ) : null}

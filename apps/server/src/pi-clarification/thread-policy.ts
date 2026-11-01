@@ -1,16 +1,33 @@
 import type { PIMessage, PISettings } from "@luma/shared";
+import { z } from "zod";
 import { PIStore } from "./store.js";
 
-export function requiredThreadSender(settings: PISettings): string | null {
-  return (
-    (
-      process.env.PI_GMAIL_REQUIRED_THREAD_SENDER ||
-      settings.requiredThreadSender ||
-      ""
-    )
-      .trim()
-      .toLowerCase() || null
+export function parseThreadSenders(value: string): string[] {
+  return [
+    ...new Set(value.split(",").map((v) => v.trim().toLowerCase()).filter(Boolean)),
+  ].sort();
+}
+export function configuredThreadSenders(settings: PISettings): string[] {
+  return parseThreadSenders(
+    [settings.requiredThreadSender || "", ...(settings.requiredThreadSenders || [])].join(","),
   );
+}
+export function deploymentThreadSenders(): string[] | null {
+  const configured =
+    process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS ||
+    process.env.PI_GMAIL_REQUIRED_THREAD_SENDER;
+  if (!configured) return null;
+  const senders = parseThreadSenders(configured);
+  if (!senders.length)
+    throw new Error("Deployment thread sender list must not be empty");
+  return z.array(z.string().email()).max(100).parse(senders);
+}
+export function requiredThreadSenders(settings: PISettings): string[] {
+  return deploymentThreadSenders() || configuredThreadSenders(settings);
+}
+// Canonical policy key: evidence cannot be reused under a changed sender set.
+export function requiredThreadSender(settings: PISettings): string | null {
+  return requiredThreadSenders(settings).join(",") || null;
 }
 export function qualifyingAnchor(
   messages: PIMessage[],
@@ -18,11 +35,12 @@ export function qualifyingAnchor(
   mailbox: string,
   threadId: string,
 ): PIMessage | undefined {
+  const senders = parseThreadSenders(sender);
   return messages.find(
     (m) =>
       m.mailbox.toLowerCase() === mailbox.toLowerCase() &&
       m.threadId === threadId &&
-      m.from.toLowerCase() === sender.toLowerCase() &&
+      senders.includes(m.from.toLowerCase()) &&
       !m.labels.some((l) => ["SPAM", "TRASH", "DRAFT"].includes(l)),
   );
 }

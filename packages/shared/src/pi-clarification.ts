@@ -73,6 +73,10 @@ export const PISettingsSchema = z
       .transform((v) => v.toLowerCase())
       .nullable()
       .default(null),
+    requiredThreadSenders: z
+      .array(z.string().email().transform((v) => v.toLowerCase()))
+      .max(100)
+      .default([]),
     killSwitch: z.boolean().default(true),
     sendDryRun: z.boolean().default(true),
     allowedSenders: z.array(z.string().email()).max(100).default([]),
@@ -449,6 +453,7 @@ export type PIStatus = {
   promptVersion: string;
   demoAvailable?: boolean;
   requiredThreadSender?: string | null;
+  requiredThreadSenders?: string[];
   receiveOnly?: boolean;
   providerConfigured: boolean;
   investigatorConfigured: boolean;

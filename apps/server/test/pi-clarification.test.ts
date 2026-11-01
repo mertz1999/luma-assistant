@@ -1,6 +1,8 @@
 import {
   qualifyingAnchor,
   recordThreadEligibility,
+  threadAuthorized,
+  deploymentThreadSenders,
 } from "../src/pi-clarification/thread-policy.js";
 import { spawnSync } from "node:child_process";
 import { FederatedGmailCredentials } from "../src/pi-clarification/federation.js";
@@ -1537,6 +1539,58 @@ test("receive-only sync admits all safe participants only after header-verifying
   assert.equal(bodyReads.length, before);
   assert.equal(s.orchestrator.ingest(gmail.messages[1]), null);
 });
+test("either configured sender admits its thread; discovery uses Gmail OR and other senders remain excluded", async () => {
+  const gmail = new FakeGmail(), s = service(false, { gmail });
+  s.store.saveSettings({
+    ...s.store.settings(), receiveOnly: true,
+    requiredThreadSenders: ["lnqcore@proimagetx.com", "tanaki.reza1999@gmail.com"],
+  }, "admin");
+  s.store.db.prepare("UPDATE pi_mailboxes SET credential='configured' WHERE address=?").run(s.store.settings().mailbox);
+  gmail.profile = async () => ({emailAddress: s.store.settings().mailbox, historyId: "100"});
+  gmail.messages = [
+    message(s, {id: "lnq-anchor", threadId: "lnq", from: "LNQCore@proimagetx.com"}),
+    message(s, {id: "reza-anchor", threadId: "reza", from: "TANAKI.REZA1999@gmail.com"}),
+    message(s, {id: "participant", threadId: "reza", from: "client@example.test"}),
+    message(s, {id: "excluded", threadId: "excluded", from: "stranger@example.test", cc: ["tanaki.reza1999@gmail.com"]}),
+  ];
+  const queries: string[] = [], reads: string[] = [];
+  Object.assign(gmail, {listMessages: async (query: string) => {
+    queries.push(query);
+    return {messages: gmail.messages.map(({id, threadId}) => ({id, threadId}))};
+  }});
+  gmail.getThread = async (id) => {reads.push(id); return gmail.messages.filter((m) => m.threadId === id);};
+  await s.sync.sync();
+  await s.drain();
+  assert.ok(queries.every((q) => q.includes("{from:lnqcore@proimagetx.com from:tanaki.reza1999@gmail.com}")));
+  assert.deepEqual([...new Set(reads)].sort(), ["lnq", "reza"]);
+  assert.equal(s.store.cases().length, 2);
+  assert.ok(threadAuthorized(s.store, s.store.settings().mailbox, "reza"));
+  for (const c of s.store.cases()) {
+    const detail = s.store.detail(c.id);
+    assert.equal(c.state, "RECEIVED");
+    assert.equal(detail.runs.length, 0);
+    assert.equal(detail.outbox.length, 0);
+  }
+  s.store.saveSettings({...s.store.settings(), requiredThreadSenders: ["lnqcore@proimagetx.com"]}, "admin");
+  assert.equal(threadAuthorized(s.store, s.store.settings().mailbox, "reza"), false);
+});
+test("plural deployment sender list is normalized and takes precedence over legacy config", () => {
+  const plural = process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS, singular = process.env.PI_GMAIL_REQUIRED_THREAD_SENDER;
+  try {
+    process.env.PI_GMAIL_REQUIRED_THREAD_SENDER = "legacy@example.test";
+    process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS = " TANAKI.REZA1999@gmail.com,lnqcore@proimagetx.com,tanaki.reza1999@gmail.com ";
+    assert.deepEqual(deploymentThreadSenders(), ["lnqcore@proimagetx.com", "tanaki.reza1999@gmail.com"]);
+    process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS = " , ";
+    assert.throws(() => deploymentThreadSenders(), /must not be empty/);
+    process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS = "stranger@example.test OR in:anywhere";
+    assert.throws(() => deploymentThreadSenders());
+  } finally {
+    if (plural === undefined) delete process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS;
+    else process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS = plural;
+    if (singular === undefined) delete process.env.PI_GMAIL_REQUIRED_THREAD_SENDER;
+    else process.env.PI_GMAIL_REQUIRED_THREAD_SENDER = singular;
+  }
+});
 test("unverified threads cannot be ingested directly even when the apparent message sender matches", () => {
   const s = service(false);
   s.store.saveSettings(
@@ -1599,7 +1653,7 @@ test("Gmail transport blocks excluded thread/message/attachment bodies and reply
     false,
     fetcher,
     provider,
-    "lnqcore@proimagetx.com",
+    "lnqcore@proimagetx.com,tanaki.reza1999@gmail.com",
   );
   await assert.rejects(adapter.getThread("excluded"), /required sender/);
   await assert.rejects(adapter.getMessage("message"), /required sender/);

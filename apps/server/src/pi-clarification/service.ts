@@ -1,4 +1,9 @@
-import { requiredThreadSender } from "./thread-policy.js";
+import {
+  requiredThreadSender,
+  requiredThreadSenders,
+  deploymentThreadSenders,
+  configuredThreadSenders,
+} from "./thread-policy.js";
 import { FederatedGmailCredentials } from "./federation.js";
 import path from "node:path";
 import { type PIMessage, type PIStatus } from "@luma/shared";
@@ -108,18 +113,23 @@ export class PIService {
         },
         "demo-setup",
       );
-    if (!this.demo && process.env.PI_GMAIL_REQUIRED_THREAD_SENDER) {
+    if (!this.demo && deploymentThreadSenders()) {
       const settings = this.store.settings(),
-        required = process.env.PI_GMAIL_REQUIRED_THREAD_SENDER.toLowerCase();
+        required = deploymentThreadSenders()!;
       const receiveOnly =
         process.env.PI_CLARIFICATION_RECEIVE_ONLY === "true" ||
         settings.receiveOnly;
       if (
-        settings.requiredThreadSender !== required ||
+        configuredThreadSenders(settings).join(",") !== required.join(",") ||
         settings.receiveOnly !== receiveOnly
       )
         this.store.saveSettings(
-          { ...settings, requiredThreadSender: required, receiveOnly },
+          {
+            ...settings,
+            requiredThreadSender: null,
+            requiredThreadSenders: required,
+            receiveOnly,
+          },
           "deployment",
         );
     }
@@ -239,6 +249,7 @@ export class PIService {
       enabled: this.enabled || this.demo,
       demoAvailable: process.env.PI_CLARIFICATION_DEMO_ENABLED !== "false",
       requiredThreadSender: this.demo ? null : requiredThreadSender(s),
+      requiredThreadSenders: this.demo ? [] : requiredThreadSenders(s),
       receiveOnly: s.receiveOnly,
       sendLocked: this.sendLocked || this.demo,
       paused: s.paused,

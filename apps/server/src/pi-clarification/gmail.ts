@@ -200,8 +200,9 @@ export class GmailAdapter implements GmailClient {
     readonly locked = true,
     readonly fetcher: typeof fetch = fetch,
     readonly tokenProvider?: GmailTokenProvider,
-    readonly requiredSender: string | null = process.env
-      .PI_GMAIL_REQUIRED_THREAD_SENDER || null,
+    readonly requiredSender: string | null =
+      process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS ||
+      process.env.PI_GMAIL_REQUIRED_THREAD_SENDER || null,
   ) {}
   private async accessToken() {
     if (this.token && this.token.expiresAt > Date.now() + 60000)

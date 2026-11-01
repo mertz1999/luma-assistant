@@ -6,13 +6,13 @@ Open https://pi-clarification-test.deepspring.co and use the existing Luma passw
 
 Mailbox: **admin@proimagetx.ai**.
 
-A thread is admitted only if a real Gmail message in that thread has the exact From address **LNQCore@proimagetx.com**, compared case-insensitively. Other incoming participants' replies and mailbox-sent context can then appear in the same case. Putting that address in To/CC, a display name, forwarded headers, quoted content or the subject does not qualify a thread. Gmail's actual thread ID determines continuity; reusing a subject alone does not establish the same conversation.
+A thread is admitted only if a real Gmail message in that thread has the exact From address **LNQCore@proimagetx.com** or **tanaki.reza1999@gmail.com** (either one is sufficient), compared case-insensitively. Other incoming participants' replies and mailbox-sent context can then appear in the same case. Putting that address in To/CC, a display name, forwarded headers, quoted content or the subject does not qualify a thread. Gmail's actual thread ID determines continuity; reusing a subject alone does not establish the same conversation.
 
-Initial discovery searches the inbox for matching sender messages from the last 30 days. History processing checks the full thread headers, including older messages, so a new reply can qualify through a prior LNQCore message. Spam, trash and drafts do not establish eligibility. Bounces/automatic replies do not start agent response loops; a mailing-list header by itself is not treated as an automatic reply.
+Initial discovery searches the inbox for matching sender messages from the last 30 days. History processing checks the full thread headers, including older messages, so a new reply can qualify through a prior message from either allowed sender. Spam, trash and drafts do not establish eligibility. Bounces/automatic replies do not start agent response loops; a mailing-list header by itself is not treated as an automatic reply.
 
-The backend verifies headers before fetching bodies, records the qualifying message ID, and enforces the same guard on full thread reads, individual message/attachment reads, and any future reply/draft path. Known cases and history-cursor recovery do not bypass it. Deployment configuration locks the required sender so normal settings edits cannot loosen this installation's boundary.
+The backend verifies headers before fetching bodies, records the qualifying message ID, and enforces the same guard on full thread reads, individual message/attachment reads, and any future reply/draft path. Known cases and history-cursor recovery do not bypass it. Deployment configuration locks the allowed sender list so normal settings edits cannot loosen this installation's boundary.
 
-**Google permission boundary:** Gmail OAuth scopes cannot restrict a token to one sender or thread. The underlying credential is mailbox-wide `gmail.readonly`; the sender/thread restriction is enforced by this application's backend. No send/compose scope is used by the cluster adapter.
+**Google permission boundary:** Gmail OAuth scopes cannot restrict a token to particular senders or threads. The underlying credential is mailbox-wide `gmail.readonly`; the sender/thread restriction is enforced by this application's backend. No send/compose scope is used by the cluster adapter.
 
 ## Current behavior
 
@@ -28,14 +28,16 @@ Developers: **Reza, Mahdi, Hossein/Hosseins**. They are not the clients; their c
 
 Clients: **Piper, Stephanie, Tony, Mickeal/Michael/Mike/Mke, Dawn, Brandy**. The listed names/spellings are owner-provided context, not identity verification or automatic approval authority. Actual client approvers still require configured email contacts and backend verification.
 
+The Gmail address added for Reza admits his threads but does not change his developer role or grant client approval authority.
+
 The release publishes this section into the effective versioned prompt while preserving unrelated prompt edits.
 
 ## How to test with a real email
 
-1. Send a simple non-sensitive email **from LNQCore@proimagetx.com to admin@proimagetx.ai**, e.g. subject `PI inbox check` and body `Please confirm the generic AR type display behavior. No patient data is included.`
+1. Send a simple non-sensitive email **from LNQCore@proimagetx.com or tanaki.reza1999@gmail.com to admin@proimagetx.ai**, e.g. subject `PI inbox check` and body `Please confirm the generic AR type display behavior. No patient data is included.`
 2. Wait roughly two minutes, or use **Cowork → Operations → Poll Gmail now**.
 3. Open **Cowork → Cases**. A real `RECEIVED` case should appear. Select it to see the actual subject and sanitized thread. Case titles are deliberately generic to keep sensitive subject information out of titles.
 4. Reply in that same Gmail conversation from another participant, keeping admin@proimagetx.ai included. The existing case should gain the reply after the next poll.
-5. Negative check: a fresh email from another address without an actual LNQCore message in its thread should not create a case. Merely CC'ing LNQCore is insufficient; have LNQCore actually reply-all to qualify it.
+5. Negative check: a fresh email from another address without an actual message from either allowed sender in its thread should not create a case. Merely CC'ing an allowed sender is insufficient; that sender must actually reply-all to qualify it.
 
 Expect **no email reply and no AI draft** in this receive-only configuration. Check the send-lock banner and Gmail last-sync/error status. Confirm delivery to the inbox and the actual sender if a case does not appear.

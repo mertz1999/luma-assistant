@@ -3,6 +3,7 @@ import { GmailError, type GmailClient } from "./gmail.js";
 import { requirePolicy, requirePrivacy } from "./policy.js";
 import {
   requiredThreadSender,
+  parseThreadSenders,
   recordThreadEligibility,
 } from "./thread-policy.js";
 import type { PIMessage } from "@luma/shared";
@@ -23,7 +24,9 @@ export class GmailSyncWorker {
     );
     const mailbox = this.store.mailbox();
     requirePolicy(mailbox?.connected, "Gmail not connected");
-    const query = sender ? `(${s.gmailQuery}) from:${sender}` : s.gmailQuery;
+    const query = sender
+      ? `(${s.gmailQuery}) {${parseThreadSenders(sender).map((address) => `from:${address}`).join(" ")}}`
+      : s.gmailQuery;
     const processed = new Set<string>();
     try {
       if (

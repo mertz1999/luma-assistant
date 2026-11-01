@@ -15,6 +15,10 @@ import {
 import { PIService } from "./service.js";
 import { requirePolicy, requirePrivacy, sanitizeBody } from "./policy.js";
 import { digest, id } from "./store.js";
+import {
+  deploymentThreadSenders,
+  configuredThreadSenders,
+} from "./thread-policy.js";
 
 const ok = (res: Response, data: unknown) => res.json({ ok: true, data });
 const wrap =
@@ -301,9 +305,9 @@ export function registerPI(
         "Deployment send lock prevents autonomous mode or disabling safety switches",
       );
       requirePolicy(
-        !process.env.PI_GMAIL_REQUIRED_THREAD_SENDER ||
-          settings.requiredThreadSender ===
-            process.env.PI_GMAIL_REQUIRED_THREAD_SENDER.toLowerCase(),
+        !deploymentThreadSenders() ||
+          configuredThreadSenders(settings).join(",") ===
+            deploymentThreadSenders()!.join(","),
         "The required thread sender is locked by deployment configuration",
       );
       requirePolicy(
