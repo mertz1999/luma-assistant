@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+import { FederatedGmailCredentials } from "../src/pi-clarification/federation.js";
 import { generateKeyPairSync } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -1113,6 +1115,7 @@ test("bounded history recovery never advances cursor after an oversized backlog"
   s.store.saveSettings(
     {
       ...s.store.settings(),
+      allowedSenders: ["client@example.test"],
       privacyReviewed: true,
       providerAgreementsConfirmed: true,
       dataPolicyReference: "reviewed",
@@ -1323,6 +1326,106 @@ test("new email during reasoning invalidates the in-flight model proposal by rev
   });
   await assert.rejects(run, /Case changed during reasoning/);
   assert.equal(s.store.detail(caseId).outbox.length, 0);
+});
+
+test("federated Gmail requests readonly delegation and caches/coalesces credentials", async () => {
+  const requests: { url: string; body: Record<string, unknown> }[] = [];
+  const provider = new FederatedGmailCredentials(
+    {
+      MAILROOM_EMAIL_AUTH0_DOMAIN: "example.us.auth0.com",
+      MAILROOM_EMAIL_AUTH0_CLIENT_ID: "test-client",
+      MAILROOM_EMAIL_AUTH0_CLIENT_SECRET: "private-test-secret",
+      MAILROOM_EMAIL_AUTH0_AUDIENCE: "https://test.example/google",
+      MAILROOM_EMAIL_FEDERATION_AUDIENCE:
+        "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/test/providers/auth0",
+      MAILROOM_EMAIL_SERVICE_ACCOUNT: "test@project.iam.gserviceaccount.com",
+      MAILROOM_EMAIL_SENDER: "admin@proimagetx.ai",
+    },
+    "admin@proimagetx.ai",
+    async (input, init) => {
+      const url = String(input),
+        body = url.includes("oauth2.googleapis.com")
+          ? Object.fromEntries(new URLSearchParams(String(init?.body)))
+          : JSON.parse(String(init?.body));
+      requests.push({ url, body });
+      return Response.json(
+        url.includes("signJwt")
+          ? { signedJwt: "fake-assertion" }
+          : { access_token: "fake-access", expires_in: 3600 },
+      );
+    },
+  );
+  const [a, b] = await Promise.all([
+    provider.accessToken(),
+    provider.accessToken(),
+  ]);
+  assert.equal(a.value, b.value);
+  assert.equal(requests.length, 4);
+  const signed = requests.find((x) => x.url.includes("signJwt"))!;
+  const claims = JSON.parse(String(signed.body.payload));
+  assert.equal(claims.scope, "https://www.googleapis.com/auth/gmail.readonly");
+  assert.equal(claims.sub, "admin@proimagetx.ai");
+  await provider.accessToken();
+  assert.equal(requests.length, 4);
+  const s = service(),
+    r = requested(s);
+  const adapter = new GmailAdapter(
+    s.vault,
+    s.store.settings().mailbox,
+    false,
+    fetch,
+    provider,
+  );
+  await assert.rejects(adapter.sendReply(r.out, r.m), /locked/);
+  await assert.rejects(adapter.createDraft(r.out, r.m));
+});
+test("unreviewed live policy permits identifier-only polling without reading bodies or advancing cursor", async () => {
+  const gmail = new FakeGmail(),
+    s = service(false, { gmail });
+  s.store.db
+    .prepare("UPDATE pi_mailboxes SET credential='configured' WHERE address=?")
+    .run(s.store.settings().mailbox);
+  gmail.profile = async () => ({
+    emailAddress: s.store.settings().mailbox,
+    historyId: "100",
+  });
+  let bodies = 0;
+  gmail.getThread = async () => {
+    bodies++;
+    return [];
+  };
+  gmail.getMessage = async () => {
+    bodies++;
+    throw new Error("must not read");
+  };
+  await s.sync.sync();
+  assert.equal(bodies, 0);
+  assert.equal(s.store.cases().length, 0);
+  assert.equal(s.store.mailbox().cursor, null);
+  assert.ok(s.store.mailbox().last_sync);
+  assert.match(s.status().gmail.processingBlockedReason || "", /Metadata-only/);
+});
+test("preview process configuration excludes inherited PM2 metadata and preserves distinct names", () => {
+  const code = `const c=require(${JSON.stringify(path.join(root, "scripts/pi-clarification-preview.config.cjs"))});process.stdout.write(JSON.stringify(c.apps.map(a=>({name:a.name,cwd:a.cwd,unsafe:Object.keys(a.env).filter(k=>['pm_id','pm_exec_path','pm_cwd','name','namespace','restart_time'].includes(k))}))));`;
+  const r = spawnSync(process.execPath, ["-e", code], {
+    env: {
+      ...process.env,
+      pm_id: "0",
+      name: "luma-assistant-server",
+      namespace: "default",
+      pm_exec_path: "/untrusted-inherited",
+      restart_time: "123",
+    },
+    encoding: "utf8",
+  });
+  assert.equal(r.status, 0);
+  const apps = JSON.parse(r.stdout);
+  assert.deepEqual(
+    apps.map((a: { name: string }) => a.name),
+    ["luma-pi-test-server", "luma-pi-test-web"],
+  );
+  assert.ok(apps.every((a: { unsafe: unknown[] }) => a.unsafe.length === 0));
+  assert.equal(apps[1].cwd, path.join(root, "apps/web"));
 });
 test.after(async () => {
   for (const cleanup of cleanups.reverse()) await cleanup();

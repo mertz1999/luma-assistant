@@ -16,10 +16,38 @@ export class GmailSyncWorker {
       !s.paused && !["disabled", "replay"].includes(s.mode),
       "Live sync is paused/disabled or replay only",
     );
-    requirePrivacy(s);
     const mailbox = this.store.mailbox();
     requirePolicy(mailbox?.connected, "Gmail not connected");
     try {
+      if (
+        !s.privacyReviewed ||
+        !s.providerAgreementsConfirmed ||
+        !s.dataPolicyReference ||
+        (!s.allowedSenders.length &&
+          !s.allowedDomains.length &&
+          !s.contacts.some((c) => c.active && c.canClarify))
+      ) {
+        const profile = await this.gmail.profile();
+        requirePolicy(
+          profile.emailAddress.toLowerCase() === s.mailbox.toLowerCase(),
+          "Connected Google account does not match configured mailbox",
+        );
+        const ids = await this.gmail.listMessages(s.gmailQuery, s.gmailLabels);
+        this.store.db
+          .prepare(
+            "UPDATE pi_mailboxes SET last_sync=?,last_error=NULL WHERE address=?",
+          )
+          .run(this.store.at(), s.mailbox);
+        this.store.event(null, "GMAIL_METADATA_CHECK", "sync", {
+          mailbox: s.mailbox,
+          matchedIdentifiers: ids.messages?.length || 0,
+          messageBodiesRead: false,
+          modelInvoked: false,
+          cursorAdvanced: false,
+        });
+        return;
+      }
+      requirePrivacy(s);
       let nextCursor = mailbox.cursor;
       // Initial/recovery profile cursor is captured BEFORE bounded enumeration to avoid missing arrivals during it.
       const full = async () => {

@@ -20,3 +20,9 @@ Browser coverage includes missing credential feedback, locked autonomous setting
 Known build notices: the existing main web bundle exceeds Vite's 500 KB advisory; Cowork is lazy-loaded. Browserslist data is old. These notices do not fail compilation.
 
 Not verified live: Google OAuth consent, actual Gmail reads/watch/push or sends, paid model requests, PI contact identities, external Investigator isolation, external Tasks publishing, production patient data or deployment. Those require the prerequisites in the operations guide. No real client mail was sent, no existing installed app was replaced, and no production deployment was performed.
+
+## Authorized test-instance follow-up
+
+After the user authorized running a test instance and using the cluster email credentials, the feature gained a read-only Auth0/Google federation adapter and was released at https://pi-clarification-test.deepspring.co through `make release-manual`. A live Gmail profile check verified admin@proimagetx.ai with gmail.readonly; periodic profile/identifier-only checks report actual successful sync health. No email body or attachment was fetched for case processing, no live email was sent, and no paid model request was made. Privacy and authorized-contact gates remain closed until configured.
+
+Updated checks: 58 backend/integration tests passed, all-workspace typecheck/build passed, three repository Playwright tests passed. An additional public-URL smoke verified existing-password login, Cowork send lock, real federation settings, mocked approved AR task, and mobile layout with zero page errors after configuring the active workspace. Kubernetes preview networking allows only the ingress controller to reach the isolated ports. The launcher regression test verifies that inherited PM2 internal fields cannot replace another application's identity.

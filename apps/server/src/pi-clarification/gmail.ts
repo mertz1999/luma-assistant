@@ -1,3 +1,4 @@
+import type { GmailTokenProvider } from "./federation.js";
 import {
   PIMessageSchema,
   type PIMessage,
@@ -187,10 +188,15 @@ export class GmailAdapter implements GmailClient {
     readonly mailbox: string,
     readonly locked = true,
     readonly fetcher: typeof fetch = fetch,
+    readonly tokenProvider?: GmailTokenProvider,
   ) {}
   private async accessToken() {
     if (this.token && this.token.expiresAt > Date.now() + 60000)
       return this.token.value;
+    if (this.tokenProvider) {
+      this.token = await this.tokenProvider.accessToken();
+      return this.token.value;
+    }
     const response = await this.fetcher("https://oauth2.googleapis.com/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -295,7 +301,10 @@ export class GmailAdapter implements GmailClient {
     );
   }
   async sendReply(row: PIOutboxRecord, source: PIMessage) {
-    requirePolicy(!this.locked, "Outbound Gmail transport locked");
+    requirePolicy(
+      !this.locked && !this.tokenProvider?.readOnly,
+      "Outbound Gmail transport locked",
+    );
     requirePolicy(!source.demo, "Demo cannot send email");
     const result = await this.call<{ id: string }>(
       "messages/send",
@@ -306,7 +315,9 @@ export class GmailAdapter implements GmailClient {
   }
   async createDraft(row: PIOutboxRecord, source: PIMessage) {
     requirePolicy(
-      !this.locked && process.env.PI_GMAIL_ALLOW_DRAFT_WRITES === "true",
+      !this.locked &&
+        !this.tokenProvider?.readOnly &&
+        process.env.PI_GMAIL_ALLOW_DRAFT_WRITES === "true",
       "Gmail draft writes disabled",
     );
     const result = await this.call<{ id: string }>("drafts", "POST", {

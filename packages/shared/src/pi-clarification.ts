@@ -434,6 +434,8 @@ export type PIStatus = {
     lastError: string | null;
     cursor: string | null;
     watchExpiresAt: string | null;
+    authenticationMode?: "oauth" | "federated_readonly";
+    processingBlockedReason?: string | null;
   };
   jobs: Record<string, number>;
   promptVersion: string;

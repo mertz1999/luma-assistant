@@ -1,3 +1,4 @@
+import { FederatedGmailCredentials } from "./federation.js";
 import path from "node:path";
 import { type PIMessage, type PIStatus } from "@luma/shared";
 import { PIStore, id } from "./store.js";
@@ -48,6 +49,7 @@ export class PIService {
   readonly runtime: ClarificationAgentRuntime;
   readonly orchestrator: CaseOrchestrator;
   readonly sync: GmailSyncWorker;
+  readonly federation: FederatedGmailCredentials | null;
   readonly demo: boolean;
   readonly sendLocked: boolean;
   readonly enabled: boolean;
@@ -116,6 +118,23 @@ export class PIService {
         this.store.settings().mailbox,
         process.env.PI_GMAIL_REFRESH_TOKEN,
       );
+    this.federation =
+      !this.demo && process.env.PI_GMAIL_FEDERATION_CREDENTIALS_FILE
+        ? FederatedGmailCredentials.fromFile(
+            process.env.PI_GMAIL_FEDERATION_CREDENTIALS_FILE,
+            this.store.settings().mailbox,
+          )
+        : null;
+    if (
+      this.federation &&
+      !this.store.mailbox()?.connected &&
+      !this.store.db
+        .prepare(
+          "SELECT 1 FROM pi_events WHERE kind='GMAIL_DISCONNECTED' LIMIT 1",
+        )
+        .get()
+    )
+      this.connectFederation();
     this.gmail =
       options.gmail ||
       (this.demo
@@ -124,6 +143,8 @@ export class PIService {
             this.vault,
             this.store.settings().mailbox,
             this.sendLocked,
+            fetch,
+            this.federation || undefined,
           ));
     this.workflow = new Workflow(this.store);
     this.outbox = new OutboxService(this.store, this.gmail, this.sendLocked);
@@ -167,6 +188,21 @@ export class PIService {
       this.orchestrator.ingest(m),
     );
   }
+  connectFederation() {
+    requirePolicy(
+      this.federation,
+      "Federated Gmail credentials are not configured",
+    );
+    this.store.db
+      .prepare(
+        "UPDATE pi_mailboxes SET credential='federated-readonly',last_error=NULL WHERE address=?",
+      )
+      .run(this.store.settings().mailbox);
+    this.store.event(null, "GMAIL_FEDERATION_CONNECTED", "admin", {
+      mailbox: this.store.settings().mailbox,
+      scope: "gmail.readonly",
+    });
+  }
   status(): PIStatus {
     const s = this.store.settings(),
       mailbox = this.store.mailbox(),
@@ -196,6 +232,18 @@ export class PIService {
         lastError: mailbox?.last_error || null,
         cursor: mailbox?.cursor || null,
         watchExpiresAt: mailbox?.watch_expires_at || null,
+        authenticationMode: this.federation ? "federated_readonly" : "oauth",
+        processingBlockedReason: this.demo
+          ? null
+          : !s.privacyReviewed ||
+              !s.providerAgreementsConfirmed ||
+              !s.dataPolicyReference
+            ? "Metadata-only polling: case processing requires reviewed privacy/provider policy"
+            : !s.allowedSenders.length &&
+                !s.allowedDomains.length &&
+                !s.contacts.some((c) => c.active && c.canClarify)
+              ? "Metadata-only polling: configure authorized PI senders/contacts"
+              : null,
       },
       promptVersion: this.runtime.prompt().version,
       providerConfigured:

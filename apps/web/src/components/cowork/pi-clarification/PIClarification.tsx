@@ -217,6 +217,15 @@ export function PIClarification(): JSX.Element {
           {status && !status.enabled ? "Background worker is disabled." : ""}
         </p>
       </div>
+      {!demo && status?.gmail.processingBlockedReason ? (
+        <p
+          role="note"
+          className="mb-3 rounded border border-card-border p-3 text-sm"
+        >
+          {status.gmail.processingBlockedReason}. Synthetic replay remains
+          available.
+        </p>
+      ) : null}
       {error ? (
         <div
           role="alert"
@@ -1096,21 +1105,33 @@ function Settings({
       <Panel title="Gmail connection">
         <p className="mb-3 text-sm">
           {status?.gmail.connected ? "Connected" : "Not connected"} ·{" "}
-          {s.mailbox}. Connect this Google Workspace/Gmail mailbox with a
-          server-side OAuth client. While sending is locked, consent requests
-          Gmail read-only access.
+          {s.mailbox}.{" "}
+          {status?.gmail.authenticationMode === "federated_readonly"
+            ? "Connected through the existing cluster Auth0/Google federation. Access is restricted to Gmail read-only; no browser consent is required."
+            : "Connect this Google Workspace/Gmail mailbox with a server-side OAuth client. While sending is locked, consent requests Gmail read-only access."}
         </p>
         <div className="flex flex-wrap gap-2">
           <button
             className={buttonClass}
             disabled={busy || demo}
             onClick={() =>
-              void act(async () => {
-                const result = await piRequest<{ url: string }>(
-                  "/gmail/oauth/start",
-                );
-                window.location.assign(result.url);
-              }, "Opening Google consent")
+              void act(
+                async () => {
+                  if (
+                    status?.gmail.authenticationMode === "federated_readonly"
+                  ) {
+                    await piRequest("/gmail/federation/connect", mutation());
+                    return;
+                  }
+                  const result = await piRequest<{ url: string }>(
+                    "/gmail/oauth/start",
+                  );
+                  window.location.assign(result.url);
+                },
+                status?.gmail.authenticationMode === "federated_readonly"
+                  ? "Read-only cluster Gmail connection verified"
+                  : "Opening Google consent",
+              )
             }
           >
             Connect Gmail read-only

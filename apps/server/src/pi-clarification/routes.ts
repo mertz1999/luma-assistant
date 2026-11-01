@@ -694,8 +694,32 @@ export function registerPI(
     }),
   );
   router.post(
+    "/gmail/federation/connect",
+    wrap(async (_req, res) => {
+      requirePolicy(live.federation, "Federated Gmail is not configured");
+      const profile = await live.gmail.profile();
+      requirePolicy(
+        profile.emailAddress.toLowerCase() ===
+          live.store.settings().mailbox.toLowerCase(),
+        "Connected mailbox mismatch",
+      );
+      live.connectFederation();
+      ok(res, live.status().gmail);
+    }),
+  );
+  router.post(
     "/gmail/disconnect",
     wrap(async (_req, res) => {
+      if (live.federation) {
+        live.vault.remove(live.store.settings().mailbox);
+        ok(res, {
+          disconnected: true,
+          revoked: false,
+          warning:
+            "Local connection disabled; shared cluster credentials were not revoked",
+        });
+        return;
+      }
       let revoked = false;
       try {
         const token = live.vault.get(live.store.settings().mailbox);

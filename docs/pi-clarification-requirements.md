@@ -31,3 +31,5 @@ Source: LUMA_PI_CLARIFICATION_CODEX_PROMPT.md (November 1, 2026), with the user'
 - Very large threads retain all messages in the UI but only the last 30 sanitized messages go to reasoning. Earlier material requires human review. Recovery bounds stop visibly without cursor advancement rather than silently discarding a backlog.
 - Settings are functional validated JSON editors, following the full shared contract. No secret-entry UI is added; credentials remain server-side.
 - No real email, paid model request, production data connection, external task publication, merge or deployment is part of verification.
+
+Follow-up: the user subsequently authorized a test deployment and reuse of the cluster email credentials. The existing Auth0/Google federation is now integrated and read-only Gmail access is live-verified. The test URL, operating mode and remaining policy/model setup are documented in [pi-clarification-test-preview.md](pi-clarification-test-preview.md). Earlier statements about missing Gmail credentials/no test instance describe the initial delivery, not the current verified preview.
