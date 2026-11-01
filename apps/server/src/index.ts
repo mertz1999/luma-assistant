@@ -1,3 +1,4 @@
+import { registerPI } from "./pi-clarification/routes.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -1879,6 +1880,10 @@ function resolveSelectedAgents(selected: unknown): ResolvedAgent[] {
       throw new AgentResolutionError(`Selected agent is outside the configured agents root: ${ref.path}`);
     }
 
+    if (item.slug === "pi-clarification") {
+      throw new AgentResolutionError("PI Clarification runs only through the protected Cowork service; coding runners are prohibited.");
+    }
+
     if (!item.prompt.trim()) {
       throw new AgentResolutionError(`Selected agent is empty: ${ref.path}`);
     }
@@ -3575,6 +3580,7 @@ class AgentScheduleManager {
   }): AgentSchedule {
     const agent = discoverAgents().find((item) => item.id === input.agentId);
     if (!agent) throw new Error("Agent not found");
+    if (agent.slug === "pi-clarification") throw new Error("PI Clarification uses the protected event-driven Cowork service and cannot be scheduled as a coding agent.");
 
     const now = Date.now();
     const time: AgentScheduleTime = {
@@ -3770,6 +3776,10 @@ class AgentScheduleManager {
     const agent = discoverAgents().find((item) => item.id === schedule.agentId && item.path === schedule.agentPath);
     if (!agent || !agent.prompt.trim()) {
       return failExecution("failed", `Agent file is missing, unreadable, or empty: ${schedule.agentPath}`);
+    }
+
+    if (agent.slug === "pi-clarification") {
+      return failExecution("failed", "PI Clarification is event-driven and must run through Cowork, never the coding scheduler.");
     }
 
     if (!this.runManager.hasCapacity()) {
@@ -7682,6 +7692,8 @@ app.post("/api/auth/login", (req, res) => {
   );
 });
 
+const piClarification = registerPI(app, { root: rootDir, secret: JWT_SECRET, authConfigured: AUTH_ENABLED });
+
 app.use(requireAuth);
 
 const runManager = new RunManager(CODEX_PATH);
@@ -8860,15 +8872,13 @@ process.on("beforeExit", () => {
   flushPersistentStateSync();
 });
 
-process.on("SIGINT", () => {
+async function shutdown(): Promise<void> {
   flushPersistentStateSync();
+  await piClarification.stop();
   process.exit(0);
-});
-
-process.on("SIGTERM", () => {
-  flushPersistentStateSync();
-  process.exit(0);
-});
+}
+process.on("SIGINT", () => { void shutdown(); });
+process.on("SIGTERM", () => { void shutdown(); });
 
 app.listen(API_PORT, HOST, () => {
   // eslint-disable-next-line no-console

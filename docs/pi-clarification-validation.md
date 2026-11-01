@@ -1,0 +1,22 @@
+# PI Clarification validation — November 1, 2026
+
+Base: origin/main `85b7a0f`. Feature: `feature/pi-clarification-test-mode`.
+
+| Check | Actual result |
+| --- | --- |
+| `npm run test:pi` | 55 tests passed; zero failures/skips. |
+| `npm run typecheck` | Passed across shared, server, web, Telegram MCP, Task Manager MCP and Image MCP. |
+| `npm run build` | Passed across all six workspaces. |
+| `npm run demo:pi` | AR case reached HANDED_OFF with exact-version approval and complete internal task; realEmailsSent = 0. |
+| `npm run demo:pi -- --ppo` | PPO case reached ESCALATED; no handoff; realEmailsSent = 0. |
+| `PI_BROWSER_CHANNEL=chrome npm run test:pi:browser` | Three Playwright tests passed. Fresh isolated app/fixture root; live worker disabled; no Gmail credentials. |
+| `git diff --check` | Passed. |
+| Dependency audit | Base and feature each have 29 findings with dev dependencies included: 2 low, 4 moderate, 20 high, 3 critical. No claim that inherited dependency findings were remediated. |
+
+Backend coverage includes deduplication/conversation continuity, unknown/automatic/outbound filtering, investigation failure, strict model schema/timeout retries, scope/digest/contact approval verification, forwarded/quoted/old/ambiguous/rejected approvals, conflicting decisions, immutable versions, scope reopening, historical standing authorization and reproduction checks, risk escalation, MIME threading, recipients/quotas/cooldown/business hours/kill switch, transport lock, uncertain-send reconciliation without duplicate sends, durable leases/restart effects, expired cursor/recovery bounds/watch renewal, encrypted tokens/OAuth state, OIDC signature/audience/identity verification, owner-authenticated routes, source-scope routing, bounded attachments, retention, and new-message invalidation of in-flight reasoning/queued handoffs.
+
+Browser coverage includes missing credential feedback, locked autonomous settings, both deterministic scenarios, task download, all eight case tabs at 390px mobile width with no horizontal overflow, and navigation back to existing Agents and Code modes. Manual browser verification also exercised the same desktop/mobile views. This is not a claim of exhaustive regression coverage for every pre-existing Luma feature.
+
+Known build notices: the existing main web bundle exceeds Vite's 500 KB advisory; Cowork is lazy-loaded. Browserslist data is old. These notices do not fail compilation.
+
+Not verified live: Google OAuth consent, actual Gmail reads/watch/push or sends, paid model requests, PI contact identities, external Investigator isolation, external Tasks publishing, production patient data or deployment. Those require the prerequisites in the operations guide. No real client mail was sent, no existing installed app was replaced, and no production deployment was performed.

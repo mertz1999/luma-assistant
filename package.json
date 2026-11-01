@@ -12,9 +12,13 @@
     "build": "npm run build -w @luma/shared && npm run build -w @luma/server && npm run build -w @luma/web && npm run build -w @luma/telegram-mcp && npm run build -w @luma/taskmanager-mcp && npm run build -w @luma/image-mcp",
     "migrate": "node scripts/migrate-data.cjs",
     "typecheck": "npm run build -w @luma/shared && npm run typecheck -w @luma/server && npm run typecheck -w @luma/web && npm run typecheck -w @luma/telegram-mcp && npm run typecheck -w @luma/taskmanager-mcp && npm run typecheck -w @luma/image-mcp",
-    "start": "npm run start -w @luma/server"
+    "start": "npm run start -w @luma/server",
+    "test:pi": "npm run build -w @luma/shared && node --import tsx --test apps/server/test/pi-clarification.test.ts",
+    "demo:pi": "npm run build -w @luma/shared && node --import tsx scripts/pi-clarification-demo.ts",
+    "test:pi:browser": "npm run build -w @luma/shared && playwright test --config playwright.pi.config.ts"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "concurrently": "^9.1.2",
     "pm2": "^7.0.1",
     "typescript": "^5.8.3"

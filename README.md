@@ -546,3 +546,5 @@ data/            private runtime data and logs
 - `Codex not found` means `CODEX_PATH` does not point at an executable Codex CLI.
 - `Skill conflict` means a global `~/.codex/skills/<slug>` or `~/.claude/skills/<slug>` exists without Luma Assistant's managed marker and was intentionally left untouched.
 - `Scheduled job skipped` can happen when the global run capacity is full.
+
+PI Clarification Agent setup, test mode and operations: [docs/pi-clarification-agent.md](docs/pi-clarification-agent.md).

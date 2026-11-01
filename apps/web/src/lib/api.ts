@@ -488,3 +488,7 @@ export function connectEvents(onEvent: (evt: SseEvent) => void): EventSource {
 
   return es;
 }
+
+export function piRequest<T>(path: string, init?: RequestInit, demo = false): Promise<T> {
+  return request<T>(`/api/cowork/pi-clarification${path}${path.includes("?") ? "&" : "?"}demo=${demo ? "1" : "0"}`, init);
+}
