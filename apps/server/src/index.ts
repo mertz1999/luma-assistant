@@ -1880,7 +1880,7 @@ function resolveSelectedAgents(selected: unknown): ResolvedAgent[] {
       throw new AgentResolutionError(`Selected agent is outside the configured agents root: ${ref.path}`);
     }
 
-    if (item.slug === "pi-clarification") {
+    if (["pi-clarification", "pi-investigator", "pi-implementor"].includes(item.slug)) {
       throw new AgentResolutionError("PI Clarification runs only through the protected Cowork service; coding runners are prohibited.");
     }
 
@@ -3580,7 +3580,7 @@ class AgentScheduleManager {
   }): AgentSchedule {
     const agent = discoverAgents().find((item) => item.id === input.agentId);
     if (!agent) throw new Error("Agent not found");
-    if (agent.slug === "pi-clarification") throw new Error("PI Clarification uses the protected event-driven Cowork service and cannot be scheduled as a coding agent.");
+    if (["pi-clarification", "pi-investigator", "pi-implementor"].includes(agent.slug)) throw new Error("PI Clarification uses the protected event-driven Cowork service and cannot be scheduled as a coding agent.");
 
     const now = Date.now();
     const time: AgentScheduleTime = {
@@ -3778,7 +3778,7 @@ class AgentScheduleManager {
       return failExecution("failed", `Agent file is missing, unreadable, or empty: ${schedule.agentPath}`);
     }
 
-    if (agent.slug === "pi-clarification") {
+    if (["pi-clarification", "pi-investigator", "pi-implementor"].includes(agent.slug)) {
       return failExecution("failed", "PI Clarification is event-driven and must run through Cowork, never the coding scheduler.");
     }
 

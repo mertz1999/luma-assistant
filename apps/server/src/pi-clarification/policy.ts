@@ -29,7 +29,7 @@ export function sanitizeBody(input: string): string {
     .filter((line) => !/^\s*>/.test(line))
     .join("\n")
     .replace(
-      /\b(?:MRN|patient(?:\s+name)?|DOB|date of birth|member\s*id|SSN)\s*[:=#-]\s*[^\n,;]+/gi,
+      /\b(?:MRN|patient(?:\s+name)?|DOB|DOS|date of (?:birth|service)|member\s*id|SSN)\s*[:=#-]\s*[^\n,;]+/gi,
       "[REDACTED]",
     )
     .replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[REDACTED]")

@@ -31,6 +31,7 @@ export class GmailSyncWorker {
     try {
       if (
         !s.receiveOnly &&
+        s.modelInputMode !== "reviewed_summary" &&
         (!s.privacyReviewed ||
           !s.providerAgreementsConfirmed ||
           !s.dataPolicyReference ||
@@ -60,7 +61,7 @@ export class GmailSyncWorker {
         });
         return;
       }
-      if (!s.receiveOnly) requirePrivacy(s);
+      if (!s.receiveOnly && s.modelInputMode !== "reviewed_summary") requirePrivacy(s);
       const processThread = async (
         threadId: string,
         historyDelivery = false,

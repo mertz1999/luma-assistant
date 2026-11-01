@@ -316,6 +316,11 @@ export function registerPI(
         "Receive-only operation is locked by deployment configuration",
       );
       requirePolicy(!svc.demo, "Demo settings are managed by fixtures");
+      requirePolicy(
+        process.env.PI_MODEL_INPUT_MODE !== "reviewed_summary" ||
+          settings.modelInputMode === "reviewed_summary",
+        "Reviewed model input is locked by deployment configuration",
+      );
       ok(res, svc.store.saveSettings(settings, "admin"));
     }),
   );
@@ -444,8 +449,94 @@ export function registerPI(
     wrap((req, res) => {
       const svc = service(req);
       svc.store.getCase(req.params.id);
+      requirePolicy(
+        !svc.store.settings().receiveOnly || svc.demo,
+        "AI processing is disabled in receive-only mode",
+      );
+      requirePolicy(
+        svc.demo || svc.status().providerConfigured,
+        "Configure/login to the selected AI runner first",
+      );
+      if (
+        !svc.demo &&
+        svc.store.settings().modelInputMode === "reviewed_summary"
+      )
+        svc.reviewedInput.requireCurrent(req.params.id);
       svc.store.enqueue("reason", `manual:${id("request")}`, {}, req.params.id);
       ok(res, { queued: true });
+    }),
+  );
+  router.get(
+    "/repositories",
+    wrap((req, res) => ok(res, service(req).repositories.publicEntries())),
+  );
+  router.get(
+    "/cases/:id/model-input",
+    wrap((req, res) => {
+      const svc = service(req);
+      svc.store.getCase(req.params.id);
+      ok(res, {
+        sourceDigest: svc.reviewedInput.sourceDigest(req.params.id),
+        reviewed: svc.reviewedInput.get(req.params.id),
+      });
+    }),
+  );
+  router.put(
+    "/cases/:id/model-input",
+    wrap((req, res) => {
+      const svc = service(req);
+      ok(res, svc.reviewedInput.save(req.params.id, req.body));
+    }),
+  );
+  router.get(
+    "/cases/:id/implementations",
+    wrap((req, res) => {
+      const svc = service(req);
+      svc.store.getCase(req.params.id);
+      ok(
+        res,
+        svc.implementation
+          .list(req.params.id)
+          .map(({ workspace: _workspace, ...record }) => record),
+      );
+    }),
+  );
+  router.post(
+    "/cases/:id/implementations",
+    wrap((req, res) => {
+      const svc = service(req);
+      const { repository } = z
+        .object({ repository: z.string().min(1).max(240) })
+        .strict()
+        .parse(req.body);
+      svc.implementation.authorize(req.params.id, repository);
+      svc.store.enqueue(
+        "implement",
+        `implement:${req.params.id}:${svc.store.getCase(req.params.id).specVersion}:${repository}`,
+        { repository },
+        req.params.id,
+      );
+      ok(res, { queued: true });
+    }),
+  );
+  router.post(
+    "/implementations/:id/publish",
+    wrap((req, res) => {
+      const { codeReviewed } = z
+        .object({ codeReviewed: z.literal(true) })
+        .strict()
+        .parse(req.body);
+      const { workspace: _workspace, ...result } = service(
+        req,
+      ).implementation.publish(req.params.id, codeReviewed);
+      ok(res, result);
+    }),
+  );
+  router.get(
+    "/implementations/:id/diff",
+    wrap((req, res) => {
+      const svc = service(req);
+      ok(res, svc.implementation.diff(req.params.id));
     }),
   );
   router.post(

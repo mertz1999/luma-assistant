@@ -1,5 +1,6 @@
 import { ApprovedKnowledge } from "./knowledge.js";
 import fs from "node:fs";
+import { ReviewedInputService } from "./reviewed-input.js";
 import {
   PIExternalSchemas,
   PIDecisionSchema,
@@ -31,6 +32,7 @@ export interface Reasoner {
   ): Promise<unknown>;
 }
 export interface Investigator {
+  readonly isolated?: boolean;
   investigate(
     request: PIInvestigationRequest,
     signal: AbortSignal,
@@ -242,6 +244,10 @@ export class ClarificationAgentRuntime {
   context(detail: PICaseDetail) {
     // Addresses, attachments, credentials, raw source and raw MIME never enter reasoning context.
     const settings = this.store.settings();
+    const reviewed =
+      !detail.case.demo && settings.modelInputMode === "reviewed_summary"
+        ? new ReviewedInputService(this.store).requireCurrent(detail.case.id)
+        : null;
     const {
       mailbox: _mailbox,
       threadId: _threadId,
@@ -250,31 +256,49 @@ export class ClarificationAgentRuntime {
     } = detail.case;
     return redactTree({
       case: safeCase,
-      thread: detail.messages
-        .map((m) => ({
-          evidenceId: m.id,
-          direction: m.direction || "incoming",
-          body: sanitizeBody(m.body),
-          at: m.date,
-        }))
-        .slice(-30),
-      specs: detail.specs.slice(-2),
-      questions: detail.outbox.map((o) => ({
-        kind: o.kind,
-        body: o.bodyText,
-        status: o.state,
-      })),
+      thread: reviewed
+        ? [
+            {
+              evidenceId: `reviewed:${reviewed.sourceDigest}`,
+              body: reviewed.summary,
+              direction: "incoming",
+            },
+          ]
+        : detail.messages
+            .map((m) => ({
+              evidenceId: m.id,
+              direction: m.direction || "incoming",
+              body: sanitizeBody(m.body),
+              at: m.date,
+            }))
+            .slice(-30),
+      specs: reviewed
+        ? detail.specs
+            .slice(-2)
+            .map(({ id, version, digest }) => ({ id, version, digest }))
+        : detail.specs.slice(-2),
+      questions: reviewed
+        ? []
+        : detail.outbox.map((o) => ({
+            kind: o.kind,
+            body: o.bodyText,
+            status: o.state,
+          })),
       investigations: detail.investigations,
       contactRoles: settings.contacts
         .filter((c) => c.active)
         .map((c) => ({
           id: c.id,
           canApproveScope: c.canApproveScope,
+          canClarify: c.canClarify,
           workflows: c.workflows,
         })),
       policy: {
         highRiskWorkflows: settings.highRiskWorkflows,
         deploymentAuthorized: false,
+        availableRepositories: settings.investigationRepositories,
+        localDraftsOnly: settings.mode === "draft_only",
+        modelInputMode: settings.modelInputMode,
       },
       approvedKnowledge: new ApprovedKnowledge(this.store).search(
         detail.case.workflow === "unclassified"
@@ -290,7 +314,11 @@ export class ClarificationAgentRuntime {
     detail: PICaseDetail,
     demo = false,
   ): Promise<{ decision: PIDecision; runId: string; promptVersion: string }> {
-    if (!demo) requirePrivacy(this.store.settings());
+    if (!demo) {
+      if (this.store.settings().modelInputMode === "reviewed_summary")
+        new ReviewedInputService(this.store).requireCurrent(detail.case.id);
+      else requirePrivacy(this.store.settings());
+    }
     const prompt = this.prompt(),
       runId = id("run");
     let repair: string | null = null;
@@ -304,7 +332,9 @@ export class ClarificationAgentRuntime {
             context: this.context(detail),
             repair,
           },
-          AbortSignal.timeout(30000),
+          AbortSignal.timeout(
+            process.env.PI_REASONER_PROVIDER === "local_cli" ? 150000 : 30000,
+          ),
         );
         const decision = PIDecisionSchema.parse(raw);
         requirePolicy(
@@ -314,9 +344,24 @@ export class ClarificationAgentRuntime {
           "Decision references stale/different case",
         );
         const known = new Set([
+          ...(!detail.case.demo &&
+          this.store.settings().modelInputMode === "reviewed_summary"
+            ? [
+                `reviewed:${new ReviewedInputService(this.store).requireCurrent(detail.case.id).sourceDigest}`,
+              ]
+            : []),
           ...detail.messages.map((x) => x.id),
           ...detail.events.map((x) => x.id),
           ...detail.specs.map((x) => x.id),
+          ...detail.investigations.flatMap((entry) =>
+            (
+              (
+                entry.result as {
+                  confirmedFacts?: { evidenceRefs: string[] }[];
+                }
+              )?.confirmedFacts || []
+            ).flatMap((fact) => fact.evidenceRefs),
+          ),
           ...new ApprovedKnowledge(this.store)
             .search(
               detail.case.workflow === "unclassified"

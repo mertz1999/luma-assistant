@@ -67,6 +67,9 @@ export const PISettingsSchema = z
       .default("draft_only"),
     paused: z.boolean().default(false),
     receiveOnly: z.boolean().default(false),
+    modelInputMode: z
+      .enum(["reviewed_policy", "reviewed_summary"])
+      .default("reviewed_policy"),
     requiredThreadSender: z
       .string()
       .email()
@@ -74,7 +77,12 @@ export const PISettingsSchema = z
       .nullable()
       .default(null),
     requiredThreadSenders: z
-      .array(z.string().email().transform((v) => v.toLowerCase()))
+      .array(
+        z
+          .string()
+          .email()
+          .transform((v) => v.toLowerCase()),
+      )
       .max(100)
       .default([]),
     killSwitch: z.boolean().default(true),
@@ -254,7 +262,7 @@ export const PIDecisionSchema = z
         kind: z.enum(["clarification", "approval", "answer"]),
         subject: short,
         bodyText: text,
-        contactIds: refs.min(1),
+        contactIds: refs,
       })
       .strict()
       .optional(),
@@ -456,6 +464,9 @@ export type PIStatus = {
   requiredThreadSenders?: string[];
   receiveOnly?: boolean;
   providerConfigured: boolean;
+  aiRunner?: "codex" | "cursor" | "api";
+  repositoryCount?: number;
+  modelInputMode?: PISettings["modelInputMode"];
   investigatorConfigured: boolean;
   limitations: string[];
 };

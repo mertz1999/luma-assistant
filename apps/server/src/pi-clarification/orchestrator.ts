@@ -1,4 +1,5 @@
 import { requiredThreadSender, threadAuthorized } from "./thread-policy.js";
+import { ReviewedInputService } from "./reviewed-input.js";
 import {
   PIMessageSchema,
   PIInvestigationResultSchema,
@@ -36,7 +37,8 @@ export class CaseOrchestrator {
       s = this.store.settings();
     requirePolicy(m.demo === demo, "Demo transport marker mismatch");
     if (!demo) {
-      if (!s.receiveOnly) requirePrivacy(s);
+      if (!s.receiveOnly && s.modelInputMode !== "reviewed_summary")
+        requirePrivacy(s);
       requirePolicy(m.mailbox === s.mailbox, "Unexpected mailbox");
     }
     const restricted = !demo && Boolean(requiredThreadSender(s));
@@ -208,6 +210,19 @@ export class CaseOrchestrator {
           "Client replied",
           [m.id],
         );
+      if (
+        !d.case.demo &&
+        this.store.settings().modelInputMode === "reviewed_summary" &&
+        !new ReviewedInputService(this.store).get(caseId)?.current
+      ) {
+        this.store.event(
+          caseId,
+          "MODEL_INPUT_REVIEW_REQUIRED",
+          "orchestrator",
+          { messageId, rawEmailProvidedToModel: false },
+        );
+        return;
+      }
       if (!approval || approval.result === "ambiguous")
         this.store.enqueue("reason", `reason:message:${m.id}`, {}, caseId);
     });
@@ -222,6 +237,17 @@ export class CaseOrchestrator {
       return;
     const c = this.store.getCase(caseId),
       s = this.store.settings();
+    if (
+      !c.demo &&
+      !s.receiveOnly &&
+      s.modelInputMode === "reviewed_summary" &&
+      !new ReviewedInputService(this.store).get(caseId)?.current
+    ) {
+      this.store.event(caseId, "MODEL_INPUT_REVIEW_REQUIRED", "orchestrator", {
+        rawEmailProvidedToModel: false,
+      });
+      return;
+    }
     if (jobId) {
       const state = c.state;
       if (
@@ -355,8 +381,9 @@ export class CaseOrchestrator {
         if (
           !c.demo &&
           (!settings.investigationEnabled ||
-            !process.env.PI_INVESTIGATOR_URL ||
-            process.env.PI_INVESTIGATOR_READONLY_VERIFIED !== "true")
+            (!this.investigator.isolated &&
+              (!process.env.PI_INVESTIGATOR_URL ||
+                process.env.PI_INVESTIGATOR_READONLY_VERIFIED !== "true")))
         ) {
           const requestId = id("investigation");
           this.store.db
@@ -422,6 +449,12 @@ export class CaseOrchestrator {
       }
       case "SEND_CLARIFICATION":
       case "ANSWER_USAGE_QUESTION": {
+        if (!c.demo && d.decision === "SEND_CLARIFICATION")
+          requirePolicy(
+            d.emailDraft!.bodyText.split(/\s+/).length <= 160 &&
+              d.blockingQuestions.length <= 3,
+            "Clarification must be short: at most three questions and 160 words",
+          );
         requirePolicy(
           d.emailDraft?.kind ===
             (d.decision === "SEND_CLARIFICATION" ? "clarification" : "answer"),
@@ -436,7 +469,10 @@ export class CaseOrchestrator {
           "Usage answer requires confirmed evidence and no uncertainty",
         );
         // The source contact and configured routing determine scope, never model-selected recipients.
-        if (c.workflow === "unclassified") {
+        if (
+          c.workflow === "unclassified" &&
+          !(this.outbox.locked && !d.emailDraft!.contactIds.length)
+        ) {
           const source = this.store.detail(caseId).messages[0];
           const sourceContact = this.store
             .settings()

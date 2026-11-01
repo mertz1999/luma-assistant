@@ -18,7 +18,7 @@ The backend verifies headers before fetching bodies, records the qualifying mess
 
 - Polling runs every 120 seconds, independently of the browser. Operations → Poll Gmail now queues an immediate pass.
 - Qualifying messages are sanitized and saved locally; a case appears as `RECEIVED` and subsequent replies update that case. Mailbox-sent messages are context only and never enqueue another reply.
-- This is explicitly **receive-only**: no live model invocation, AI-generated answer, automatic clarification or scope approval is performed. AI drafting needs separately configured model/provider and privacy policy. These attestations were not invented.
+- Intake is active with a **reviewed-summary AI lane** using the existing Codex login (Cursor is also supported). In each case’s review panel, save an explicitly reviewed de-identified business summary before requesting an agent draft. Patient names, dates of service and raw email content stay outside model thread context. New messages or specifications require another review. Provider/privacy attestations remain unconfirmed; raw-email AI analysis is not enabled. See [the local worker guide](pi-clarification-local-workers.md).
 - Outbound email and Gmail draft creation remain locked. Nothing is emailed back to the sender.
 - There are no live sample cases, replay controls or simulator endpoints. Automated tests retain isolated fixtures outside the live mailbox/database.
 
@@ -30,6 +30,8 @@ Clients: **Piper, Stephanie, Tony, Mickeal/Michael/Mike/Mke, Dawn, Brandy**. The
 
 The Gmail address added for Reza admits his threads but does not change his developer role or grant client approval authority.
 
+Target PI deployments, merges, releases and workflow dispatch are prohibited. Implementation requires an exactly approved task, isolated checks and explicit diff review before draft PR publication. PI invoicing PR publication is blocked by its existing PR-triggered staging deployment workflow.
+
 The release publishes this section into the effective versioned prompt while preserving unrelated prompt edits.
 
 ## How to test with a real email
@@ -40,4 +42,4 @@ The release publishes this section into the effective versioned prompt while pre
 4. Reply in that same Gmail conversation from another participant, keeping admin@proimagetx.ai included. The existing case should gain the reply after the next poll.
 5. Negative check: a fresh email from another address without an actual message from either allowed sender in its thread should not create a case. Merely CC'ing an allowed sender is insufficient; that sender must actually reply-all to qualify it.
 
-Expect **no email reply and no AI draft** in this receive-only configuration. Check the send-lock banner and Gmail last-sync/error status. Confirm delivery to the inbox and the actual sender if a case does not appear.
+Expect **no email reply**. AI runs and local drafts require the reviewed-input step described above; simply receiving an email does not send its contents to a model. Check the send-lock banner and Gmail last-sync/error status. Confirm delivery to the inbox and the actual sender if a case does not appear.

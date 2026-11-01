@@ -9,6 +9,7 @@ import type {
 } from "@luma/shared";
 import { PIStateSchema } from "@luma/shared";
 import { piRequest } from "../../../lib/api";
+import { PIWorkflowControls } from "./PIWorkflowControls";
 
 const inputClass =
   "w-full rounded-md border border-card-border bg-control px-3 py-2 text-sm";
@@ -216,7 +217,7 @@ export function PIClarification(): JSX.Element {
           {!status
             ? "Loading server policy…"
             : status.sendLocked
-              ? "The AI cannot send emails or create Gmail drafts. Local drafts and replay are available."
+              ? "The AI cannot send emails or create Gmail drafts. Local drafts are available."
               : "Messages require autonomous mode, allowlisted recipients and all server policy checks."}{" "}
           {status && !status.enabled ? "Background worker is disabled." : ""}
         </p>
@@ -226,18 +227,26 @@ export function PIClarification(): JSX.Element {
           role="note"
           className="mb-3 rounded border border-card-border p-3 text-sm"
         >
-          {status.gmail.processingBlockedReason}. Synthetic replay remains
-          available.
+          {status.gmail.processingBlockedReason}.
+          {status.demoAvailable ? " Synthetic replay remains available." : ""}
         </p>
       ) : null}
       {status?.requiredThreadSender ? (
         <p className="mb-3 rounded border border-card-border p-3 text-sm">
           Production mailbox: only threads containing an actual message from{" "}
           <strong>
-            {status.requiredThreadSenders?.join(" or ") || status.requiredThreadSender}
+            {status.requiredThreadSenders?.join(" or ") ||
+              status.requiredThreadSender}
           </strong>{" "}
-          are admitted. To/CC,
-          display names and quoted text do not qualify a thread.
+          are admitted. To/CC, display names and quoted text do not qualify a
+          thread.
+        </p>
+      ) : null}
+      {status?.aiRunner && status.aiRunner !== "api" ? (
+        <p className="mb-3 text-sm">
+          AI runner: {status.aiRunner} · {status.repositoryCount || 0} PI
+          repositories · Reviewed summaries required · Target deployments
+          prohibited
         </p>
       ) : null}
       {error ? (
@@ -972,6 +981,14 @@ function CaseDetail({
       ) : null}
       {view === "review" ? (
         <div className="space-y-3">
+          {!demo ? (
+            <PIWorkflowControls
+              detail={d}
+              settings={settings}
+              busy={busy}
+              act={act}
+            />
+          ) : null}
           <button
             className={buttonClass}
             disabled={busy || receiveOnly}

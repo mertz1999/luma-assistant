@@ -83,6 +83,9 @@ export class PIStore {
         CREATE TABLE IF NOT EXISTS pi_thread_eligibility(mailbox TEXT NOT NULL,thread_id TEXT NOT NULL,required_sender TEXT NOT NULL,anchor_id TEXT NOT NULL,verified_at TEXT NOT NULL,PRIMARY KEY(mailbox,thread_id));
         INSERT OR IGNORE INTO pi_migrations VALUES(3,strftime('%Y-%m-%dT%H:%M:%fZ','now'));
         CREATE TABLE IF NOT EXISTS pi_job_effects(job_id TEXT PRIMARY KEY,completed_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS pi_reviewed_inputs(case_id TEXT PRIMARY KEY REFERENCES pi_cases(id),source_digest TEXT NOT NULL,body TEXT NOT NULL,reviewed_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS pi_implementations(id TEXT PRIMARY KEY,case_id TEXT NOT NULL REFERENCES pi_cases(id),payload TEXT NOT NULL);
+        INSERT OR IGNORE INTO pi_migrations VALUES(4,strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       `);
       })
       .immediate();

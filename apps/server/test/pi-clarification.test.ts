@@ -46,6 +46,17 @@ import {
 } from "../src/pi-clarification/policy.js";
 import { verifyPubSub, registerPI } from "../src/pi-clarification/routes.js";
 import { GmailSyncWorker } from "../src/pi-clarification/sync.js";
+import { ReviewedInputService } from "../src/pi-clarification/reviewed-input.js";
+import {
+  RepositoryRegistry,
+  safeCodePath,
+  LocalInvestigator,
+} from "../src/pi-clarification/repositories.js";
+import { assertWorkflowSafe } from "../src/pi-clarification/implementation.js";
+import {
+  sandboxBase,
+  boundedProcess,
+} from "../src/pi-clarification/local-runner.js";
 
 const root = path.resolve(import.meta.dirname, "../../..");
 const cleanups: (() => void | Promise<void>)[] = [];
@@ -1540,28 +1551,72 @@ test("receive-only sync admits all safe participants only after header-verifying
   assert.equal(s.orchestrator.ingest(gmail.messages[1]), null);
 });
 test("either configured sender admits its thread; discovery uses Gmail OR and other senders remain excluded", async () => {
-  const gmail = new FakeGmail(), s = service(false, { gmail });
-  s.store.saveSettings({
-    ...s.store.settings(), receiveOnly: true,
-    requiredThreadSenders: ["lnqcore@proimagetx.com", "tanaki.reza1999@gmail.com"],
-  }, "admin");
-  s.store.db.prepare("UPDATE pi_mailboxes SET credential='configured' WHERE address=?").run(s.store.settings().mailbox);
-  gmail.profile = async () => ({emailAddress: s.store.settings().mailbox, historyId: "100"});
+  const gmail = new FakeGmail(),
+    s = service(false, { gmail });
+  s.store.saveSettings(
+    {
+      ...s.store.settings(),
+      receiveOnly: true,
+      requiredThreadSenders: [
+        "lnqcore@proimagetx.com",
+        "tanaki.reza1999@gmail.com",
+      ],
+    },
+    "admin",
+  );
+  s.store.db
+    .prepare("UPDATE pi_mailboxes SET credential='configured' WHERE address=?")
+    .run(s.store.settings().mailbox);
+  gmail.profile = async () => ({
+    emailAddress: s.store.settings().mailbox,
+    historyId: "100",
+  });
   gmail.messages = [
-    message(s, {id: "lnq-anchor", threadId: "lnq", from: "LNQCore@proimagetx.com"}),
-    message(s, {id: "reza-anchor", threadId: "reza", from: "TANAKI.REZA1999@gmail.com"}),
-    message(s, {id: "participant", threadId: "reza", from: "client@example.test"}),
-    message(s, {id: "excluded", threadId: "excluded", from: "stranger@example.test", cc: ["tanaki.reza1999@gmail.com"]}),
+    message(s, {
+      id: "lnq-anchor",
+      threadId: "lnq",
+      from: "LNQCore@proimagetx.com",
+    }),
+    message(s, {
+      id: "reza-anchor",
+      threadId: "reza",
+      from: "TANAKI.REZA1999@gmail.com",
+    }),
+    message(s, {
+      id: "participant",
+      threadId: "reza",
+      from: "client@example.test",
+    }),
+    message(s, {
+      id: "excluded",
+      threadId: "excluded",
+      from: "stranger@example.test",
+      cc: ["tanaki.reza1999@gmail.com"],
+    }),
   ];
-  const queries: string[] = [], reads: string[] = [];
-  Object.assign(gmail, {listMessages: async (query: string) => {
-    queries.push(query);
-    return {messages: gmail.messages.map(({id, threadId}) => ({id, threadId}))};
-  }});
-  gmail.getThread = async (id) => {reads.push(id); return gmail.messages.filter((m) => m.threadId === id);};
+  const queries: string[] = [],
+    reads: string[] = [];
+  Object.assign(gmail, {
+    listMessages: async (query: string) => {
+      queries.push(query);
+      return {
+        messages: gmail.messages.map(({ id, threadId }) => ({ id, threadId })),
+      };
+    },
+  });
+  gmail.getThread = async (id) => {
+    reads.push(id);
+    return gmail.messages.filter((m) => m.threadId === id);
+  };
   await s.sync.sync();
   await s.drain();
-  assert.ok(queries.every((q) => q.includes("{from:lnqcore@proimagetx.com from:tanaki.reza1999@gmail.com}")));
+  assert.ok(
+    queries.every((q) =>
+      q.includes(
+        "{from:lnqcore@proimagetx.com from:tanaki.reza1999@gmail.com}",
+      ),
+    ),
+  );
   assert.deepEqual([...new Set(reads)].sort(), ["lnq", "reza"]);
   assert.equal(s.store.cases().length, 2);
   assert.ok(threadAuthorized(s.store, s.store.settings().mailbox, "reza"));
@@ -1571,23 +1626,40 @@ test("either configured sender admits its thread; discovery uses Gmail OR and ot
     assert.equal(detail.runs.length, 0);
     assert.equal(detail.outbox.length, 0);
   }
-  s.store.saveSettings({...s.store.settings(), requiredThreadSenders: ["lnqcore@proimagetx.com"]}, "admin");
-  assert.equal(threadAuthorized(s.store, s.store.settings().mailbox, "reza"), false);
+  s.store.saveSettings(
+    {
+      ...s.store.settings(),
+      requiredThreadSenders: ["lnqcore@proimagetx.com"],
+    },
+    "admin",
+  );
+  assert.equal(
+    threadAuthorized(s.store, s.store.settings().mailbox, "reza"),
+    false,
+  );
 });
 test("plural deployment sender list is normalized and takes precedence over legacy config", () => {
-  const plural = process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS, singular = process.env.PI_GMAIL_REQUIRED_THREAD_SENDER;
+  const plural = process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS,
+    singular = process.env.PI_GMAIL_REQUIRED_THREAD_SENDER;
   try {
     process.env.PI_GMAIL_REQUIRED_THREAD_SENDER = "legacy@example.test";
-    process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS = " TANAKI.REZA1999@gmail.com,lnqcore@proimagetx.com,tanaki.reza1999@gmail.com ";
-    assert.deepEqual(deploymentThreadSenders(), ["lnqcore@proimagetx.com", "tanaki.reza1999@gmail.com"]);
+    process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS =
+      " TANAKI.REZA1999@gmail.com,lnqcore@proimagetx.com,tanaki.reza1999@gmail.com ";
+    assert.deepEqual(deploymentThreadSenders(), [
+      "lnqcore@proimagetx.com",
+      "tanaki.reza1999@gmail.com",
+    ]);
     process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS = " , ";
     assert.throws(() => deploymentThreadSenders(), /must not be empty/);
-    process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS = "stranger@example.test OR in:anywhere";
+    process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS =
+      "stranger@example.test OR in:anywhere";
     assert.throws(() => deploymentThreadSenders());
   } finally {
-    if (plural === undefined) delete process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS;
+    if (plural === undefined)
+      delete process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS;
     else process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS = plural;
-    if (singular === undefined) delete process.env.PI_GMAIL_REQUIRED_THREAD_SENDER;
+    if (singular === undefined)
+      delete process.env.PI_GMAIL_REQUIRED_THREAD_SENDER;
     else process.env.PI_GMAIL_REQUIRED_THREAD_SENDER = singular;
   }
 });
@@ -1862,4 +1934,489 @@ test("mailing-list headers alone do not discard a qualifying LNQCore message", (
 });
 test.after(async () => {
   for (const cleanup of cleanups.reverse()) await cleanup();
+});
+
+test("reviewed summaries exclude raw email evidence and expire when a thread or specification changes", () => {
+  const s = service(false);
+  s.store.saveSettings(
+    {
+      ...s.store.settings(),
+      modelInputMode: "reviewed_summary",
+      allowedSenders: ["client@example.test"],
+    },
+    "admin",
+  );
+  const caseId = s.orchestrator.ingest(
+    message(s, {
+      subject: "Private person subject",
+      body: "Patient: Synthetic Person\nDOS: 2026-01-01\nA configured label is absent",
+    }),
+  )!;
+  const reviewed = new ReviewedInputService(s.store);
+  assert.throws(
+    () => s.runtime.context(s.store.detail(caseId)),
+    /Review a de-identified summary/,
+  );
+  const sourceDigest = reviewed.sourceDigest(caseId);
+  assert.throws(() =>
+    reviewed.save(caseId, {
+      summary: "Generic labels need a visible fallback value",
+      sourceDigest,
+      deidentifiedConfirmed: false,
+    }),
+  );
+  reviewed.save(caseId, {
+    summary:
+      "The configured type label is absent. Show the existing configured label without modifying stored records.",
+    sourceDigest,
+    deidentifiedConfirmed: true,
+  });
+  const context = JSON.stringify(s.runtime.context(s.store.detail(caseId)));
+  assert.ok(context.includes("configured type label"));
+  for (const forbidden of [
+    "Synthetic Person",
+    "2026-01-01",
+    "Private person subject",
+    "client@example.test",
+  ])
+    assert.ok(!context.includes(forbidden));
+  s.orchestrator.ingest(message(s, { id: "new-detail" }));
+  assert.equal(reviewed.get(caseId)?.current, false);
+  assert.throws(
+    () =>
+      reviewed.save(caseId, {
+        summary: "A new summary of the requested generic display change",
+        sourceDigest,
+        deidentifiedConfirmed: true,
+      }),
+    /changed while/,
+  );
+  assert.throws(
+    () =>
+      reviewed.save(caseId, {
+        summary: "DOS: 2026-01-01. Please change the generic display label.",
+        sourceDigest: reviewed.sourceDigest(caseId),
+        deidentifiedConfirmed: true,
+      }),
+    /Remove patient/,
+  );
+});
+
+test("reviewed-summary mode prepares a local-only short clarification without recipient privileges", async () => {
+  const s = service(false);
+  s.store.saveSettings(
+    {
+      ...s.store.settings(),
+      modelInputMode: "reviewed_summary",
+      allowedSenders: ["client@example.test"],
+    },
+    "admin",
+  );
+  const caseId = s.orchestrator.ingest(message(s))!;
+  const draft = s.outbox.prepare(
+    caseId,
+    "clarification",
+    [],
+    "Which configured label should appear when the type is missing?",
+    "local-question",
+  );
+  assert.equal(draft.state, "local_only");
+  assert.deepEqual(draft.recipients, []);
+  await s.outbox.deliver(draft.id);
+  assert.equal(s.outbox.get(draft.id).providerId, null);
+  assert.equal(
+    (
+      s.store.db
+        .prepare("SELECT COUNT(*) AS n FROM pi_work_items WHERE kind='outbox'")
+        .get() as { n: number }
+    ).n,
+    0,
+  );
+});
+
+test("PR preflight rejects deployment, credential and unsupported automatic workflows", () => {
+  for (const source of [
+    "on: [pull_request]\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - run: kubectl apply -f deployment.yaml\n",
+    "on: [pull_request_target]\njobs: {}\n",
+    "on: [push]\njobs: {}\n",
+    "on: [create]\njobs: {}\n",
+    "on: [pull_request]\njobs:\n  check:\n    secrets: inherit\n    uses: ./.github/workflows/other.yml\n",
+    "on: [pull_request]\njobs:\n  check:\n    steps:\n      - run: echo '${{ secrets.DEPLOY_TOKEN }}'\n",
+  ])
+    assert.throws(() => assertWorkflowSafe(source, "pi-automation/case-1"));
+  assert.doesNotThrow(() =>
+    assertWorkflowSafe(
+      "on:\n  workflow_dispatch: {}\njobs:\n  deploy:\n    steps:\n      - run: kubectl apply -f deployment.yaml\n",
+      "pi-automation/case-1",
+    ),
+  );
+  assert.doesNotThrow(() =>
+    assertWorkflowSafe(
+      "on:\n  push:\n    branches: [main]\n  pull_request: {}\njobs:\n  check:\n    steps:\n      - run: python -m pytest\n",
+      "pi-automation/case-1",
+    ),
+  );
+});
+
+test("source path guard excludes data, credentials, workflows, releases and traversal", () => {
+  for (const value of [
+    "../secret.py",
+    "/tmp/code.py",
+    "src/../../code.ts",
+    ".env",
+    ".github/workflows/check.yml",
+    "data/people.json",
+    "tests/fixtures/records.json",
+    "secrets/key.py",
+    "Makefile",
+    "Dockerfile",
+    "deploy/release.py",
+    "src/key.pem",
+  ])
+    assert.equal(safeCodePath(value), false, value);
+  for (const value of [
+    "src/display.ts",
+    "backend/app/report.py",
+    "tests/test_generic_label.py",
+  ])
+    assert.equal(safeCodePath(value), true, value);
+});
+
+test("read-only investigator rejects fabricated evidence and out-of-registry requests", async () => {
+  const registry = new RepositoryRegistry([]);
+  const request = {
+    correlationId: "case-1",
+    question: "Find the configured label",
+    repositories: ["org/repo"],
+    evidenceRefs: [],
+    outputRequest: "Cited findings",
+    permissions: "read_only" as const,
+    timeoutSeconds: 30,
+    state: "pending" as const,
+  };
+  const empty = {
+    correlationId: "case-1",
+    confirmedFacts: [],
+    hypotheses: [],
+    confidence: 0.5,
+    limitations: [],
+    fileRefs: [],
+    commitRefs: [],
+    prRefs: [],
+    recommendedClarifications: [],
+    likelyBlastRadius: [],
+    testCases: [],
+  };
+  const runner = {
+    kind: "codex",
+    json: async () => ({
+      ...empty,
+      confirmedFacts: [
+        { fact: "Unsupported claim", evidenceRefs: ["fabricated"] },
+      ],
+    }),
+  };
+  const investigator = new LocalInvestigator(registry, runner as never);
+  await assert.rejects(
+    investigator.investigate(request, AbortSignal.timeout(1000)),
+    /outside the PI registry/,
+  );
+  registry.snapshot = () => ({
+    repository: "org/repo",
+    commit: "a".repeat(40),
+    files: [{ ref: "real-ref", path: "src/a.py", content: "pass" }],
+    limitations: ["Static source"],
+  });
+  await assert.rejects(
+    investigator.investigate(request, AbortSignal.timeout(1000)),
+    /unsupplied evidence/,
+  );
+});
+
+test(
+  "OS validation sandbox hides host credentials and environment, blocks host writes and network",
+  { skip: !fs.existsSync("/usr/bin/bwrap") },
+  async () => {
+    const args = sandboxBase();
+    args.push(
+      "--unshare-net",
+      "--setenv",
+      "HOME",
+      "/tmp",
+      "--",
+      "/usr/bin/node",
+      "-e",
+      `
+    const fs=require('node:fs');
+    for(const p of ['/home/agent/.codex/auth.json','/var/run/secrets/kubernetes.io/serviceaccount/token','/home/pi']) if(fs.existsSync(p))process.exit(2);
+    if(process.env.GITHUB_TOKEN||process.env.PASSWORD||process.env.OPENAI_API_KEY)process.exit(3);
+    try {fs.writeFileSync('/usr/pi-sandbox-canary','no');process.exit(4);}catch{}
+    fetch('http://127.0.0.1:19091',{signal:AbortSignal.timeout(500)}).then(()=>process.exit(5)).catch(()=>console.log('isolated'));
+  `,
+    );
+    assert.equal(
+      (
+        await boundedProcess(
+          "/usr/bin/bwrap",
+          args,
+          "",
+          AbortSignal.timeout(5000),
+        )
+      ).trim(),
+      "isolated",
+    );
+  },
+);
+
+test("implementation proposals run only in a separate checkout and bind successful validation to exact contents", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-implementation-test-"));
+  cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const source = path.join(dir, "source");
+  fs.mkdirSync(path.join(source, "src"), { recursive: true });
+  fs.writeFileSync(
+    path.join(source, "src/math.js"),
+    "export const value = 1;\n",
+  );
+  function git(...args: string[]) {
+    const result = spawnSync(
+      "git",
+      ["-c", "core.hooksPath=/dev/null", "-C", source, ...args],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  }
+  git("init", "-b", "main");
+  git("add", ".");
+  git(
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.test",
+    "commit",
+    "-m",
+    "Synthetic source",
+  );
+  git("update-ref", "refs/remotes/origin/main", "HEAD");
+  const s = service(false);
+  s.store.saveSettings(
+    {
+      ...s.store.settings(),
+      modelInputMode: "reviewed_summary",
+      allowedSenders: ["client@example.test"],
+    },
+    "admin",
+  );
+  const caseId = s.orchestrator.ingest(message(s))!;
+  const { ImplementationService } =
+    await import("../src/pi-clarification/implementation.js");
+  const registry = new RepositoryRegistry([
+    {
+      id: "org/repo",
+      path: source,
+      baseBranch: "main",
+      implementationAllowed: true,
+      validation: [["node", "--check", "src/math.js"]],
+    },
+  ]);
+  fs.mkdirSync(path.join(dir, "agents/pi-implementor"), { recursive: true });
+  fs.copyFileSync(
+    path.join(root, "agents/pi-implementor/AGENT.md"),
+    path.join(dir, "agents/pi-implementor/AGENT.md"),
+  );
+  const runner = {
+    json: async () => ({
+      summary: "Adjust the synthetic constant",
+      changes: [{ path: "src/math.js", content: "export const value = 2;\n" }],
+    }),
+  };
+  const implementation = new ImplementationService(
+    s.store,
+    registry,
+    s.handoff,
+    dir,
+    runner as never,
+  );
+  implementation.authorize = () => ({
+    task: {
+      ...spec({ repositoryCandidates: ["org/repo"] }),
+      specDigest: "a".repeat(64),
+      specVersion: 1,
+    } as never,
+    brief: {
+      summary: "Change the synthetic math constant",
+      sourceDigest: "b".repeat(64),
+    } as never,
+  });
+  const record = await implementation.prepare(caseId, "org/repo");
+  assert.equal(record.state, "ready", record.error || undefined);
+  assert.ok(record.checks.every((check) => check.passed));
+  assert.equal(
+    fs.readFileSync(path.join(source, "src/math.js"), "utf8"),
+    "export const value = 1;\n",
+  );
+  assert.equal(
+    fs.readFileSync(path.join(record.workspace, "src/math.js"), "utf8"),
+    "export const value = 2;\n",
+  );
+  assert.ok(record.contentDigest);
+  assert.equal(record.prUrl, null);
+  assert.throws(
+    () => implementation.publish(record.id, false),
+    /Review the implementation diff/,
+  );
+  assert.ok(implementation.diff(record.id).includes("+export const value = 2"));
+});
+
+test("reasoning can cite the reviewed input without receiving raw thread evidence", async () => {
+  const s = service(false, {
+    reasoner: {
+      decide: async (input) => {
+        const context = input.context as {
+          case: { id: string; state: string; specVersion: number };
+          thread: { evidenceId: string; body: string }[];
+        };
+        assert.equal(context.thread.length, 1);
+        assert.ok(context.thread[0].evidenceId.startsWith("reviewed:"));
+        assert.ok(!context.thread[0].body.includes("UNREVIEWED_RAW_CANARY"));
+        return {
+          schemaVersion: 1,
+          caseId: context.case.id,
+          observedSpecVersion: context.case.specVersion,
+          caseState: context.case.state,
+          classification: "unclear",
+          priority: "normal",
+          riskLevel: "low",
+          decision: "WAIT",
+          rationale: "Await the missing application detail",
+          factEvidenceIds: [context.thread[0].evidenceId],
+          uncertainties: ["Application unspecified"],
+          requiredActions: ["wait"],
+          blockingQuestions: [],
+        };
+      },
+    },
+  });
+  s.store.saveSettings(
+    {
+      ...s.store.settings(),
+      modelInputMode: "reviewed_summary",
+      allowedSenders: ["client@example.test"],
+    },
+    "admin",
+  );
+  const caseId = s.orchestrator.ingest(
+    message(s, { body: "UNREVIEWED_RAW_CANARY" }),
+  )!;
+  s.reviewedInput.save(caseId, {
+    summary:
+      "The configured label is absent, but the application has not been specified.",
+    deidentifiedConfirmed: true,
+    sourceDigest: s.reviewedInput.sourceDigest(caseId),
+  });
+  await s.orchestrator.runCase(caseId);
+  assert.equal(s.store.detail(caseId).runs[0].status, "completed");
+  assert.equal(s.store.detail(caseId).outbox.length, 0);
+});
+
+test("editing a reviewed summary while reasoning runs invalidates the pending proposal", async () => {
+  let captured: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    captured = resolve;
+  });
+  let start: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    start = resolve;
+  });
+  const s = service(false, {
+    reasoner: {
+      decide: async (input) => {
+        const context = input.context as {
+          case: { id: string; state: string; specVersion: number };
+        };
+        start!();
+        await gate;
+        return {
+          schemaVersion: 1,
+          caseId: context.case.id,
+          observedSpecVersion: context.case.specVersion,
+          caseState: context.case.state,
+          classification: "unclear",
+          priority: "normal",
+          riskLevel: "low",
+          decision: "WAIT",
+          rationale: "Wait for the missing application",
+          factEvidenceIds: [],
+          uncertainties: [],
+          requiredActions: ["wait"],
+          blockingQuestions: [],
+        };
+      },
+    },
+  });
+  s.store.saveSettings(
+    {
+      ...s.store.settings(),
+      modelInputMode: "reviewed_summary",
+      allowedSenders: ["client@example.test"],
+    },
+    "admin",
+  );
+  const caseId = s.orchestrator.ingest(message(s))!;
+  const body = {
+    summary:
+      "Show the existing configured type label without modifying any records.",
+    deidentifiedConfirmed: true,
+    sourceDigest: s.reviewedInput.sourceDigest(caseId),
+  };
+  s.reviewedInput.save(caseId, body);
+  const run = s.orchestrator.runCase(caseId);
+  await started;
+  s.reviewedInput.save(caseId, {
+    ...body,
+    summary:
+      "Review the existing configured label and ask which application is affected.",
+  });
+  captured!();
+  await assert.rejects(run, /Case changed during reasoning/);
+  assert.equal(s.store.detail(caseId).outbox.length, 0);
+});
+
+test("isolated CLI token refresh preserves the login and does not overwrite another login or account", async () => {
+  const { persistRefreshedLogin } =
+    await import("../src/pi-clarification/local-runner.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-auth-refresh-test-"));
+  cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "auth.json");
+  const initial = JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: {
+      account_id: "synthetic-account",
+      access_token: "old-synthetic",
+      refresh_token: "old-refresh",
+    },
+  });
+  const updated = JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: {
+      account_id: "synthetic-account",
+      access_token: "new-synthetic",
+      refresh_token: "new-refresh",
+    },
+  });
+  fs.writeFileSync(file, initial);
+  persistRefreshedLogin(file, initial, updated, "codex");
+  assert.equal(fs.readFileSync(file, "utf8"), updated);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  fs.writeFileSync(file, "concurrent-login");
+  persistRefreshedLogin(file, initial, updated, "codex");
+  assert.equal(fs.readFileSync(file, "utf8"), "concurrent-login");
+  fs.writeFileSync(file, initial);
+  persistRefreshedLogin(
+    file,
+    initial,
+    updated.replace("synthetic-account", "another-account"),
+    "codex",
+  );
+  assert.equal(fs.readFileSync(file, "utf8"), initial);
 });

@@ -32,6 +32,10 @@ import {
 import { CaseOrchestrator } from "./orchestrator.js";
 import { GmailSyncWorker } from "./sync.js";
 import { requirePolicy, sanitizeBody } from "./policy.js";
+import { LocalReasoner, localRunnerReady, runnerKind } from "./local-runner.js";
+import { LocalInvestigator, RepositoryRegistry } from "./repositories.js";
+import { ReviewedInputService } from "./reviewed-input.js";
+import { ImplementationService } from "./implementation.js";
 
 export type ServiceOptions = {
   root: string;
@@ -59,6 +63,9 @@ export class PIService {
   readonly demo: boolean;
   readonly sendLocked: boolean;
   readonly enabled: boolean;
+  readonly repositories: RepositoryRegistry;
+  readonly reviewedInput: ReviewedInputService;
+  readonly implementation: ImplementationService;
   private owner = id("worker");
   private timer: ReturnType<typeof setTimeout> | null = null;
   private busy = false;
@@ -117,11 +124,17 @@ export class PIService {
       const settings = this.store.settings(),
         required = deploymentThreadSenders()!;
       const receiveOnly =
-        process.env.PI_CLARIFICATION_RECEIVE_ONLY === "true" ||
-        settings.receiveOnly;
+        process.env.PI_CLARIFICATION_RECEIVE_ONLY !== undefined
+          ? process.env.PI_CLARIFICATION_RECEIVE_ONLY === "true"
+          : settings.receiveOnly;
+      const modelInputMode =
+        process.env.PI_MODEL_INPUT_MODE === "reviewed_summary"
+          ? "reviewed_summary"
+          : settings.modelInputMode;
       if (
         configuredThreadSenders(settings).join(",") !== required.join(",") ||
-        settings.receiveOnly !== receiveOnly
+        settings.receiveOnly !== receiveOnly ||
+        settings.modelInputMode !== modelInputMode
       )
         this.store.saveSettings(
           {
@@ -129,6 +142,7 @@ export class PIService {
             requiredThreadSender: null,
             requiredThreadSenders: required,
             receiveOnly,
+            modelInputMode,
           },
           "deployment",
         );
@@ -174,6 +188,27 @@ export class PIService {
             requiredThreadSender(this.store.settings()),
           ));
     this.workflow = new Workflow(this.store);
+    this.repositories = this.demo
+      ? new RepositoryRegistry([])
+      : RepositoryRegistry.load();
+    this.reviewedInput = new ReviewedInputService(this.store);
+    if (!this.demo && process.env.PI_INVESTIGATOR_PROVIDER === "local_cli") {
+      const settings = this.store.settings();
+      const ids = this.repositories.entries.map((r) => r.id);
+      if (
+        !settings.investigationEnabled ||
+        JSON.stringify(settings.investigationRepositories) !==
+          JSON.stringify(ids)
+      )
+        this.store.saveSettings(
+          {
+            ...settings,
+            investigationEnabled: true,
+            investigationRepositories: ids,
+          },
+          "deployment",
+        );
+    }
     this.outbox = new OutboxService(this.store, this.gmail, this.sendLocked);
     this.approvals = new ApprovalService(
       this.store,
@@ -193,9 +228,11 @@ export class PIService {
               ).decide();
             },
           }
-        : process.env.PI_REASONER_PROVIDER === "anthropic"
-          ? new AnthropicReasoner()
-          : new JsonReasoner());
+        : process.env.PI_REASONER_PROVIDER === "local_cli"
+          ? new LocalReasoner()
+          : process.env.PI_REASONER_PROVIDER === "anthropic"
+            ? new AnthropicReasoner()
+            : new JsonReasoner());
     this.runtime = new ClarificationAgentRuntime(
       this.store,
       path.join(options.root, "agents/pi-clarification/AGENT.md"),
@@ -209,7 +246,21 @@ export class PIService {
       this.handoff,
       this.outbox,
       options.investigator ||
-        (this.demo ? new FakeInvestigator() : new JsonInvestigator()),
+        (this.demo
+          ? new FakeInvestigator()
+          : process.env.PI_INVESTIGATOR_PROVIDER === "local_cli"
+            ? new LocalInvestigator(
+                this.repositories,
+                undefined,
+                path.join(options.root, "agents/pi-investigator/AGENT.md"),
+              )
+            : new JsonInvestigator()),
+    );
+    this.implementation = new ImplementationService(
+      this.store,
+      this.repositories,
+      this.handoff,
+      options.root,
     );
     this.sync = new GmailSyncWorker(this.store, this.gmail, (m) =>
       this.orchestrator.ingest(m),
@@ -247,6 +298,10 @@ export class PIService {
     );
     return {
       enabled: this.enabled || this.demo,
+      aiRunner:
+        process.env.PI_REASONER_PROVIDER === "local_cli" ? runnerKind() : "api",
+      repositoryCount: this.repositories.entries.length,
+      modelInputMode: s.modelInputMode,
       demoAvailable: process.env.PI_CLARIFICATION_DEMO_ENABLED !== "false",
       requiredThreadSender: this.demo ? null : requiredThreadSender(s),
       requiredThreadSenders: this.demo ? [] : requiredThreadSenders(s),
@@ -268,45 +323,61 @@ export class PIService {
           ? null
           : s.receiveOnly
             ? "Inbox receive-only: eligible threads are stored locally. AI processing and replies are disabled"
-            : !s.privacyReviewed ||
-                !s.providerAgreementsConfirmed ||
-                !s.dataPolicyReference
-              ? "Metadata-only polling: case processing requires reviewed privacy/provider policy"
-              : !s.allowedSenders.length &&
-                  !s.allowedDomains.length &&
-                  !s.contacts.some((c) => c.active && c.canClarify)
-                ? "Metadata-only polling: configure authorized PI senders/contacts"
-                : null,
+            : s.modelInputMode === "reviewed_summary"
+              ? "AI uses only an owner-reviewed de-identified summary. Raw mailbox content stays local; sending remains separately locked"
+              : !s.privacyReviewed ||
+                  !s.providerAgreementsConfirmed ||
+                  !s.dataPolicyReference
+                ? "Metadata-only polling: case processing requires reviewed privacy/provider policy"
+                : !s.allowedSenders.length &&
+                    !s.allowedDomains.length &&
+                    !s.contacts.some((c) => c.active && c.canClarify)
+                  ? "Metadata-only polling: configure authorized PI senders/contacts"
+                  : null,
       },
       promptVersion: this.runtime.prompt().version,
       providerConfigured:
         this.demo ||
-        (process.env.PI_REASONER_PROVIDER === "anthropic"
-          ? Boolean(
-              process.env.PI_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY,
-            )
-          : Boolean(process.env.PI_REASONER_URL)),
+        (process.env.PI_REASONER_PROVIDER === "local_cli"
+          ? localRunnerReady()
+          : process.env.PI_REASONER_PROVIDER === "anthropic"
+            ? Boolean(
+                process.env.PI_ANTHROPIC_API_KEY ||
+                process.env.ANTHROPIC_API_KEY,
+              )
+            : Boolean(process.env.PI_REASONER_URL)),
       investigatorConfigured:
         this.demo ||
         Boolean(
+          process.env.PI_INVESTIGATOR_PROVIDER === "local_cli" &&
+          this.repositories.entries.length &&
+          localRunnerReady(),
+        ) ||
+        Boolean(
           process.env.PI_INVESTIGATOR_URL &&
-            process.env.PI_INVESTIGATOR_READONLY_VERIFIED === "true",
+          process.env.PI_INVESTIGATOR_READONLY_VERIFIED === "true",
         ),
       limitations: [
         ...(this.sendLocked
           ? ["Outbound email and Gmail draft writes are deployment-locked"]
           : []),
-        ...(!(process.env.PI_REASONER_PROVIDER === "anthropic"
-          ? process.env.PI_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY
-          : process.env.PI_REASONER_URL) && !this.demo
+        ...(!(process.env.PI_REASONER_PROVIDER === "local_cli"
+          ? localRunnerReady()
+          : process.env.PI_REASONER_PROVIDER === "anthropic"
+            ? process.env.PI_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY
+            : process.env.PI_REASONER_URL) && !this.demo
           ? [
               "Configure an isolated JSON reasoning provider; coding CLI runners are prohibited",
             ]
           : []),
-        ...(!process.env.PI_INVESTIGATOR_URL && !this.demo
+        ...(!process.env.PI_INVESTIGATOR_URL &&
+        process.env.PI_INVESTIGATOR_PROVIDER !== "local_cli" &&
+        !this.demo
           ? ["Read-only Investigator is not configured"]
           : []),
-        "Automatic implementor execution and external Tasks publishing are disabled; approved briefs are queued internally",
+        process.env.PI_IMPLEMENTATION_ENABLED === "true"
+          ? "Implementation requires exact scope authorization, isolated validation, code review and deployment-safe workflows. Only draft PRs; no merge or deployment"
+          : "Implementation/PR execution is not enabled; approved briefs are queued internally",
         "High-risk work requires human escalation; no deployment is authorized",
       ],
     };
@@ -370,6 +441,7 @@ export class PIService {
           messageId?: string;
           outboxId?: string;
           requestId?: string;
+          repository?: string;
         };
         if (
           this.store.db
@@ -426,6 +498,12 @@ export class PIService {
             break;
           case "handoff":
             this.handoff.publish(job.case_id!);
+            break;
+          case "implement":
+            await this.implementation.prepare(
+              job.case_id!,
+              payload.repository!,
+            );
             break;
           default:
             throw new Error("Unsupported work item kind");
@@ -581,6 +659,10 @@ export class PIService {
       this.store.db
         .prepare("DELETE FROM pi_investigation_requests WHERE case_id=?")
         .run(caseId);
+      this.store.db
+        .prepare("DELETE FROM pi_reviewed_inputs WHERE case_id=?")
+        .run(caseId);
+      this.implementation.erase(caseId);
       this.store.event(caseId, "CONTENT_ERASED", "admin", {
         immutableEvidenceRetained: true,
       });

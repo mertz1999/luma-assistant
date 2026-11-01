@@ -33,12 +33,11 @@ export class OutboxService {
         c.demo || threadAuthorized(this.store, c.mailbox, c.threadId),
         "Thread does not meet the required sender policy",
       );
-      const recipients = recipientsFor(
-        contactIds,
-        c.workflow,
-        s,
-        kind === "approval",
-      );
+      const localOnly =
+        this.locked && s.mode === "draft_only" && !c.demo && !contactIds.length;
+      const recipients = localOnly
+        ? []
+        : recipientsFor(contactIds, c.workflow, s, kind === "approval");
       const existing = this.store.db
         .prepare("SELECT payload FROM pi_outbox WHERE idempotency_key=?")
         .get(key) as { payload: string } | undefined;
@@ -51,9 +50,11 @@ export class OutboxService {
         caseId,
         kind,
         recipients,
-        subject: original.subject.replace(/^(Re:\s*)+/i, "Re: "),
+        subject: localOnly
+          ? `PI clarification ${caseId}`
+          : original.subject.replace(/^(Re:\s*)+/i, "Re: "),
         bodyText: `${sanitizeBody(body)}\n\nPI AI Support Assistant · disclosed AI assistant\nScope approval does not authorize production deployment.`,
-        state: "prepared",
+        state: localOnly ? "local_only" : "prepared",
         providerId: null,
         rfcMessageId: `<${digest(outId)}@${s.mailbox.split("@")[1]}>`,
         specVersion: c.specVersion,
@@ -78,12 +79,13 @@ export class OutboxService {
         kind,
         policyDigest: digest(s),
       });
-      this.store.enqueue(
-        "outbox",
-        `outbox:${row.id}`,
-        { outboxId: row.id },
-        caseId,
-      );
+      if (!localOnly)
+        this.store.enqueue(
+          "outbox",
+          `outbox:${row.id}`,
+          { outboxId: row.id },
+          caseId,
+        );
       return row;
     });
   }
@@ -131,7 +133,8 @@ export class OutboxService {
   }
   async deliver(outboxId: string) {
     let row = this.get(outboxId);
-    if (["sent", "cancelled", "simulated"].includes(row.state)) return;
+    if (["sent", "cancelled", "simulated", "local_only"].includes(row.state))
+      return;
     const c = this.store.getCase(row.caseId),
       settings = this.store.settings();
     if (c.demo) {
