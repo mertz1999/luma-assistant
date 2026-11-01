@@ -158,3 +158,7 @@ The live installation now sets `PI_GMAIL_REQUIRED_THREAD_SENDERS=lnqcore@proimag
 ## Current Codex/Cursor worker update
 
 The owner requested the existing Luma Codex/Cursor connection, PI repositories under `/home/pi`, implementation and PRs, and prohibited target deployment. The isolated local-worker and reviewed-summary configuration supersedes the earlier blanket receive-only/API-provider requirement. Email sending remains locked. See [local worker setup and exact limitations](pi-clarification-local-workers.md). Provider agreements are not marked confirmed; patient names/DOS are excluded from model thread context through owner-reviewed summaries. Client approver addresses are still required.
+
+## Automatic analysis enabled by the owner
+
+The latest owner instruction removes the manual input-summary checkpoint. New eligible messages and replies now queue isolated AI analysis automatically using sanitized thread text. The previous reviewed-summary requirement no longer describes this installation. Text redaction is retained but is not guaranteed anonymization; provider/privacy attestations are unchanged. Send locks, client scope-approval gates, draft-PR review and the prohibition on target deployments remain active. See the live inbox guide for current behavior.

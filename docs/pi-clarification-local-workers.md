@@ -8,9 +8,9 @@ This supersedes the earlier requirement for a separately configured API reasoner
 - All PI workers are protected from ordinary agent selection and scheduling: `pi-clarification`, `pi-investigator`, `pi-implementor`.
 - Real mailbox intake remains restricted to threads containing an actual From message from `LNQCore@proimagetx.com` or `tanaki.reza1999@gmail.com`.
 - Email sending and Gmail draft writes remain locked. Local clarification drafts can have no recipient while client identities are awaiting configuration; those records are permanently `local_only` and are never queued for Gmail delivery.
-- Names and dates of service are treated as sensitive. The deployed model-input mode requires an owner-reviewed de-identified business summary. Raw message bodies, subjects, attachments, addresses and unreviewed specification text do not enter the reasoning thread context. Regex redaction is not a guarantee of de-identification: a human must review the summary.
-- Privacy-review/provider-agreement fields remain unconfirmed. The reviewed-summary lane is an explicit, restricted workflow and does not claim that an account is approved for raw patient information. Automatic raw-email analysis requires a separately established policy/provider configuration.
-- A summary is bound to a digest of the actual latest thread and specification versions. New messages or a new specification invalidate the review. Source changes while a review form is open reject the save.
+- The owner explicitly requested automatic analysis without summaries or confirmation clicks. The deployed mode is `automatic`: each eligible message supplies sanitized thread text to the isolated AI worker. Existing redaction removes recognized identifiers, credentials, quotes and unsafe markup; it is not guaranteed de-identification. Residual names/DOS or other patient information may reach the selected AI account. No model summary-review form is shown or required. Attachments and mailbox addresses remain excluded from reasoning thread context.
+- Privacy-review/provider-agreement fields remain unconfirmed. Automatic processing records the actual owner instruction as its authorization reference, not a claim of institutional/provider agreement. It is gated to the isolated local runner, restricted sender threads, `draft_only`, and a deployment send lock. Clearing any of those requirements fails closed.
+- Optional `reviewed_summary` mode remains available for other installations; its source digests and stale-review protections are retained. It is not used by this automatic installation.
 - No PI target application deployment, merge, release, image publication, workflow dispatch or production database action is permitted.
 
 ## Architecture and enforcement
@@ -19,7 +19,7 @@ This supersedes the earlier requirement for a separately configured API reasoner
 
 The read-only investigator receives bounded, filtered source excerpts at exact local origin-tracking commits. It cannot execute repository scripts. Confirmed facts must cite exact supplied references; fabricated file/commit/PR citations are rejected. Static inspection does not establish a reproduction or passing tests. Excluded paths include data, fixtures, uploads, secrets, deployment/infra files and binaries. Source may be incomplete or stale; results disclose those limitations.
 
-The implementation worker proposes source contents only. The backend requires a verified exact-version approved handoff and the latest reviewed input, then creates a separate checkout. Changes outside allowed source paths, symlinks, deployment/workflow files, redacted/incompletely supplied existing files and unauthorized repositories fail. Server-configured validation commands execute in a separate namespace **without network or host credentials**, not inside the model worker. Failed or missing checks stop publication. Successful checks bind an exact source digest; subsequent edits or authorization changes invalidate publication. Artifacts remain available for owner diff review.
+The implementation worker proposes source contents only. The backend requires a verified exact-version approved handoff and the latest authorized input (automatic sanitized thread or optional reviewed summary), then creates a separate checkout. Changes outside allowed source paths, symlinks, deployment/workflow files, redacted/incompletely supplied existing files and unauthorized repositories fail. Server-configured validation commands execute in a separate namespace **without network or host credentials**, not inside the model worker. Failed or missing checks stop publication. Successful checks bind an exact source digest; subsequent edits or authorization changes invalidate publication. Artifacts remain available for owner diff review.
 
 PR publication is a separate explicit owner action after diff review. The backend verifies that the remote base still matches the inspected commit and checks workflow triggers before any push. Unsupported automatic events, broad branch pushes and PR workflows containing deployment/credential/delegated-workflow risks block publication. Commits carry `[skip ci]`, PRs are drafts, and uncertain publication results require manual reconciliation. There is no merge/deployment action. Existing repository automation is not modified implicitly.
 
@@ -36,11 +36,10 @@ Snapshots use local `origin/<branch>` refs and may lag remote changes. PR public
 ## How to test
 
 1. Send a non-sensitive request from either allowed sender to `admin@proimagetx.ai`; wait two minutes or use Operations → Poll Gmail now.
-2. Open Cowork → Cases → select the received case → review.
-3. In Reviewed AI input, write the business issue and expected behavior without names, dates of service, identifiers or secrets. Review the latest thread/specification, check the confirmation, and save.
-4. Click Request agent draft. Review the decision/evidence, specification and outbound panels. Any clarification is a short, local draft; nothing is sent to Gmail.
-5. New messages or specifications require a new summary review. Use short generic examples when testing; no live patient input is necessary.
-6. After actual client contacts and exact scope approval exist, publish the approved task. Select an authorized repository in the review panel, generate/validate changes, inspect the full diff, and explicitly create a draft PR. Unsafe workflows, stale bases, missing dependencies/checks or unapproved/high-risk scope stop the operation.
+2. Open Cowork → Cases and select the case. AI analysis starts automatically; no summary or confirmation is needed.
+3. Review evidence, specifications and outbound panels for the AI decision and any local draft. Nothing is sent to Gmail. Clinical/high-risk requests can be escalated; missing details can yield a short local question.
+4. Reply in the same qualifying Gmail thread. The next poll ingests it and queues another analysis automatically.
+5. After verified client contacts and exact scope approval exist, publish the approved task. Generate/validate changes in an authorized repository, inspect the diff and explicitly create a draft PR. Scope approval and code review remain separate from the removed AI-input review.
 
 Do not mistake a general request to enable implementation for approval of every incoming requirement. Client addresses and authority are still required. Reza, Mahdi and Hossein are developers, not clients. No client identities or approvals have been invented.
 

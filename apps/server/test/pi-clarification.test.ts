@@ -2420,3 +2420,158 @@ test("isolated CLI token refresh preserves the login and does not overwrite anot
   );
   assert.equal(fs.readFileSync(file, "utf8"), initial);
 });
+
+async function withAutomaticAnalysis(fn: () => Promise<void>) {
+  const values = {
+    PI_MODEL_INPUT_MODE: "automatic",
+    PI_AUTOMATIC_EMAIL_ANALYSIS: "true",
+    PI_AUTOMATIC_EMAIL_AUTHORIZATION: "synthetic-owner-authorization",
+    PI_REASONER_PROVIDER: "local_cli",
+    PI_CLARIFICATION_SEND_LOCK: "true",
+    PI_CLARIFICATION_RECEIVE_ONLY: "false",
+    PI_GMAIL_REQUIRED_THREAD_SENDERS:
+      "lnqcore@proimagetx.com,tanaki.reza1999@gmail.com",
+  };
+  const prior = Object.fromEntries(
+    Object.keys(values).map((k) => [k, process.env[k]]),
+  );
+  Object.assign(process.env, values);
+  try {
+    await fn();
+  } finally {
+    for (const [key, value] of Object.entries(prior)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test("automatic inbox processing analyzes new messages and replies without a manual summary, with sends locked", async () => {
+  await withAutomaticAnalysis(async () => {
+    const gmail = new FakeGmail();
+    let decisions = 0;
+    const s = service(false, {
+      gmail,
+      reasoner: {
+        decide: async (input) => {
+          decisions++;
+          const context = input.context as {
+            case: { id: string; state: string; specVersion: number };
+            thread: { evidenceId: string; body: string }[];
+          };
+          assert.ok(
+            context.thread.every((m) => !m.evidenceId.startsWith("reviewed:")),
+          );
+          assert.ok(!JSON.stringify(context).includes("Synthetic Patient"));
+          assert.ok(!JSON.stringify(context).includes("DOS: 2026-01-01"));
+          return {
+            schemaVersion: 1,
+            caseId: context.case.id,
+            caseState: context.case.state,
+            observedSpecVersion: context.case.specVersion,
+            classification: "unclear",
+            priority: "normal",
+            riskLevel: "low",
+            decision: "SEND_CLARIFICATION",
+            rationale:
+              "The application and expected fallback need clarification",
+            factEvidenceIds: context.thread.map((m) => m.evidenceId),
+            uncertainties: ["Application unspecified"],
+            requiredActions: ["clarify"],
+            blockingQuestions: ["Which application?"],
+            emailDraft: {
+              kind: "clarification",
+              subject: "Display question",
+              bodyText:
+                "Which application is affected, and what should appear when the configured type is missing?",
+              contactIds: [],
+            },
+          };
+        },
+      },
+    });
+    s.store.db
+      .prepare(
+        "UPDATE pi_mailboxes SET credential='configured' WHERE address=?",
+      )
+      .run(s.store.settings().mailbox);
+    gmail.profile = async () => ({
+      emailAddress: s.store.settings().mailbox,
+      historyId: "100",
+    });
+    gmail.messages = [
+      message(s, {
+        id: "automatic-anchor",
+        from: "tanaki.reza1999@gmail.com",
+        body: "DOS: 2026-01-01\nThe configured type is missing.",
+      }),
+      message(s, {
+        id: "automatic-excluded",
+        threadId: "excluded",
+        from: "stranger@example.test",
+      }),
+    ];
+    await s.sync.sync();
+    await s.drain();
+    assert.equal(s.store.cases().length, 1);
+    const caseId = s.store.cases()[0].id;
+    assert.equal(s.reviewedInput.get(caseId), null);
+    assert.equal(decisions, 1);
+    assert.equal(s.store.detail(caseId).outbox[0].state, "local_only");
+    assert.equal(s.store.detail(caseId).case.state, "NEEDS_CLIENT_DETAILS");
+    gmail.messages.push(
+      message(s, {
+        id: "automatic-reply",
+        from: "client@example.test",
+        body: "The generic display screen is affected.",
+        date: new Date(s.store.now().getTime() + 1000).toISOString(),
+      }),
+    );
+    await s.sync.sync();
+    await s.drain();
+    assert.equal(decisions, 2);
+    assert.equal(s.store.detail(caseId).runs.length, 2);
+    assert.ok(
+      s.store
+        .detail(caseId)
+        .outbox.every((o) => o.state === "local_only" && o.providerId === null),
+    );
+    assert.equal(s.store.settings().privacyReviewed, false);
+    assert.equal(s.store.settings().providerAgreementsConfirmed, false);
+    assert.equal(
+      s.store
+        .events(caseId)
+        .some((e) => e.kind === "MODEL_INPUT_REVIEW_REQUIRED"),
+      false,
+    );
+    assert.equal(gmail.calls, 0);
+  });
+});
+
+test("automatic analysis fails closed without owner authorization or with send restrictions loosened", async () => {
+  const { requireProcessingAuthorization } =
+    await import("../src/pi-clarification/policy.js");
+  await withAutomaticAnalysis(async () => {
+    const settings = PISettingsSchema.parse({ modelInputMode: "automatic" });
+    assert.doesNotThrow(() => requireProcessingAuthorization(settings));
+    for (const key of [
+      "PI_AUTOMATIC_EMAIL_ANALYSIS",
+      "PI_AUTOMATIC_EMAIL_AUTHORIZATION",
+      "PI_REASONER_PROVIDER",
+      "PI_CLARIFICATION_SEND_LOCK",
+      "PI_GMAIL_REQUIRED_THREAD_SENDERS",
+    ]) {
+      const saved = process.env[key];
+      process.env[key] = "";
+      assert.throws(
+        () => requireProcessingAuthorization(settings),
+        /Automatic email analysis requires/,
+      );
+      process.env[key] = saved;
+    }
+    assert.throws(
+      () => requireProcessingAuthorization({ ...settings, mode: "autonomous" }),
+      /Automatic email analysis requires/,
+    );
+  });
+});

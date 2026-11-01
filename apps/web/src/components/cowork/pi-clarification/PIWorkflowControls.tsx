@@ -153,10 +153,13 @@ export function PIWorkflowControls({
       <section className="space-y-2 rounded border border-card-border p-3">
         <h3 className="font-medium">Implementation and draft PR</h3>
         <p className="text-sm">
-          Requires an approved task, a current reviewed summary and configured
-          repository checks. Changes are validated in an isolated checkout
-          without network or deployment credentials. The agent cannot merge,
-          deploy or dispatch workflows.
+          Requires an approved task and configured repository checks
+          {settings?.modelInputMode === "reviewed_summary"
+            ? ", plus a current reviewed summary"
+            : ""}
+          . Changes are validated in an isolated checkout without network or
+          deployment credentials. The agent cannot merge, deploy or dispatch
+          workflows.
         </p>
         <label className="block text-sm">
           Repository

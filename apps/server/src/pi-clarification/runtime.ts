@@ -14,7 +14,7 @@ import {
 import { PIStore, id, digest } from "./store.js";
 import {
   requirePolicy,
-  requirePrivacy,
+  requireProcessingAuthorization,
   sanitizeBody,
   redactTree,
 } from "./policy.js";
@@ -317,7 +317,7 @@ export class ClarificationAgentRuntime {
     if (!demo) {
       if (this.store.settings().modelInputMode === "reviewed_summary")
         new ReviewedInputService(this.store).requireCurrent(detail.case.id);
-      else requirePrivacy(this.store.settings());
+      else requireProcessingAuthorization(this.store.settings());
     }
     const prompt = this.prompt(),
       runId = id("run");

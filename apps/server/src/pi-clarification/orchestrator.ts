@@ -16,7 +16,7 @@ import { ClarificationAgentRuntime, type Investigator } from "./runtime.js";
 import {
   allowedInbound,
   requirePolicy,
-  requirePrivacy,
+  requireProcessingAuthorization,
   sanitizeBody,
   safeTitle,
   redactTree,
@@ -37,8 +37,7 @@ export class CaseOrchestrator {
       s = this.store.settings();
     requirePolicy(m.demo === demo, "Demo transport marker mismatch");
     if (!demo) {
-      if (!s.receiveOnly && s.modelInputMode !== "reviewed_summary")
-        requirePrivacy(s);
+      if (!s.receiveOnly) requireProcessingAuthorization(s);
       requirePolicy(m.mailbox === s.mailbox, "Unexpected mailbox");
     }
     const restricted = !demo && Boolean(requiredThreadSender(s));

@@ -11,7 +11,11 @@ import {
   sandboxBase,
 } from "./local-runner.js";
 import { HandoffService } from "./handoff.js";
-import { requirePolicy } from "./policy.js";
+import {
+  requirePolicy,
+  requireProcessingAuthorization,
+  sanitizeBody,
+} from "./policy.js";
 import { ReviewedInputService } from "./reviewed-input.js";
 
 const ProposalSchema = z
@@ -207,10 +211,26 @@ export class ImplementationService {
       "Implementation/PR service is not enabled",
     );
     requirePolicy(
-      this.store.settings().modelInputMode === "reviewed_summary",
-      "Local implementation requires reviewed de-identified input",
+      ["reviewed_summary", "automatic"].includes(
+        this.store.settings().modelInputMode,
+      ),
+      "Local implementation requires a configured protected input mode",
     );
-    const brief = new ReviewedInputService(this.store).requireCurrent(caseId);
+    requireProcessingAuthorization(this.store.settings());
+    const input = new ReviewedInputService(this.store);
+    const brief =
+      this.store.settings().modelInputMode === "automatic"
+        ? {
+            sourceDigest: input.sourceDigest(caseId),
+            summary: this.store
+              .detail(caseId)
+              .messages.filter((m) => m.direction !== "outgoing")
+              .slice(-15)
+              .map((m) => sanitizeBody(m.body))
+              .join("\n\n")
+              .slice(0, 12000),
+          }
+        : input.requireCurrent(caseId);
     const task = this.handoff.publish(caseId);
     requirePolicy(
       task.repositoryCandidates.includes(repository),

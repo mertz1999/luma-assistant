@@ -127,15 +127,16 @@ export class PIService {
         process.env.PI_CLARIFICATION_RECEIVE_ONLY !== undefined
           ? process.env.PI_CLARIFICATION_RECEIVE_ONLY === "true"
           : settings.receiveOnly;
-      const modelInputMode =
-        process.env.PI_MODEL_INPUT_MODE === "reviewed_summary"
-          ? "reviewed_summary"
-          : settings.modelInputMode;
+      const modelInputMode = ["reviewed_summary", "automatic"].includes(
+        process.env.PI_MODEL_INPUT_MODE || "",
+      )
+        ? (process.env.PI_MODEL_INPUT_MODE as "reviewed_summary" | "automatic")
+        : settings.modelInputMode;
       if (
         configuredThreadSenders(settings).join(",") !== required.join(",") ||
         settings.receiveOnly !== receiveOnly ||
         settings.modelInputMode !== modelInputMode
-      )
+      ) {
         this.store.saveSettings(
           {
             ...settings,
@@ -146,6 +147,23 @@ export class PIService {
           },
           "deployment",
         );
+        if (
+          modelInputMode === "automatic" &&
+          settings.modelInputMode !== "automatic"
+        )
+          this.store.event(
+            null,
+            "AUTOMATIC_EMAIL_ANALYSIS_ENABLED",
+            "owner-deployment",
+            {
+              authorizationReference:
+                process.env.PI_AUTOMATIC_EMAIL_AUTHORIZATION || "",
+              emailSendingLocked: this.sendLocked,
+              targetDeploymentAuthorized: false,
+              providerAgreementAttestationChanged: false,
+            },
+          );
+      }
     }
     this.vault = new CredentialVault(this.store);
     if (
@@ -325,15 +343,17 @@ export class PIService {
             ? "Inbox receive-only: eligible threads are stored locally. AI processing and replies are disabled"
             : s.modelInputMode === "reviewed_summary"
               ? "AI uses only an owner-reviewed de-identified summary. Raw mailbox content stays local; sending remains separately locked"
-              : !s.privacyReviewed ||
-                  !s.providerAgreementsConfirmed ||
-                  !s.dataPolicyReference
-                ? "Metadata-only polling: case processing requires reviewed privacy/provider policy"
-                : !s.allowedSenders.length &&
-                    !s.allowedDomains.length &&
-                    !s.contacts.some((c) => c.active && c.canClarify)
-                  ? "Metadata-only polling: configure authorized PI senders/contacts"
-                  : null,
+              : s.modelInputMode === "automatic"
+                ? "Automatic email analysis: eligible messages queue isolated AI processing with text redaction. No manual summary is required; email sending remains locked"
+                : !s.privacyReviewed ||
+                    !s.providerAgreementsConfirmed ||
+                    !s.dataPolicyReference
+                  ? "Metadata-only polling: case processing requires reviewed privacy/provider policy"
+                  : !s.allowedSenders.length &&
+                      !s.allowedDomains.length &&
+                      !s.contacts.some((c) => c.active && c.canClarify)
+                    ? "Metadata-only polling: configure authorized PI senders/contacts"
+                    : null,
       },
       promptVersion: this.runtime.prompt().version,
       providerConfigured:

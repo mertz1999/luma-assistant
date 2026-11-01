@@ -85,6 +85,24 @@ export function requirePrivacy(s: PISettings) {
     "Live processing requires a reviewed data policy and confirmed provider agreements",
   );
 }
+export function requireProcessingAuthorization(s: PISettings) {
+  if (s.modelInputMode === "automatic") {
+    requirePolicy(
+      process.env.PI_AUTOMATIC_EMAIL_ANALYSIS === "true" &&
+        Boolean(process.env.PI_AUTOMATIC_EMAIL_AUTHORIZATION?.trim()) &&
+        process.env.PI_REASONER_PROVIDER === "local_cli" &&
+        process.env.PI_CLARIFICATION_SEND_LOCK === "true" &&
+        s.mode === "draft_only" &&
+        Boolean(
+          process.env.PI_GMAIL_REQUIRED_THREAD_SENDERS ||
+          process.env.PI_GMAIL_REQUIRED_THREAD_SENDER,
+        ),
+      "Automatic email analysis requires explicit deployment authorization, the isolated local runner, a sender restriction and the send lock",
+    );
+    return;
+  }
+  if (s.modelInputMode !== "reviewed_summary") requirePrivacy(s);
+}
 export function highRisk(spec: PISpec, settings: PISettings): boolean {
   const content =
     `${spec.workflow} ${spec.title} ${spec.inScope.join(" ")} ${spec.expectedBehavior} ${spec.dataMigrationImpact}`.toLowerCase();

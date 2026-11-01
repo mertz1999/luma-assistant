@@ -68,7 +68,7 @@ export const PISettingsSchema = z
     paused: z.boolean().default(false),
     receiveOnly: z.boolean().default(false),
     modelInputMode: z
-      .enum(["reviewed_policy", "reviewed_summary"])
+      .enum(["reviewed_policy", "reviewed_summary", "automatic"])
       .default("reviewed_policy"),
     requiredThreadSender: z
       .string()

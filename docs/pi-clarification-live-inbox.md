@@ -17,8 +17,8 @@ The backend verifies headers before fetching bodies, records the qualifying mess
 ## Current behavior
 
 - Polling runs every 120 seconds, independently of the browser. Operations → Poll Gmail now queues an immediate pass.
-- Qualifying messages are sanitized and saved locally; a case appears as `RECEIVED` and subsequent replies update that case. Mailbox-sent messages are context only and never enqueue another reply.
-- Intake is active with a **reviewed-summary AI lane** using the existing Codex login (Cursor is also supported). In each case’s review panel, save an explicitly reviewed de-identified business summary before requesting an agent draft. Patient names, dates of service and raw email content stay outside model thread context. New messages or specifications require another review. Provider/privacy attestations remain unconfirmed; raw-email AI analysis is not enabled. See [the local worker guide](pi-clarification-local-workers.md).
+- Qualifying messages are sanitized and saved locally; a case starts as `RECEIVED`, then progresses through automatic analysis. Incoming replies update that case and trigger another analysis. Mailbox-sent messages remain context only and do not trigger reply loops.
+- **Automatic AI analysis is enabled at the owner’s request**, using the existing Codex login (Cursor is also supported). Each new eligible incoming message queues analysis without a manual summary or per-message confirmation. The service supplies sanitized thread text and applies its existing identifier/credential/quote redaction. This is not guaranteed anonymization; residual patient information can reach the chosen AI connection. Provider/privacy-agreement fields remain unconfirmed rather than being fabricated. See [the local worker guide](pi-clarification-local-workers.md).
 - Outbound email and Gmail draft creation remain locked. Nothing is emailed back to the sender.
 - There are no live sample cases, replay controls or simulator endpoints. Automated tests retain isolated fixtures outside the live mailbox/database.
 
@@ -38,8 +38,8 @@ The release publishes this section into the effective versioned prompt while pre
 
 1. Send a simple non-sensitive email **from LNQCore@proimagetx.com or tanaki.reza1999@gmail.com to admin@proimagetx.ai**, e.g. subject `PI inbox check` and body `Please confirm the generic AR type display behavior. No patient data is included.`
 2. Wait roughly two minutes, or use **Cowork → Operations → Poll Gmail now**.
-3. Open **Cowork → Cases**. A real `RECEIVED` case should appear. Select it to see the actual subject and sanitized thread. Case titles are deliberately generic to keep sensitive subject information out of titles.
+3. Open **Cowork → Cases**. A real case should appear and move beyond `RECEIVED` as the AI processes it. Select it to see the actual subject and sanitized thread. Case titles are deliberately generic to keep sensitive subject information out of titles.
 4. Reply in that same Gmail conversation from another participant, keeping admin@proimagetx.ai included. The existing case should gain the reply after the next poll.
 5. Negative check: a fresh email from another address without an actual message from either allowed sender in its thread should not create a case. Merely CC'ing an allowed sender is insufficient; that sender must actually reply-all to qualify it.
 
-Expect **no email reply**. AI runs and local drafts require the reviewed-input step described above; simply receiving an email does not send its contents to a model. Check the send-lock banner and Gmail last-sync/error status. Confirm delivery to the inbox and the actual sender if a case does not appear.
+Expect **automatic AI analysis and no email reply**. Check the case’s evidence, specifications and outbound panels for a decision, specification or local clarification draft. No manual summary is required. Missing details or high-risk requests may result in waiting/escalation instead of a draft. Check the send-lock banner and Gmail last-sync/error status. Confirm delivery to the inbox and the actual sender if a case does not appear.

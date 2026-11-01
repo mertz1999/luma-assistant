@@ -1,6 +1,6 @@
 import { PIStore } from "./store.js";
 import { GmailError, type GmailClient } from "./gmail.js";
-import { requirePolicy, requirePrivacy } from "./policy.js";
+import { requirePolicy, requireProcessingAuthorization } from "./policy.js";
 import {
   requiredThreadSender,
   parseThreadSenders,
@@ -25,13 +25,15 @@ export class GmailSyncWorker {
     const mailbox = this.store.mailbox();
     requirePolicy(mailbox?.connected, "Gmail not connected");
     const query = sender
-      ? `(${s.gmailQuery}) {${parseThreadSenders(sender).map((address) => `from:${address}`).join(" ")}}`
+      ? `(${s.gmailQuery}) {${parseThreadSenders(sender)
+          .map((address) => `from:${address}`)
+          .join(" ")}}`
       : s.gmailQuery;
     const processed = new Set<string>();
     try {
       if (
         !s.receiveOnly &&
-        s.modelInputMode !== "reviewed_summary" &&
+        s.modelInputMode === "reviewed_policy" &&
         (!s.privacyReviewed ||
           !s.providerAgreementsConfirmed ||
           !s.dataPolicyReference ||
@@ -61,7 +63,7 @@ export class GmailSyncWorker {
         });
         return;
       }
-      if (!s.receiveOnly && s.modelInputMode !== "reviewed_summary") requirePrivacy(s);
+      if (!s.receiveOnly) requireProcessingAuthorization(s);
       const processThread = async (
         threadId: string,
         historyDelivery = false,

@@ -245,8 +245,11 @@ export function PIClarification(): JSX.Element {
       {status?.aiRunner && status.aiRunner !== "api" ? (
         <p className="mb-3 text-sm">
           AI runner: {status.aiRunner} · {status.repositoryCount || 0} PI
-          repositories · Reviewed summaries required · Target deployments
-          prohibited
+          repositories ·{" "}
+          {status.modelInputMode === "automatic"
+            ? "Automatic email analysis"
+            : "Reviewed summaries required"}{" "}
+          · Target deployments prohibited
         </p>
       ) : null}
       {error ? (

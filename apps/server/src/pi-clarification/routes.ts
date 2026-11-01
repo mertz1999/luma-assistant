@@ -317,9 +317,10 @@ export function registerPI(
       );
       requirePolicy(!svc.demo, "Demo settings are managed by fixtures");
       requirePolicy(
-        process.env.PI_MODEL_INPUT_MODE !== "reviewed_summary" ||
-          settings.modelInputMode === "reviewed_summary",
-        "Reviewed model input is locked by deployment configuration",
+        !["reviewed_summary", "automatic"].includes(
+          process.env.PI_MODEL_INPUT_MODE || "",
+        ) || settings.modelInputMode === process.env.PI_MODEL_INPUT_MODE,
+        "AI input mode is locked by deployment configuration",
       );
       ok(res, svc.store.saveSettings(settings, "admin"));
     }),
