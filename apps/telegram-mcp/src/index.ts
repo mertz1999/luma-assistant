@@ -424,7 +424,30 @@ function rememberCandidate(state: TelegramReceiveState, candidate: InboundFileCa
   }
 }
 
+function serverSessionBridgeOwnsUpdates(): boolean {
+  const ownerPath = path.join(path.dirname(telegramReceiveStatePath), "updates-owner.json");
+  if (process.env.TELEGRAM_SESSIONS_THREAD_ID?.trim()) {
+    try {
+      if (!fs.existsSync(ownerPath)) return true;
+      const parsed = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as { owner?: string };
+      return parsed.owner === "server-session-bridge" || !parsed.owner;
+    } catch {
+      return true;
+    }
+  }
+  try {
+    if (!fs.existsSync(ownerPath)) return false;
+    const parsed = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as { owner?: string };
+    return parsed.owner === "server-session-bridge";
+  } catch {
+    return false;
+  }
+}
+
 async function pollTelegramFileUpdates(state: TelegramReceiveState): Promise<void> {
+  // Luma server Sessions bridge is the sole getUpdates consumer when configured.
+  if (serverSessionBridgeOwnsUpdates()) return;
+
   let offset = state.next_update_offset ?? -100;
   const maxPages = Number.isSafeInteger(TELEGRAM_RECEIVE_MAX_PAGES) && TELEGRAM_RECEIVE_MAX_PAGES > 0
     ? TELEGRAM_RECEIVE_MAX_PAGES
@@ -707,8 +730,11 @@ async function getLastUploadedFile(args: {
     const candidate = state.last_candidates[stateKey];
     if (!candidate) {
       const location = threadId ? `chat ${chatId}, topic ${threadId}` : `chat ${chatId}`;
+      const bridgeHint = serverSessionBridgeOwnsUpdates()
+        ? " The Luma Sessions bridge owns Telegram updates — upload a document while the server is running, then try again."
+        : "";
       throw new Error(
-        `No uploaded Telegram document was found for ${location}. Upload a document, then try again.`,
+        `No uploaded Telegram document was found for ${location}. Upload a document, then try again.${bridgeHint}`,
       );
     }
 
@@ -805,6 +831,7 @@ async function sendTelegramMessage(args: {
   message_thread_id?: string | number | null;
   parse_mode?: "HTML" | "Markdown" | "MarkdownV2";
   disable_notification?: boolean;
+  reply_markup?: Record<string, unknown>;
 }): Promise<SendMessageResult> {
   const text = args.text.trim();
   if (!text) throw new Error("Telegram message text is empty.");
@@ -812,18 +839,19 @@ async function sendTelegramMessage(args: {
   const chatId = resolveChatId(args.chat_id);
   const threadId = resolveThreadId(args.message_thread_id, TEXT_THREAD_ENV);
 
-  const body = new URLSearchParams({
+  const payload: Record<string, unknown> = {
     chat_id: chatId,
     text: text.slice(0, 4096),
-  });
-  if (threadId) body.set("message_thread_id", threadId);
-  if (args.parse_mode) body.set("parse_mode", args.parse_mode);
-  if (args.disable_notification !== undefined) body.set("disable_notification", String(Boolean(args.disable_notification)));
+  };
+  if (threadId) payload.message_thread_id = threadId;
+  if (args.parse_mode) payload.parse_mode = args.parse_mode;
+  if (args.disable_notification !== undefined) payload.disable_notification = Boolean(args.disable_notification);
+  if (args.reply_markup) payload.reply_markup = args.reply_markup;
 
   const result = await callTelegram<TelegramSendMessageResult>("sendMessage", {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   });
 
   return {
@@ -904,6 +932,7 @@ function createServer(): McpServer {
         message_thread_id: z.union([z.string(), z.number()]).nullable().optional().describe("Telegram topic/thread id. Defaults to TELEGRAM_MESSAGE_TEXT_THREAD_ID, then TELEGRAM_MESSAGE_FILE_THREAD_ID."),
         parse_mode: z.enum(["HTML", "Markdown", "MarkdownV2"]).optional().describe("Optional Telegram parse mode."),
         disable_notification: z.boolean().optional().describe("Whether Telegram should send the message silently."),
+        reply_markup: z.record(z.string(), z.unknown()).optional().describe("Optional Telegram reply_markup (inline keyboard, force reply, etc.)."),
       },
     },
     async (args) => {

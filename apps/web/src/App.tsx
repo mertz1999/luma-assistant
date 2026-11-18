@@ -8,11 +8,9 @@ import {
   Bot,
   CalendarClock,
   Check,
-  ClipboardList,
   CircleStop,
   Copy,
   Download,
-  ExternalLink,
   FileCode2,
   Image as ImageIcon,
   Lock,
@@ -97,14 +95,13 @@ import {
   uploadAttachment,
 } from "@/lib/api";
 import { parsePlanningMessage, type PlanningSegment } from "@/lib/planning";
+import { createScreenWakeLockController } from "@/lib/screenWakeLock";
 import { resolveTextDirection } from "@/lib/textDirection";
 import { cn } from "@/lib/utils";
 import { useUiStore } from "@/store/useUiStore";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { CardContent } from "@/components/ui/card";
-import { TaskManager } from "@/TaskManager";
-
 type StatusFilter = "all" | "running" | "completed" | "failed" | "stopped";
 type SessionFilterValue = StatusFilter | "all-history";
 type DockTab = "terminal" | "context";
@@ -170,7 +167,17 @@ type PlanSessionState = "idle" | "armed" | "active";
 
 const sandboxOptions: SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
 const runnerOptions: RunRunner[] = ["codex", "claude", "cursor"];
-const codexModelOptions = ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4"];
+const codexModelOptions = [
+  "gpt-6.1-sol",
+  "gpt-6-sol",
+  "gpt-6-astra",
+  "gpt-6-luna",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.5",
+  "gpt-5.4",
+];
 const claudeModelOptions = ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-4-1"];
 const defaultCursorModelOptions = ["composer-2.5", "auto", "gpt-5.3-codex", "claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro"];
 const codexReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
@@ -1126,7 +1133,7 @@ function readAttachmentRef(input: unknown): AttachmentRef | null {
     && typeof input.name === "string"
     && typeof input.mimeType === "string"
     && typeof input.size === "number"
-    && (input.kind === "image" || input.kind === "text")
+    && (input.kind === "image" || input.kind === "text" || input.kind === "file")
     && typeof input.relativePath === "string"
     && typeof input.uploadedAt === "number"
     ? {
@@ -2117,10 +2124,6 @@ function ToolEntryGroup({
 }
 
 export function App(): JSX.Element {
-  if (typeof window !== "undefined" && window.location.pathname.startsWith("/taskmanager")) {
-    return <TaskManager />;
-  }
-
   const {
     selectedRunId,
     setSelectedRunId,
@@ -2181,6 +2184,8 @@ export function App(): JSX.Element {
   const [agentsError, setAgentsError] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [agentScheduleTime, setAgentScheduleTime] = useState("09:00");
+  const [agentScheduleModel, setAgentScheduleModel] = useState("gpt-5.4");
+  const [agentScheduleEffort, setAgentScheduleEffort] = useState<ReasoningEffort>("high");
   const [agentActionId, setAgentActionId] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentRef[]>([]);
   const [pendingAttachmentWorkspace, setPendingAttachmentWorkspace] = useState<string | null>(null);
@@ -2238,6 +2243,7 @@ export function App(): JSX.Element {
   const selectedRunIdRef = useRef<string | null>(selectedRunId);
   const selectedSessionIdRef = useRef<string | null>(selectedSessionId);
   const showAllHistoryRef = useRef(showAllHistory);
+  const activeWorkspaceRef = useRef(activeWorkspace);
   const isDraftSessionRef = useRef(isDraftSession);
   const lastEventAtRef = useRef<number>(Date.now());
   const autoRefreshInFlightRef = useRef(false);
@@ -2264,6 +2270,10 @@ export function App(): JSX.Element {
   useEffect(() => {
     showAllHistoryRef.current = showAllHistory;
   }, [showAllHistory]);
+
+  useEffect(() => {
+    activeWorkspaceRef.current = activeWorkspace;
+  }, [activeWorkspace]);
 
   useEffect(() => {
     isDraftSessionRef.current = isDraftSession;
@@ -2462,8 +2472,17 @@ export function App(): JSX.Element {
       setLoading(false);
       return;
     }
-    void loadBootstrapLite();
+    void loadSessionList();
   }, [authReady, isAuthenticated, showAllHistory]);
+
+  useEffect(() => {
+    if (!authReady || typeof window === "undefined") return;
+    const controller = createScreenWakeLockController();
+    controller.setEnabled(isAuthenticated);
+    return () => {
+      controller.dispose();
+    };
+  }, [authReady, isAuthenticated]);
 
   useEffect(() => {
     if (!authReady || !isAuthenticated) {
@@ -2475,13 +2494,14 @@ export function App(): JSX.Element {
     let hasOpenedOnce = false;
     let shouldRefreshSelectedSession = false;
 
-    const refreshSelectedSessionState = () => {
+    const refreshSelectedSessionState = (options?: { forceMessages?: boolean }) => {
       const currentSelectedSessionId = selectedSessionIdRef.current;
       if (currentSelectedSessionId) {
-        // Avoid full message reload when the timeline is already warm (common on
-        // mobile focus/SSE reconnect). SSE upserts keep it current.
+        // On a healthy live stream, skip reload when the timeline is already warm.
+        // After mobile screen-off / stale SSE, force a message reload — upserts were missed.
         const existing = messagesByRunIdRef.current[currentSelectedSessionId];
-        if (!existing || existing.length === 0) {
+        const shouldReloadMessages = Boolean(options?.forceMessages) || !existing || existing.length === 0;
+        if (shouldReloadMessages) {
           void loadRunMessagesPage(currentSelectedSessionId, { reset: true });
         }
       }
@@ -2491,9 +2511,9 @@ export function App(): JSX.Element {
       }
     };
 
-    const refreshRealtimeState = () => {
+    const refreshRealtimeState = (options?: { forceMessages?: boolean }) => {
       void refreshRunList(selectedSessionIdRef.current);
-      refreshSelectedSessionState();
+      refreshSelectedSessionState(options);
     };
 
     const openEventStream = () => {
@@ -2579,7 +2599,8 @@ export function App(): JSX.Element {
         }
         if (!shouldRefreshSelectedSession) return;
         shouldRefreshSelectedSession = false;
-        refreshRealtimeState();
+        // Reconnected after a drop (common when mobile screen turns off): reload chat.
+        refreshRealtimeState({ forceMessages: true });
       };
 
       es.onerror = () => {
@@ -2593,10 +2614,13 @@ export function App(): JSX.Element {
       if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
       if (typeof navigator !== "undefined" && "onLine" in navigator && !navigator.onLine) return;
 
-      refreshRealtimeState();
-
       const isStale = Date.now() - lastEventAtRef.current > eventStreamHeartbeatStaleMs;
-      if (!es || es.readyState === EventSource.CLOSED || isStale) {
+      const streamDead = !es || es.readyState === EventSource.CLOSED || isStale;
+      const forceMessages = streamDead || shouldRefreshSelectedSession;
+
+      refreshRealtimeState({ forceMessages });
+
+      if (streamDead) {
         shouldRefreshSelectedSession = true;
         setBackendConnectionStatus("connecting");
         openEventStream();
@@ -2608,6 +2632,10 @@ export function App(): JSX.Element {
       ensureFreshRealtimeState();
     };
 
+    const handlePageShow = () => {
+      ensureFreshRealtimeState();
+    };
+
     openEventStream();
 
     const watchdog = window.setInterval(() => {
@@ -2616,17 +2644,19 @@ export function App(): JSX.Element {
       shouldRefreshSelectedSession = true;
       setBackendConnectionStatus("connecting");
       openEventStream();
-      refreshRealtimeState();
+      refreshRealtimeState({ forceMessages: true });
     }, eventStreamWatchdogIntervalMs);
 
     window.addEventListener("focus", ensureFreshRealtimeState);
     window.addEventListener("online", ensureFreshRealtimeState);
+    window.addEventListener("pageshow", handlePageShow);
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
     return () => {
       window.clearInterval(watchdog);
       window.removeEventListener("focus", ensureFreshRealtimeState);
       window.removeEventListener("online", ensureFreshRealtimeState);
+      window.removeEventListener("pageshow", handlePageShow);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       es?.close();
     };
@@ -2647,6 +2677,10 @@ export function App(): JSX.Element {
       void (async () => {
         try {
           await refreshRunList(selectedSessionIdRef.current);
+          const selectedSessionId = selectedSessionIdRef.current;
+          if (selectedSessionId) {
+            await loadRunMessagesPage(selectedSessionId, { reset: true });
+          }
           const selectedRunId = selectedRunIdRef.current;
           if (selectedRunId) await loadSelectedRunRecord(selectedRunId);
         } catch {
@@ -2662,12 +2696,44 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     if (!authReady || !isAuthenticated || sidebarMode !== "agents") return;
-    void refreshAgentSchedules();
+    void ensureAppDefaults().then(() => refreshAgentSchedules());
     const timer = window.setInterval(() => {
       void refreshAgentSchedules();
     }, 30000);
     return () => window.clearInterval(timer);
   }, [authReady, isAuthenticated, sidebarMode]);
+
+  useEffect(() => {
+    if (!authReady || !isAuthenticated) return;
+    if (!skillPickerOpen && !agentPickerOpen) return;
+    void (async () => {
+      await ensureAppDefaults();
+      if (skillPickerOpen) await refreshSkillCatalog();
+      if (agentPickerOpen) await refreshAgentSchedules();
+    })();
+  }, [authReady, isAuthenticated, skillPickerOpen, agentPickerOpen]);
+
+  useEffect(() => {
+    if (!authReady || !isAuthenticated) return;
+    if (!newSessionDialogOpen && !mobileContextOpen) return;
+    void ensureAppDefaults();
+  }, [authReady, isAuthenticated, newSessionDialogOpen, mobileContextOpen]);
+
+  useEffect(() => {
+    const options = modelOptionsForRunner(runner, cursorModels);
+    setAgentScheduleModel((current) => (
+      options.includes(current)
+        ? current
+        : defaultModelForRunner(runner, {
+          codex: defaultCodexModel,
+          claude: defaultClaudeModel,
+          cursor: defaultCursorModel,
+        })
+    ));
+    setAgentScheduleEffort((current) => (
+      reasoningEffortOptionsForRunner(runner).includes(current) ? current : "high"
+    ));
+  }, [runner, cursorModels, defaultCodexModel, defaultClaudeModel, defaultCursorModel]);
 
   const allSessions = useMemo(() => buildSessionCards(runItems), [runItems]);
   const filteredSessions = useMemo(() => {
@@ -2979,36 +3045,14 @@ export function App(): JSX.Element {
     });
   }
 
-  async function loadBootstrapLite(): Promise<void> {
+  async function loadSessionList(): Promise<void> {
     setLoading(true);
     setLoadingRunList(true);
-    setSkillsLoading(true);
-    setAgentsLoading(true);
     try {
-      const [payload, listPayload, skillsPayload, agentPayload] = await Promise.all([
-        getBootstrapLite(),
-        getSessionList(runListPageSize, null, showAllHistoryRef.current),
-        getSkills(),
-        getAgentSchedules(),
-      ]);
-      setWorkspaces(payload.workspaces);
-      setWorkspace(payload.activeWorkspace);
-      setSkillCatalog(skillsPayload.skills);
-      setSkillsError(null);
-      applyAgentScheduleState(agentPayload);
+      const listPayload = await getSessionList(runListPageSize, null, showAllHistoryRef.current);
       const normalizedItems = normalizeSessionItems(listPayload.items);
       setRunItems(normalizedItems);
       setRunListNextCursor(listPayload.nextCursor);
-      setRunnerState(payload.defaults.runner);
-      setDefaultCodexModel(payload.defaults.codexModel);
-      setDefaultClaudeModel(payload.defaults.claudeModel);
-      setDefaultCursorModel(payload.defaults.cursorModel || "composer-2.5");
-      setClaudeEffortFlagSupported(payload.defaults.claudeEffortFlagSupported);
-      setCursorAvailable(Boolean(payload.defaults.cursorAvailable));
-      setCursorModels(Array.isArray(payload.defaults.cursorModels) ? payload.defaults.cursorModels : []);
-      setModel(payload.defaults.model);
-      setReasoningEffort(payload.defaults.reasoningEffort);
-      setSandbox(payload.defaults.sandbox);
       const sessions = buildSessionCards(normalizedItems);
       if (isDraftSessionRef.current) return;
       if (selectedSessionIdRef.current) {
@@ -3030,17 +3074,37 @@ export function App(): JSX.Element {
       setSelectedRunId(null);
     } finally {
       setLoadingRunList(false);
-      setSkillsLoading(false);
-      setAgentsLoading(false);
       setLoading(false);
     }
   }
 
+  async function ensureAppDefaults(): Promise<string> {
+    if (activeWorkspaceRef.current && workspaces.length > 0) return activeWorkspaceRef.current;
+    const payload = await getBootstrapLite();
+    setWorkspaces(payload.workspaces);
+    setWorkspace(payload.activeWorkspace);
+    activeWorkspaceRef.current = payload.activeWorkspace;
+    setRunnerState(payload.defaults.runner);
+    setDefaultCodexModel(payload.defaults.codexModel);
+    setDefaultClaudeModel(payload.defaults.claudeModel);
+    setDefaultCursorModel(payload.defaults.cursorModel || "composer-2.5");
+    setClaudeEffortFlagSupported(payload.defaults.claudeEffortFlagSupported);
+    setCursorAvailable(Boolean(payload.defaults.cursorAvailable));
+    setCursorModels(Array.isArray(payload.defaults.cursorModels) ? payload.defaults.cursorModels : []);
+    setModel(payload.defaults.model);
+    setReasoningEffort(payload.defaults.reasoningEffort);
+    setAgentScheduleModel(payload.defaults.model || "gpt-5.4");
+    setAgentScheduleEffort(payload.defaults.reasoningEffort);
+    setSandbox(payload.defaults.sandbox);
+    return payload.activeWorkspace;
+  }
+
   async function refreshSkillCatalog(workspace = activeWorkspace): Promise<void> {
-    if (!workspace) return;
+    const resolvedWorkspace = workspace || await ensureAppDefaults();
+    if (!resolvedWorkspace) return;
     setSkillsLoading(true);
     try {
-      const payload = await getSkills(workspace);
+      const payload = await getSkills(resolvedWorkspace);
       setSkillCatalog(payload.skills);
       setSkillsError(null);
     } catch (error) {
@@ -3092,12 +3156,30 @@ export function App(): JSX.Element {
     if (isDraftSessionRef.current) return;
 
     const sessions = buildSessionCards(normalizedItems);
-    const preferred = preferredSessionId && !selectedSessionIdRef.current
-      ? sessions.find((session) => session.id === preferredSessionId)
+    const deepLinkSessionId = (() => {
+      try {
+        return new URLSearchParams(window.location.search).get("session")?.trim() || null;
+      } catch {
+        return null;
+      }
+    })();
+    const preferredId = deepLinkSessionId || preferredSessionId;
+    const preferred = preferredId
+      ? sessions.find((session) => session.id === preferredId)
       : null;
-    if (preferred) {
+    if (preferred && (deepLinkSessionId || !selectedSessionIdRef.current)) {
       setSelectedSessionId(preferred.id);
       setSelectedRunId(preferred.latestRunId);
+      setIsDraftSession(false);
+      if (deepLinkSessionId && preferred.id === deepLinkSessionId) {
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.delete("session");
+          window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+        } catch {
+          // ignore history cleanup failures
+        }
+      }
       return;
     }
 
@@ -3160,6 +3242,18 @@ export function App(): JSX.Element {
       }
     } finally {
       setLoadingMessagesByRunId((prev) => ({ ...prev, [sessionId]: false }));
+    }
+  }
+
+  async function reloadSelectedChat(): Promise<void> {
+    const sessionId = selectedSessionIdRef.current;
+    if (!sessionId) return;
+    await loadRunMessagesPage(sessionId, { reset: true });
+    const runId = selectedRunIdRef.current;
+    if (runId) {
+      await loadSelectedRunRecord(runId);
+    } else {
+      setSelectedRunRecord(null);
     }
   }
 
@@ -3415,7 +3509,7 @@ export function App(): JSX.Element {
       prompt: promptValue,
       attachments: readAttachmentRefs(overrides?.attachments),
       createdAt: Date.now(),
-      workspace: activeWorkspace,
+      workspace: activeWorkspaceRef.current || activeWorkspace,
       runner: requestRunner,
       model: requestModel,
       reasoningEffort: requestReasoningEffort,
@@ -3713,7 +3807,8 @@ export function App(): JSX.Element {
     const selectedFiles = Array.from(files || []);
     if (selectedFiles.length === 0) return;
 
-    if (!activeWorkspace) {
+    const workspace = await ensureAppDefaults();
+    if (!workspace) {
       setAttachmentError("Select a workspace before adding attachments.");
       return;
     }
@@ -3735,7 +3830,7 @@ export function App(): JSX.Element {
     const failures: string[] = [];
     for (const file of acceptedFiles) {
       try {
-        const payload = await uploadAttachment(file, activeWorkspace);
+        const payload = await uploadAttachment(file, workspace);
         uploaded.push(payload.attachment);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Upload failed";
@@ -3745,7 +3840,7 @@ export function App(): JSX.Element {
 
     if (uploaded.length > 0) {
       setPendingAttachments((current) => [...current, ...uploaded].slice(0, attachmentMaxFiles));
-      setPendingAttachmentWorkspace(activeWorkspace);
+      setPendingAttachmentWorkspace(workspace);
     }
 
     if (failures.length > 0) {
@@ -3921,6 +4016,7 @@ export function App(): JSX.Element {
 
   async function onStartRun(): Promise<void> {
     if (!prompt.trim()) return;
+    await ensureAppDefaults();
     if (isUploadingAttachments) {
       setAttachmentError("Wait for attachments to finish uploading before sending.");
       return;
@@ -4036,7 +4132,9 @@ export function App(): JSX.Element {
   }
 
   async function onCreateAgentSchedule(): Promise<void> {
-    if (!selectedAgentId || !activeWorkspace) return;
+    if (!selectedAgentId) return;
+    const workspace = await ensureAppDefaults();
+    if (!workspace) return;
     const match = agentScheduleTime.match(/^(\d{2}):(\d{2})$/);
     if (!match) {
       setAgentsError("Use HH:mm for Tehran time.");
@@ -4055,10 +4153,10 @@ export function App(): JSX.Element {
         agentId: selectedAgentId,
         hour,
         minute,
-        workspace: activeWorkspace,
+        workspace,
         runner,
-        model,
-        reasoningEffort,
+        model: agentScheduleModel.trim() || model,
+        reasoningEffort: agentScheduleEffort,
         sandbox,
         approvalPolicy,
         skills: selectedSkills.map(selectedSkillRef),
@@ -4075,6 +4173,21 @@ export function App(): JSX.Element {
     setAgentActionId(schedule.id);
     try {
       await updateAgentSchedule(schedule.id, { status: schedule.status === "active" ? "paused" : "active" });
+      await refreshAgentSchedules();
+    } catch (error) {
+      setAgentsError(error instanceof Error ? error.message : "Failed to update schedule");
+    } finally {
+      setAgentActionId(null);
+    }
+  }
+
+  async function onUpdateAgentScheduleConfig(
+    schedule: AgentSchedule,
+    patch: { model?: string; reasoningEffort?: ReasoningEffort },
+  ): Promise<void> {
+    setAgentActionId(schedule.id);
+    try {
+      await updateAgentSchedule(schedule.id, patch);
       await refreshAgentSchedules();
     } catch (error) {
       setAgentsError(error instanceof Error ? error.message : "Failed to update schedule");
@@ -4164,6 +4277,7 @@ export function App(): JSX.Element {
   }
 
   function onNewSession(): void {
+    void ensureAppDefaults();
     setNewSessionDialogOpen(true);
   }
 
@@ -4407,12 +4521,19 @@ export function App(): JSX.Element {
       setSelectedAgentId={setSelectedAgentId}
       scheduleTime={agentScheduleTime}
       setScheduleTime={setAgentScheduleTime}
+      scheduleModel={agentScheduleModel}
+      setScheduleModel={setAgentScheduleModel}
+      scheduleEffort={agentScheduleEffort}
+      setScheduleEffort={setAgentScheduleEffort}
+      scheduleRunner={runner}
+      cursorModels={cursorModels}
       selectedSkills={selectedSkills}
       skillCatalog={skillCatalog}
       actionId={agentActionId}
       onReload={onReloadAgentsAndSkills}
       onCreateSchedule={onCreateAgentSchedule}
       onToggleSchedule={onToggleAgentSchedule}
+      onUpdateScheduleConfig={onUpdateAgentScheduleConfig}
       onDeleteSchedule={onDeleteAgentSchedule}
       onRunNow={onRunAgentScheduleNow}
       onSelectExecution={onSelectAgentExecution}
@@ -4478,16 +4599,29 @@ export function App(): JSX.Element {
   return (
     <div className="h-[100dvh] w-full overflow-hidden bg-background text-[color:var(--text)]">
       <header className="fixed inset-x-0 top-0 z-20 bg-surface-1/95 px-2 py-2 shadow-[0_14px_30px_-24px_rgba(0,0,0,0.9)] lg:hidden">
-        <div className="mx-auto flex max-w-7xl items-center justify-between">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-1">
           <Button size="sm" variant="ghost" onClick={() => setMobileThreadsOpen(true)}>
             <PanelLeft className="mr-1.5 h-4 w-4" /> Chats
           </Button>
-          <div className="max-w-[48vw] truncate text-sm font-semibold" title={mobileHeaderTitle} dir="auto">
+          <div className="min-w-0 flex-1 truncate text-center text-sm font-semibold" title={mobileHeaderTitle} dir="auto">
             {mobileHeaderTitle}
           </div>
-          <Button size="sm" variant="ghost" onClick={() => setMobileContextOpen(true)}>
-            <PanelRight className="mr-1.5 h-4 w-4" /> Tools
-          </Button>
+          <div className="flex shrink-0 items-center gap-0.5">
+            <Button
+              size="sm"
+              variant="ghost"
+              className="px-2"
+              onClick={() => void reloadSelectedChat()}
+              disabled={!selectedSessionId || Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId])}
+              aria-label="Reload chat"
+              title="Reload chat"
+            >
+              <RefreshCw className={cn("h-4 w-4", selectedSessionId && loadingMessagesByRunId[selectedSessionId] && "animate-spin")} />
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setMobileContextOpen(true)}>
+              <PanelRight className="mr-1.5 h-4 w-4" /> Tools
+            </Button>
+          </div>
         </div>
       </header>
 
@@ -4548,6 +4682,8 @@ export function App(): JSX.Element {
             }}
             leftSidebarOpen={leftSidebarOpen}
             onOpenLeftSidebar={() => setLeftSidebarOpen(true)}
+            reloadingChat={Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId])}
+            onReloadChat={() => void reloadSelectedChat()}
             timeline={visibleTimeline}
             hiddenTimelineCount={hiddenTimelineCount}
             prompt={prompt}
@@ -5407,6 +5543,8 @@ type CenterPanelProps = {
   onOpenRightPanel: (tab: DockTab) => void;
   leftSidebarOpen: boolean;
   onOpenLeftSidebar: () => void;
+  reloadingChat: boolean;
+  onReloadChat: () => void;
   timeline: TimelineEntry[];
   hiddenTimelineCount: number;
   prompt: string;
@@ -5813,6 +5951,18 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 w-7 p-0"
+            onClick={props.onReloadChat}
+            disabled={!props.selectedSession || props.reloadingChat}
+            aria-label="Reload chat"
+            title="Reload chat"
+          >
+            <RefreshCw className={cn("h-3.5 w-3.5", props.reloadingChat && "animate-spin")} />
+          </Button>
           <Button type="button" variant={props.rightDockOpen && props.rightPanelTab === "terminal" ? "primary" : "ghost"} size="sm" className="h-7 w-7 p-0" onClick={() => props.onOpenRightPanel("terminal")} aria-label="Open terminal" title="Terminal">
             <Terminal className="h-3.5 w-3.5" />
           </Button>
@@ -6672,10 +6822,6 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
             </div>
 
             <div className="rounded-md border border-card-border bg-surface-2 p-3">
-              <button type="button" onClick={() => window.location.assign("/taskmanager")} className="mb-2 flex w-full items-center justify-between rounded-md bg-control px-3 py-2 text-left text-sm hover:bg-control-hover">
-                <span className="flex items-center gap-2"><ClipboardList className="h-4 w-4" /> Luma Tasks</span>
-                <ExternalLink className="h-3.5 w-3.5" />
-              </button>
               <Button variant="ghost" onClick={props.toggleTheme} className="w-full justify-between">
                 <span className="flex items-center gap-2"><Layers className="h-4 w-4" /> {props.theme === "light" ? "Light mode" : "Dark mode"}</span>
                 {props.theme === "light" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
@@ -6718,12 +6864,22 @@ type AgentsPanelProps = {
   setSelectedAgentId: (agentId: string) => void;
   scheduleTime: string;
   setScheduleTime: (time: string) => void;
+  scheduleModel: string;
+  setScheduleModel: (model: string) => void;
+  scheduleEffort: ReasoningEffort;
+  setScheduleEffort: (effort: ReasoningEffort) => void;
+  scheduleRunner: RunRunner;
+  cursorModels: CursorModelInfo[];
   selectedSkills: SkillListItem[];
   skillCatalog: SkillListItem[];
   actionId: string | null;
   onReload: () => Promise<void>;
   onCreateSchedule: () => Promise<void>;
   onToggleSchedule: (schedule: AgentSchedule) => Promise<void>;
+  onUpdateScheduleConfig: (
+    schedule: AgentSchedule,
+    patch: { model?: string; reasoningEffort?: ReasoningEffort },
+  ) => Promise<void>;
   onDeleteSchedule: (schedule: AgentSchedule) => Promise<void>;
   onRunNow: (schedule: AgentSchedule) => Promise<void>;
   onSelectExecution: (execution: AgentScheduleExecution) => void;
@@ -6771,10 +6927,19 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
   const [visibleExecutionCount, setVisibleExecutionCount] = useState(sidebarListPageSize);
   const visibleExecutions = props.executions.slice(0, visibleExecutionCount);
   const hasHiddenExecutions = visibleExecutionCount < props.executions.length;
+  const createModelOptions = modelOptionsForRunner(props.scheduleRunner, props.cursorModels);
+  const createEffortOptions = reasoningEffortOptionsForRunner(props.scheduleRunner);
+  const createModelChoices = createModelOptions.includes(props.scheduleModel)
+    ? createModelOptions
+    : [props.scheduleModel, ...createModelOptions];
 
   useEffect(() => {
     setVisibleExecutionCount(sidebarListPageSize);
   }, [props.executions.length]);
+
+  const createEffortValue = createEffortOptions.includes(props.scheduleEffort)
+    ? props.scheduleEffort
+    : "high";
 
   return (
     <div className={cn(props.compact ? "space-y-2" : "space-y-3")}>
@@ -6826,7 +6991,38 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
               value={props.scheduleTime}
               onChange={(event) => props.setScheduleTime(event.target.value)}
             />
-            <p className="mt-1 text-xs text-foreground/60">Asia/Tehran</p>
+            <p className="mt-1 text-xs text-foreground/60">Asia/Tehran · runner {runnerLabel(props.scheduleRunner)}</p>
+          </div>
+
+          <div className="grid grid-cols-1 gap-2">
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-foreground/75">Model</label>
+              <select
+                className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                value={props.scheduleModel}
+                onChange={(event) => props.setScheduleModel(event.target.value)}
+              >
+                {createModelChoices.map((modelOption) => (
+                  <option key={modelOption} value={modelOption}>
+                    {modelOption}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-foreground/75">Reasoning effort</label>
+              <select
+                className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                value={createEffortValue}
+                onChange={(event) => props.setScheduleEffort(event.target.value as ReasoningEffort)}
+              >
+                {createEffortOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {reasoningEffortLabel(option)}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
 
           <div className={cn("border border-card-border bg-surface-2 px-3 py-2 text-xs text-foreground/70", props.compact ? "rounded-md" : "rounded-xl")}>
@@ -6873,33 +7069,75 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
         </div>
         <div className="space-y-2">
           {props.schedules.length === 0 ? <p className="text-xs text-foreground/70">No schedules yet.</p> : null}
-          {props.schedules.map((schedule) => (
-            <div key={schedule.id} className={cn("border border-card-border bg-surface-2 px-3 py-2", props.compact ? "rounded-md" : "rounded-xl")}>
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-semibold">{schedule.agentName}</p>
-                  <p className="text-xs text-foreground/65">
-                    {formatTehranSchedule(schedule)} | next {formatDateTime(schedule.nextRunAt)}
-                  </p>
-                  {schedule.runConfig.skills.length > 0 ? (
-                    <p className="mt-0.5 text-[11px] text-foreground/60">{formatSkillSummary(schedule.runConfig.skills, props.skillCatalog)}</p>
-                  ) : null}
+          {props.schedules.map((schedule) => {
+            const scheduleRunner = normalizeRunRunnerValue(schedule.runConfig.runner);
+            const scheduleModelOptions = modelOptionsForRunner(scheduleRunner, props.cursorModels);
+            const scheduleEffortOptions = reasoningEffortOptionsForRunner(scheduleRunner);
+            const scheduleModelChoices = scheduleModelOptions.includes(schedule.runConfig.model)
+              ? scheduleModelOptions
+              : [schedule.runConfig.model, ...scheduleModelOptions];
+            const busy = props.actionId === schedule.id;
+            return (
+              <div key={schedule.id} className={cn("border border-card-border bg-surface-2 px-3 py-2", props.compact ? "rounded-md" : "rounded-xl")}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold">{schedule.agentName}</p>
+                    <p className="text-xs text-foreground/65">
+                      {formatTehranSchedule(schedule)} | next {formatDateTime(schedule.nextRunAt)}
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-foreground/60">
+                      {runnerLabel(scheduleRunner)} · {schedule.runConfig.model} · {reasoningEffortLabel(schedule.runConfig.reasoningEffort)}
+                    </p>
+                    {schedule.runConfig.skills.length > 0 ? (
+                      <p className="mt-0.5 text-[11px] text-foreground/60">{formatSkillSummary(schedule.runConfig.skills, props.skillCatalog)}</p>
+                    ) : null}
+                  </div>
+                  <Badge>{schedule.status}</Badge>
                 </div>
-                <Badge>{schedule.status}</Badge>
+                <div className="mt-2 grid grid-cols-1 gap-1.5">
+                  <select
+                    className="h-9 w-full rounded-lg border border-card-border bg-surface-1 px-2 text-xs outline-none focus:border-brand"
+                    value={schedule.runConfig.model}
+                    disabled={busy}
+                    onChange={(event) => void props.onUpdateScheduleConfig(schedule, { model: event.target.value })}
+                    aria-label={`${schedule.agentName} model`}
+                  >
+                    {scheduleModelChoices.map((modelOption) => (
+                      <option key={modelOption} value={modelOption}>
+                        {modelOption}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="h-9 w-full rounded-lg border border-card-border bg-surface-1 px-2 text-xs outline-none focus:border-brand"
+                    value={scheduleEffortOptions.includes(schedule.runConfig.reasoningEffort)
+                      ? schedule.runConfig.reasoningEffort
+                      : "high"}
+                    disabled={busy}
+                    onChange={(event) => void props.onUpdateScheduleConfig(schedule, { reasoningEffort: event.target.value as ReasoningEffort })}
+                    aria-label={`${schedule.agentName} reasoning effort`}
+                  >
+                    {scheduleEffortOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {reasoningEffortLabel(option)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="mt-2 grid grid-cols-3 gap-1">
+                  <Button size="sm" variant="ghost" className="px-2" onClick={() => void props.onRunNow(schedule)} disabled={busy}>
+                    {busy ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+                  </Button>
+                  <Button size="sm" variant="ghost" className="px-2" onClick={() => void props.onToggleSchedule(schedule)} disabled={busy}>
+                    {schedule.status === "active" ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                  </Button>
+                  <Button size="sm" variant="ghost" className="px-2 text-rose-700" onClick={() => void props.onDeleteSchedule(schedule)} disabled={busy}>
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
               </div>
-              <div className="mt-2 grid grid-cols-3 gap-1">
-                <Button size="sm" variant="ghost" className="px-2" onClick={() => void props.onRunNow(schedule)} disabled={props.actionId === schedule.id}>
-                  {props.actionId === schedule.id ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
-                </Button>
-                <Button size="sm" variant="ghost" className="px-2" onClick={() => void props.onToggleSchedule(schedule)} disabled={props.actionId === schedule.id}>
-                  {schedule.status === "active" ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
-                </Button>
-                <Button size="sm" variant="ghost" className="px-2 text-rose-700" onClick={() => void props.onDeleteSchedule(schedule)} disabled={props.actionId === schedule.id}>
-                  <Trash2 className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </section>
 

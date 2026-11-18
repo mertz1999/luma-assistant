@@ -61,8 +61,6 @@ Luma keeps parity by:
 
 - `luma-tel` → `http://127.0.0.1:9013/mcp`
 - `luma-images` → `http://127.0.0.1:9015/mcp`
-- optional `luma-tasks` when `ENABLE_TASK_MANAGER_MCP=1`
-
 Non-interactive runs pass `--approve-mcps` (disable with `CURSOR_APPROVE_MCPS=0`).
 
 ## Env reference

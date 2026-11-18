@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
@@ -11,25 +11,16 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import type { IPty } from "node-pty";
 import { openMessageDatabase, type MessageDatabase } from "./message-db.js";
+import { createSessionTelegramBridge, isSessionTelegramBridgeConfigured } from "./session-telegram-bridge.js";
 import {
   approvalPolicySchema,
   attachmentRefSchema,
-  createTaskManagerCommentSchema,
-  createTaskManagerLabelSchema,
-  createTaskManagerProjectSchema,
-  createTaskManagerTaskSchema,
-  createTaskManagerUserSchema,
   createAgentScheduleSchema,
   rerunSchema,
   sendMessageSchema,
   setWorkspaceSchema,
   startRunSchema,
-  taskManagerLoginSchema,
-  updateTaskManagerProfileSchema,
   updateAgentScheduleSchema,
-  updateTaskManagerProjectSchema,
-  updateTaskManagerTaskSchema,
-  updateTaskManagerUserSchema,
   type ApiResponse,
   type AgentListItem,
   type AgentListResponse,
@@ -73,16 +64,6 @@ import {
   type SkillListResponse,
   type SseEvent,
   type TerminalSessionSnapshot,
-  type TaskManagerActivity,
-  type TaskManagerBootstrap,
-  type TaskManagerComment,
-  type TaskManagerLabel,
-  type TaskManagerPriority,
-  type TaskManagerProject,
-  type TaskManagerRole,
-  type TaskManagerStatus,
-  type TaskManagerTask,
-  type TaskManagerUser,
   type TokenUsageSummary,
   type WorkspaceOption,
 } from "@luma/shared";
@@ -103,7 +84,6 @@ const MESSAGE_STORE_META_PATH = path.resolve(rootDir, "data/message-store-meta.j
 const MESSAGE_OUTBOX_PATH = path.resolve(rootDir, "data/message-outbox.json");
 const MESSAGE_LOG_DIR = path.resolve(rootDir, "data/messages");
 const MESSAGE_DB_PATH = path.resolve(rootDir, "data/messages.sqlite");
-const TASK_MANAGER_DATA_PATH = path.resolve(rootDir, "data/taskmanager/state.json");
 const SESSION_IMAGE_DIR = path.resolve(rootDir, "data/session-images");
 
 const API_PORT = Number(process.env.API_PORT || 9001);
@@ -137,18 +117,23 @@ const DEFAULT_CURSOR_MODELS: CursorModelInfo[] = [
 const DEFAULT_REASONING_EFFORT = normalizeReasoningEffort(process.env.DEFAULT_REASONING_EFFORT);
 const DEFAULT_SANDBOX = resolveDefaultSandboxMode();
 const MAX_CONCURRENT_RUNS = Number(process.env.MAX_CONCURRENT_RUNS || 8);
+/**
+ * Cursor often stays alive after the final reply (e.g. child servers).
+ * Idle-complete is a fallback only when the turn looks settled (assistant
+ * spoke after the last tool). Mid-tool-chain silence uses the longer stuck timeout.
+ */
+const CURSOR_IDLE_COMPLETE_MS = Math.max(60_000, Number(process.env.CURSOR_IDLE_COMPLETE_MS || 600_000));
+const CURSOR_STUCK_COMPLETE_MS = Math.max(
+  CURSOR_IDLE_COMPLETE_MS,
+  Number(process.env.CURSOR_STUCK_COMPLETE_MS || 1_800_000),
+);
 const AUTH_PASSWORD = process.env.PASSWORD || process.env.APP_PASSWORD || "";
 const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
 const AUTH_TOKEN_TTL_SECONDS = Number(process.env.AUTH_TOKEN_TTL_SECONDS || 24 * 60 * 60);
 const JWT_SECRET = process.env.JWT_SECRET || AUTH_PASSWORD || "luma-assistant-default-jwt-secret";
-const TASK_MANAGER_ADMIN_USERNAME = process.env.TASK_MANAGER_ADMIN_USERNAME || "admin";
-const TASK_MANAGER_ADMIN_PASSWORD = process.env.TASK_MANAGER_ADMIN_PASSWORD || AUTH_PASSWORD;
-const TASK_MANAGER_JWT_SECRET = process.env.TASK_MANAGER_JWT_SECRET || JWT_SECRET;
-const TASK_MANAGER_TOKEN_TTL_SECONDS = Number(process.env.TASK_MANAGER_TOKEN_TTL_SECONDS || 7 * 24 * 60 * 60);
-const TASK_MANAGER_DEFAULT_TIME_ZONE = process.env.TASK_MANAGER_DEFAULT_TIME_ZONE || "Asia/Tehran";
 const PLAN_MODE_FILE_PATH = path.resolve(rootDir, "plan.md");
 const ATTACHMENT_STAGING_DIR = path.join(".agentic", "attachments");
-const ATTACHMENT_MAX_BYTES = Number(process.env.ATTACHMENT_MAX_BYTES || 15 * 1024 * 1024);
+const ATTACHMENT_MAX_BYTES = Number(process.env.ATTACHMENT_MAX_BYTES || 100 * 1024 * 1024);
 const IMAGE_MCP_MAX_BYTES = Number(process.env.IMAGE_MCP_MAX_BYTES || 3 * 1024 * 1024);
 const IMAGE_MCP_MAX_HEIGHT = Number(process.env.IMAGE_MCP_MAX_HEIGHT || 1200);
 const ATTACHMENT_MAX_FILES = 10;
@@ -309,6 +294,16 @@ type CursorActiveRun = {
   stopRequested: boolean;
   sawResult: boolean;
   streamText: string;
+  /** Stable message id for the current assistant text segment (between tools). */
+  streamItemId: string;
+  streamSegment: number;
+  lastActivityAt: number;
+  /** Last time we received assistant text (streaming or final). */
+  lastAssistantAt: number;
+  /** Last time a tool_call started (0 if none). */
+  lastToolStartedAt: number;
+  pendingToolCallIds: Set<string>;
+  sawAssistantOutput: boolean;
 };
 
 type ActiveRun = CodexActiveRun | ClaudeActiveRun | CursorActiveRun;
@@ -370,29 +365,6 @@ type MessageOutboxItem = {
   updatedAt: number;
 };
 
-type PersistedTaskManagerUser = TaskManagerUser & {
-  passwordHash: string;
-  passwordSalt: string;
-};
-
-type PersistedTaskManagerState = {
-  users: PersistedTaskManagerUser[];
-  projects: TaskManagerProject[];
-  labels: TaskManagerLabel[];
-  tasks: TaskManagerTask[];
-  comments: TaskManagerComment[];
-  activity: TaskManagerActivity[];
-};
-
-type TaskManagerSession = {
-  userId: string;
-  role: TaskManagerRole;
-  username: string;
-};
-
-type TaskManagerRequest = express.Request & {
-  taskUser?: TaskManagerSession;
-};
 
 type RunLifecycleKind = "started" | "completed" | "failed" | "stopped" | "updated";
 
@@ -446,6 +418,12 @@ const TERMINAL_HISTORY_MAX_CHARS = Number(process.env.TERMINAL_HISTORY_MAX_CHARS
 
 function runSessionId(run: RunRecord): string {
   return run.sessionId || run.threadId || run.id;
+}
+
+/** Prefer provider/local session ids; never invent a run-id session for projection. */
+function runProjectionSessionId(run: RunRecord): string | null {
+  const fromRun = run.sessionId || run.threadId;
+  return fromRun && fromRun.trim() ? fromRun : null;
 }
 
 function normalizeRunRunner(input: unknown): RunRunner {
@@ -556,630 +534,6 @@ function writeJsonAtomicSync(filePath: string, value: unknown): void {
   fs.renameSync(tempPath, filePath);
 }
 
-function makeTaskManagerId(prefix: string): string {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function hashTaskManagerPassword(password: string, salt = randomBytes(16).toString("hex")): { hash: string; salt: string } {
-  const hash = scryptSync(password, salt, 64).toString("hex");
-  return { hash, salt };
-}
-
-function verifyTaskManagerPassword(password: string, salt: string, expectedHash: string): boolean {
-  const actual = scryptSync(password, salt, 64);
-  const expected = Buffer.from(expectedHash, "hex");
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
-}
-
-function normalizeTaskManagerTimeZone(timeZone: string | undefined | null): string {
-  const candidate = (timeZone || TASK_MANAGER_DEFAULT_TIME_ZONE).trim();
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: candidate }).format(Date.now());
-    return candidate;
-  } catch {
-    return TASK_MANAGER_DEFAULT_TIME_ZONE;
-  }
-}
-
-function requireValidTaskManagerTimeZone(timeZone: string): string {
-  const normalized = timeZone.trim();
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: normalized }).format(Date.now());
-    return normalized;
-  } catch {
-    throw new Error("Invalid timezone.");
-  }
-}
-
-function taskManagerZonedParts(timestamp: number, timeZone: string): { year: number; month: number; day: number; hour: number; minute: number; second: number } {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).formatToParts(timestamp);
-  const value = (type: string): number => Number(parts.find((part) => part.type === type)?.value || "0");
-  return {
-    year: value("year"),
-    month: value("month"),
-    day: value("day"),
-    hour: value("hour"),
-    minute: value("minute"),
-    second: value("second"),
-  };
-}
-
-function taskManagerTimeZoneOffsetMs(timestamp: number, timeZone: string): number {
-  const parts = taskManagerZonedParts(timestamp, timeZone);
-  const asUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
-  return asUtc - timestamp;
-}
-
-function taskManagerZonedTimeToUtc(year: number, month: number, day: number, hour: number, minute: number, second: number, timeZone: string): number {
-  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, second);
-  const first = utcGuess - taskManagerTimeZoneOffsetMs(utcGuess, timeZone);
-  return utcGuess - taskManagerTimeZoneOffsetMs(first, timeZone);
-}
-
-function taskManagerStartOfToday(timeZone: string): number {
-  const parts = taskManagerZonedParts(Date.now(), timeZone);
-  return taskManagerZonedTimeToUtc(parts.year, parts.month, parts.day, 0, 0, 0, timeZone);
-}
-
-function taskManagerEndOfToday(timeZone: string): number {
-  const parts = taskManagerZonedParts(Date.now(), timeZone);
-  return taskManagerZonedTimeToUtc(parts.year, parts.month, parts.day, 23, 59, 59, timeZone);
-}
-
-function taskManagerCalendarDateWithOffset(year: number, month: number, day: number, offsetDays: number): { year: number; month: number; day: number } {
-  const date = new Date(Date.UTC(year, month - 1, day + offsetDays));
-  return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
-}
-
-function taskManagerEndOfTomorrow(timeZone: string): number {
-  const parts = taskManagerZonedParts(Date.now(), timeZone);
-  const tomorrow = taskManagerCalendarDateWithOffset(parts.year, parts.month, parts.day, 1);
-  return taskManagerZonedTimeToUtc(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59, timeZone);
-}
-
-function taskManagerFormatReportDate(timestamp: number, timeZone: string): string {
-  return new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  }).format(timestamp);
-}
-
-function taskManagerFormatShortDate(timestamp: number, timeZone: string): string {
-  return new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    month: "short",
-    day: "numeric",
-  }).format(timestamp);
-}
-
-function taskManagerPriorityIcon(priority: TaskManagerPriority): string {
-  if (priority === "urgent") return "🔴";
-  if (priority === "high") return "🟠";
-  if (priority === "medium") return "🟡";
-  return "🟢";
-}
-
-function taskManagerCalendarDaySerial(timestamp: number, timeZone: string): number {
-  const parts = taskManagerZonedParts(timestamp, timeZone);
-  return Math.floor(Date.UTC(parts.year, parts.month - 1, parts.day) / 86_400_000);
-}
-
-function taskManagerDaysUntilDate(timestamp: number, timeZone: string): number {
-  return taskManagerCalendarDaySerial(timestamp, timeZone) - taskManagerCalendarDaySerial(Date.now(), timeZone);
-}
-
-function taskManagerFormatDaysLeftLabel(daysLeft: number): string {
-  if (daysLeft < 0) {
-    const overdueDays = Math.abs(daysLeft);
-    return `Overdue by ${overdueDays} ${overdueDays === 1 ? "day" : "days"}`;
-  }
-  if (daysLeft === 0) return "0 days left";
-  if (daysLeft === 1) return "1 day left";
-  return `${daysLeft} days left`;
-}
-
-function publicTaskManagerUser(user: PersistedTaskManagerUser): TaskManagerUser {
-  const { passwordHash: _passwordHash, passwordSalt: _passwordSalt, ...safeUser } = user;
-  return safeUser;
-}
-
-function loadPersistedTaskManagerState(): PersistedTaskManagerState {
-  const fallback: PersistedTaskManagerState = {
-    users: [],
-    projects: [],
-    labels: [],
-    tasks: [],
-    comments: [],
-    activity: [],
-  };
-  if (!fs.existsSync(TASK_MANAGER_DATA_PATH)) return fallback;
-  const parsed = safeJsonParse<PersistedTaskManagerState>(fs.readFileSync(TASK_MANAGER_DATA_PATH, "utf8"), fallback);
-  return {
-    users: Array.isArray(parsed.users) ? parsed.users : [],
-    projects: Array.isArray(parsed.projects) ? parsed.projects : [],
-    labels: Array.isArray(parsed.labels) ? parsed.labels : [],
-    tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
-    comments: Array.isArray(parsed.comments) ? parsed.comments : [],
-    activity: Array.isArray(parsed.activity) ? parsed.activity : [],
-  };
-}
-
-class TaskManagerStore {
-  private users = new Map<string, PersistedTaskManagerUser>();
-  private projects = new Map<string, TaskManagerProject>();
-  private labels = new Map<string, TaskManagerLabel>();
-  private tasks = new Map<string, TaskManagerTask>();
-  private comments = new Map<string, TaskManagerComment>();
-  private activity = new Map<string, TaskManagerActivity>();
-
-  constructor() {
-    const persisted = loadPersistedTaskManagerState();
-    for (const user of persisted.users) this.users.set(user.id, { ...user, timeZone: normalizeTaskManagerTimeZone(user.timeZone) });
-    for (const project of persisted.projects) this.projects.set(project.id, { ...project, userIds: project.userIds ?? [] });
-    for (const label of persisted.labels) this.labels.set(label.id, label);
-    for (const task of persisted.tasks) {
-      this.tasks.set(task.id, {
-        ...task,
-        isDeadline: task.isDeadline ?? false,
-        sortOrder: typeof task.sortOrder === "number" ? task.sortOrder : task.createdAt || task.updatedAt || Date.now(),
-      });
-    }
-    for (const comment of persisted.comments) this.comments.set(comment.id, comment);
-    for (const item of persisted.activity) this.activity.set(item.id, item);
-    this.ensureAdminUser();
-    this.ensureDefaults();
-  }
-
-  snapshot(): PersistedTaskManagerState {
-    return {
-      users: [...this.users.values()].sort((a, b) => a.createdAt - b.createdAt),
-      projects: [...this.projects.values()].sort((a, b) => a.createdAt - b.createdAt),
-      labels: [...this.labels.values()].sort((a, b) => a.createdAt - b.createdAt),
-      tasks: [...this.tasks.values()].sort((a, b) => a.sortOrder - b.sortOrder || b.updatedAt - a.updatedAt),
-      comments: [...this.comments.values()].sort((a, b) => a.createdAt - b.createdAt),
-      activity: [...this.activity.values()].sort((a, b) => b.createdAt - a.createdAt),
-    };
-  }
-
-  flushSync(): void {
-    writeJsonAtomicSync(TASK_MANAGER_DATA_PATH, this.snapshot());
-  }
-
-  authenticate(username: string, password: string): { user: TaskManagerUser; token: string; expiresAt: number; expiresInSeconds: number } | null {
-    const normalized = username.trim().toLowerCase();
-    const user = [...this.users.values()].find((item) => item.username.toLowerCase() === normalized);
-    if (!user || !user.active) return null;
-    if (!verifyTaskManagerPassword(password, user.passwordSalt, user.passwordHash)) return null;
-    const now = Date.now();
-    user.lastLoginAt = now;
-    user.updatedAt = now;
-    this.persist();
-    const nowSeconds = Math.floor(now / 1000);
-    const expiresIn = Math.max(60, TASK_MANAGER_TOKEN_TTL_SECONDS);
-    const token = jwt.sign(
-      { sub: user.id, username: user.username, role: user.role, scope: "taskmanager", iat: nowSeconds },
-      TASK_MANAGER_JWT_SECRET,
-      { expiresIn },
-    );
-    return {
-      user: publicTaskManagerUser(user),
-      token,
-      expiresAt: (nowSeconds + expiresIn) * 1000,
-      expiresInSeconds: expiresIn,
-    };
-  }
-
-  getSessionUser(session: TaskManagerSession): TaskManagerUser | null {
-    const user = this.users.get(session.userId);
-    if (!user || !user.active) return null;
-    return publicTaskManagerUser(user);
-  }
-
-  bootstrap(session: TaskManagerSession): TaskManagerBootstrap {
-    const currentUser = this.requireCurrentUser(session);
-    const visibleTasks = [...this.tasks.values()].filter((task) => this.canAccessTask(session, task));
-    const visibleTaskIds = new Set(visibleTasks.map((task) => task.id));
-    const visibleProjects = [...this.projects.values()].filter((project) => this.canAccessProject(session, project));
-    return {
-      currentUser,
-      users: [...this.users.values()].map(publicTaskManagerUser).sort((a, b) => a.displayName.localeCompare(b.displayName)),
-      projects: visibleProjects.sort((a, b) => a.name.localeCompare(b.name)),
-      labels: [...this.labels.values()].sort((a, b) => a.name.localeCompare(b.name)),
-      tasks: visibleTasks.sort((a, b) => a.sortOrder - b.sortOrder || b.updatedAt - a.updatedAt),
-      comments: [...this.comments.values()].filter((comment) => visibleTaskIds.has(comment.taskId)),
-      activity: [...this.activity.values()].filter((item) => visibleTaskIds.has(item.taskId)).sort((a, b) => b.createdAt - a.createdAt),
-    };
-  }
-
-  todayReport(session: TaskManagerSession, input: { timeZone?: string; onlyMine?: boolean; assigneeId?: string; projectId?: string }): { report: string; timeZone: string } {
-    const currentUser = this.requireCurrentUser(session);
-    const timeZone = input.timeZone ? requireValidTaskManagerTimeZone(input.timeZone) : normalizeTaskManagerTimeZone(currentUser.timeZone);
-    const todayEnd = taskManagerEndOfToday(timeZone);
-    const tomorrowEnd = taskManagerEndOfTomorrow(timeZone);
-
-    const visibleTasks = [...this.tasks.values()]
-      .filter((task) => this.canAccessTask(session, task))
-      .filter((task) => task.status !== "done")
-      .filter((task) => task.dueAt !== null && (task.dueAt <= todayEnd || task.isDeadline))
-      .filter((task) => !input.onlyMine || task.assigneeId === session.userId)
-      .filter((task) => !input.assigneeId || task.assigneeId === input.assigneeId)
-      .filter((task) => !input.projectId || task.projectId === input.projectId)
-      .sort((a, b) => {
-        const priorityOrder: Record<TaskManagerPriority, number> = { urgent: 4, high: 3, medium: 2, low: 1 };
-        const dueDiff = (a.dueAt || Number.MAX_SAFE_INTEGER) - (b.dueAt || Number.MAX_SAFE_INTEGER);
-        if (dueDiff !== 0) return dueDiff;
-        return priorityOrder[b.priority] - priorityOrder[a.priority] || a.title.localeCompare(b.title);
-      });
-
-    const usersById = new Map([...this.users.values()].map((user) => [user.id, user]));
-    const projectsById = new Map([...this.projects.values()].map((project) => [project.id, project]));
-    const grouped = new Map<string, { name: string; tasks: TaskManagerTask[] }>();
-
-    for (const task of visibleTasks) {
-      const userId = task.assigneeId || task.createdBy || "unassigned";
-      const user = usersById.get(userId);
-      const name = user?.displayName || user?.username || "Unassigned";
-      const existing = grouped.get(userId);
-      if (existing) {
-        existing.tasks.push(task);
-      } else {
-        grouped.set(userId, { name, tasks: [task] });
-      }
-    }
-
-    const separator = "———————————-";
-    const lines = [
-      separator,
-      "Luma Tasks - Today",
-      `${taskManagerFormatReportDate(Date.now(), timeZone)} · ${timeZone}`,
-      separator,
-      "",
-    ];
-
-    if (grouped.size === 0) {
-      lines.push("No tasks for today.");
-      return { report: lines.join("\n"), timeZone };
-    }
-
-    const groups = [...grouped.values()].sort((a, b) => a.name.localeCompare(b.name));
-    groups.forEach((group, groupIndex) => {
-      lines.push(`${group.name}:`, "");
-      group.tasks.forEach((task, taskIndex) => {
-        const projectName = task.projectId ? projectsById.get(task.projectId)?.name || "No project" : "No project";
-        lines.push(`${taskIndex + 1}. ${taskManagerPriorityIcon(task.priority)} ${task.title} - ${this.reportDateLabel(task, timeZone, todayEnd, tomorrowEnd)} - ${projectName}`);
-      });
-      if (groupIndex < groups.length - 1) lines.push("");
-    });
-
-    return { report: lines.join("\n"), timeZone };
-  }
-
-  createUser(input: { username: string; displayName: string; password: string; role: TaskManagerRole }): TaskManagerUser {
-    const normalized = input.username.trim();
-    if ([...this.users.values()].some((user) => user.username.toLowerCase() === normalized.toLowerCase())) {
-      throw new Error("Username already exists.");
-    }
-    const now = Date.now();
-    const password = hashTaskManagerPassword(input.password);
-    const user: PersistedTaskManagerUser = {
-      id: makeTaskManagerId("tm_user"),
-      username: normalized,
-      displayName: input.displayName.trim(),
-      role: input.role,
-      active: true,
-      timeZone: TASK_MANAGER_DEFAULT_TIME_ZONE,
-      createdAt: now,
-      updatedAt: now,
-      lastLoginAt: null,
-      passwordHash: password.hash,
-      passwordSalt: password.salt,
-    };
-    this.users.set(user.id, user);
-    this.persist();
-    return publicTaskManagerUser(user);
-  }
-
-  updateUser(id: string, input: { displayName?: string; role?: TaskManagerRole; active?: boolean; password?: string; timeZone?: string }): TaskManagerUser {
-    const user = this.users.get(id);
-    if (!user || user.username === TASK_MANAGER_ADMIN_USERNAME) throw new Error("User not found.");
-    if (input.displayName !== undefined) user.displayName = input.displayName.trim();
-    if (input.role !== undefined) user.role = input.role;
-    if (input.active !== undefined) user.active = input.active;
-    if (input.timeZone !== undefined) user.timeZone = requireValidTaskManagerTimeZone(input.timeZone);
-    if (input.password !== undefined) {
-      const password = hashTaskManagerPassword(input.password);
-      user.passwordHash = password.hash;
-      user.passwordSalt = password.salt;
-    }
-    user.updatedAt = Date.now();
-    this.persist();
-    return publicTaskManagerUser(user);
-  }
-
-  updateProfile(session: TaskManagerSession, input: { timeZone: string }): TaskManagerUser {
-    const user = this.users.get(session.userId);
-    if (!user || !user.active) throw new Error("User not found.");
-    user.timeZone = requireValidTaskManagerTimeZone(input.timeZone);
-    user.updatedAt = Date.now();
-    this.persist();
-    return publicTaskManagerUser(user);
-  }
-
-  createProject(input: { name: string; color: string; userIds?: string[] }, userId: string): TaskManagerProject {
-    const now = Date.now();
-    const creator = this.users.get(userId);
-    const allowedUserIds = this.normalizeProjectUserIds(input.userIds || []);
-    if (creator?.role !== "admin" && !allowedUserIds.includes(userId)) allowedUserIds.push(userId);
-    const project: TaskManagerProject = {
-      id: makeTaskManagerId("tm_project"),
-      name: input.name.trim(),
-      color: input.color,
-      archived: false,
-      createdBy: userId,
-      userIds: allowedUserIds,
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.projects.set(project.id, project);
-    this.persist();
-    return project;
-  }
-
-  updateProject(id: string, input: { name?: string; color?: string; archived?: boolean; userIds?: string[] }, session?: TaskManagerSession): TaskManagerProject {
-    const project = this.projects.get(id);
-    if (!project) throw new Error("Project not found.");
-    if (input.name !== undefined) project.name = input.name.trim();
-    if (input.color !== undefined) project.color = input.color;
-    if (input.archived !== undefined) project.archived = input.archived;
-    if (input.userIds !== undefined && session?.role !== "admin") throw new Error("Only admins can update project access.");
-    if (input.userIds !== undefined) project.userIds = this.normalizeProjectUserIds(input.userIds);
-    project.updatedAt = Date.now();
-    this.persist();
-    return project;
-  }
-
-  deleteProject(id: string): { deleted: boolean } {
-    const project = this.projects.get(id);
-    if (!project) throw new Error("Project not found.");
-    this.projects.delete(id);
-    for (const task of this.tasks.values()) {
-      if (task.projectId === id) {
-        task.projectId = null;
-        task.updatedAt = Date.now();
-      }
-    }
-    this.persist();
-    return { deleted: true };
-  }
-
-  createLabel(input: { name: string; color: string }): TaskManagerLabel {
-    const label: TaskManagerLabel = {
-      id: makeTaskManagerId("tm_label"),
-      name: input.name.trim(),
-      color: input.color,
-      createdAt: Date.now(),
-    };
-    this.labels.set(label.id, label);
-    this.persist();
-    return label;
-  }
-
-  createTask(input: {
-    title: string;
-    description: string;
-    status: TaskManagerStatus;
-    priority: TaskManagerPriority;
-    projectId: string | null;
-    assigneeId: string | null;
-    dueAt: number | null;
-    isDeadline: boolean;
-    sortOrder?: number;
-    labelIds: string[];
-    checklist: TaskManagerTask["checklist"];
-  }, userId: string): TaskManagerTask {
-    const now = Date.now();
-    const task: TaskManagerTask = {
-      id: makeTaskManagerId("tm_task"),
-      title: input.title.trim(),
-      description: input.description,
-      status: input.status,
-      priority: input.priority,
-      projectId: this.canUseProject(userId, input.projectId) ? input.projectId : null,
-      assigneeId: this.users.has(input.assigneeId || "") ? input.assigneeId : null,
-      createdBy: userId,
-      dueAt: input.dueAt,
-      isDeadline: input.isDeadline,
-      sortOrder: input.sortOrder || now,
-      labelIds: input.labelIds.filter((id) => this.labels.has(id)),
-      checklist: input.checklist,
-      createdAt: now,
-      updatedAt: now,
-      completedAt: input.status === "done" ? now : null,
-    };
-    this.tasks.set(task.id, task);
-    this.recordActivity(task.id, userId, "created", "Task created");
-    this.persist();
-    return task;
-  }
-
-  updateTask(id: string, input: Partial<Omit<TaskManagerTask, "id" | "createdAt" | "updatedAt" | "createdBy">>, session: TaskManagerSession): TaskManagerTask {
-    const task = this.tasks.get(id);
-    if (!task || !this.canAccessTask(session, task)) throw new Error("Task not found.");
-    const beforeStatus = task.status;
-    if (input.title !== undefined) task.title = input.title.trim();
-    if (input.description !== undefined) task.description = input.description;
-    if (input.status !== undefined) task.status = input.status;
-    if (input.priority !== undefined) task.priority = input.priority;
-    if (input.projectId !== undefined) task.projectId = this.canUseProject(session.userId, input.projectId) ? input.projectId : null;
-    if (input.assigneeId !== undefined) task.assigneeId = this.users.has(input.assigneeId || "") ? input.assigneeId : null;
-    if (input.dueAt !== undefined) task.dueAt = input.dueAt;
-    if (input.isDeadline !== undefined) task.isDeadline = input.isDeadline;
-    if (input.sortOrder !== undefined) task.sortOrder = input.sortOrder;
-    if (input.labelIds !== undefined) task.labelIds = input.labelIds.filter((labelId) => this.labels.has(labelId));
-    if (input.checklist !== undefined) task.checklist = input.checklist;
-    if (input.completedAt !== undefined) task.completedAt = input.completedAt;
-    if (input.status !== undefined && input.completedAt === undefined) task.completedAt = input.status === "done" ? Date.now() : null;
-    task.updatedAt = Date.now();
-    this.recordActivity(task.id, session.userId, beforeStatus !== task.status ? "status_changed" : "updated", beforeStatus !== task.status ? `${beforeStatus} -> ${task.status}` : "Task updated");
-    this.persist();
-    return task;
-  }
-
-  deleteTask(id: string, session: TaskManagerSession): { deleted: boolean } {
-    const task = this.tasks.get(id);
-    if (!task || !this.canAccessTask(session, task)) throw new Error("Task not found.");
-    this.tasks.delete(id);
-    for (const [commentId, comment] of this.comments) {
-      if (comment.taskId === id) this.comments.delete(commentId);
-    }
-    for (const [activityId, item] of this.activity) {
-      if (item.taskId === id) this.activity.delete(activityId);
-    }
-    this.persist();
-    return { deleted: true };
-  }
-
-  createComment(taskId: string, body: string, session: TaskManagerSession): TaskManagerComment {
-    const task = this.tasks.get(taskId);
-    if (!task || !this.canAccessTask(session, task)) throw new Error("Task not found.");
-    const now = Date.now();
-    const comment: TaskManagerComment = {
-      id: makeTaskManagerId("tm_comment"),
-      taskId,
-      userId: session.userId,
-      body: body.trim(),
-      createdAt: now,
-    };
-    this.comments.set(comment.id, comment);
-    this.recordActivity(taskId, session.userId, "commented", "Comment added");
-    this.persist();
-    return comment;
-  }
-
-  private ensureAdminUser(): void {
-    const username = TASK_MANAGER_ADMIN_USERNAME.trim() || "admin";
-    const existing = [...this.users.values()].find((user) => user.username.toLowerCase() === username.toLowerCase());
-    const now = Date.now();
-    const passwordValue = TASK_MANAGER_ADMIN_PASSWORD || "change_me_task_admin";
-    const password = hashTaskManagerPassword(passwordValue, existing?.passwordSalt);
-    const admin: PersistedTaskManagerUser = {
-      id: existing?.id || "tm_admin",
-      username,
-      displayName: existing?.displayName || "Task Manager Admin",
-      role: "admin",
-      active: true,
-      timeZone: normalizeTaskManagerTimeZone(existing?.timeZone),
-      createdAt: existing?.createdAt || now,
-      updatedAt: now,
-      lastLoginAt: existing?.lastLoginAt || null,
-      passwordHash: password.hash,
-      passwordSalt: password.salt,
-    };
-    this.users.set(admin.id, admin);
-    this.persist();
-  }
-
-  private ensureDefaults(): void {
-    if (this.projects.size === 0) {
-      const now = Date.now();
-      this.projects.set("tm_project_inbox", {
-        id: "tm_project_inbox",
-        name: "Inbox",
-        color: "#12867d",
-        archived: false,
-        createdBy: "tm_admin",
-        userIds: [],
-        createdAt: now,
-        updatedAt: now,
-      });
-    }
-    if (this.labels.size === 0) {
-      const now = Date.now();
-      for (const [id, name, color] of [
-        ["tm_label_followup", "Follow up", "#f97316"],
-        ["tm_label_client", "Client", "#0ea5e9"],
-        ["tm_label_internal", "Internal", "#64748b"],
-      ]) {
-        this.labels.set(id, { id, name, color, createdAt: now });
-      }
-    }
-    this.persist();
-  }
-
-  private requireCurrentUser(session: TaskManagerSession): TaskManagerUser {
-    const user = this.getSessionUser(session);
-    if (!user) throw new Error("Unauthorized");
-    return user;
-  }
-
-  private canAccessTask(session: TaskManagerSession, task: TaskManagerTask): boolean {
-    const project = task.projectId ? this.projects.get(task.projectId) : null;
-    return session.role === "admin" || task.createdBy === session.userId || task.assigneeId === session.userId || Boolean(project && this.canAccessProject(session, project));
-  }
-
-  private canAccessProject(session: TaskManagerSession, project: TaskManagerProject): boolean {
-    return session.role === "admin" || project.createdBy === session.userId || project.userIds.includes(session.userId);
-  }
-
-  private canUseProject(userId: string, projectId: string | null): boolean {
-    if (!projectId) return false;
-    const project = this.projects.get(projectId);
-    if (!project || project.archived) return false;
-    const user = this.users.get(userId);
-    return user?.role === "admin" || project.createdBy === userId || project.userIds.includes(userId);
-  }
-
-  private normalizeProjectUserIds(userIds: string[]): string[] {
-    return [...new Set(userIds)].filter((id) => {
-      const user = this.users.get(id);
-      return Boolean(user?.active && user.role !== "admin");
-    });
-  }
-
-  private reportDateLabel(task: TaskManagerTask, timeZone: string, todayEnd: number, tomorrowEnd: number): string {
-    if (!task.dueAt) return task.isDeadline ? "No date (deadline)" : "No date";
-    if (task.isDeadline) return `${taskManagerFormatDaysLeftLabel(taskManagerDaysUntilDate(task.dueAt, timeZone))} (deadline)`;
-    let label = "";
-    if (task.dueAt < taskManagerStartOfToday(timeZone)) {
-      label = "Overdue";
-    } else if (task.dueAt <= todayEnd) {
-      label = "Today";
-    } else if (task.dueAt <= tomorrowEnd) {
-      label = "Tomorrow";
-    } else {
-      label = taskManagerFormatShortDate(task.dueAt, timeZone);
-    }
-    return label;
-  }
-
-  private recordActivity(taskId: string, userId: string, action: string, detail: string): void {
-    const item: TaskManagerActivity = {
-      id: makeTaskManagerId("tm_activity"),
-      taskId,
-      userId,
-      action,
-      detail,
-      createdAt: Date.now(),
-    };
-    this.activity.set(item.id, item);
-  }
-
-  private persist(): void {
-    writeJsonAtomicSync(TASK_MANAGER_DATA_PATH, this.snapshot());
-  }
-}
 
 function compactJsonForStorage(value: unknown, depth = 0): unknown {
   if (typeof value === "string") {
@@ -1272,7 +626,7 @@ function normalizeMimeType(input: string | undefined): string {
   return raw || "application/octet-stream";
 }
 
-function classifyAttachment(name: string, mimeType: string): "image" | "text" | null {
+function classifyAttachment(name: string, mimeType: string): "image" | "text" | "file" {
   const normalizedMimeType = normalizeMimeType(mimeType);
   const extension = path.extname(name).toLowerCase();
 
@@ -1288,7 +642,7 @@ function classifyAttachment(name: string, mimeType: string): "image" | "text" | 
     return "text";
   }
 
-  return null;
+  return "file";
 }
 
 function sanitizeAttachmentName(input: string): string {
@@ -1996,18 +1350,43 @@ function resolveClaudeCodeExecutable(configured: string | undefined): string {
 function resolveCursorExecutable(configured: string | undefined): string {
   const explicit = (configured || "").trim();
   if (explicit) return explicit;
-  const fromPath = resolveCommandPath("cursor");
-  if (fromPath) return fromPath;
+  const fromCursor = resolveCommandPath("cursor");
+  if (fromCursor) return fromCursor;
+  const fromAgent = resolveCommandPath("agent");
+  if (fromAgent) return fromAgent;
   const macApp = "/Applications/Cursor.app/Contents/Resources/app/bin/cursor";
   if (fs.existsSync(macApp)) return macApp;
-  const linuxApp = path.join(os.homedir(), ".local/bin/cursor");
-  if (fs.existsSync(linuxApp)) return linuxApp;
+  const linuxCursor = path.join(os.homedir(), ".local/bin/cursor");
+  if (fs.existsSync(linuxCursor)) return linuxCursor;
+  const linuxAgent = path.join(os.homedir(), ".local/bin/agent");
+  if (fs.existsSync(linuxAgent)) return linuxAgent;
   return "cursor";
+}
+
+/** Standalone Cursor Agent CLI (`agent` / `cursor-agent`) takes flags at top level. */
+function isStandaloneCursorAgentCli(executable: string): boolean {
+  const base = path.basename(executable).toLowerCase();
+  return base === "agent" || base === "cursor-agent" || base.startsWith("cursor-agent");
+}
+
+function cursorCliArgs(argsAfterAgent: string[]): string[] {
+  const args = argsAfterAgent.includes("--disable-auto-update")
+    ? argsAfterAgent
+    : ["--disable-auto-update", ...argsAfterAgent];
+  const executable = CURSOR_EXECUTABLE || "cursor";
+  if (isStandaloneCursorAgentCli(executable)) return args;
+  return ["agent", ...args];
 }
 
 function cursorCliAvailable(): boolean {
   const executable = CURSOR_EXECUTABLE || "cursor";
-  if (executable.includes(path.sep)) return fs.existsSync(executable);
+  if (executable.includes(path.sep)) {
+    try {
+      return fs.existsSync(executable) || Boolean(fs.realpathSync(executable));
+    } catch {
+      return false;
+    }
+  }
   return commandExists(executable);
 }
 
@@ -2052,6 +1431,13 @@ function resolveCursorModelArg(model: string, effort: ReasoningEffort, catalog?:
 
 function buildCursorEnvironment(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
+  const localBin = path.join(os.homedir(), ".local/bin");
+  const pathParts = String(env.PATH || "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  if (!pathParts.includes(localBin)) {
+    env.PATH = [localBin, ...pathParts].join(path.delimiter);
+  }
   if (CURSOR_API_KEY) {
     env.CURSOR_API_KEY = CURSOR_API_KEY;
     env.CURSOR_AUTH_TOKEN = CURSOR_API_KEY;
@@ -2061,7 +1447,7 @@ function buildCursorEnvironment(): NodeJS.ProcessEnv {
 
 function listCursorModelsFromCli(): CursorModelInfo[] {
   if (!cursorCliAvailable()) return [...DEFAULT_CURSOR_MODELS];
-  const args = ["agent", "--list-models"];
+  const args = cursorCliArgs(["--list-models"]);
   const result = spawnSync(CURSOR_EXECUTABLE || "cursor", args, {
     encoding: "utf8",
     env: buildCursorEnvironment(),
@@ -2306,8 +1692,13 @@ class RunManager extends EventEmitter {
   deleteSession(sessionId: string): { removedRuns: number; removedApprovals: number } | null {
     const sessionRuns = this.getSessionRuns(sessionId);
     if (sessionRuns.length === 0) return null;
-    if (this.hasActiveRunInSession(sessionId)) {
-      throw new Error("Cannot delete a session with a running task");
+
+    // Force-stop any live process first so finished-looking Cursor runs (hung on
+    // child shells/servers) can still be deleted.
+    for (const run of sessionRuns) {
+      if (this.activeRuns.has(run.id) || run.status === "running" || run.status === "queued") {
+        this.forceStopRun(run.id);
+      }
     }
 
     const runIds = new Set(sessionRuns.map((run) => run.id));
@@ -2348,7 +1739,10 @@ class RunManager extends EventEmitter {
       ? buildPlanModePrompt(promptBase, planModeInstructions)
       : promptBase;
     const promptWithAgents = buildAgentBackedPrompt(promptWithPlan, resolvedAgents);
-    const prompt = buildSkillBackedPrompt(promptWithAgents, resolvedSkills);
+    const promptWithSkills = buildSkillBackedPrompt(promptWithAgents, resolvedSkills);
+    const prompt = effectiveConfig.runner === "cursor"
+      ? buildCursorRuntimePrompt(promptWithSkills)
+      : promptWithSkills;
     const imageArgs = resolvedAttachments
       .filter((attachment) => attachment.ref.kind === "image")
       .flatMap((attachment) => ["-i", attachment.absolutePath]);
@@ -2525,8 +1919,7 @@ class RunManager extends EventEmitter {
     }
 
     const modelArg = resolveCursorModelArg(effectiveConfig.model, effectiveConfig.reasoningEffort, getCursorModels());
-    const args = [
-      "agent",
+    const argsAfterAgent = [
       "-p",
       "--output-format",
       "stream-json",
@@ -2540,24 +1933,25 @@ class RunManager extends EventEmitter {
       mapCursorSandbox(effectiveConfig.sandbox),
     ];
 
-    if (CURSOR_APPROVE_MCPS) args.push("--approve-mcps");
+    if (CURSOR_APPROVE_MCPS) argsAfterAgent.push("--approve-mcps");
     if (
       CURSOR_FORCE
       || effectiveConfig.approvalPolicy === "never"
       || effectiveConfig.sandbox === "danger-full-access"
     ) {
-      args.push("--force");
+      argsAfterAgent.push("--force");
     }
     if (effectiveConfig.planMode) {
-      args.push("--plan");
+      argsAfterAgent.push("--plan");
     } else if (effectiveConfig.askMode) {
-      args.push("--mode", "ask");
+      argsAfterAgent.push("--mode", "ask");
     }
-    if (CURSOR_WORKTREE) args.push("--worktree");
+    if (CURSOR_WORKTREE) argsAfterAgent.push("--worktree");
     if (effectiveConfig.sessionId) {
-      args.push("--resume", effectiveConfig.sessionId);
+      argsAfterAgent.push("--resume", effectiveConfig.sessionId);
     }
-    args.push(prompt);
+    argsAfterAgent.push(prompt);
+    const args = cursorCliArgs(argsAfterAgent);
 
     const child = spawn(executable, args, {
       cwd: effectiveConfig.workspace,
@@ -2577,6 +1971,13 @@ class RunManager extends EventEmitter {
       stopRequested: false,
       sawResult: false,
       streamText: "",
+      streamItemId: `cursor_stream_${runId}_0`,
+      streamSegment: 0,
+      lastActivityAt: Date.now(),
+      lastAssistantAt: 0,
+      lastToolStartedAt: 0,
+      pendingToolCallIds: new Set(),
+      sawAssistantOutput: false,
     };
     this.activeRuns.set(runId, active);
     this.updateRun(runId, { status: "running" });
@@ -2648,6 +2049,12 @@ class RunManager extends EventEmitter {
 
     const run = this.runs.get(runId);
     if (!run) return;
+    // Already finalized by idle auto-complete / force-stop.
+    if (run.status === "completed" || run.status === "failed" || run.status === "stopped") {
+      this.releaseCachedEvents(runId);
+      this.persistState();
+      return;
+    }
 
     if (stopRequested) {
       this.updateRun(runId, { status: "stopped" });
@@ -2656,7 +2063,7 @@ class RunManager extends EventEmitter {
       if (stoppedRun) {
         this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous: run } as RunLifecycleEvent);
       }
-    } else if (code === 0 && run.status !== "stopped") {
+    } else if (code === 0) {
       this.updateRun(runId, {
         status: "completed",
         ...(run.lastError && isBenignCodexErrorItemText(run.lastError) ? { lastError: null } : {}),
@@ -2666,7 +2073,7 @@ class RunManager extends EventEmitter {
       if (completedRun) {
         this.emit("run.lifecycle", { kind: "completed", run: completedRun, previous: run } as RunLifecycleEvent);
       }
-    } else if (run.status !== "stopped") {
+    } else {
       this.updateRun(runId, { status: "failed" });
       this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code } });
       const failedRun = this.runs.get(runId);
@@ -2680,6 +2087,9 @@ class RunManager extends EventEmitter {
   }
 
   private handleCursorStdoutLine(runId: string, line: string): void {
+    const active = this.activeRuns.get(runId);
+    if (active?.runner === "cursor") active.lastActivityAt = Date.now();
+
     const storedLine = truncateText(line, STORED_EVENT_TEXT_MAX_CHARS);
     this.appendEvent(runId, { source: "stdout", text: storedLine });
     this.emitSse({ kind: "run.stdout", runId, at: Date.now(), payload: { text: storedLine } });
@@ -2703,6 +2113,9 @@ class RunManager extends EventEmitter {
         return;
       case "user":
         return;
+      case "thinking":
+        // Keep the idle timer fresh while the model is thinking between tools.
+        return;
       case "assistant":
         this.handleCursorAssistantMessage(runId, message);
         return;
@@ -2718,54 +2131,60 @@ class RunManager extends EventEmitter {
   }
 
   private trackCursorSessionId(runId: string, message: Record<string, unknown>): void {
-    const sessionId = typeof message.session_id === "string" ? message.session_id : "";
+    const sessionId = typeof message.session_id === "string" ? message.session_id.trim() : "";
     if (!sessionId) return;
     const run = this.runs.get(runId);
     if (!run) return;
-    const patch: Partial<RunRecord> = { threadId: sessionId };
-    if (!run.sessionId) patch.sessionId = sessionId;
+    // Always adopt Cursor's session id (replaces provisional local_* ids).
+    const patch: Partial<RunRecord> = { threadId: sessionId, sessionId };
     this.updateRun(runId, patch);
     this.emitClaudeParsed(runId, { type: "thread.started", thread_id: sessionId });
   }
 
   private handleCursorAssistantMessage(runId: string, message: Record<string, unknown>): void {
-    // Skip duplicate flushes when streaming partial output (see Cursor CLI docs).
+    // Cursor with --stream-partial-output emits:
+    // 1) timestamped token deltas (no model_call_id)
+    // 2) a model_call_id snapshot of the full segment (duplicate of deltas)
+    // 3) sometimes a final assistant row with no timestamp_ms (duplicate again)
     const hasTimestamp = typeof message.timestamp_ms === "number";
     const hasModelCallId = typeof message.model_call_id === "string" && message.model_call_id.length > 0;
-    if (hasModelCallId) return;
-    if (!hasTimestamp && Object.prototype.hasOwnProperty.call(message, "timestamp_ms") === false) {
-      // Non-partial complete segment (no streaming fields).
-    } else if (!hasTimestamp) {
-      // Final flush at end of turn without timestamp — duplicate of streamed text.
-      return;
-    }
-
     const text = readCursorAssistantText(message);
-    if (!text.trim()) return;
+    if (!text) return;
 
     const active = this.activeRuns.get(runId);
-    const streamId = `cursor_stream_${runId}`;
+    if (!active || active.runner !== "cursor") return;
 
-    if (hasTimestamp && active?.runner === "cursor") {
-      active.streamText += text;
-      const full = active.streamText;
-      this.updateRun(runId, { summary: full.slice(0, 240) });
-      this.emitClaudeParsed(runId, {
-        type: "item.completed",
-        item: {
-          id: streamId,
-          type: "agent_message",
-          text: full,
-        },
-      });
+    // Authoritative full segment from the model call — replace streamed tokens.
+    if (hasModelCallId) {
+      active.streamText = text;
+      active.sawAssistantOutput = true;
+      active.lastAssistantAt = Date.now();
+      this.emitCursorAssistantText(runId, active.streamItemId, text);
       return;
     }
 
-    if (active?.runner === "cursor") active.streamText = "";
+    // Streaming token deltas.
+    if (hasTimestamp) {
+      active.streamText += text;
+      active.sawAssistantOutput = true;
+      active.lastAssistantAt = Date.now();
+      this.emitCursorAssistantText(runId, active.streamItemId, active.streamText);
+      return;
+    }
 
-    const itemId = typeof message.session_id === "string"
-      ? `cursor_assistant_${message.session_id}_${Date.now()}`
-      : `cursor_assistant_${Date.now()}`;
+    // Final flush without streaming fields: update the same bubble, do not fork a duplicate.
+    if (active.streamText && active.streamText !== text) {
+      active.streamText = text;
+    } else if (!active.streamText) {
+      active.streamText = text;
+    }
+    active.sawAssistantOutput = true;
+    active.lastAssistantAt = Date.now();
+    this.emitCursorAssistantText(runId, active.streamItemId, active.streamText || text);
+  }
+
+  private emitCursorAssistantText(runId: string, itemId: string, text: string): void {
+    if (!text.trim()) return;
     this.updateRun(runId, { summary: text.slice(0, 240) });
     this.emitClaudeParsed(runId, {
       type: "item.completed",
@@ -2777,12 +2196,29 @@ class RunManager extends EventEmitter {
     });
   }
 
+  private beginCursorAssistantSegment(active: CursorActiveRun, runId: string): void {
+    active.streamSegment += 1;
+    active.streamItemId = `cursor_stream_${runId}_${active.streamSegment}`;
+    active.streamText = "";
+  }
+
   private handleCursorToolCallMessage(runId: string, message: Record<string, unknown>): void {
     const active = this.activeRuns.get(runId);
-    if (active?.runner === "cursor") active.streamText = "";
-
     const subtype = typeof message.subtype === "string" ? message.subtype : "";
     const callId = typeof message.call_id === "string" ? message.call_id : `cursor_tool_${Date.now()}`;
+    if (active?.runner === "cursor") {
+      active.lastActivityAt = Date.now();
+      if (subtype === "started") {
+        active.pendingToolCallIds.add(callId);
+        active.lastToolStartedAt = Date.now();
+      }
+      if (subtype === "completed") active.pendingToolCallIds.delete(callId);
+      if (active.streamText) {
+        // Keep prior assistant text as its own message; start a fresh segment after the tool.
+        this.beginCursorAssistantSegment(active, runId);
+      }
+    }
+
     const toolCall = isRecord(message.tool_call) ? message.tool_call : {};
     const mapped = mapCursorToolCall(callId, toolCall, subtype === "completed");
     if (!mapped) return;
@@ -3233,27 +2669,152 @@ class RunManager extends EventEmitter {
 
   stopRun(runId: string): boolean {
     const active = this.activeRuns.get(runId);
-    if (!active) return false;
+    if (!active) {
+      const run = this.runs.get(runId);
+      if (run && (run.status === "running" || run.status === "queued")) {
+        this.forceStopRun(runId);
+        return true;
+      }
+      return false;
+    }
 
     active.stopRequested = true;
-    if (active.runner === "claude") {
-      active.process.kill("SIGINT");
-    } else {
-      active.process.kill("SIGINT");
-    }
+    this.killActiveRunProcess(active);
 
     setTimeout(() => {
       const running = this.activeRuns.get(runId);
       if (!running) return;
-      running.process.kill("SIGTERM");
+      this.killActiveRunProcess(running, "SIGTERM");
       setTimeout(() => {
         const stillRunning = this.activeRuns.get(runId);
         if (!stillRunning) return;
-        stillRunning.process.kill("SIGKILL");
+        this.killActiveRunProcess(stillRunning, "SIGKILL");
       }, 2500);
     }, 2500);
 
     return true;
+  }
+
+  /** Immediately stop a run and mark it stopped (used by session delete / stuck Cursor). */
+  forceStopRun(runId: string): void {
+    const active = this.activeRuns.get(runId);
+    if (active) {
+      active.stopRequested = true;
+      this.killActiveRunProcess(active, "SIGKILL");
+      this.activeRuns.delete(runId);
+    }
+
+    const run = this.runs.get(runId);
+    if (!run) return;
+    if (run.status !== "running" && run.status !== "queued") return;
+
+    const previous = run;
+    this.updateRun(runId, { status: "stopped" });
+    this.emitSse({ kind: "run.stopped", runId, at: Date.now() });
+    const stoppedRun = this.runs.get(runId);
+    if (stoppedRun) {
+      this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous } as RunLifecycleEvent);
+    }
+    this.releaseCachedEvents(runId);
+  }
+
+  /**
+   * Cursor CLI often keeps the process alive after the final assistant reply
+   * (e.g. a child web server). Prefer Cursor's `result` event; idle-complete only
+   * when the turn looks settled (assistant output after the last tool) or when
+   * the run is stuck with no activity for the longer stuck timeout.
+   */
+  sweepIdleCursorRuns(now = Date.now()): number {
+    let completed = 0;
+    for (const [runId, active] of this.activeRuns.entries()) {
+      if (active.runner !== "cursor") continue;
+      if (active.stopRequested || active.sawResult) continue;
+      if (!active.sawAssistantOutput) continue;
+      if (active.pendingToolCallIds.size > 0) continue;
+      const idleFor = now - active.lastActivityAt;
+      const turnSettled = active.lastAssistantAt > 0 && active.lastAssistantAt >= active.lastToolStartedAt;
+      if (turnSettled) {
+        if (idleFor < CURSOR_IDLE_COMPLETE_MS) continue;
+      } else if (idleFor < CURSOR_STUCK_COMPLETE_MS) {
+        // Mid-work silence after tools (report build, GCP, etc.) — do not cut early.
+        continue;
+      }
+      this.forceCompleteCursorRun(runId);
+      completed += 1;
+    }
+    return completed;
+  }
+
+  forceCompleteCursorRun(runId: string): void {
+    const active = this.activeRuns.get(runId);
+    if (active?.runner === "cursor") {
+      // Detach tracking first so the exit handler does not mark failed.
+      // Kill only the agent CLI — leave child servers (pm2/node apps) running.
+      this.activeRuns.delete(runId);
+      this.killActiveRunProcess(active, "SIGTERM", { descendants: false });
+      setTimeout(() => {
+        try {
+          if (!active.process.killed) this.killActiveRunProcess(active, "SIGKILL", { descendants: false });
+        } catch {
+          // ignore
+        }
+      }, 2000);
+    }
+
+    const run = this.runs.get(runId);
+    if (!run) return;
+    if (run.status !== "running" && run.status !== "queued") return;
+
+    const previous = run;
+    this.updateRun(runId, { status: "completed" });
+    this.emitClaudeParsed(runId, { type: "turn.completed", usage: null });
+    this.emitSse({ kind: "run.completed", runId, at: Date.now() });
+    const completedRun = this.runs.get(runId);
+    if (completedRun) {
+      this.emit("run.lifecycle", { kind: "completed", run: completedRun, previous } as RunLifecycleEvent);
+    }
+    this.releaseCachedEvents(runId);
+    this.persistState();
+  }
+
+  private killActiveRunProcess(
+    active: ActiveRun,
+    signal: NodeJS.Signals = "SIGINT",
+    options: { descendants?: boolean } = {},
+  ): void {
+    const killDescendants = options.descendants !== false;
+    const child = active.process;
+    const pid = child.pid;
+    if (!pid) {
+      try {
+        child.kill(signal);
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    if (killDescendants) {
+      // Explicit stop/delete: tear down the agent and its child shells/servers.
+      this.signalProcessTree(pid, signal);
+    }
+    try {
+      child.kill(signal);
+    } catch {
+      // ignore
+    }
+  }
+
+  private signalProcessTree(rootPid: number, signal: NodeJS.Signals): void {
+    const children = getChildPids(rootPid);
+    for (const childPid of children) {
+      this.signalProcessTree(childPid, signal);
+      try {
+        process.kill(childPid, signal);
+      } catch {
+        // already gone
+      }
+    }
   }
 
   acceptApproval(id: string): ApprovalQueueItem | null {
@@ -3611,14 +3172,46 @@ class AgentScheduleManager {
   }
 
   updateStatus(scheduleId: string, status: AgentSchedule["status"]): AgentSchedule | null {
+    return this.update(scheduleId, { status });
+  }
+
+  update(
+    scheduleId: string,
+    patch: {
+      status?: AgentSchedule["status"];
+      model?: string;
+      reasoningEffort?: ReasoningEffort;
+      hour?: number;
+      minute?: number;
+    },
+  ): AgentSchedule | null {
     const current = this.schedules.get(scheduleId);
     if (!current) return null;
     const now = Date.now();
+    const nextTime: AgentScheduleTime = {
+      hour: patch.hour ?? current.time.hour,
+      minute: patch.minute ?? current.time.minute,
+      timezone: current.time.timezone || TEHRAN_TIMEZONE,
+    };
+    const timeChanged = nextTime.hour !== current.time.hour || nextTime.minute !== current.time.minute;
+    const nextStatus = patch.status ?? current.status;
     const next: AgentSchedule = {
       ...current,
-      status,
+      status: nextStatus,
+      time: nextTime,
       updatedAt: now,
-      nextRunAt: status === "active" ? nextTehranDailyRun(current.time, now) : null,
+      nextRunAt: nextStatus === "active"
+        ? (timeChanged || patch.status === "active" || current.nextRunAt === null
+          ? nextTehranDailyRun(nextTime, now)
+          : current.nextRunAt)
+        : null,
+      runConfig: {
+        ...current.runConfig,
+        model: patch.model?.trim() || current.runConfig.model,
+        reasoningEffort: patch.reasoningEffort !== undefined
+          ? normalizeReasoningEffort(patch.reasoningEffort)
+          : normalizeReasoningEffort(current.runConfig.reasoningEffort),
+      },
     };
     this.schedules.set(scheduleId, next);
     this.persist();
@@ -4190,6 +3783,25 @@ function buildImageRenderContextPrompt(prompt: string, sessionId: string): strin
   ].join("\n");
 }
 
+/**
+ * Keep Cursor CLI turns finite. Foreground servers leave the agent process
+ * blocked, so Luma sessions stay "running" forever.
+ */
+function buildCursorRuntimePrompt(prompt: string): string {
+  if (prompt.includes("Luma Cursor runtime rules:")) return prompt;
+  return [
+    "Luma Cursor runtime rules:",
+    "- This run must finish. After your final answer, do not leave the agent blocked on a long-lived process.",
+    "- Never run app servers, watchers, tunnels, or other long-lived processes in the foreground shell.",
+    "- Start long-lived processes detached/backgrounded (preferred: pm2/systemd; else nohup … >/tmp/….log 2>&1 & echo $!), verify with a short curl/health check, then continue.",
+    "- Prefer existing process managers already on the host when present.",
+    "- Do not wait indefinitely for servers; background them, confirm they listen, then end the turn.",
+    "",
+    "User request:",
+    prompt,
+  ].join("\n");
+}
+
 function resolveEffectiveRunConfig(config: RunConfig): RunConfig {
   const attachments = normalizeAttachmentRefs(config.attachments);
   const skills = normalizeSelectedSkillRefs(config.skills);
@@ -4270,8 +3882,18 @@ function readClaudeAssistantText(message: Record<string, unknown>): string {
     .trim();
 }
 
+/** Cursor stream-json partials often include leading/trailing spaces as their own tokens — never trim. */
 function readCursorAssistantText(message: Record<string, unknown>): string {
-  return readClaudeAssistantText(message);
+  const payload = isRecord(message.message) ? message.message : {};
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  return content
+    .map((item) => {
+      if (!isRecord(item)) return "";
+      if (item.type === "text" && typeof item.text === "string") return item.text;
+      return "";
+    })
+    .filter((text) => text.length > 0)
+    .join("");
 }
 
 function mapCursorToolCall(
@@ -5629,7 +5251,21 @@ function isMissingLocalImageReadErrorText(text: string): boolean {
 /** Codex emits this as item.type=error, but it is only a skills-context warning. */
 function isBenignCodexErrorItemText(text: string): boolean {
   const normalized = text.trim().toLowerCase();
-  return normalized.includes("skill descriptions were shortened to fit the skills context budget");
+  if (normalized.includes("skill descriptions were shortened to fit the skills context budget")) {
+    return true;
+  }
+  // Codex often drops the OpenAI WebSocket mid-turn and continues over HTTPS.
+  // Treat that transport notice as non-fatal so the UI does not show a hard Error.
+  if (normalized.includes("falling back from websockets to https transport")) {
+    return true;
+  }
+  if (
+    normalized.includes("stream disconnected before completion")
+    && normalized.includes("websocket closed by server before response.completed")
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function isSuppressedCodexErrorText(text: string): boolean {
@@ -5637,8 +5273,8 @@ function isSuppressedCodexErrorText(text: string): boolean {
 }
 
 /**
- * Codex 0.154+ emits a skills-budget warning as item.type=error. Older Luma builds
- * marked those runs failed even when the turn finished successfully.
+ * Codex may emit soft item.type=error notices (skills budget, WebSocket→HTTPS
+ * fallback). Older Luma builds marked those runs failed even when the turn finished.
  */
 function shouldHealBenignSkillsBudgetFailure(run: RunRecord): boolean {
   if (run.status !== "failed") return false;
@@ -5648,7 +5284,10 @@ function shouldHealBenignSkillsBudgetFailure(run: RunRecord): boolean {
   if (!fs.existsSync(eventsPath)) return false;
   try {
     const text = fs.readFileSync(eventsPath, "utf8");
-    if (!text.includes("Skill descriptions were shortened to fit the skills context budget")) return false;
+    const hasBenignNotice = text.includes("Skill descriptions were shortened to fit the skills context budget")
+      || text.toLowerCase().includes("falling back from websockets to https transport")
+      || text.toLowerCase().includes("websocket closed by server before response.completed");
+    if (!hasBenignNotice) return false;
     return text.includes("\"type\":\"turn.completed\"") || Boolean(run.summary && run.summary.trim());
   } catch {
     return false;
@@ -6177,9 +5816,26 @@ class MessageStore {
       this.renameSession(sessionId, canonicalSessionId, latestRunId);
     }
 
+    // Remove empty ghost sessions keyed by run id after remap to provider session ids.
+    for (const [sessionId, state] of [...this.sessions.entries()]) {
+      if (!sessionId.startsWith("run_")) continue;
+      if (state.item.messageCount > 0) continue;
+      const run = runById.get(sessionId);
+      const canonical = run ? runProjectionSessionId(run) : null;
+      if (canonical && canonical !== sessionId) {
+        this.removeSession(sessionId);
+        continue;
+      }
+      // Orphan empty run-keyed row with no live run, or run already bound elsewhere.
+      if (!run || (run.sessionId && run.sessionId !== sessionId) || (run.threadId && run.threadId !== sessionId)) {
+        this.removeSession(sessionId);
+      }
+    }
+
     const runsBySession = new Map<string, RunRecord[]>();
     for (const run of activeRuns) {
-      const sessionId = runSessionId(run);
+      const sessionId = runProjectionSessionId(run);
+      if (!sessionId) continue;
       const existing = runsBySession.get(sessionId) || [];
       existing.push(run);
       runsBySession.set(sessionId, existing);
@@ -7179,14 +6835,18 @@ class MessageProjector {
       if (!meaningfulChange) return;
     }
 
-    const resolvedSessionId = this.sessionIdByRunId.get(event.run.id) || runSessionId(event.run);
+    const resolvedSessionId = this.sessionIdByRunId.get(event.run.id) || runProjectionSessionId(event.run);
+    // Avoid creating ghost sessions keyed by run.id before the real session is bound
+    // (Cursor/Codex provisional starts emit lifecycle with sessionId/threadId still null).
+    if (!resolvedSessionId) return;
+
     this.messageStore.updateSessionFromRun(event.run, resolvedSessionId);
     if (event.kind === "completed" || event.kind === "failed" || event.kind === "stopped") {
       this.outboxBridge.handleRunFinished(event.run.id);
       this.sessionIdByRunId.delete(event.run.id);
     }
 
-    if (event.kind === "failed" && event.run.lastError) {
+    if (event.kind === "failed" && event.run.lastError && !isSuppressedCodexErrorText(event.run.lastError)) {
       const messageId = `${event.run.id}_failed`;
       this.messageStore.upsertGeneratedMessage(resolvedSessionId, {
         id: messageId,
@@ -7214,6 +6874,13 @@ class MessageProjector {
         this.messageStore.renameSession(currentSessionId, actualSessionId, event.run.id);
         this.outboxBridge.remapSession(currentSessionId, actualSessionId, event.run.id);
         this.sessionIdByRunId.set(event.runId, actualSessionId);
+      } else {
+        this.sessionIdByRunId.set(event.runId, actualSessionId);
+      }
+      // Drop empty run-id ghost sessions left by early lifecycle races.
+      const runKeyed = this.messageStore.getLocalSession(event.run.id);
+      if (runKeyed && runKeyed.id !== actualSessionId && runKeyed.messageCount === 0) {
+        this.messageStore.removeSession(event.run.id);
       }
     }
 
@@ -7437,214 +7104,6 @@ app.use(
   }),
 );
 
-const taskManagerStore = new TaskManagerStore();
-
-function extractTaskManagerSession(req: express.Request): TaskManagerSession | null {
-  const token = extractAuthToken(req);
-  if (!token) return null;
-  try {
-    const decoded = jwt.verify(token, TASK_MANAGER_JWT_SECRET);
-    if (!isRecord(decoded) || decoded.scope !== "taskmanager") return null;
-    const userId = typeof decoded.sub === "string" ? decoded.sub : "";
-    const role = decoded.role === "admin" || decoded.role === "user" ? decoded.role : null;
-    const username = typeof decoded.username === "string" ? decoded.username : "";
-    if (!userId || !role || !username) return null;
-    return { userId, role, username };
-  } catch {
-    return null;
-  }
-}
-
-function requireTaskManagerAuth(req: TaskManagerRequest, res: express.Response, next: express.NextFunction): void {
-  const session = extractTaskManagerSession(req);
-  if (!session || !taskManagerStore.getSessionUser(session)) {
-    res.status(401).json(apiErr("Unauthorized"));
-    return;
-  }
-  req.taskUser = session;
-  next();
-}
-
-function requireTaskManagerAdmin(req: TaskManagerRequest, res: express.Response, next: express.NextFunction): void {
-  if (req.taskUser?.role !== "admin") {
-    res.status(403).json(apiErr("Admin access is required."));
-    return;
-  }
-  next();
-}
-
-function taskSession(req: TaskManagerRequest): TaskManagerSession {
-  if (!req.taskUser) throw new Error("Unauthorized");
-  return req.taskUser;
-}
-
-app.post("/api/taskmanager/auth/login", (req, res) => {
-  const parsed = taskManagerLoginSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid login payload."));
-    return;
-  }
-  const result = taskManagerStore.authenticate(parsed.data.username, parsed.data.password);
-  if (!result) {
-    res.status(401).json(apiErr("Invalid username or password."));
-    return;
-  }
-  res.json(apiOk(result));
-});
-
-app.get("/api/taskmanager/bootstrap", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
-  try {
-    res.json(apiOk(taskManagerStore.bootstrap(taskSession(req))));
-  } catch (error) {
-    res.status(401).json(apiErr(error instanceof Error ? error.message : "Unauthorized"));
-  }
-});
-
-app.get("/api/taskmanager/reports/today", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
-  try {
-    const timeZone =
-      typeof req.query.timezone === "string"
-        ? req.query.timezone
-        : typeof req.query.timeZone === "string"
-          ? req.query.timeZone
-          : undefined;
-    const onlyMine = req.query.onlyMine === "1" || req.query.onlyMine === "true";
-    const assigneeId = typeof req.query.assigneeId === "string" && req.query.assigneeId.trim() ? req.query.assigneeId.trim() : undefined;
-    const projectId = typeof req.query.projectId === "string" && req.query.projectId.trim() ? req.query.projectId.trim() : undefined;
-    const result = taskManagerStore.todayReport(taskSession(req), { timeZone, onlyMine, assigneeId, projectId });
-
-    if (req.query.format === "json") {
-      res.json(apiOk(result));
-      return;
-    }
-
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.send(result.report);
-  } catch (error) {
-    res.status(400).json(apiErr(error instanceof Error ? error.message : "Unable to build today report."));
-  }
-});
-
-app.patch("/api/taskmanager/profile", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
-  const parsed = updateTaskManagerProfileSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid profile payload."));
-    return;
-  }
-  try {
-    res.json(apiOk({ user: taskManagerStore.updateProfile(taskSession(req), parsed.data) }));
-  } catch (error) {
-    res.status(400).json(apiErr(error instanceof Error ? error.message : "Unable to update profile."));
-  }
-});
-
-app.post("/api/taskmanager/users", requireTaskManagerAuth, requireTaskManagerAdmin, (req, res) => {
-  const parsed = createTaskManagerUserSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid user payload."));
-    return;
-  }
-  try {
-    res.json(apiOk({ user: taskManagerStore.createUser(parsed.data) }));
-  } catch (error) {
-    res.status(400).json(apiErr(error instanceof Error ? error.message : "Unable to create user."));
-  }
-});
-
-app.patch("/api/taskmanager/users/:id", requireTaskManagerAuth, requireTaskManagerAdmin, (req, res) => {
-  const parsed = updateTaskManagerUserSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid user payload."));
-    return;
-  }
-  try {
-    res.json(apiOk({ user: taskManagerStore.updateUser(req.params.id, parsed.data) }));
-  } catch (error) {
-    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to update user."));
-  }
-});
-
-app.post("/api/taskmanager/projects", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
-  const parsed = createTaskManagerProjectSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid project payload."));
-    return;
-  }
-  res.json(apiOk({ project: taskManagerStore.createProject(parsed.data, taskSession(req).userId) }));
-});
-
-app.patch("/api/taskmanager/projects/:id", requireTaskManagerAuth, (req, res) => {
-  const parsed = updateTaskManagerProjectSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid project payload."));
-    return;
-  }
-  try {
-    res.json(apiOk({ project: taskManagerStore.updateProject(req.params.id, parsed.data, taskSession(req)) }));
-  } catch (error) {
-    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to update project."));
-  }
-});
-
-app.delete("/api/taskmanager/projects/:id", requireTaskManagerAuth, (req, res) => {
-  try {
-    res.json(apiOk(taskManagerStore.deleteProject(req.params.id)));
-  } catch (error) {
-    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to delete project."));
-  }
-});
-
-app.post("/api/taskmanager/labels", requireTaskManagerAuth, (req, res) => {
-  const parsed = createTaskManagerLabelSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid label payload."));
-    return;
-  }
-  res.json(apiOk({ label: taskManagerStore.createLabel(parsed.data) }));
-});
-
-app.post("/api/taskmanager/tasks", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
-  const parsed = createTaskManagerTaskSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid task payload."));
-    return;
-  }
-  res.json(apiOk({ task: taskManagerStore.createTask(parsed.data, taskSession(req).userId) }));
-});
-
-app.patch("/api/taskmanager/tasks/:id", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
-  const parsed = updateTaskManagerTaskSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid task payload."));
-    return;
-  }
-  try {
-    res.json(apiOk({ task: taskManagerStore.updateTask(req.params.id, parsed.data, taskSession(req)) }));
-  } catch (error) {
-    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to update task."));
-  }
-});
-
-app.delete("/api/taskmanager/tasks/:id", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
-  try {
-    res.json(apiOk(taskManagerStore.deleteTask(req.params.id, taskSession(req))));
-  } catch (error) {
-    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to delete task."));
-  }
-});
-
-app.post("/api/taskmanager/tasks/:id/comments", requireTaskManagerAuth, (req: TaskManagerRequest, res) => {
-  const parsed = createTaskManagerCommentSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid comment payload."));
-    return;
-  }
-  try {
-    res.json(apiOk({ comment: taskManagerStore.createComment(req.params.id, parsed.data.body, taskSession(req)) }));
-  } catch (error) {
-    res.status(404).json(apiErr(error instanceof Error ? error.message : "Unable to create comment."));
-  }
-});
 
 app.post("/api/auth/login", (req, res) => {
   if (!AUTH_ENABLED) {
@@ -7716,6 +7175,139 @@ outboxProcessor = new OutboxProcessor(
   },
 );
 
+function defaultModelForRunner(runner: RunRunner): string {
+  if (runner === "claude") return DEFAULT_CLAUDE_MODEL;
+  if (runner === "cursor") return DEFAULT_CURSOR_MODEL;
+  return DEFAULT_CODEX_MODEL;
+}
+
+function getLatestTelegramResultText(
+  sessionId: string,
+  runId: string,
+): { text: string; kind: "assistant" | "error" | "preview" } | null {
+  const page = messageStore.getMessagesPage(sessionId, null, 40);
+  if (page?.messages?.length) {
+    for (let index = page.messages.length - 1; index >= 0; index -= 1) {
+      const message = page.messages[index];
+      if (!message?.text?.trim()) continue;
+      if (message.runId && message.runId !== runId && message.role !== "error") continue;
+      if (message.role === "assistant" && message.kind === "message") {
+        return { text: message.text, kind: "assistant" };
+      }
+      if (message.role === "error") {
+        return { text: message.text, kind: "error" };
+      }
+    }
+    for (let index = page.messages.length - 1; index >= 0; index -= 1) {
+      const message = page.messages[index];
+      if (message?.role === "assistant" && message.kind === "message" && message.text?.trim()) {
+        return { text: message.text, kind: "assistant" };
+      }
+    }
+  }
+
+  const session = messageStore.getLocalSession(sessionId);
+  if (session?.lastMessagePreview?.trim()) {
+    return { text: session.lastMessagePreview, kind: "preview" };
+  }
+  const run = runManager.getRun(runId);
+  if (run?.lastError?.trim()) return { text: run.lastError, kind: "error" };
+  if (run?.summary?.trim()) return { text: run.summary, kind: "preview" };
+  return null;
+}
+
+const sessionTelegramBridge = isSessionTelegramBridgeConfigured()
+  ? createSessionTelegramBridge({
+    rootDir,
+    resolveSessionId: (run) => {
+      const direct = runProjectionSessionId(run) || run.sessionId || run.threadId;
+      if (direct) return direct;
+      const byRun = messageStore.listLocalSessions().find((session) => session.latestRunId === run.id);
+      return byRun?.id || null;
+    },
+    getSession: (sessionId) => messageStore.getLocalSession(sessionId),
+    // Same source/order as the web sidebar default (local sessions, hide scheduled).
+    listSessions: () => readSessionListItems(false).filter((session) => !session.scheduled),
+    getLatestResultText: getLatestTelegramResultText,
+    sendToSession: (sessionId, text) => {
+      const session = messageStore.getLocalSession(sessionId);
+      if (!session) return { ok: false, error: "Session not found" };
+      if (!outboxProcessor) return { ok: false, error: "Message outbox is not ready" };
+
+      const runner = session.runner || DEFAULT_RUNNER;
+      const model = session.model || defaultModelForRunner(runner);
+      const clientMessageId = `tg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const acceptedMessage = messageStore.acceptOutgoingMessage(sessionId, {
+        clientMessageId,
+        sessionId,
+        text,
+        runner,
+        workspace: session.workspace || uiState.activeWorkspace,
+        model,
+        reasoningEffort: session.reasoningEffort || "high",
+        sandbox: "danger-full-access",
+        approvalPolicy: "never",
+        planMode: false,
+        askMode: false,
+        attachments: [],
+        skills: [],
+        agents: [],
+      });
+
+      outboxProcessor.enqueue({
+        sessionId,
+        provisionalSession: false,
+        messageId: acceptedMessage.id,
+        clientMessageId,
+        text,
+        attachments: [],
+        workspace: session.workspace || uiState.activeWorkspace,
+        runner,
+        model,
+        reasoningEffort: session.reasoningEffort || "high",
+        sandbox: "danger-full-access",
+        approvalPolicy: "never",
+        planMode: false,
+        askMode: false,
+        skills: [],
+        agents: [],
+      });
+
+      broadcastSse({
+        kind: "message.ack",
+        at: Date.now(),
+        sessionId,
+        payload: {
+          message: acceptedMessage as unknown as Record<string, unknown>,
+          queueStatus: "accepted",
+          latestRunId: session.latestRunId,
+        },
+      });
+
+      return { ok: true };
+    },
+    rerun: (runId) => {
+      const baseRun = runManager.getRun(runId);
+      if (!baseRun) return { ok: false, error: "Run not found" };
+      try {
+        const run = runManager.startRun({
+          ...baseRun.config,
+          sessionId: baseRun.sessionId || undefined,
+        });
+        const sessionId = runProjectionSessionId(run) || baseRun.sessionId || baseRun.threadId;
+        if (sessionId) {
+          messageProjector.registerRun(run.id, sessionId);
+          messageStore.updateSessionFromRun(run, sessionId);
+        }
+        return { ok: true, runId: run.id };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : "Failed to rerun" };
+      }
+    },
+    webBaseUrl: (process.env.LUMA_WEB_URL || process.env.WEB_PUBLIC_URL || `http://127.0.0.1:${WEB_PORT}`).trim() || null,
+  })
+  : null;
+
 const terminalManager = new TerminalManager(() => uiState.activeWorkspace);
 let latestSkillSyncResult = syncRepoSkills();
 const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, prompt, execution) => {
@@ -7768,8 +7360,24 @@ runManager.on("sse", (event: SseEvent) => {
   broadcastSse(event);
 });
 runManager.on("run.lifecycle", (event: RunLifecycleEvent) => {
-  messageProjector.onLifecycle(event);
-  agentScheduleManager.onRunLifecycle(event);
+  try {
+    messageProjector.onLifecycle(event);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("[luma-assistant/server] messageProjector.onLifecycle failed", error);
+  }
+  try {
+    agentScheduleManager.onRunLifecycle(event);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("[luma-assistant/server] agentScheduleManager.onRunLifecycle failed", error);
+  }
+  try {
+    sessionTelegramBridge?.onRunLifecycle(event);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("[luma-assistant/server] sessionTelegramBridge.onRunLifecycle failed", error);
+  }
 });
 runManager.on("run.parsed", (event: RunParsedEvent) => {
   messageProjector.onParsed(event);
@@ -7781,6 +7389,7 @@ terminalManager.on("sse", (event: SseEvent) => {
 setInterval(() => {
   const evt: SseEvent = { kind: "heartbeat", at: Date.now() };
   broadcastSse(evt);
+  runManager.sweepIdleCursorRuns();
 }, 10000);
 
 function apiOk<T>(data: T): ApiResponse<T> {
@@ -8078,7 +7687,7 @@ app.patch("/api/agent-schedules/:id", (req, res) => {
     return;
   }
 
-  const schedule = agentScheduleManager.updateStatus(req.params.id, parsed.data.status);
+  const schedule = agentScheduleManager.update(req.params.id, parsed.data);
   if (!schedule) {
     res.status(404).json(apiErr("Schedule not found"));
     return;
@@ -8226,10 +7835,6 @@ app.post("/api/attachments", express.raw({ limit: ATTACHMENT_MAX_BYTES, type: ()
   const displayName = path.basename(decodedName || "").trim() || "attachment";
   const mimeType = normalizeMimeType(req.header("x-attachment-content-type") || req.header("content-type") || undefined);
   const kind = classifyAttachment(displayName, mimeType);
-  if (!kind) {
-    res.status(400).json(apiErr("Unsupported attachment type. Use an image or a text/code file."));
-    return;
-  }
 
   const body = Buffer.isBuffer(req.body) ? req.body : null;
   if (!body || body.byteLength === 0) {
@@ -8853,7 +8458,6 @@ function flushPersistentStateSync(): void {
   messageStore.flushSync();
   outboxProcessor?.flushSync();
   agentScheduleManager.flushSync();
-  taskManagerStore.flushSync();
 }
 
 process.on("beforeExit", () => {
@@ -8861,11 +8465,13 @@ process.on("beforeExit", () => {
 });
 
 process.on("SIGINT", () => {
+  sessionTelegramBridge?.stop();
   flushPersistentStateSync();
   process.exit(0);
 });
 
 process.on("SIGTERM", () => {
+  sessionTelegramBridge?.stop();
   flushPersistentStateSync();
   process.exit(0);
 });
@@ -8875,4 +8481,9 @@ app.listen(API_PORT, HOST, () => {
   console.log(
     `[luma-assistant/server] listening on http://${HOST}:${API_PORT} | auth=${AUTH_ENABLED ? "enabled" : "disabled"}`,
   );
+  sessionTelegramBridge?.start();
+});
+
+process.on("exit", () => {
+  sessionTelegramBridge?.stop();
 });

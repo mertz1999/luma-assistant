@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Merge Luma MCP HTTP endpoints into ~/.cursor/mcp.json so Cursor Agent
- * (CLI / Luma runner) can use the same telegram/image/tasks tools.
+ * (CLI / Luma runner) can use the same telegram/image tools.
  */
 const fs = require("node:fs");
 const os = require("node:os");
@@ -25,13 +25,6 @@ function buildEntries() {
   const imagePort = process.env.IMAGE_MCP_PORT || "9015";
   const imageUrl = process.env.IMAGE_MCP_URL || `http://127.0.0.1:${imagePort}/mcp`;
   entries[imageName] = { url: imageUrl };
-
-  if (process.env.ENABLE_TASK_MANAGER_MCP === "1") {
-    const tasksName = process.env.TASK_MANAGER_MCP_NAME || "luma-tasks";
-    const tasksPort = process.env.TASK_MANAGER_MCP_PORT || "9014";
-    const tasksUrl = process.env.TASK_MANAGER_MCP_URL || `http://127.0.0.1:${tasksPort}/mcp`;
-    entries[tasksName] = { url: tasksUrl };
-  }
 
   return entries;
 }

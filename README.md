@@ -5,7 +5,7 @@
 <h1 align="center">Luma Assistant</h1>
 
 <p align="center">
-  Self-hosted web application for Codex and Claude Code with remote URL access, scheduled agents, per-session terminals, browser voice input, MCP integrations, plan mode, reusable skills, Luma Tasks, and persistent session history.
+  Self-hosted web application for Codex and Claude Code with remote URL access, scheduled agents, per-session terminals, browser voice input, MCP integrations, plan mode, reusable skills, and persistent session history.
 </p>
 
 ## What It Is
@@ -45,13 +45,10 @@ It keeps the core coding-agent workflow available in the app: runner selection, 
 ### Built-In Integrations
 
 - `Telegram MCP (luma-tel)`: send Markdown or plain-text messages and generated files to Telegram chats/topics, and retrieve the latest user-uploaded document. A self-hosted Telegram Bot API endpoint can be used for downloads above Telegram's hosted 20 MB limit.
-- `Luma Tasks MCP (luma-tasks)`: test connectivity, produce Today reports, list users/projects/tasks, search tasks, create projects and tasks, update or complete tasks, assign work, and add comments. The service is opt-in so the task web app can run without its MCP process.
 - `Image render MCP (luma-images)`: publish validated PNG, JPEG, WebP, or GIF files from local paths or public HTTP(S) URLs into the active chat. Images use size, height, content-type, and private-network guardrails, then lazy-load on demand.
 - `Cross-runner MCP setup`: development and deployment commands register supported local MCP services for Codex and Claude Code; the Tasks MCP is registered when enabled.
 
-### Luma Tasks
 
-- `Separate task workspace`: open `/taskmanager` as its own responsive, installable PWA with independent login, light/dark mode, mobile navigation, desktop sidebar layouts, automatic background refresh, and a manual refresh control.
 - `Projects and access`: create color-coded projects, control per-project user access, archive or delete projects, filter task views by project, and reorder mobile project chips.
 - `Complete task records`: manage title, description, to-do/in-progress/completed status, priority, assignee, project, labels, due date and optional time, deadline flag, checklist items, comments, and activity history.
 - `Focused views`: work from All Tasks, Today, Upcoming, Completed, Admin, or Settings; admins can filter team work by user or show only their own tasks.
@@ -63,7 +60,7 @@ It keeps the core coding-agent workflow available in the app: runner selection, 
 
 - `Durable history`: store chat messages in SQLite with indexed page seeks, migrate older JSONL message logs automatically, keep run events in append-only JSONL files, and maintain a small session index for fast startup and chat opening.
 - `Long-running server safeguards`: cap hot in-memory sessions and active-run event buffers, limit concurrent runs, auto-archive old finished runs, and suppress benign Codex warnings that should not fail a run.
-- `Authentication`: protect the assistant with password/JWT login, browser-persisted sessions, expiration handling, and sign-out; Luma Tasks uses separate users and tokens with an initial admin configured from the environment.
+- `Authentication`: protect the assistant with password/JWT login, browser-persisted sessions, expiration handling, and sign-out.
 - `Safe migrations`: run idempotent persistence migrations during deployment and write backups before changing existing task-manager data.
 - `Production tooling`: build and run all services with npm workspaces and Make targets, manage processes with PM2, and use the included Nginx HTTPS/SSE reverse-proxy example.
 - `Public landing site`: build and deploy the independent React/Vite landing page to GitHub Pages without exposing private runtime conversations.
@@ -75,7 +72,6 @@ It keeps the core coding-agent workflow available in the app: runner selection, 
 - `Web`: React, Vite, TypeScript, Tailwind-style UI utilities
 - `Shared types`: `@luma/shared`
 - `Telegram MCP`: `@luma/telegram-mcp`
-- `Luma Tasks MCP`: `@luma/taskmanager-mcp`
 - `Image render MCP`: `@luma/image-mcp`
 - `Process management`: PM2
 - `Proxy`: Nginx example config
@@ -123,11 +119,6 @@ CODEX_PATH=codex
 PASSWORD=change_me
 JWT_SECRET=change_me_too
 AUTH_TOKEN_TTL_SECONDS=86400
-TASK_MANAGER_ADMIN_USERNAME=admin
-TASK_MANAGER_ADMIN_PASSWORD=
-TASK_MANAGER_JWT_SECRET=change_task_manager_secret
-TASK_MANAGER_TOKEN_TTL_SECONDS=604800
-TASK_MANAGER_DEFAULT_TIME_ZONE=Asia/Tehran
 DEFAULT_MODEL=gpt-5.6-sol
 DEFAULT_RUNNER=codex
 CLAUDE_DEFAULT_MODEL=sonnet
@@ -135,7 +126,7 @@ DEFAULT_REASONING_EFFORT=high
 CLAUDE_CODE_EXECUTABLE=
 CLAUDE_AUTH_MODE=oauth
 DEFAULT_SANDBOX=danger-full-access
-ATTACHMENT_MAX_BYTES=15728640
+ATTACHMENT_MAX_BYTES=104857600
 IMAGE_MCP_PORT=9015
 IMAGE_MCP_NAME=luma-images
 IMAGE_MCP_MAX_BYTES=3145728
@@ -147,10 +138,6 @@ Important variables:
 
 - `PASSWORD`: browser login password.
 - `JWT_SECRET`: secret used to sign auth tokens.
-- `TASK_MANAGER_ADMIN_USERNAME` / `TASK_MANAGER_ADMIN_PASSWORD`: initial admin login for `/taskmanager`. If `TASK_MANAGER_ADMIN_PASSWORD` is omitted, it uses `PASSWORD`.
-- `TASK_MANAGER_JWT_SECRET`: secret used to sign task-manager auth tokens. Falls back to `JWT_SECRET` when omitted.
-- `TASK_MANAGER_TOKEN_TTL_SECONDS`: task-manager login lifetime in seconds.
-- `TASK_MANAGER_DEFAULT_TIME_ZONE`: default timezone for new task-manager users. Users can change their own timezone from `/taskmanager/settings`.
 - `CODEX_PATH`: path to the Codex executable if it is not simply `codex`.
 - `DEFAULT_RUNNER`: default runner for new sessions. Use `codex`, `claude`, or `cursor`.
 - `DEFAULT_MODEL`: default Codex model for new sessions and new scheduled jobs.
@@ -165,7 +152,7 @@ Important variables:
 - `CURSOR_WORKTREE`: set `1` to pass `--worktree` on every Cursor run.
 - `CLAUDE_AUTH_MODE`: Claude auth mode. Defaults to `oauth`, which uses your logged-in Claude Code account and strips inherited Anthropic API-key variables from the Claude subprocess. Set `api_key` to intentionally use `ANTHROPIC_API_KEY`.
 - `DEFAULT_SANDBOX`: default sandbox mode for new sessions.
-- `ATTACHMENT_MAX_BYTES`: max browser attachment upload size in bytes. Defaults to 15 MB.
+- `ATTACHMENT_MAX_BYTES`: max browser attachment upload size in bytes. Defaults to 100 MB. Any file type is accepted.
 - `IMAGE_MCP_PORT` / `IMAGE_MCP_NAME`: local MCP server used by agents to render images in chat.
 - `IMAGE_MCP_MAX_BYTES`: max image size accepted by the image MCP and server-side image renderer. Defaults to 3 MB.
 - `IMAGE_MCP_MAX_HEIGHT`: max image height accepted by the image MCP and server-side image renderer. Defaults to 1200 px.
@@ -173,7 +160,6 @@ Important variables:
 - `MESSAGE_STORE_HOT_SESSIONS`: max chat sessions that keep full message bodies in RAM (default `48`). Others stay index-only until opened.
 - `RUN_EVENTS_MEMORY_CAP`: max stdout/stderr events kept in RAM per *active* run (default `400`). Full history remains on disk under `data/runs/`.
 - `RUN_RETENTION_DAYS`: auto-archive finished runs older than this many days on startup (default `45`; set `0` to disable).
-- `ENABLE_TASK_MANAGER_MCP=1`: opt-in to start the Luma Tasks MCP (off by default).
 - `TERMINAL_DISABLE_PTY=1`: force plain-pipe terminal mode.
 - `TERMINAL_SHELL=/bin/bash`: choose the shell used by session terminals.
 
@@ -243,36 +229,6 @@ Scheduled agents let Luma Assistant run specific work every day at a configured 
 
 Schedule creation snapshots the selected runner, workspace, model, thinking effort, sandbox, approval policy, and skills. The agent prompt body is read at run time, so updating the agent file changes future executions.
 
-## Luma Tasks
-
-Luma Tasks is a standalone task manager served from:
-
-```text
-/taskmanager
-```
-
-It has separate task-manager authentication from the main assistant. The initial admin account comes from `.env`, and additional users are managed inside the task-manager admin screen.
-
-Task-manager data is persisted as JSON under `data/taskmanager/` and is covered by the migration runner used by `make deploy-start`.
-
-Current task-manager capabilities include:
-
-- Project/list columns with project colors and browser-saved project chip ordering.
-- Mobile-friendly project chips with one-project-at-a-time task browsing.
-- Admin-only user management and per-project user access.
-- Tasks with status, priority, assignee, due date, optional time, deadline flag, checklist, comments, and activity.
-- Views for All Tasks, Today, Upcoming, Completed, Admin, and Settings.
-- Timezone-aware date handling, defaulting to `Asia/Tehran`.
-- Desktop collapsed sidebar icons, mobile drawer navigation, refresh control, and light/dark mode.
-- Separate PWA metadata for installing Luma Tasks apart from the main Luma Assistant app.
-- A Today report endpoint:
-
-```text
-/api/taskmanager/reports/today
-```
-
-The report endpoint returns plain text that is already formatted for Telegram. The `luma-tasks` MCP server exposes this through `get_today_report` so agents can send the report directly with `luma-tel.send_message`.
-
 ## Agents
 
 Repo-owned scheduled agents live here:
@@ -302,7 +258,6 @@ The repository currently includes ready-to-use agents for:
 - Producing AI transformation opportunity reports.
 - Sending daily article digests to Telegram.
 - Pruning unused Docker resources and warning about high disk usage.
-- Sending the Luma Tasks Today report to Telegram.
 - Building a TickTick briefing for overdue work, today's tasks, and upcoming meetings.
 
 Codex workspace instructions such as `AGENTS.md` remain part of the normal Codex CLI workflow and are honored by Codex in the selected workspace.
@@ -346,6 +301,9 @@ TELEGRAM_BOT_TOKEN=123456:abc...
 TELEGRAM_CHAT_ID=-1001234567890
 TELEGRAM_MESSAGE_FILE_THREAD_ID=42
 TELEGRAM_MESSAGE_TEXT_THREAD_ID=43
+TELEGRAM_SESSIONS_THREAD_ID=44
+TELEGRAM_ALLOWED_USER_IDS=123456789
+LUMA_WEB_URL=http://127.0.0.1:5175
 TELEGRAM_MCP_PORT=9013
 TELEGRAM_MCP_NAME=luma-tel
 TELEGRAM_API_BASE=https://api.telegram.org
@@ -356,41 +314,26 @@ TELEGRAM_DOWNLOAD_DIR=/Users/applestation/Project/.luma/telegram-uploads
 TELEGRAM_MAX_TEXT_READ_BYTES=262144
 ```
 
-The MCP exposes `get_last_uploaded_file` for inbound documents. It reads Telegram's bot update stream, finds the latest user-uploaded document in the configured chat/topic, and saves it under `TELEGRAM_DOWNLOAD_DIR` (or `.luma/telegram-uploads` beneath the first allowed root). Recognized text and code files also return their leading UTF-8 content; binary files return the saved local path. The last downloaded file is cached, so asking for it again returns the saved copy until a newer document arrives.
+### Sessions topic (ops room)
+
+Create a forum topic named **Sessions** and set `TELEGRAM_SESSIONS_THREAD_ID` to its `message_thread_id`. When configured, the Luma server posts a polished result card whenever a session completes, fails, or stops (latest reply only), with inline buttons:
+
+- **Reply** — next message in the topic is sent into that session
+- **Full** — send the untruncated reply
+- **Rerun** — start the same run again
+- **Open in Luma** — opens `LUMA_WEB_URL/?session=<id>`
+
+You can also reply to a card directly, use `/sessions`, `/ask <id|title> message`, or `/help`. Optionally restrict controllers with `TELEGRAM_ALLOWED_USER_IDS`.
+
+When the Sessions bridge is enabled, **the Luma server owns the bot `getUpdates` stream** and also caches inbound documents for `get_last_uploaded_file`. Do not run a second getUpdates consumer or webhook on the same bot.
+
+The MCP exposes `get_last_uploaded_file` for inbound documents. It reads the shared receive-state cache (and polls Telegram only when the Sessions bridge is not active), finds the latest user-uploaded document in the configured chat/topic, and saves it under `TELEGRAM_DOWNLOAD_DIR` (or `.luma/telegram-uploads` beneath the first allowed root). Recognized text and code files also return their leading UTF-8 content; binary files return the saved local path. The last downloaded file is cached, so asking for it again returns the saved copy until a newer document arrives.
 
 Telegram's hosted Bot API limits `getFile` downloads to 20 MB. To receive larger documents, run a local Telegram Bot API server and set `TELEGRAM_API_BASE` and `TELEGRAM_FILE_BASE` to its base URL. `TELEGRAM_MAX_FILE_BYTES` remains the MCP's independent local upload/download policy.
 
-For group uploads, disable the bot's privacy mode with `@BotFather` or make the bot an administrator so it can receive ordinary document messages. `getUpdates` cannot be used while a webhook is configured, and this MCP should be the only consumer of the bot's update stream.
+For group uploads, disable the bot's privacy mode with `@BotFather` or make the bot an administrator so it can receive ordinary document messages. `getUpdates` cannot be used while a webhook is configured.
 
 `make run` and `make deploy-start` ensure the local Codex MCP entry points at the Telegram MCP server.
-
-## Luma Tasks MCP
-
-The repo also includes a Luma Tasks MCP server (`luma-tasks`). It is **off by default** (to save CPU/RAM); set `ENABLE_TASK_MANAGER_MCP=1` to start it under PM2 and register it for Codex. The `/taskmanager` web app and `/api/taskmanager/*` routes still work without the MCP. When enabled, it connects to the local Luma Tasks API and exposes tools for prompts and agents:
-
-- `get_today_report`: returns the ready-to-send plain-text Today report.
-- `list_users`: lists task-manager users for assignment.
-- `list_projects`: lists visible projects and access users.
-- `list_tasks`: lists visible tasks with filters.
-- `search_tasks`: finds visible tasks by title, description, checklist, project, or assignee.
-- `create_project`: creates projects/lists with optional user access.
-- `create_task`, `update_task`, `complete_task`, `add_comment`: basic task actions.
-
-Default configuration (when enabling):
-
-```env
-ENABLE_TASK_MANAGER_MCP=1
-TASK_MANAGER_MCP_PORT=9014
-TASK_MANAGER_MCP_NAME=luma-tasks
-LUMA_TASKS_API_BASE=http://127.0.0.1:9001
-LUMA_TASKS_USERNAME=admin
-LUMA_TASKS_PASSWORD=
-LUMA_TASKS_AUTH_TOKEN=
-```
-
-If `LUMA_TASKS_PASSWORD` is omitted, the MCP server falls back to `TASK_MANAGER_ADMIN_PASSWORD`, then `PASSWORD`. `LUMA_TASKS_AUTH_TOKEN` is optional and can be used instead of username/password, but normal username/password login is preferred because task-manager tokens expire.
-
-`make run` and `make deploy-start` ensure the local MCP entries for `luma-tel` and `luma-images` for Codex, Claude Code, and Cursor (Claude uses user-scope registration; Cursor merges into `~/.cursor/mcp.json`). `luma-tasks` is registered only when `ENABLE_TASK_MANAGER_MCP=1`. For local development without PM2, run `npm run dev:taskmanager` in a separate terminal when you need the MCP.
 
 ## Luma Images MCP
 
@@ -430,12 +373,11 @@ The root npm workspaces are:
 - `@luma/server`
 - `@luma/web`
 - `@luma/telegram-mcp`
-- `@luma/taskmanager-mcp`
 - `@luma/image-mcp`
 
 ## Landing Page
 
-The standalone GitHub Pages landing site lives in `landing-page/`. It presents the current Claude-like workspace, Codex and Claude runner support, plan mode, inline tools, terminal dock, skills, agents, and Luma Tasks without exposing private session screenshots.
+The standalone GitHub Pages landing site lives in `landing-page/`. It presents the current Claude-like workspace, Codex and Claude runner support, plan mode, inline tools, terminal dock, skills, and agents without exposing private session screenshots.
 
 ```bash
 npm ci --prefix landing-page
@@ -474,7 +416,6 @@ PM2 process names are:
 - `luma-assistant-web`
 - `luma-telegram-mcp`
 - `luma-image-mcp`
-- `luma-taskmanager-mcp` (only when `ENABLE_TASK_MANAGER_MCP=1`)
 
 ### Nginx
 
@@ -498,10 +439,10 @@ Customize `server_name`, TLS certificate paths, and upstream ports before reload
 The example also sets:
 
 ```nginx
-client_max_body_size 20m;
+client_max_body_size 110m;
 ```
 
-This must be higher than `ATTACHMENT_MAX_BYTES`; otherwise Nginx's default 1 MB request limit can reject image uploads before they reach the app. If an already-deployed server rejects a small attachment with `413 Request Entity Too Large`, add or update `client_max_body_size` in `/etc/nginx/sites-available/luma-assistant.conf`, then run:
+This must be higher than `ATTACHMENT_MAX_BYTES`; otherwise Nginx's default 1 MB request limit can reject uploads before they reach the app. If an already-deployed server rejects a small attachment with `413 Request Entity Too Large`, add or update `client_max_body_size` in `/etc/nginx/sites-available/luma-assistant.conf`, then run:
 
 ```bash
 sudo nginx -t
@@ -526,7 +467,6 @@ Security notes:
 agents/          repo-owned scheduled agent prompts
 apps/
   server/        Express API, scheduler, run manager, auth, SSE, terminal bridge
-  taskmanager-mcp/ local MCP server for Luma Tasks reports and task actions
   telegram-mcp/  local MCP server for Telegram messages and file uploads
   image-mcp/     local MCP server for rendering images in Luma chat
   web/           React workspace UI
