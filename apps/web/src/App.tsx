@@ -2506,7 +2506,7 @@ export function App(): JSX.Element {
   }, [authReady, isAuthenticated, showAllHistory]);
 
   useEffect(() => {
-    if (!authReady || typeof window === "undefined") return;
+    if (!authReady || typeof window === "undefined" || window.lumaDesktop) return;
     const controller = createScreenWakeLockController();
     controller.setEnabled(isAuthenticated);
     return () => {

@@ -2,6 +2,7 @@ export type DesktopState = {
   mode: "local" | "cloud";
   cloudUrl: string;
   folders: string[];
+  keepScreenOn: boolean;
   engine: {
     status: "stopped" | "starting" | "ready" | "error";
     error: string | null;
@@ -28,6 +29,7 @@ export type DesktopRemoteState = {
 export type DesktopBridge = {
   isLocal: boolean;
   getState(): Promise<DesktopState>;
+  setKeepScreenOn(enabled: boolean): Promise<boolean>;
   localAuth(): Promise<{ token: string; expiresAt: number } | null>;
   switchConnection(mode: "local" | "cloud", cloudUrl?: string): Promise<boolean>;
   chooseFolder(): Promise<string | null>;

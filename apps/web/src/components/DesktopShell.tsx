@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Cloud, FolderPlus, Laptop, LoaderCircle, Settings2, Trash2, X } from "lucide-react";
+import { Cloud, FolderPlus, Laptop, LoaderCircle, Settings2, Sun, Trash2, X } from "lucide-react";
 import { setActiveWorkspace } from "../lib/api";
 import type { DesktopState } from "../lib/desktop";
 import { DesktopRemoteSettings } from "./DesktopRemoteSettings";
@@ -65,6 +65,14 @@ export function DesktopShell({ children }: { children: ReactNode }) {
         </div>
         <span className="desktop-environment" title={isLocal ? "Sessions execute on this Mac" : state?.cloudUrl}>{isLocal ? (ready ? "Local engine ready" : state?.engine.status === "error" ? "Local engine stopped" : "Starting local engine…") : state?.cloudUrl || "Luma cloud"}</span>
         {isLocal ? <button type="button" className="desktop-control" disabled={busy || !ready} onClick={() => void perform(chooseFolder)}><FolderPlus size={15} />Add folder</button> : null}
+        <button type="button" className="desktop-control desktop-keep-screen-on" aria-pressed={state?.keepScreenOn ?? false}
+          disabled={busy || !state} title={state?.keepScreenOn ? "Allow the screen to sleep" : "Prevent idle display sleep while Luma Desktop is running"}
+          onClick={() => void perform(async () => {
+            const keepScreenOn = await bridge.setKeepScreenOn(!state?.keepScreenOn);
+            setState(current => current ? { ...current, keepScreenOn } : current);
+          })}>
+          <Sun size={15} aria-hidden="true" /> Keep screen on
+        </button>
         <button type="button" className="desktop-control" onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen} aria-label="Desktop settings"><Settings2 size={17} /></button>
       </div>
 

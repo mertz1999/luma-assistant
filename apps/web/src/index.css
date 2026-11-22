@@ -391,6 +391,8 @@ html[data-theme="dark"] .scrollbar-thin::-webkit-scrollbar-track {
 .desktop-environment { flex: 1; color: #a8bab2; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .desktop-control { border: 1px solid #3a4540; background: transparent; color: #d3e2da; }
 .desktop-control:hover, .desktop-settings-heading button:hover, .desktop-folder button:hover { background: #2b3731; }
+.desktop-keep-screen-on { flex-shrink: 0; white-space: nowrap; }
+.desktop-keep-screen-on[aria-pressed="true"] { border-color: #398a6c; background: #294a3f; color: #c8f5e4; }
 .desktop-primary { background: #246f54; color: white; font-weight: 600; border: 1px solid #398a6c; }
 .desktop-primary:hover { background: #2d8263; }
 .desktop-container button:disabled { opacity: .55; }

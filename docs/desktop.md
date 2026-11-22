@@ -35,6 +35,8 @@ Session smoke tests use deterministic CLI stubs.
 
 Local history, settings, logs, and isolated runner state live under `~/Library/Application Support/Luma Desktop/`. Closing the window or switching to Cloud keeps the local engine running. Quitting Luma stops local runs and terminals. Local schedules need the app running and the Mac awake; missed-run catch-up and a separate always-on background service are not included.
 
+Turn on **Keep screen on** in the Desktop toolbar to prevent idle display sleep. The toggle starts off each time you launch Luma, and stays active across connection switches and window closures until you turn it off or quit.
+
 ## Connection isolation
 
 The app serves its bundled interface through a secure `luma://` protocol. Each cloud origin receives a different hostname, separate from `luma://local`. Chromium therefore separates saved login tokens, queued prompts, and browser storage across connections. Changing environments reloads the interface and its query cache; sessions remain on their original backend. There is no automatic history or file synchronization.

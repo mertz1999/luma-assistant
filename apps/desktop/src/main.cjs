@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, safeStorage, session, shell, systemPreferences, utilityProcess } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, net, powerSaveBlocker, protocol, safeStorage, session, shell, systemPreferences, utilityProcess } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
@@ -33,6 +33,7 @@ let localAuth = null;
 let localPassword = '';
 let authPromise;
 let quitting = false;
+let displaySleepBlockerId = null;
 const allowedOrigins = new Set();
 const remoteSecret = randomBytes(32).toString('hex');
 const remote = new RemoteDesktop(path.join(userData, 'remote-pairing.json'), {
@@ -65,7 +66,22 @@ function trustedFrame(event) {
 }
 
 function publicState() {
-  return { mode: settings.mode, cloudUrl: settings.cloudUrl, folders: readFolders(foldersFile), engine: engineState, remote: remote.state(), version: app.getVersion() };
+  return { mode: settings.mode, cloudUrl: settings.cloudUrl, folders: readFolders(foldersFile), engine: engineState, remote: remote.state(), keepScreenOn: isScreenKeptOn(), version: app.getVersion() };
+}
+
+function isScreenKeptOn() {
+  return displaySleepBlockerId !== null && powerSaveBlocker.isStarted(displaySleepBlockerId);
+}
+
+function setKeepScreenOn(enabled) {
+  if (typeof enabled !== 'boolean') throw new Error('Invalid screen sleep setting.');
+  if (enabled && !isScreenKeptOn()) {
+    displaySleepBlockerId = powerSaveBlocker.start('prevent-display-sleep');
+  } else if (!enabled && displaySleepBlockerId !== null) {
+    powerSaveBlocker.stop(displaySleepBlockerId);
+    displaySleepBlockerId = null;
+  }
+  return isScreenKeptOn();
 }
 
 function resolveRunner(executablePath, configured, names) {
@@ -249,6 +265,7 @@ async function handleProtocol(request) {
 function installIpc() {
   const handle = (name, handler) => ipcMain.handle(name, async (event, ...args) => { trustedFrame(event); return handler(...args); });
   handle('luma:state', () => publicState());
+  handle('luma:keep-screen-on', setKeepScreenOn);
   handle('luma:local-auth', () => settings.mode === 'local' ? ensureLocalAuth() : null);
   handle('luma:retry-local', async () => { await startEngine(); return publicState(); });
   handle('luma:remote-pair', input => remote.pair(input));
@@ -345,6 +362,7 @@ else {
   app.on('window-all-closed', () => { /* Keep local sessions and remote access running until Quit. */ });
   app.on('activate', () => { if (!window) createWindow(); });
   app.on('before-quit', event => {
+    setKeepScreenOn(false);
     remote.stop(true);
     if (!engine || quitting) return;
     event.preventDefault();
