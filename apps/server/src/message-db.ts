@@ -47,6 +47,7 @@ export class MessageDatabase {
 
   private readonly upsertStmt: Database.Statement;
   private readonly getByIdStmt: Database.Statement;
+  private readonly getByClientIdStmt: Database.Statement;
   private readonly deleteSessionStmt: Database.Statement;
   private readonly countSessionStmt: Database.Statement;
   private readonly maxSequenceStmt: Database.Statement;
@@ -78,6 +79,11 @@ export class MessageDatabase {
 
     this.getByIdStmt = this.db.prepare(`
       SELECT payload FROM messages WHERE session_id = ? AND id = ?
+    `);
+    this.getByClientIdStmt = this.db.prepare(`
+      SELECT payload FROM messages
+      WHERE role = 'user' AND json_extract(payload, '$.clientMessageId') = ?
+      ORDER BY created_at ASC LIMIT 1
     `);
     this.deleteSessionStmt = this.db.prepare(`DELETE FROM messages WHERE session_id = ?`);
     this.countSessionStmt = this.db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE session_id = ?`);
@@ -111,6 +117,10 @@ export class MessageDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_messages_session_counted_seq
         ON messages(session_id, counts_toward_page, sequence DESC, created_at DESC, id DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_messages_client_id
+        ON messages(json_extract(payload, '$.clientMessageId'), created_at)
+        WHERE role = 'user';
     `);
 
     const version = this.getMeta("schema_version");
@@ -157,6 +167,11 @@ export class MessageDatabase {
     const row = this.getByIdStmt.get(sessionId, messageId) as { payload: string } | undefined;
     if (!row) return null;
     return parsePayload(row.payload);
+  }
+
+  getMessageByClientId(clientMessageId: string): ChatMessage | null {
+    const row = this.getByClientIdStmt.get(clientMessageId) as { payload: string } | undefined;
+    return row ? parsePayload(row.payload) : null;
   }
 
   upsertMessage(message: ChatMessage): void {

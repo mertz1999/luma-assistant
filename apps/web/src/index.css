@@ -377,3 +377,43 @@ html[data-theme="dark"] .scrollbar-thin::-webkit-scrollbar-track {
     opacity: 1;
   }
 }
+
+/* Desktop chrome is present only inside the packaged macOS app. */
+.luma-desktop { --desktop-toolbar-height: 52px; }
+.desktop-container { height: 100dvh; background: #151718; color: #e8edeb; }
+.desktop-toolbar { height: var(--desktop-toolbar-height); display: flex; align-items: center; gap: 14px; padding: 0 16px; border-bottom: 1px solid #333b38; background: #1a1e1c; position: relative; z-index: 60; font-size: 12px; }
+.desktop-wordmark { font-size: 16px; font-weight: 650; white-space: nowrap; }
+.desktop-wordmark span { color: #8faaa2; font-weight: 400; }
+.desktop-modes { display: flex; gap: 3px; padding: 3px; border: 1px solid #3a433f; border-radius: 9px; }
+.desktop-modes button, .desktop-control, .desktop-primary { display: inline-flex; align-items: center; justify-content: center; gap: 7px; border-radius: 6px; padding: 7px 10px; font-size: 12px; }
+.desktop-modes button[aria-pressed="true"] { background: #294a3f; color: #c8f5e4; }
+.desktop-modes button:disabled { cursor: default; }
+.desktop-environment { flex: 1; color: #a8bab2; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.desktop-control { border: 1px solid #3a4540; background: transparent; color: #d3e2da; }
+.desktop-control:hover, .desktop-settings-heading button:hover, .desktop-folder button:hover { background: #2b3731; }
+.desktop-primary { background: #246f54; color: white; font-weight: 600; border: 1px solid #398a6c; }
+.desktop-primary:hover { background: #2d8263; }
+.desktop-container button:disabled { opacity: .55; }
+.desktop-container button:focus-visible, .desktop-settings input:focus-visible { outline: 2px solid #79c9aa; outline-offset: 3px; }
+.desktop-app { height: calc(100dvh - var(--desktop-toolbar-height)); overflow: hidden; }
+.luma-desktop .desktop-app > div { height: 100%; }
+.luma-desktop .desktop-app header.fixed { top: var(--desktop-toolbar-height); }
+.desktop-settings { position: absolute; z-index: 70; top: 62px; right: 12px; width: 430px; max-height: calc(100dvh - 80px); overflow-y: auto; padding: 22px; border: 1px solid #415046; border-radius: 12px; background: #1c2420; color: #e8edeb; box-shadow: 0 18px 60px #0008; }
+.desktop-settings-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+.desktop-settings-heading h2 { font-size: 17px; font-weight: 650; }
+.desktop-settings-heading button, .desktop-folder button { padding: 5px; border-radius: 5px; }
+.desktop-settings label, .desktop-settings h3 { display: block; font-size: 13px; font-weight: 600; margin-bottom: 9px; }
+.desktop-settings input:not([type="checkbox"]) { width: 100%; border: 1px solid #4b5f52; border-radius: 6px; background: #131b16; color: #e8edeb; padding: 10px; font-size: 13px; }
+.desktop-settings label:has(input[type="checkbox"]) { display: flex; align-items: flex-start; gap: .5rem; margin-bottom: .5rem; font-size: .75rem; font-weight: 500; }
+.desktop-settings p { margin: 10px 0 14px; font-size: 12px; line-height: 1.65; color: #a8bab2; }
+.desktop-settings section { margin-top: 22px; padding-top: 20px; border-top: 1px solid #39483e; }
+.desktop-folder { display: flex; gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px solid #334138; font-size: 12px; margin-bottom: 10px; }
+.desktop-folder span { flex: 1; overflow-wrap: anywhere; }
+.desktop-error { padding: 11px 13px; border-radius: 7px; border: 1px solid #9c605a; background: #402522; color: #ffd8d1; font-size: 12px; overflow-wrap: anywhere; }
+.desktop-error-banner { position: absolute; top: 62px; left: 50%; transform: translateX(-50%); z-index: 80; max-width: 650px; display: flex; gap: 16px; align-items: center; }
+.desktop-onboarding { display: flex; align-items: center; justify-content: center; padding: 40px; background: radial-gradient(ellipse at 50% 35%, #21372d, #151718 65%); }
+.desktop-onboarding-card { max-width: 460px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 20px; color: #c2e9d7; }
+.desktop-onboarding-card h1 { font-size: 27px; font-weight: 550; letter-spacing: -.6px; color: #edf6f1; }
+.desktop-onboarding-card p { font-size: 14px; color: #aebfb5; line-height: 1.8; }
+.desktop-onboarding-card .desktop-primary { padding: 12px 20px; font-size: 14px; }
+@media (max-width: 900px) { .desktop-environment { display: none; } .desktop-wordmark { flex: 1; } }

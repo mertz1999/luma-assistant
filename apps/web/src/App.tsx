@@ -1,5 +1,10 @@
-import { isValidElement, useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { ModelCatalogContext, ModelCatalogRefresh, ModelCatalogNotice, ModelEffortOptions, useModelCatalogState, useModelOptions } from "./lib/model-catalog";
+import { isValidElement, useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
+import { useQuery } from "@tanstack/react-query";
+import { VoiceSettings } from "@/components/VoiceSettings";
+import { RemoteMacs } from "@/components/RemoteMacs";
+import { getSpeechSettings, speechSettingsQueryKey, useApiDictation } from "@/lib/speech";
 import Convert from "ansi-to-html";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -8,13 +13,19 @@ import {
   Bot,
   CalendarClock,
   Check,
+  ChevronRight,
   CircleStop,
   Copy,
   Download,
   FileCode2,
+  Folder,
+  FolderOpen,
+  FolderPlus,
   Image as ImageIcon,
+  Laptop,
   Lock,
   Layers,
+  ListFilter,
   LogOut,
   LoaderCircle,
   MessageSquare,
@@ -27,10 +38,12 @@ import {
   Paperclip,
   Pause,
   Play,
+  Plus,
   RefreshCw,
   Send,
   Settings,
   Sparkles,
+  SquarePen,
   Sun,
   Terminal,
   Trash2,
@@ -80,6 +93,8 @@ import {
   getTerminal,
   interruptTerminal,
   loginWithPassword,
+  recordCloudActivity,
+  revokeCloudSession,
   reloadAgentsAndSkills,
   getRun,
   rerun,
@@ -97,6 +112,10 @@ import {
 import { parsePlanningMessage, type PlanningSegment } from "@/lib/planning";
 import { createScreenWakeLockController } from "@/lib/screenWakeLock";
 import { resolveTextDirection } from "@/lib/textDirection";
+import { isDesktopLocal } from "@/lib/desktop";
+import { ProjectsContext, useProjects, useProjectState } from "@/lib/projects";
+import { moveSessionToProject } from "@/lib/projects-api";
+import { ProjectSessionControls, ProjectMemoryDialog } from "@/components/ProjectMemory";
 import { cn } from "@/lib/utils";
 import { useUiStore } from "@/store/useUiStore";
 import { Button } from "@/components/ui/button";
@@ -145,6 +164,7 @@ type TimelineRenderBlock =
     };
 
 type SessionCard = {
+  projectId: string | null;
   id: string;
   sessionId: string;
   latestRunId: string | null;
@@ -165,25 +185,8 @@ type SessionCard = {
 
 type PlanSessionState = "idle" | "armed" | "active";
 
-const sandboxOptions: SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
+const sandboxOptions: SandboxMode[] = isDesktopLocal ? ["read-only", "workspace-write"] : ["read-only", "workspace-write", "danger-full-access"];
 const runnerOptions: RunRunner[] = ["codex", "claude", "cursor"];
-const codexModelOptions = [
-  "gpt-6.1-sol",
-  "gpt-6-sol",
-  "gpt-6-astra",
-  "gpt-6-luna",
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-  "gpt-5.5",
-  "gpt-5.4",
-];
-const claudeModelOptions = ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-4-1"];
-const defaultCursorModelOptions = ["composer-2.5", "auto", "gpt-5.3-codex", "claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro"];
-const codexReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
-const claudeReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
-const cursorReasoningEffortOptions: ReasoningEffort[] = ["low", "medium", "high"];
-
 function normalizeRunRunnerValue(input: unknown): RunRunner {
   if (input === "claude" || input === "cursor") return input;
   return "codex";
@@ -196,21 +199,6 @@ function defaultModelForRunner(
   if (runner === "claude") return defaults.claude;
   if (runner === "cursor") return defaults.cursor;
   return defaults.codex;
-}
-
-function modelOptionsForRunner(runner: RunRunner, cursorModels: CursorModelInfo[] = []): string[] {
-  if (runner === "claude") return claudeModelOptions;
-  if (runner === "cursor") {
-    const ids = cursorModels.map((item) => item.id).filter(Boolean);
-    return ids.length > 0 ? ids : defaultCursorModelOptions;
-  }
-  return codexModelOptions;
-}
-
-function reasoningEffortOptionsForRunner(runner: RunRunner): ReasoningEffort[] {
-  if (runner === "claude") return claudeReasoningEffortOptions;
-  if (runner === "cursor") return cursorReasoningEffortOptions;
-  return codexReasoningEffortOptions;
 }
 
 function runnerLabel(runner: RunRunner): string {
@@ -239,7 +227,7 @@ function reasoningEffortLabel(effort: ReasoningEffort): string {
   return effort;
 }
 function isReasoningEffort(input: unknown): input is ReasoningEffort {
-  return input === "low" || input === "medium" || input === "high" || input === "xhigh" || input === "max";
+  return input === "low" || input === "medium" || input === "high" || input === "xhigh" || input === "max" || input === "ultra";
 }
 function compactSelectWidth(label: string): string {
   return `${Math.max(label.length + 2, 6)}ch`;
@@ -255,7 +243,8 @@ const legacyTerminalHistoryStorageKey = "agentic_cli_terminal_history_v1";
 const terminalHistoryLimit = 80;
 const authSessionStorageKey = "luma_assistant_auth_session_v1";
 const legacyAuthSessionStorageKey = "agentic_cli_auth_session_v1";
-const authSessionMaxAgeMs = 24 * 60 * 60 * 1000;
+const authSessionMaxAgeMs = 48 * 60 * 60 * 1_000;
+const cloudActivityIntervalMs = 60_000;
 const planInstructionPath = "plan.md";
 const attachmentMaxFiles = 10;
 // Account for the chat stack gap and bottom padding so "visually at bottom"
@@ -267,6 +256,7 @@ const eventStreamWatchdogIntervalMs = 10000;
 type StoredAuthSession = {
   token: string;
   expiresAt: number;
+  idleTimeoutMs?: number;
 };
 
 function getLocalStorageWithLegacy(primaryKey: string, legacyKey: string): string | null {
@@ -289,6 +279,8 @@ type SlashCommandSuggestion = {
 };
 
 type QueuedMessage = {
+  deliveryError?: string;
+  projectId?: string | null;
   id: string;
   sessionKey: string;
   prompt: string;
@@ -304,13 +296,6 @@ type QueuedMessage = {
   askMode: boolean;
   skills: SelectedSkillRef[];
   agents: SelectedAgentRef[];
-};
-
-type ProcessingQueueItem = {
-  item: QueuedMessage;
-  runSessionKey: string | null;
-  startedAt: number;
-  observedActive: boolean;
 };
 
 type SpeechRecognitionAlternativeLike = {
@@ -573,7 +558,8 @@ function loadStoredAuthSession(): StoredAuthSession | null {
     if (Date.now() >= expiresAt) return null;
     if (expiresAt - Date.now() > authSessionMaxAgeMs) return null;
 
-    return { token, expiresAt };
+    const idleTimeoutMs = typeof parsed.idleTimeoutMs === "number" ? parsed.idleTimeoutMs : undefined;
+    return { token, expiresAt, idleTimeoutMs };
   } catch {
     return null;
   }
@@ -614,7 +600,9 @@ function loadQueuedMessages(): Record<string, QueuedMessage[]> {
         }
 
         normalized.push({
+          projectId: typeof item.projectId === "string" ? item.projectId : item.projectId === null ? null : undefined,
           id,
+          deliveryError: typeof item.deliveryError === "string" ? item.deliveryError : undefined,
           sessionKey,
           prompt,
           attachments,
@@ -699,17 +687,10 @@ function getSessionSourceBadge(session: SessionCard): { label: string; className
   };
 }
 
-function statusClass(status: string): string {
-  if (status === "running") return "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-200";
-  if (status === "completed") return "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200";
-  if (status === "failed") return "bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-200";
-  if (status === "stopped") return "bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-100";
-  return "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-200";
-}
-
 function buildSessionCards(items: SessionListItem[]): SessionCard[] {
   return items.map((item) => ({
     id: item.id,
+    projectId: item.projectId || null,
     sessionId: item.id,
     latestRunId: item.latestRunId,
     messageCount: item.messageCount,
@@ -726,6 +707,38 @@ function buildSessionCards(items: SessionListItem[]): SessionCard[] {
     historyOnly: item.historyOnly,
     scheduled: Boolean(item.scheduled),
   }));
+}
+
+const sessionReviewStorageKey = "luma_session_reviews_v1";
+
+type SessionReviews = {
+  trackingSince: number;
+  reviewedRunIds: Record<string, string>;
+};
+
+function loadSessionReviews(): SessionReviews {
+  try {
+    const stored: unknown = JSON.parse(window.localStorage.getItem(sessionReviewStorageKey) || "null");
+    if (isRecord(stored) && typeof stored.trackingSince === "number" && isRecord(stored.reviewedRunIds)) {
+      return {
+        trackingSince: stored.trackingSince,
+        reviewedRunIds: Object.fromEntries(
+          Object.entries(stored.reviewedRunIds).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+        ),
+      };
+    }
+  } catch {
+    // The page can still track reviews if browser storage is unavailable.
+  }
+  return { trackingSince: Date.now(), reviewedRunIds: {} };
+}
+
+function needsSessionReview(session: SessionCard, reviews: SessionReviews): boolean {
+  return !session.historyOnly
+    && session.status === "completed"
+    && session.latestRunId !== null
+    && session.updatedAt >= reviews.trackingSince
+    && reviews.reviewedRunIds[session.id] !== session.latestRunId;
 }
 
 function isProvisionalSessionId(sessionId: string): boolean {
@@ -1370,6 +1383,7 @@ function readSessionListItem(input: unknown): SessionListItem | null {
         messageCount: input.messageCount,
         historyOnly: input.historyOnly,
         scheduled: typeof input.scheduled === "boolean" ? input.scheduled : undefined,
+        projectId: typeof input.projectId === "string" ? input.projectId : null,
       }
     : null;
 }
@@ -2161,13 +2175,23 @@ export function App(): JSX.Element {
   const [showAllHistory, setShowAllHistory] = useState(false);
   const [loadingRunList, setLoadingRunList] = useState(false);
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>("code");
+  const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
+  const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({});
 
-  const [prompt, setPrompt] = useState("");
+  const [prompt, setPromptState] = useState("");
+  const promptRef = useRef("");
+  const composerSendLock = useRef(false);
+  const setPrompt = useCallback((value: string | ((current: string) => string)) => {
+    const next = typeof value === "function" ? value(promptRef.current) : value;
+    promptRef.current = next;
+    setPromptState(next);
+  }, []);
   const [skillCatalog, setSkillCatalog] = useState<SkillListItem[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillsError, setSkillsError] = useState<string | null>(null);
   const [skillPickerOpen, setSkillPickerOpen] = useState(false);
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
+  const [newSessionProjectId, setNewSessionProjectId] = useState<string | null>(null);
   const [newSessionUseCustomModel, setNewSessionUseCustomModel] = useState(false);
   const [selectedSkills, setSelectedSkills] = useState<SkillListItem[]>([]);
   const [showSystemSkills, setShowSystemSkills] = useState(false);
@@ -2197,33 +2221,63 @@ export function App(): JSX.Element {
   const [defaultClaudeModel, setDefaultClaudeModel] = useState("sonnet");
   const [defaultCursorModel, setDefaultCursorModel] = useState("composer-2.5");
   const [claudeEffortFlagSupported, setClaudeEffortFlagSupported] = useState(true);
+  const [claudeAvailable, setClaudeAvailable] = useState(!isDesktopLocal);
   const [cursorAvailable, setCursorAvailable] = useState(false);
+  const unavailableRunners: RunRunner[] = isDesktopLocal
+    ? runnerOptions.filter(option => (option === "claude" && !claudeAvailable) || (option === "cursor" && !cursorAvailable))
+    : [];
   const [cursorModels, setCursorModels] = useState<CursorModelInfo[]>([]);
   const [askMode, setAskMode] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("high");
-  const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
+  const [sandbox, setSandbox] = useState<SandboxMode>(isDesktopLocal ? "workspace-write" : "danger-full-access");
   const approvalPolicy: ApprovalPolicy = "never";
   const [planFlowBySession, setPlanFlowBySession] = useState<Record<string, PlanSessionState>>({});
 
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [sessionReviews, setSessionReviews] = useState(loadSessionReviews);
   const [isDraftSession, setIsDraftSession] = useState(false);
   const [slashEntriesBySession, setSlashEntriesBySession] = useState<Record<string, TimelineEntry[]>>({});
   const [queuedBySession, setQueuedBySession] = useState<Record<string, QueuedMessage[]>>(() => loadQueuedMessages());
   const [terminalHistoryBySession, setTerminalHistoryBySession] = useState<Record<string, string[]>>(() => loadTerminalCommandHistory());
-  const [processingQueueItem, setProcessingQueueItem] = useState<ProcessingQueueItem | null>(null);
+  const [processingQueueItemId, setProcessingQueueItemId] = useState<string | null>(null);
+  const processingQueueRef = useRef<string | null>(null);
+  const sessionAliasesRef = useRef(new Map<string, string>());
   const [sessionAction, setSessionAction] = useState<"archive" | "delete" | null>(null);
   const [terminalsBySession, setTerminalsBySession] = useState<Record<string, TerminalSessionSnapshot>>({});
   const [terminalInput, setTerminalInput] = useState("");
   const [terminalAction, setTerminalAction] = useState<"starting" | "stopping" | "sending" | null>(null);
+  const [voiceSettingsOpen, setVoiceSettingsOpen] = useState(false);
+  const [remoteMacsOpen, setRemoteMacsOpen] = useState(false);
   const [voiceSupported, setVoiceSupported] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceRecordingStartedAt, setVoiceRecordingStartedAt] = useState<number | null>(null);
   const [voiceRecordingSeconds, setVoiceRecordingSeconds] = useState(0);
   const [authReady, setAuthReady] = useState(false);
-  const [authToken, setAuthTokenState] = useState<string | null>(null);
-  const [authExpiresAt, setAuthExpiresAt] = useState<number>(0);
+  const [authSession, setAuthSession] = useState<StoredAuthSession | null>(null);
+  const authSessionRef = useRef<StoredAuthSession | null>(null);
+  const authToken = authSession?.token;
+  const authExpiresAt = authSession?.expiresAt ?? 0;
+  const idleTimeoutMs = authSession?.idleTimeoutMs;
+  const updateAuthSession = useCallback((session: StoredAuthSession | null, persist = true) => {
+    const stored = persist && session && !isDesktopLocal ? loadStoredAuthSession() : null;
+    const next = stored && stored.token === session?.token && stored.expiresAt > session.expiresAt ? stored : session;
+    authSessionRef.current = next;
+    setApiAuthToken(next?.token ?? null);
+    setAuthSession(next);
+    if (isDesktopLocal || !persist) return;
+    try {
+      if (next) {
+        window.localStorage.setItem(authSessionStorageKey, JSON.stringify(next));
+        window.localStorage.removeItem(legacyAuthSessionStorageKey);
+      } else {
+        removeLocalStorageWithLegacy(authSessionStorageKey, legacyAuthSessionStorageKey);
+      }
+    } catch {
+      // Users can still sign in when this browser disables persistent storage.
+    }
+  }, []);
   const [authPasswordInput, setAuthPasswordInput] = useState("");
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -2245,6 +2299,7 @@ export function App(): JSX.Element {
   const showAllHistoryRef = useRef(showAllHistory);
   const activeWorkspaceRef = useRef(activeWorkspace);
   const isDraftSessionRef = useRef(isDraftSession);
+  const modelControlsTouchedRef = useRef(false);
   const lastEventAtRef = useRef<number>(Date.now());
   const autoRefreshInFlightRef = useRef(false);
   const messagesByRunIdRef = useRef(messagesByRunId);
@@ -2252,7 +2307,28 @@ export function App(): JSX.Element {
     sessionKey: draftSessionKey,
     length: 0,
   });
-  const isAuthenticated = Boolean(authToken && authExpiresAt > Date.now());
+  const appDefaultsRequestRef = useRef<Promise<string> | null>(null);
+  const appDefaultsLoadedRef = useRef(false);
+  const isAuthenticated = isDesktopLocal || Boolean(authToken && authExpiresAt > Date.now());
+  const speechSettings = useQuery({
+    queryKey: speechSettingsQueryKey,
+    queryFn: getSpeechSettings,
+    enabled: authReady && isAuthenticated,
+    retry: false,
+  });
+  const apiDictationEnabled = speechSettings.data?.configured === true;
+  const appendDictation = useCallback((text: string) => setPrompt((current) => appendTranscriptToPrompt(current, text)), [setPrompt]);
+  const dictation = useApiDictation(
+    authReady && isAuthenticated && apiDictationEnabled ? selectedSessionId || `draft:${draftProjectId ?? ""}` : null,
+    appendDictation,
+  );
+  const recording = dictation.phase === "recording" || voiceListening;
+  const recordingStartedAt = dictation.startedAt ?? voiceRecordingStartedAt;
+  const needsVoiceProvider = !apiDictationEnabled && (Boolean(window.lumaDesktop) || !voiceSupported);
+
+  const projectState = useProjectState(authReady && isAuthenticated);
+  const modelCatalogState = useModelCatalogState(authReady && isAuthenticated);
+  const { modelOptionsForRunner, reasoningEffortOptionsForRunner, modelSupportsEffort, modelLabel, effortForModel } = useModelOptions(modelCatalogState);
   const isUploadingAttachments = uploadingAttachmentNames.length > 0;
 
   useEffect(() => {
@@ -2297,44 +2373,83 @@ export function App(): JSX.Element {
   }, []);
 
   useEffect(() => {
-    const session = loadStoredAuthSession();
-    if (session) {
-      setAuthTokenState(session.token);
-      setAuthExpiresAt(session.expiresAt);
-      setApiAuthToken(session.token);
-    } else {
-      setApiAuthToken(null);
+    if (isDesktopLocal) {
+      let cancelled = false;
+      void window.lumaDesktop!.localAuth().then(session => {
+        if (cancelled) return;
+        updateAuthSession(session);
+        setAuthReady(true);
+      }).catch(() => { if (!cancelled) setAuthReady(true); });
+      return () => { cancelled = true; };
     }
+    updateAuthSession(loadStoredAuthSession());
     setAuthReady(true);
-  }, []);
 
-  useEffect(() => {
-    if (!authReady || typeof window === "undefined") return;
-    if (isAuthenticated && authToken) {
-      const session: StoredAuthSession = {
-        token: authToken,
-        expiresAt: Math.min(authExpiresAt, Date.now() + authSessionMaxAgeMs),
-      };
-      window.localStorage.setItem(authSessionStorageKey, JSON.stringify(session));
-      window.localStorage.removeItem(legacyAuthSessionStorageKey);
-      return;
-    }
-    removeLocalStorageWithLegacy(authSessionStorageKey, legacyAuthSessionStorageKey);
-  }, [authReady, isAuthenticated, authToken, authExpiresAt]);
-
-  useEffect(() => {
-    if (!authReady || !isAuthenticated) return;
-    const onUnauthorized = () => {
-      setApiAuthToken(null);
-      setAuthTokenState(null);
-      setAuthExpiresAt(0);
-      setAuthError("Session expired. Please enter password again.");
+    const syncAuth = (event: StorageEvent) => {
+      if (event.key !== authSessionStorageKey && event.key !== null) return;
+      updateAuthSession(loadStoredAuthSession(), false);
     };
-    window.addEventListener("luma:unauthorized", onUnauthorized as EventListener);
+    window.addEventListener("storage", syncAuth);
+    return () => window.removeEventListener("storage", syncAuth);
+  }, [updateAuthSession]);
+
+  useEffect(() => {
+    if (isDesktopLocal || !authReady || !authToken) return;
+
+    const expire = () => {
+      if (authSessionRef.current?.token !== authToken) return;
+      updateAuthSession(null);
+      setAuthError("Session expired. Please enter your password again.");
+    };
+    const checkExpiry = () => {
+      if (authSessionRef.current && Date.now() >= authSessionRef.current.expiresAt) expire();
+    };
+    const timer = window.setTimeout(checkExpiry, Math.max(0, authExpiresAt - Date.now()));
+    window.addEventListener("focus", checkExpiry);
+    window.addEventListener("pageshow", checkExpiry);
+    document.addEventListener("visibilitychange", checkExpiry);
+    window.addEventListener("luma:unauthorized", expire);
     return () => {
-      window.removeEventListener("luma:unauthorized", onUnauthorized as EventListener);
+      window.clearTimeout(timer);
+      window.removeEventListener("focus", checkExpiry);
+      window.removeEventListener("pageshow", checkExpiry);
+      document.removeEventListener("visibilitychange", checkExpiry);
+      window.removeEventListener("luma:unauthorized", expire);
     };
-  }, [authReady, isAuthenticated]);
+  }, [authReady, authToken, authExpiresAt, updateAuthSession]);
+
+  useEffect(() => {
+    if (isDesktopLocal || !authToken || !idleTimeoutMs) return;
+    const controller = new AbortController();
+    let lastAttemptAt = 0;
+    let recording = false;
+
+    const onActivity = (event: Event) => {
+      const now = Date.now();
+      const session = authSessionRef.current;
+      if (!event.isTrusted || document.visibilityState !== "visible" || !session || session.token !== authToken) return;
+      if (now >= session.expiresAt || recording || now - lastAttemptAt < cloudActivityIntervalMs) return;
+
+      lastAttemptAt = now;
+      recording = true;
+      void recordCloudActivity(controller.signal).then(({ expiresAt }) => {
+        const current = authSessionRef.current;
+        if (!controller.signal.aborted && current?.token === authToken && expiresAt > current.expiresAt) {
+          updateAuthSession({ ...current, expiresAt });
+        }
+      }).catch(() => {
+        // Keep the current expiry if offline. A later interaction may retry.
+      }).finally(() => { recording = false; });
+    };
+
+    const inputEvents = ["pointerdown", "keydown", "wheel"] as const;
+    const options = { capture: true, passive: true };
+    for (const name of inputEvents) window.addEventListener(name, onActivity, options);
+    return () => {
+      controller.abort();
+      for (const name of inputEvents) window.removeEventListener(name, onActivity, options);
+    };
+  }, [authToken, idleTimeoutMs, updateAuthSession]);
 
   useEffect(() => {
     if (!activeWorkspace || pendingAttachments.length === 0) return;
@@ -2423,18 +2538,18 @@ export function App(): JSX.Element {
   }, []);
 
   useEffect(() => {
-    if (!voiceListening || voiceRecordingStartedAt === null) {
+    if (!recording || recordingStartedAt === null) {
       setVoiceRecordingSeconds(0);
       return;
     }
 
     const tick = () => {
-      setVoiceRecordingSeconds(Math.floor((Date.now() - voiceRecordingStartedAt) / 1000));
+      setVoiceRecordingSeconds(Math.floor((Date.now() - recordingStartedAt) / 1000));
     };
     tick();
     const timer = window.setInterval(tick, 1000);
     return () => window.clearInterval(timer);
-  }, [voiceListening, voiceRecordingStartedAt]);
+  }, [recording, recordingStartedAt]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -2521,6 +2636,14 @@ export function App(): JSX.Element {
       es = connectEvents((event) => {
         lastEventAtRef.current = Date.now();
         if (event.kind === "heartbeat") return;
+        if (event.kind === "project.updated" || event.kind === "memory.updated") {
+          projectState.invalidate();
+          if (event.kind === "project.updated" && typeof event.payload?.sessionId === "string") {
+            const { sessionId, projectId } = event.payload;
+            updateSessionProject(sessionId, typeof projectId === "string" ? projectId : null);
+          }
+          return;
+        }
 
         if (event.kind === "terminal.started" || event.kind === "terminal.stopped") {
           const terminal = readTerminalSnapshot(event.payload);
@@ -2660,7 +2783,7 @@ export function App(): JSX.Element {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       es?.close();
     };
-  }, [authReady, isAuthenticated]);
+  }, [authReady, isAuthenticated, authToken]);
 
   useEffect(() => {
     if (!authReady || !isAuthenticated) return;
@@ -2731,11 +2854,18 @@ export function App(): JSX.Element {
         })
     ));
     setAgentScheduleEffort((current) => (
-      reasoningEffortOptionsForRunner(runner).includes(current) ? current : "high"
+      reasoningEffortOptionsForRunner(runner, model).includes(current) ? current : "high"
     ));
-  }, [runner, cursorModels, defaultCodexModel, defaultClaudeModel, defaultCursorModel]);
+  }, [runner]);
 
   const allSessions = useMemo(() => buildSessionCards(runItems), [runItems]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(sessionReviewStorageKey, JSON.stringify(sessionReviews));
+    } catch {
+      // Keep reviews in memory if browser storage is unavailable.
+    }
+  }, [sessionReviews]);
   const filteredSessions = useMemo(() => {
     const visibleSessions = showAllHistory
       ? allSessions
@@ -2748,6 +2878,10 @@ export function App(): JSX.Element {
     () => allSessions.find((session) => session.id === selectedSessionId) || null,
     [allSessions, selectedSessionId],
   );
+  const currentProjectId = selectedSessionId ? selectedSession?.projectId ?? null : draftProjectId;
+  useEffect(() => {
+    if (currentProjectId) setExpandedProjects((current) => ({ ...current, [currentProjectId]: true }));
+  }, [currentProjectId]);
   const selectedTerminal = useMemo(
     () => (selectedSessionId ? terminalsBySession[selectedSessionId] || null : null),
     [selectedSessionId, terminalsBySession],
@@ -2822,13 +2956,7 @@ export function App(): JSX.Element {
     }
     return ids;
   }, [allSessions]);
-  const activeProcessingQueueItem = processingQueueItem?.item.sessionKey === sessionTimelineKey ? processingQueueItem.item : null;
-  const queuedMessagesForActiveSession = useMemo(() => {
-    const queued = queuedBySession[sessionTimelineKey] || [];
-    if (!activeProcessingQueueItem) return queued;
-    if (queued.some((item) => item.id === activeProcessingQueueItem.id)) return queued;
-    return [activeProcessingQueueItem, ...queued];
-  }, [activeProcessingQueueItem, queuedBySession, sessionTimelineKey]);
+  const queuedMessagesForActiveSession = queuedBySession[sessionTimelineKey] || [];
 
   const mobileHeaderTitle = selectedSession
     ? truncatePreview(selectedSession.summary || `Session ${selectedSession.id}`, 34)
@@ -2947,51 +3075,22 @@ export function App(): JSX.Element {
   }, [isDraftSession, selectedSessionId, selectedSession?.historyOnly, selectedSession?.latestRunId]);
 
   useEffect(() => {
-    if (!processingQueueItem) return;
-
-    const runSessionKey = processingQueueItem.runSessionKey || processingQueueItem.item.sessionKey;
-    const session = allSessions.find((item) => item.id === runSessionKey || item.sessionId === runSessionKey);
-    if (!session || session.historyOnly) return;
-
-    const isActive = session.status === "queued" || session.status === "running";
-    if (isActive && !processingQueueItem.observedActive) {
-      setProcessingQueueItem((current) => current && current.item.id === processingQueueItem.item.id
-        ? { ...current, observedActive: true }
-        : current);
-      return;
-    }
-
-    const isTerminal = session.status === "completed" || session.status === "failed" || session.status === "stopped";
-    const terminalAfterQueueStart = isTerminal && session.updatedAt >= processingQueueItem.startedAt;
-    if ((processingQueueItem.observedActive && isTerminal) || terminalAfterQueueStart) {
-      setProcessingQueueItem((current) => current?.item.id === processingQueueItem.item.id ? null : current);
-    }
-  }, [allSessions, processingQueueItem]);
-
-  useEffect(() => {
     const node = terminalOutputRef.current;
     if (!node || !selectedSessionId || !selectedTerminal) return;
     node.scrollTop = node.scrollHeight;
   }, [selectedSessionId, selectedTerminal?.output]);
 
   useEffect(() => {
-    if (submitting || processingQueueItem) return;
+    if (!authReady || !isAuthenticated || loadingRunList || submitting || processingQueueRef.current) return;
 
-    for (const [sessionKey, queued] of Object.entries(queuedBySession)) {
-      if (!queued.length) continue;
-      if (sessionKey === draftSessionKey) continue;
-      if (busySessionIds.has(sessionKey)) continue;
-
-      setProcessingQueueItem({
-        item: queued[0],
-        runSessionKey: null,
-        startedAt: Date.now(),
-        observedActive: false,
-      });
-      void runQueuedMessage(queued[0]);
+    for (const [sessionKey, [head]] of Object.entries(queuedBySession)) {
+      if (!head || head.deliveryError || sessionKey === draftSessionKey || busySessionIds.has(sessionKey)) continue;
+      processingQueueRef.current = head.id;
+      setProcessingQueueItemId(head.id);
+      void runQueuedMessage(head);
       return;
     }
-  }, [queuedBySession, busySessionIds, submitting, processingQueueItem]);
+  }, [authReady, isAuthenticated, loadingRunList, queuedBySession, busySessionIds, submitting]);
 
   async function onAuthenticate(event?: FormEvent): Promise<void> {
     event?.preventDefault();
@@ -3001,29 +3100,28 @@ export function App(): JSX.Element {
     setAuthError(null);
     try {
       const payload = await loginWithPassword(authPasswordInput);
-      setAuthTokenState(payload.token);
-      setAuthExpiresAt(payload.expiresAt);
-      setApiAuthToken(payload.token);
+      updateAuthSession({
+        token: payload.token,
+        expiresAt: Math.min(payload.expiresAt, Date.now() + authSessionMaxAgeMs),
+        idleTimeoutMs: payload.idleTimeoutMs,
+      });
       setAuthPasswordInput("");
       setLoading(true);
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Authentication failed.");
-      setApiAuthToken(null);
-      setAuthTokenState(null);
-      setAuthExpiresAt(0);
+      updateAuthSession(null);
     } finally {
       setAuthSubmitting(false);
     }
   }
 
   function onSignOut(): void {
-    setApiAuthToken(null);
-    setAuthTokenState(null);
-    setAuthExpiresAt(0);
+    if (authSessionRef.current?.idleTimeoutMs) void revokeCloudSession().catch(() => {});
+    updateAuthSession(null);
     setAuthPasswordInput("");
+    setRemoteMacsOpen(false);
     setAuthError(null);
     setBackendConnectionStatus("disconnected");
-    removeLocalStorageWithLegacy(authSessionStorageKey, legacyAuthSessionStorageKey);
   }
 
   function applyAgentScheduleState(payload: {
@@ -3049,7 +3147,9 @@ export function App(): JSX.Element {
     setLoading(true);
     setLoadingRunList(true);
     try {
-      const listPayload = await getSessionList(runListPageSize, null, showAllHistoryRef.current);
+      const includeHistory = showAllHistoryRef.current;
+      const listPayload = await getSessionList(runListPageSize, null, includeHistory);
+      if (includeHistory !== showAllHistoryRef.current) return;
       const normalizedItems = normalizeSessionItems(listPayload.items);
       setRunItems(normalizedItems);
       setRunListNextCursor(listPayload.nextCursor);
@@ -3079,24 +3179,33 @@ export function App(): JSX.Element {
   }
 
   async function ensureAppDefaults(): Promise<string> {
-    if (activeWorkspaceRef.current && workspaces.length > 0) return activeWorkspaceRef.current;
-    const payload = await getBootstrapLite();
-    setWorkspaces(payload.workspaces);
-    setWorkspace(payload.activeWorkspace);
-    activeWorkspaceRef.current = payload.activeWorkspace;
-    setRunnerState(payload.defaults.runner);
-    setDefaultCodexModel(payload.defaults.codexModel);
-    setDefaultClaudeModel(payload.defaults.claudeModel);
-    setDefaultCursorModel(payload.defaults.cursorModel || "composer-2.5");
-    setClaudeEffortFlagSupported(payload.defaults.claudeEffortFlagSupported);
-    setCursorAvailable(Boolean(payload.defaults.cursorAvailable));
-    setCursorModels(Array.isArray(payload.defaults.cursorModels) ? payload.defaults.cursorModels : []);
-    setModel(payload.defaults.model);
-    setReasoningEffort(payload.defaults.reasoningEffort);
-    setAgentScheduleModel(payload.defaults.model || "gpt-5.4");
-    setAgentScheduleEffort(payload.defaults.reasoningEffort);
-    setSandbox(payload.defaults.sandbox);
-    return payload.activeWorkspace;
+    if (appDefaultsLoadedRef.current) return activeWorkspaceRef.current;
+    if (appDefaultsRequestRef.current) return appDefaultsRequestRef.current;
+    const request = (async () => {
+      const payload = await getBootstrapLite();
+      setWorkspaces(payload.workspaces);
+      setWorkspace(payload.activeWorkspace);
+      activeWorkspaceRef.current = payload.activeWorkspace;
+      setDefaultCodexModel(payload.defaults.codexModel);
+      setDefaultClaudeModel(payload.defaults.claudeModel);
+      setDefaultCursorModel(payload.defaults.cursorModel || "composer-2.5");
+      setClaudeEffortFlagSupported(payload.defaults.claudeEffortFlagSupported);
+      setClaudeAvailable(payload.defaults.claudeAvailable ?? !isDesktopLocal);
+      setCursorAvailable(Boolean(payload.defaults.cursorAvailable));
+      setCursorModels(Array.isArray(payload.defaults.cursorModels) ? payload.defaults.cursorModels : []);
+      if (!modelControlsTouchedRef.current) {
+        setRunnerState(payload.defaults.runner);
+        setModel(payload.defaults.model);
+        setReasoningEffort(payload.defaults.reasoningEffort);
+        setAgentScheduleModel(payload.defaults.model || "gpt-5.4");
+        setAgentScheduleEffort(payload.defaults.reasoningEffort);
+        setSandbox(payload.defaults.sandbox);
+      }
+      appDefaultsLoadedRef.current = true;
+      return payload.activeWorkspace;
+    })();
+    appDefaultsRequestRef.current = request;
+    try { return await request; } finally { appDefaultsRequestRef.current = null; }
   }
 
   async function refreshSkillCatalog(workspace = activeWorkspace): Promise<void> {
@@ -3148,7 +3257,9 @@ export function App(): JSX.Element {
   }
 
   async function refreshRunList(preferredSessionId?: string | null): Promise<void> {
-    const payload = await getSessionList(runListPageSize, null, showAllHistoryRef.current);
+    const includeHistory = showAllHistoryRef.current;
+    const payload = await getSessionList(runListPageSize, null, includeHistory);
+    if (includeHistory !== showAllHistoryRef.current) return;
     const normalizedItems = normalizeSessionItems(payload.items);
     setRunItems(normalizedItems);
     setRunListNextCursor(payload.nextCursor);
@@ -3208,7 +3319,9 @@ export function App(): JSX.Element {
     if (!runListNextCursor || loadingMoreRunItems) return;
     setLoadingMoreRunItems(true);
     try {
-      const payload = await getSessionList(runListPageSize, runListNextCursor, showAllHistoryRef.current);
+      const includeHistory = showAllHistoryRef.current;
+      const payload = await getSessionList(runListPageSize, runListNextCursor, includeHistory);
+      if (includeHistory !== showAllHistoryRef.current) return;
       setRunItems((prev) => {
         const next = new Map(prev.map((item) => [item.id, item]));
         for (const item of payload.items) next.set(item.id, item);
@@ -3342,7 +3455,11 @@ export function App(): JSX.Element {
     });
     setQueuedBySession((prev) => {
       if (!(previousSessionId in prev) || previousSessionId === nextSessionId) return prev;
-      const next = { ...prev, [nextSessionId]: [...(prev[nextSessionId] || []), ...(prev[previousSessionId] || [])] };
+      const next = {
+        ...prev,
+        [nextSessionId]: [...(prev[nextSessionId] || []), ...prev[previousSessionId].map((item) => ({ ...item, sessionKey: nextSessionId }))]
+          .sort((left, right) => left.createdAt - right.createdAt),
+      };
       delete next[previousSessionId];
       return next;
     });
@@ -3356,6 +3473,7 @@ export function App(): JSX.Element {
 
   function applySessionUpsert(session: SessionListItem, previousSessionId: string | null): void {
     if (previousSessionId && previousSessionId !== session.id) {
+      sessionAliasesRef.current.set(previousSessionId, session.id);
       moveSessionCollections(previousSessionId, session.id);
       if (selectedSessionIdRef.current === previousSessionId) {
         setSelectedSessionId(session.id);
@@ -3376,13 +3494,33 @@ export function App(): JSX.Element {
     }
   }
 
-  function applyIncomingMessage(message: ChatMessage): void {
+  function updateSessionProject(sessionId: string, projectId: string | null): void {
+    setRunItems((items) => items.map((item) => (
+      item.id === sessionId && item.projectId !== projectId ? { ...item, projectId } : item
+    )));
+  }
+
+  function resolveSessionAlias(sessionId: string): string {
+    let current = sessionId;
+    const visited = new Set<string>();
+    while (sessionAliasesRef.current.has(current) && !visited.has(current)) {
+      visited.add(current);
+      current = sessionAliasesRef.current.get(current)!;
+    }
+    return current;
+  }
+
+  function applyIncomingMessage(message: ChatMessage, fromSendResponse = false): void {
     if (isPlaceholderPlanMessage(message)) return;
-    const nextEntry = chatMessageToTimelineEntry(message);
-    setMessagesByRunId((prev) => ({
-      ...prev,
-      [message.sessionId]: upsertTimelineEntry(prev[message.sessionId] || [], nextEntry),
-    }));
+    const sessionId = resolveSessionAlias(message.sessionId);
+    if (message.role === "user" && message.clientMessageId) removeQueuedMessage(sessionId, message.clientMessageId);
+    const nextEntry = chatMessageToTimelineEntry({ ...message, sessionId });
+    setMessagesByRunId((prev) => {
+      const existing = prev[sessionId] || [];
+      // An SSE upsert can arrive while the send response is still in flight.
+      if (fromSendResponse && existing.some((entry) => entry.messageId === message.id)) return prev;
+      return { ...prev, [sessionId]: upsertTimelineEntry(existing, nextEntry) };
+    });
   }
 
   function resolvePlanState(sessionKey: string): PlanSessionState {
@@ -3418,24 +3556,46 @@ export function App(): JSX.Element {
     });
   }
 
+  function chooseEffort(next: ReasoningEffort): void {
+    modelControlsTouchedRef.current = true;
+    setReasoningEffort(next);
+  }
+
+  function chooseScheduleModel(next: string): void {
+    modelControlsTouchedRef.current = true;
+    setAgentScheduleModel(next);
+  }
+
+  function chooseScheduleEffort(next: ReasoningEffort): void {
+    modelControlsTouchedRef.current = true;
+    setAgentScheduleEffort(next);
+  }
+
+  function chooseSandbox(next: SandboxMode): void {
+    modelControlsTouchedRef.current = true;
+    setSandbox(next);
+  }
+
+  function chooseModel(next: string): void {
+    modelControlsTouchedRef.current = true;
+    setModel(next);
+    setReasoningEffort(current => effortForModel(runner, next, current));
+  }
+
   function setRunner(nextRunner: RunRunner): void {
+    if (unavailableRunners.includes(nextRunner)) return;
+    modelControlsTouchedRef.current = true;
     setRunnerState(nextRunner);
     if (nextRunner !== "cursor") setAskMode(false);
-    setModel((current) => {
-      if (modelOptionsForRunner(nextRunner, cursorModels).includes(current)) return current;
-      return defaultModelForRunner(nextRunner, {
-        codex: defaultCodexModel,
-        claude: defaultClaudeModel,
-        cursor: defaultCursorModel,
-      });
+    const nextModel = modelOptionsForRunner(nextRunner, cursorModels).includes(model) ? model : defaultModelForRunner(nextRunner, {
+      codex: defaultCodexModel, claude: defaultClaudeModel, cursor: defaultCursorModel,
     });
-    setReasoningEffort((current) => {
-      if (reasoningEffortOptionsForRunner(nextRunner).includes(current)) return current;
-      return "high";
-    });
+    setModel(nextModel);
+    setReasoningEffort(current => effortForModel(nextRunner, nextModel, current));
   }
 
   function applyRunConfigToControls(nextRunner: RunRunner, nextModel?: string, nextReasoningEffort?: ReasoningEffort): void {
+    modelControlsTouchedRef.current = true;
     setRunnerState(nextRunner);
     if (nextRunner !== "cursor") setAskMode(false);
     if (nextModel?.trim()) {
@@ -3457,14 +3617,14 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     setNewSessionUseCustomModel(!modelOptionsForRunner(runner, cursorModels).includes(model));
-  }, [model, runner, cursorModels]);
+  }, [model, runner, cursorModels, modelOptionsForRunner]);
 
   useEffect(() => {
-    if (isDraftSession || !selectedRunRecord) return;
+    if (newSessionDialogOpen || isDraftSession || !selectedRunRecord) return;
     if (selectedSession?.latestRunId && selectedRunRecord.id !== selectedSession.latestRunId) return;
     if (selectedSessionIdRef.current !== runSessionId(selectedRunRecord)) return;
     applyRunConfigToControls(selectedRunRecord.config.runner, selectedRunRecord.config.model, selectedRunRecord.config.reasoningEffort);
-  }, [isDraftSession, selectedRunRecord?.id, selectedSession?.latestRunId]);
+  }, [newSessionDialogOpen, isDraftSession, selectedRunRecord?.id, selectedSession?.latestRunId]);
 
   function buildQueuedMessage(
     sessionKey: string,
@@ -3504,12 +3664,13 @@ export function App(): JSX.Element {
             ? selectedRunRecord.config.reasoningEffort
             : "high";
     return {
+      projectId: sessionKey === draftSessionKey ? draftProjectId : existingSession?.projectId,
       id: `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       sessionKey,
       prompt: promptValue,
       attachments: readAttachmentRefs(overrides?.attachments),
       createdAt: Date.now(),
-      workspace: activeWorkspaceRef.current || activeWorkspace,
+      workspace: (isDesktopLocal ? allSessions.find(session => session.id === sessionKey)?.workspace : undefined) || activeWorkspaceRef.current || activeWorkspace,
       runner: requestRunner,
       model: requestModel,
       reasoningEffort: requestReasoningEffort,
@@ -3540,6 +3701,7 @@ export function App(): JSX.Element {
   }
 
   function removeQueuedMessage(sessionKey: string, messageId: string): void {
+    sessionKey = resolveSessionAlias(sessionKey);
     setQueuedBySession((prev) => {
       const current = prev[sessionKey] || [];
       const next = current.filter((item) => item.id !== messageId);
@@ -3554,14 +3716,29 @@ export function App(): JSX.Element {
     });
   }
 
-  async function startCodexRun(request: QueuedMessage, focusSession: boolean): Promise<{ sessionId: string; latestRunId: string | null }> {
-    const optimisticEntry = buildOptimisticUserEntry(request.sessionKey, request.id, request.prompt, request.attachments);
-    setMessagesByRunId((prev) => ({
-      ...prev,
-      [request.sessionKey]: upsertTimelineEntry(prev[request.sessionKey] || [], optimisticEntry),
-    }));
+  function setQueuedDeliveryError(sessionKey: string, messageId: string, deliveryError?: string): void {
+    const sessionId = resolveSessionAlias(sessionKey);
+    setQueuedBySession((prev) => {
+      const queue = prev[sessionId];
+      if (!queue?.some((item) => item.id === messageId)) return prev;
+      return {
+        ...prev,
+        [sessionId]: queue.map((item) => item.id === messageId ? { ...item, deliveryError } : item),
+      };
+    });
+  }
+
+  async function startCodexRun(request: QueuedMessage, focusSession: boolean, showOptimistic = true): Promise<void> {
+    if (showOptimistic) {
+      const optimisticEntry = buildOptimisticUserEntry(request.sessionKey, request.id, request.prompt, request.attachments);
+      setMessagesByRunId((prev) => ({
+        ...prev,
+        [request.sessionKey]: upsertTimelineEntry(prev[request.sessionKey] || [], optimisticEntry),
+      }));
+    }
 
     const input: SendMessageInput = {
+      projectId: request.projectId,
       clientMessageId: request.id,
       text: request.prompt,
       attachments: request.attachments,
@@ -3575,12 +3752,12 @@ export function App(): JSX.Element {
       askMode: request.askMode,
       skills: request.skills,
       agents: request.agents,
-      sessionId: request.sessionKey === draftSessionKey ? undefined : request.sessionKey,
+      sessionId: request.sessionKey === draftSessionKey ? undefined : resolveSessionAlias(request.sessionKey),
     };
 
     try {
       const payload = await sendMessage(input);
-      const nextSessionKey = payload.sessionId;
+      const nextSessionKey = resolveSessionAlias(payload.sessionId);
 
       if (request.sessionKey === draftSessionKey) {
         moveDraftTimelineEntries(nextSessionKey);
@@ -3588,29 +3765,24 @@ export function App(): JSX.Element {
         setPlanState(draftSessionKey, "idle");
       }
 
-      setIsDraftSession(false);
+      if (focusSession && (!selectedSessionIdRef.current || resolveSessionAlias(request.sessionKey) === selectedSessionIdRef.current)) {
+        setIsDraftSession(false);
+      }
 
       if (request.planMode) {
         setPlanState(nextSessionKey, "active");
       }
 
-      applyIncomingMessage(payload.message);
+      applyIncomingMessage(payload.message, true);
 
-      if (focusSession) {
+      if (focusSession && (!selectedSessionIdRef.current || selectedSessionIdRef.current === nextSessionKey)) {
         setSelectedSessionId(nextSessionKey);
         setSelectedRunId(payload.latestRunId);
         setRightPanelTab("terminal");
         setMobileThreadsOpen(false);
-      } else if (selectedSessionId && nextSessionKey === selectedSessionId) {
-        setSelectedRunId(payload.latestRunId);
       }
-
-      return {
-        sessionId: nextSessionKey,
-        latestRunId: payload.latestRunId,
-      };
     } catch (error) {
-      setMessagesByRunId((prev) => {
+      if (showOptimistic) setMessagesByRunId((prev) => {
         const current = prev[request.sessionKey] || [];
         return {
           ...prev,
@@ -3622,36 +3794,15 @@ export function App(): JSX.Element {
   }
 
   async function runQueuedMessage(queued: QueuedMessage): Promise<void> {
-    const focusSession = selectedSessionId === queued.sessionKey;
-    let accepted = false;
+    setSubmitting(true);
     try {
-      setSubmitting(true);
-      const result = await startCodexRun(queued, focusSession);
-      accepted = true;
+      await startCodexRun(queued, false, false);
       removeQueuedMessage(queued.sessionKey, queued.id);
-      setProcessingQueueItem((current) => current?.item.id === queued.id
-        ? {
-            ...current,
-            runSessionKey: result.sessionId,
-          }
-        : current);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to run queued message";
-      pushSlashEntries(queued.sessionKey, [
-        buildLocalTimelineEntry(
-          queued.sessionKey,
-          `queue_${queued.id}_error`,
-          "error",
-          "System",
-          `Queued message failed: ${message}`,
-          Date.now(),
-        ),
-      ]);
-      removeQueuedMessage(queued.sessionKey, queued.id);
+      setQueuedDeliveryError(queued.sessionKey, queued.id, error instanceof Error ? error.message : "Unable to send message.");
     } finally {
-      if (!accepted) {
-        setProcessingQueueItem((current) => current?.item.id === queued.id ? null : current);
-      }
+      processingQueueRef.current = null;
+      setProcessingQueueItemId(null);
       setSubmitting(false);
     }
   }
@@ -3962,7 +4113,13 @@ export function App(): JSX.Element {
 
     if (command === "/speech") {
       pushSlashEntries(sessionKey, [
-        buildLocalTimelineEntry(sessionKey, `slash_${messageId}_speech`, "assistant", "System", buildSpeechSupportText(), Date.now()),
+        buildLocalTimelineEntry(
+          sessionKey, `slash_${messageId}_speech`, "assistant", "System",
+          speechSettings.data?.configured
+            ? `Voice provider: **${speechSettings.data.model}**. Use Record to insert a transcript into your draft.`
+            : window.lumaDesktop ? "Set up a transcription provider in Voice settings to record on desktop." : buildSpeechSupportText(),
+          Date.now(),
+        ),
       ]);
       return;
     }
@@ -4015,8 +4172,21 @@ export function App(): JSX.Element {
   }
 
   async function onStartRun(): Promise<void> {
-    if (!prompt.trim()) return;
-    await ensureAppDefaults();
+    const originalPrompt = promptRef.current;
+    if (!originalPrompt.trim() || composerSendLock.current || dictation.phase !== "idle") return;
+    if (!selectedSessionId && submitting) return;
+    composerSendLock.current = true;
+    try {
+      if (!appDefaultsLoadedRef.current) await ensureAppDefaults();
+      await sendComposerPrompt(originalPrompt);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Unable to send message.");
+    } finally {
+      composerSendLock.current = false;
+    }
+  }
+
+  async function sendComposerPrompt(originalPrompt: string): Promise<void> {
     if (isUploadingAttachments) {
       setAttachmentError("Wait for attachments to finish uploading before sending.");
       return;
@@ -4033,8 +4203,8 @@ export function App(): JSX.Element {
       }
     }
 
-    const trimmedPrompt = prompt.trim();
-    const slashCommand = parseSlashCommand(prompt);
+    const trimmedPrompt = originalPrompt.trim();
+    const slashCommand = parseSlashCommand(originalPrompt);
     const sessionKey = selectedSessionId || draftSessionKey;
     const selectedSkillRefs = selectedSkills.map(selectedSkillRef);
     const selectedAgentRefs = selectedPromptAgents.map(selectedAgentRef);
@@ -4053,7 +4223,7 @@ export function App(): JSX.Element {
           now + 1,
         ),
       ]);
-      setPrompt("");
+      setPrompt((current) => current === originalPrompt ? "" : current);
       return;
     }
 
@@ -4061,7 +4231,7 @@ export function App(): JSX.Element {
       setSubmitting(true);
       try {
         await runSlashCommand(slashCommand, sessionKey);
-        setPrompt("");
+        setPrompt((current) => current === originalPrompt ? "" : current);
       } finally {
         setSubmitting(false);
       }
@@ -4069,14 +4239,13 @@ export function App(): JSX.Element {
     }
 
     try {
-      const shouldQueueBehindActiveRun = sessionKey !== draftSessionKey && busySessionIds.has(sessionKey);
-      if (shouldQueueBehindActiveRun) {
+      if (sessionKey !== draftSessionKey) {
         enqueueMessage(buildQueuedMessage(sessionKey, trimmedPrompt, {
           attachments: pendingAttachments,
           skills: selectedSkillRefs,
           agents: selectedAgentRefs,
         }));
-        setPrompt("");
+        setPrompt((current) => current === originalPrompt ? "" : current);
         clearComposerAttachments();
         setSelectedSkills([]);
         setSelectedPromptAgents([]);
@@ -4092,7 +4261,7 @@ export function App(): JSX.Element {
         agents: selectedAgentRefs,
         onError: (message) => window.alert(message),
       });
-      setPrompt("");
+      setPrompt((current) => current === originalPrompt ? "" : current);
       clearComposerAttachments();
       setSelectedSkills([]);
       setSelectedPromptAgents([]);
@@ -4150,6 +4319,7 @@ export function App(): JSX.Element {
     setAgentActionId("create");
     try {
       await createAgentSchedule({
+        projectId: currentProjectId,
         agentId: selectedAgentId,
         hour,
         minute,
@@ -4246,6 +4416,17 @@ export function App(): JSX.Element {
     setAgentPickerOpen(false);
     const target = allSessions.find((item) => item.id === sessionId);
     if (target) {
+      const runId = target.latestRunId;
+      if (runId && needsSessionReview(target, sessionReviews)) {
+        setSessionReviews((current) => ({
+          ...current,
+          reviewedRunIds: { ...current.reviewedRunIds, [target.id]: runId },
+        }));
+      }
+      if (target.projectId) {
+        const projectId = target.projectId;
+        setExpandedProjects((current) => ({ ...current, [projectId]: true }));
+      }
       setSelectedSessionId(target.id);
       setSelectedRunId(target.latestRunId);
       applyRunConfigToControls(target.runner, target.model, target.reasoningEffort);
@@ -4254,8 +4435,14 @@ export function App(): JSX.Element {
   }
 
   function createDraftSession(nextRunner: RunRunner): void {
-    setRunner(nextRunner);
+    modelControlsTouchedRef.current = true;
+    if (nextRunner !== runner) setRunner(nextRunner);
     setIsDraftSession(true);
+    setDraftProjectId(newSessionProjectId);
+    if (newSessionProjectId) {
+      const projectId = newSessionProjectId;
+      setExpandedProjects((current) => ({ ...current, [projectId]: true }));
+    }
     setSelectedSessionId(null);
     setSelectedRunId(null);
     setSelectedRunRecord(null);
@@ -4276,9 +4463,15 @@ export function App(): JSX.Element {
     setNewSessionDialogOpen(false);
   }
 
-  function onNewSession(): void {
-    void ensureAppDefaults();
-    setNewSessionDialogOpen(true);
+  async function onNewSession(projectId = currentProjectId): Promise<void> {
+    try {
+      await ensureAppDefaults();
+      setNewSessionProjectId(projectId);
+      setMobileThreadsOpen(false);
+      setNewSessionDialogOpen(true);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Could not load session defaults.");
+    }
   }
 
   function startVoiceInput(): void {
@@ -4307,7 +4500,21 @@ export function App(): JSX.Element {
     }
   }
 
+  function openVoiceSettings(): void {
+    setMobileThreadsOpen(false);
+    setVoiceSettingsOpen(true);
+  }
+
   function onToggleVoiceRecording(): void {
+    if (apiDictationEnabled) {
+      if (dictation.phase === "recording") dictation.stop();
+      else if (dictation.phase === "idle") void dictation.start();
+      return;
+    }
+    if (needsVoiceProvider) {
+      openVoiceSettings();
+      return;
+    }
     if (voiceListening) {
       stopVoiceInput();
       return;
@@ -4522,9 +4729,9 @@ export function App(): JSX.Element {
       scheduleTime={agentScheduleTime}
       setScheduleTime={setAgentScheduleTime}
       scheduleModel={agentScheduleModel}
-      setScheduleModel={setAgentScheduleModel}
+      setScheduleModel={chooseScheduleModel}
       scheduleEffort={agentScheduleEffort}
-      setScheduleEffort={setAgentScheduleEffort}
+      setScheduleEffort={chooseScheduleEffort}
       scheduleRunner={runner}
       cursorModels={cursorModels}
       selectedSkills={selectedSkills}
@@ -4597,14 +4804,33 @@ export function App(): JSX.Element {
       : "lg:grid-cols-1";
 
   return (
+    <ProjectsContext.Provider value={{ ...projectState,
+      selectedSessionId, selectedRunId, currentProjectId,
+      setDraftProject: setDraftProjectId,
+      startProjectDraft: projectId => {
+        setDraftProjectId(projectId);
+        setIsDraftSession(true); setSelectedSessionId(null); setSelectedRunId(null); setSelectedRunRecord(null);
+      },
+      setPanel: panel => { setMobileThreadsOpen(false); projectState.setPanel(panel); },
+      onMoveSession: async projectId => {
+        if (!selectedSessionId) return;
+        await moveSessionToProject(selectedSessionId, projectId);
+        updateSessionProject(selectedSessionId, projectId);
+        projectState.invalidate();
+      },
+    }}>
+    <ModelCatalogContext.Provider value={modelCatalogState}>
     <div className="h-[100dvh] w-full overflow-hidden bg-background text-[color:var(--text)]">
-      <header className="fixed inset-x-0 top-0 z-20 bg-surface-1/95 px-2 py-2 shadow-[0_14px_30px_-24px_rgba(0,0,0,0.9)] lg:hidden">
-        <div className="mx-auto flex max-w-7xl items-center justify-between gap-1">
+      <header className="fixed inset-x-0 top-0 z-20 bg-surface-1/95 px-2 py-1 shadow-[0_14px_30px_-24px_rgba(0,0,0,0.9)] lg:hidden">
+        <div className="mx-auto flex min-h-10 max-w-7xl items-center justify-between gap-1">
           <Button size="sm" variant="ghost" onClick={() => setMobileThreadsOpen(true)}>
             <PanelLeft className="mr-1.5 h-4 w-4" /> Chats
           </Button>
-          <div className="min-w-0 flex-1 truncate text-center text-sm font-semibold" title={mobileHeaderTitle} dir="auto">
-            {mobileHeaderTitle}
+          <div className="flex min-w-0 flex-1 flex-col items-center">
+            <div className="max-w-full truncate text-center text-sm font-semibold leading-4" title={mobileHeaderTitle} dir="auto">
+              {mobileHeaderTitle}
+            </div>
+            <ProjectSessionControls key={selectedSessionId ?? "draft"} />
           </div>
           <div className="flex shrink-0 items-center gap-0.5">
             <Button
@@ -4635,6 +4861,9 @@ export function App(): JSX.Element {
         <aside className="hidden min-h-0 flex-col overflow-hidden rounded-lg bg-surface-1 shadow-[10px_0_26px_-26px_rgba(0,0,0,0.9)] lg:flex">
           <SessionsPanel
             sessions={filteredSessions}
+            sessionReviews={sessionReviews}
+            expandedProjects={expandedProjects}
+            setExpandedProjects={setExpandedProjects}
             selectedSessionId={selectedSessionId}
             statusFilter={statusFilter}
             setStatusFilter={setStatusFilter}
@@ -4653,6 +4882,8 @@ export function App(): JSX.Element {
             theme={theme}
             setTheme={setTheme}
             onSignOut={onSignOut}
+            onOpenRemoteMacs={isDesktopLocal ? undefined : () => setRemoteMacsOpen(true)}
+            onOpenVoiceSettings={openVoiceSettings}
             onCloseSidebar={() => setLeftSidebarOpen(false)}
           />
         </aside>
@@ -4666,10 +4897,11 @@ export function App(): JSX.Element {
             activeWorkspace={activeWorkspace}
             runner={runner}
             setRunner={setRunner}
+            unavailableRunners={unavailableRunners}
             model={model}
-            setModel={setModel}
+            setModel={chooseModel}
             reasoningEffort={reasoningEffort}
-            setReasoningEffort={setReasoningEffort}
+            setReasoningEffort={chooseEffort}
             claudeEffortFlagSupported={claudeEffortFlagSupported}
             cursorModels={cursorModels}
             askMode={askMode}
@@ -4716,7 +4948,7 @@ export function App(): JSX.Element {
             submitting={submitting}
             stopping={stopping}
             onStopRun={onStopRun}
-            onNewSession={onNewSession}
+            onNewSession={() => void onNewSession()}
             hasPendingIndicator={Boolean(selectedSession && selectedSession.status === "running" && !hasPendingTimelineEntry)}
             ansi={ansi}
             timelineScrollRef={timelineScrollRef}
@@ -4726,15 +4958,19 @@ export function App(): JSX.Element {
             slashSuggestions={slashSuggestions}
             onSelectSlashCommand={onSelectSlashCommand}
             queueItems={queuedMessagesForActiveSession}
-            processingQueueItemId={processingQueueItem?.item.sessionKey === sessionTimelineKey ? processingQueueItem.item.id : null}
+            processingQueueItemId={processingQueueItemId}
+            onRetryQueueItem={(id) => setQueuedDeliveryError(sessionTimelineKey, id)}
             onRemoveQueueItem={(messageId) => removeQueuedMessage(sessionTimelineKey, messageId)}
             onRetryMessage={onRetryTimelineMessage}
             onSelectAttachments={uploadPendingFiles}
             onRemovePendingAttachment={removePendingAttachment}
-            voiceSupported={voiceSupported}
-            voiceListening={voiceListening}
-            voiceError={voiceError}
+            voiceListening={recording}
+            voiceError={apiDictationEnabled ? dictation.error : voiceError}
             voiceRecordingSeconds={voiceRecordingSeconds}
+            voiceNeedsSetup={needsVoiceProvider}
+            voiceSettingsLoading={speechSettings.isLoading}
+            voicePhase={dictation.phase}
+            onCancelDictation={dictation.cancel}
             onToggleVoiceRecording={onToggleVoiceRecording}
             onSendButtonClick={onSendButtonClick}
             planSessionState={planSessionState}
@@ -4756,13 +4992,14 @@ export function App(): JSX.Element {
             onChangeWorkspace={onChangeWorkspace}
             runner={runner}
             setRunner={setRunner}
+            unavailableRunners={unavailableRunners}
             model={model}
-            setModel={setModel}
+            setModel={chooseModel}
             reasoningEffort={reasoningEffort}
-            setReasoningEffort={setReasoningEffort}
+            setReasoningEffort={chooseEffort}
             cursorModels={cursorModels}
             sandbox={sandbox}
-            setSandbox={setSandbox}
+            setSandbox={chooseSandbox}
             theme={theme}
             toggleTheme={toggleTheme}
             ansi={ansi}
@@ -4791,15 +5028,18 @@ export function App(): JSX.Element {
         ) : null}
       </div>
 
+      <ProjectMemoryDialog />
+      {!isDesktopLocal ? <RemoteMacs open={remoteMacsOpen} setOpen={setRemoteMacsOpen} /> : null}
+      <VoiceSettings open={voiceSettingsOpen} setOpen={setVoiceSettingsOpen} settings={speechSettings.data} loading={speechSettings.isLoading} />
       <Dialog.Root open={newSessionDialogOpen} onOpenChange={setNewSessionDialogOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 z-40 bg-black/55" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-[min(460px,calc(100vw-24px))] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-card-border bg-surface-1 p-4 shadow-xl outline-none">
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 max-h-[calc(100dvh-24px)] w-[min(460px,calc(100vw-24px))] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-lg border border-card-border bg-surface-1 p-4 shadow-xl outline-none">
             <div className="mb-4 flex items-center justify-between gap-3">
               <div>
                 <Dialog.Title className="text-base font-semibold">Create new session</Dialog.Title>
                 <Dialog.Description className="mt-1 text-xs text-foreground/65">
-                  Choose runner, model, and thinking effort.
+                  Choose a project, runner, model, and thinking effort.
                 </Dialog.Description>
               </div>
               <Button type="button" variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => setNewSessionDialogOpen(false)} aria-label="Close">
@@ -4823,6 +5063,8 @@ export function App(): JSX.Element {
               <Button
                 type="button"
                 variant={runner === "claude" ? "primary" : "ghost"}
+                disabled={unavailableRunners.includes("claude")}
+                title={unavailableRunners.includes("claude") ? "Install Claude Code on this Mac and reopen Luma" : undefined}
                 className="h-16 justify-start gap-3 rounded-md border border-card-border px-3 text-left"
                 onClick={() => setRunner("claude")}
               >
@@ -4837,8 +5079,8 @@ export function App(): JSX.Element {
                 variant={runner === "cursor" ? "primary" : "ghost"}
                 className="h-16 justify-start gap-3 rounded-md border border-card-border px-3 text-left"
                 onClick={() => setRunner("cursor")}
-                disabled={!cursorAvailable && cursorModels.length === 0}
-                title={cursorAvailable ? "Cursor Agent CLI" : "Cursor CLI not detected on server; you can still select it if the host will install it"}
+                disabled={unavailableRunners.includes("cursor") || (!isDesktopLocal && !cursorAvailable && cursorModels.length === 0)}
+                title={unavailableRunners.includes("cursor") ? "Install Cursor Agent on this Mac and reopen Luma" : "Cursor Agent CLI"}
               >
                 <Sparkles className="h-5 w-5 shrink-0" />
                 <span className="min-w-0">
@@ -4849,9 +5091,23 @@ export function App(): JSX.Element {
             </div>
 
             <div className="mt-4 space-y-3">
+              {projectState.projects.length > 0 ? (
+                <label className="block space-y-1 text-xs font-semibold text-foreground/75">
+                  <span>Project</span>
+                  <select
+                    className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                    value={newSessionProjectId || ""}
+                    onChange={(event) => setNewSessionProjectId(event.target.value || null)}
+                  >
+                    <option value="">No project</option>
+                    {projectState.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+                  </select>
+                </label>
+              ) : null}
               <div>
                 <div className="mb-1 flex items-center justify-between gap-2">
                   <label className="block text-xs font-semibold text-foreground/75">Model</label>
+                  <ModelCatalogRefresh runner={runner} />
                   {runner === "cursor" ? (
                     <button
                       type="button"
@@ -4883,12 +5139,12 @@ export function App(): JSX.Element {
                       return;
                     }
                     setNewSessionUseCustomModel(false);
-                    setModel(next);
+                    chooseModel(next);
                   }}
                 >
                   {modelOptionsForRunner(runner, cursorModels).map((modelOption) => (
                     <option key={modelOption} value={modelOption}>
-                      {modelOption}
+                      {modelLabel(runner, modelOption)}
                     </option>
                   ))}
                   <option value="__custom__">Custom model...</option>
@@ -4897,7 +5153,7 @@ export function App(): JSX.Element {
                   <input
                     className="mt-2 h-9 w-full rounded-md border border-card-border bg-control px-3 text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
                     value={model}
-                    onChange={(event) => setModel(event.target.value)}
+                    onChange={(event) => chooseModel(event.target.value)}
                     placeholder={
                       runner === "claude"
                         ? "Enter Claude model id"
@@ -4910,10 +5166,11 @@ export function App(): JSX.Element {
               </div>
 
               <div>
+                <ModelCatalogNotice runner={runner} />
                 <div className="mb-1 flex items-center justify-between gap-2">
                   <label className="block text-xs font-semibold text-foreground/75">Thinking effort</label>
                   {runner === "claude" && !claudeEffortFlagSupported ? (
-                    <span className="text-[11px] text-amber-600 dark:text-amber-300" title="This Claude CLI rejected --effort; Luma uses CLAUDE_CODE_EFFORT_LEVEL instead.">
+                    <span className="text-[11px] text-amber-600 dark:text-amber-300" title="Claude effort flag support was not detected; Luma uses CLAUDE_CODE_EFFORT_LEVEL. Check model discovery for CLI errors.">
                       env fallback
                     </span>
                   ) : null}
@@ -4926,14 +5183,10 @@ export function App(): JSX.Element {
                 <select
                   className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 disabled:opacity-50"
                   value={reasoningEffort}
-                  disabled={runner === "cursor" && !cursorModelSupportsEffort(model, cursorModels)}
-                  onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}
+                  disabled={runner === "cursor" ? !cursorModelSupportsEffort(model, cursorModels) : !modelSupportsEffort(runner, model)}
+                  onChange={(event) => chooseEffort(event.target.value as ReasoningEffort)}
                 >
-                  {reasoningEffortOptionsForRunner(runner).map((option) => (
-                    <option key={option} value={option}>
-                      {reasoningEffortLabel(option)}
-                    </option>
-                  ))}
+                  <ModelEffortOptions runner={runner} model={model} value={reasoningEffort} />
                 </select>
               </div>
 
@@ -4954,6 +5207,9 @@ export function App(): JSX.Element {
             <div className="flex h-full min-h-0 flex-col overflow-hidden animate-slide-in">
               <SessionsPanel
                 sessions={filteredSessions}
+                sessionReviews={sessionReviews}
+                expandedProjects={expandedProjects}
+                setExpandedProjects={setExpandedProjects}
                 selectedSessionId={selectedSessionId}
                 statusFilter={statusFilter}
                 setStatusFilter={setStatusFilter}
@@ -4972,6 +5228,11 @@ export function App(): JSX.Element {
                 theme={theme}
                 setTheme={setTheme}
                 onSignOut={onSignOut}
+                onOpenRemoteMacs={isDesktopLocal ? undefined : () => {
+                  setMobileThreadsOpen(false);
+                  setRemoteMacsOpen(true);
+                }}
+                onOpenVoiceSettings={openVoiceSettings}
                 onCloseSidebar={() => setMobileThreadsOpen(false)}
               />
             </div>
@@ -4995,13 +5256,14 @@ export function App(): JSX.Element {
                 onChangeWorkspace={onChangeWorkspace}
                 runner={runner}
                 setRunner={setRunner}
+                unavailableRunners={unavailableRunners}
                 model={model}
-                setModel={setModel}
+                setModel={chooseModel}
                 reasoningEffort={reasoningEffort}
-                setReasoningEffort={setReasoningEffort}
+                setReasoningEffort={chooseEffort}
                 cursorModels={cursorModels}
                 sandbox={sandbox}
-                setSandbox={setSandbox}
+                setSandbox={chooseSandbox}
                 theme={theme}
                 toggleTheme={toggleTheme}
                 ansi={ansi}
@@ -5032,11 +5294,72 @@ export function App(): JSX.Element {
         </Dialog.Portal>
       </Dialog.Root>
     </div>
+    </ModelCatalogContext.Provider>
+    </ProjectsContext.Provider>
+  );
+}
+
+const sessionActionClass = "inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md text-foreground/75 hover:bg-control-hover hover:text-foreground focus-visible:outline focus-visible:outline-brand";
+
+const sessionFilters: { value: SessionFilterValue; label: string }[] = [
+  { value: "all", label: "All sessions" },
+  { value: "all-history", label: "All history" },
+  { value: "running", label: "Running" },
+  { value: "completed", label: "Completed" },
+  { value: "failed", label: "Failed" },
+  { value: "stopped", label: "Stopped" },
+];
+
+function SidebarSessionRows({
+  sessions,
+  sessionReviews,
+  selectedSessionId,
+  onSelectSession,
+}: Pick<SessionsPanelProps, "sessions" | "sessionReviews" | "selectedSessionId" | "onSelectSession">): JSX.Element | null {
+  if (sessions.length === 0) return null;
+  return (
+    <ul className="space-y-0.5">
+      {sessions.map((session) => {
+        const needsReview = needsSessionReview(session, sessionReviews);
+        const running = session.status === "running" && !session.historyOnly;
+        return (
+          <li key={session.id}>
+            <button
+              type="button"
+              className={cn(
+                "flex min-h-9 w-full items-center gap-2 rounded-md px-2 text-left text-sm focus-visible:outline focus-visible:outline-brand",
+                selectedSessionId === session.id ? "bg-brand-soft text-brand" : "text-foreground/80 hover:bg-control-hover",
+                needsReview && "font-bold",
+              )}
+              aria-current={selectedSessionId === session.id ? "true" : undefined}
+              aria-description={needsReview ? "Ready to review" : running ? "Running" : undefined}
+              onClick={() => onSelectSession(session.id)}
+              title={`${session.summary || "Session"} · ${session.status}${needsReview ? " · Ready to review" : ""}`}
+            >
+              <span className="relative flex h-3 w-3 shrink-0 items-center justify-center" aria-hidden="true">
+                {running ? (
+                  <span className="absolute inset-0 rounded-full border border-brand/70 motion-safe:animate-spin motion-safe:border-r-transparent" />
+                ) : null}
+                <span className={cn(
+                  "h-1.5 w-1.5 rounded-full",
+                  running || session.status === "queued" ? "bg-brand" :
+                    session.status === "failed" ? "bg-danger-fg" : "bg-foreground/30",
+                )} />
+              </span>
+              <span className="min-w-0 flex-1 truncate" dir="auto">{session.summary || "Session"}</span>
+            </button>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
 type SessionsPanelProps = {
   sessions: SessionCard[];
+  sessionReviews: SessionReviews;
+  expandedProjects: Record<string, boolean>;
+  setExpandedProjects: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
   selectedSessionId: string | null;
   statusFilter: StatusFilter;
   setStatusFilter: (next: StatusFilter) => void;
@@ -5047,7 +5370,7 @@ type SessionsPanelProps = {
   onToggleShowAllHistory: (next: boolean) => void;
   onSelectSession: (sessionId: string) => void;
   onLoadMoreRuns: () => Promise<void>;
-  onNewSession: () => void;
+  onNewSession: (projectId?: string) => void;
   mode: SidebarMode;
   setMode: (mode: SidebarMode) => void;
   agentsPanel: ReactNode;
@@ -5055,11 +5378,16 @@ type SessionsPanelProps = {
   theme: "light" | "dark";
   setTheme: (theme: "light" | "dark") => void;
   onSignOut: () => void;
+  onOpenRemoteMacs?: () => void;
   onCloseSidebar: () => void;
+  onOpenVoiceSettings: () => void;
 };
 
 function SessionsPanel({
   sessions,
+  sessionReviews,
+  expandedProjects,
+  setExpandedProjects,
   selectedSessionId,
   statusFilter,
   setStatusFilter,
@@ -5078,20 +5406,27 @@ function SessionsPanel({
   theme,
   setTheme,
   onSignOut,
+  onOpenRemoteMacs,
   onCloseSidebar,
+  onOpenVoiceSettings,
 }: SessionsPanelProps): JSX.Element {
   const sessionFilterValue: SessionFilterValue = showAllHistory ? "all-history" : statusFilter;
   const environmentLabel = deploymentLabel();
-  const [visibleSessionCount, setVisibleSessionCount] = useState(sidebarListPageSize);
+  const { projects, loading: projectsLoading, error: projectsError, setPanel } = useProjects();
+  const [recentsOpen, setRecentsOpen] = useState(true);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const accountMenuRef = useRef<HTMLDivElement>(null);
-  const visibleSessions = sessions.slice(0, visibleSessionCount);
-  const hasHiddenLoadedSessions = visibleSessionCount < sessions.length;
-  const canLoadMoreSessions = hasHiddenLoadedSessions || hasMoreRuns;
-
-  useEffect(() => {
-    setVisibleSessionCount(sidebarListPageSize);
-  }, [statusFilter, showAllHistory, mode]);
+  const sessionsByProject = useMemo(() => {
+    const groups = new Map<string | null, SessionCard[]>();
+    for (const session of sessions) {
+      const group = groups.get(session.projectId);
+      if (group) group.push(session);
+      else groups.set(session.projectId, [session]);
+    }
+    return groups;
+  }, [sessions]);
+  const recents = sessionsByProject.get(null) ?? [];
+  const filterLabel = sessionFilters.find((filter) => filter.value === sessionFilterValue)?.label;
 
   useEffect(() => {
     if (!accountMenuOpen) return;
@@ -5126,171 +5461,154 @@ function SessionsPanel({
     if (showAllHistory) onToggleShowAllHistory(false);
   }
 
-  function onLoadMoreVisibleSessions(): void {
-    if (hasHiddenLoadedSessions) {
-      setVisibleSessionCount((current) => Math.min(current + sidebarListPageSize, sessions.length));
-      return;
-    }
-
-    void onLoadMoreRuns();
-  }
-
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="relative z-10 px-3 pb-3 pt-3 shadow-[0_14px_28px_-28px_rgba(0,0,0,0.9)]">
-        <div className="flex items-center gap-1">
-          <div className="grid min-w-0 flex-1 grid-cols-3 gap-1 rounded-md bg-surface-2 p-1 text-xs">
-            <button
-              type="button"
-              className={cn(
-                "flex h-8 items-center justify-center gap-1.5 rounded px-2",
-                mode === "agents" ? "bg-control-hover font-medium text-foreground" : "text-foreground/60 hover:bg-control-hover",
-              )}
-              onClick={() => setMode("agents")}
-            >
-              <Bot className="h-3.5 w-3.5" /> Agents
-            </button>
-            <button type="button" className="flex h-8 items-center justify-center gap-1.5 rounded px-2 text-foreground/60 hover:bg-control-hover">
-              <Bot className="h-3.5 w-3.5" /> Cowork
-            </button>
-            <button
-              type="button"
-              className={cn(
-                "flex h-8 items-center justify-center gap-1.5 rounded px-2",
-                mode === "code" ? "bg-control-hover font-medium text-foreground" : "text-foreground/60 hover:bg-control-hover",
-              )}
-              onClick={() => setMode("code")}
-            >
-              <FileCode2 className="h-3.5 w-3.5" /> Code
-            </button>
-          </div>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="hidden h-8 w-8 shrink-0 p-0 lg:inline-flex"
-            onClick={onCloseSidebar}
-            aria-label="Close left sidebar"
-            title="Close sidebar"
+      {mode === "code" ? (
+        <div role="group" aria-label="Session actions" className="flex shrink-0 items-center gap-1 border-b border-card-border px-3 py-2">
+          <button type="button" className={sessionActionClass} onClick={() => onNewSession()} aria-label="New session" title="New session">
+            <SquarePen className="h-4 w-4" aria-hidden="true" />
+          </button>
+          <button type="button" className={sessionActionClass} onClick={() => setPanel({ tab: "create", projectId: null })} aria-label="New project" title="New project">
+            <FolderPlus className="h-4 w-4" aria-hidden="true" />
+          </button>
+          <label
+            className={cn(sessionActionClass, "relative focus-within:ring-2 focus-within:ring-brand", sessionFilterValue !== "all" && "bg-brand-soft text-brand")}
+            title={`Filter sessions · ${filterLabel}`}
           >
-            <PanelLeft className="h-3.5 w-3.5" />
-          </Button>
+            {loadingRunList ? <RefreshCw className="h-4 w-4 animate-spin" aria-hidden="true" /> : <ListFilter className="h-4 w-4" aria-hidden="true" />}
+            <select
+              aria-label="Filter sessions"
+              title={`Filter sessions · ${filterLabel}`}
+              className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+              value={sessionFilterValue}
+              onChange={(event) => onSessionFilterChange(event.target.value as SessionFilterValue)}
+              disabled={loadingRunList}
+            >
+              {sessionFilters.map((filter) => <option key={filter.value} value={filter.value}>{filter.label}</option>)}
+            </select>
+          </label>
         </div>
-
-        {mode === "code" ? (
-          <nav className="mt-3 space-y-1 text-sm">
-            <button type="button" onClick={onNewSession} className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-foreground/85 hover:bg-control-hover">
-              <span className="text-lg leading-none">+</span> New session
-            </button>
-            <button type="button" className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-foreground/75 hover:bg-control-hover">
-              <Layers className="h-3.5 w-3.5" /> Customize
-            </button>
-            <label className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-foreground/75 hover:bg-control-hover">
-              {loadingRunList ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <PanelRight className="h-3.5 w-3.5" />}
-              <select
-                className="h-7 min-w-0 flex-1 border-0 bg-transparent text-sm outline-none"
-                value={sessionFilterValue}
-                onChange={(event) => onSessionFilterChange(event.target.value as SessionFilterValue)}
-                disabled={loadingRunList}
-              >
-                <option value="all">More: all sessions</option>
-                <option value="all-history">More: All History</option>
-                <option value="running">More: running</option>
-                <option value="completed">More: completed</option>
-                <option value="failed">More: failed</option>
-                <option value="stopped">More: stopped</option>
-              </select>
-            </label>
-          </nav>
-        ) : null}
-      </div>
+      ) : null}
 
       {mode === "agents" ? (
         <div className="scrollbar-thin min-h-0 flex-1 overflow-auto px-3 py-3">
           {agentsPanel}
         </div>
       ) : (
-      <div className="flex min-h-0 flex-1 flex-col px-3 py-3">
-        <div className="mb-2 flex items-center justify-between gap-2 px-1 text-xs text-foreground/55">
-          <span>Recents</span>
-          <span>{sessions.length}</span>
-        </div>
-
-        <div className="scrollbar-thin flex-1 space-y-1 overflow-auto pr-1">
-          {sessions.length === 0 ? (
-            <div className="rounded-md border border-dashed border-card-border bg-surface-2 px-3 py-2 text-xs text-foreground/70">
-              No sessions yet
-            </div>
+        <nav aria-label="Sessions and projects" className="scrollbar-thin min-h-0 flex-1 space-y-5 overflow-auto px-3 py-3">
+          {projects.length > 0 || projectsLoading || projectsError ? (
+            <section aria-label="Projects">
+              <h2 className="mb-1.5 px-2 text-xs font-semibold text-foreground/55">Projects</h2>
+              {projectsLoading ? <p className="px-2 py-1 text-xs text-foreground/55">Loading projects…</p> : null}
+              {projectsError ? <p role="alert" className="px-2 py-1 text-xs text-danger-fg">Projects could not load.</p> : null}
+              <ul className="space-y-1">
+                {projects.map((project) => {
+                  const expanded = Boolean(expandedProjects[project.id]);
+                  const projectSessions = sessionsByProject.get(project.id) ?? [];
+                  const Icon = expanded ? FolderOpen : Folder;
+                  return (
+                    <li key={project.id}>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          aria-expanded={expanded}
+                          onClick={() => setExpandedProjects((current) => ({ ...current, [project.id]: !current[project.id] }))}
+                          className="flex min-h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-sm font-medium text-foreground/85 hover:bg-control-hover focus-visible:outline focus-visible:outline-brand"
+                        >
+                          <Icon className="h-4 w-4 shrink-0 text-brand" aria-hidden="true" />
+                          <span className="min-w-0 flex-1 truncate" title={project.name} dir="auto">{project.name}</span>
+                          <ChevronRight className={cn("h-3.5 w-3.5 shrink-0 text-foreground/45 transition-transform", expanded && "rotate-90")} aria-hidden="true" />
+                        </button>
+                        <button
+                          type="button"
+                          className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-foreground/65 hover:bg-brand-soft hover:text-brand focus-visible:outline focus-visible:outline-brand"
+                          aria-label={`New session in ${project.name}`}
+                          title={`New session in ${project.name}`}
+                          onClick={() => onNewSession(project.id)}
+                        >
+                          <Plus className="h-4 w-4" aria-hidden="true" />
+                        </button>
+                      </div>
+                      {expanded ? (
+                        <div className="ml-4 border-l border-card-border pl-2">
+                          <SidebarSessionRows sessions={projectSessions} sessionReviews={sessionReviews} selectedSessionId={selectedSessionId} onSelectSession={onSelectSession} />
+                          {projectSessions.length === 0 ? (
+                            <p className="px-2 py-1.5 text-xs text-foreground/60">
+                              {hasMoreRuns && project.sessionCount > 0 ? "Load more to see earlier sessions." : "No sessions to show"}
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            </section>
           ) : null}
 
-          {visibleSessions.map((session) => {
-            const sourceBadge = getSessionSourceBadge(session);
-            return (
-              <div
-                key={session.id}
-                className={cn(
-                  "w-full rounded-md border border-transparent px-2.5 py-1.5 text-left transition hover:bg-control-hover",
-                  selectedSessionId === session.id ? "bg-control-hover text-foreground" : "text-foreground/82",
-                )}
-              >
-                <button
-                  type="button"
-                  className="w-full text-left"
-                  onClick={() => onSelectSession(session.id)}
-                >
-                  <div className="flex items-center gap-2">
-                    <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", session.status === "running" || session.status === "queued" ? "bg-brand" : "bg-foreground/35")} />
-                    <p className="min-w-0 flex-1 truncate text-sm" title={session.summary} dir="auto">
-                      {session.summary || "Session"}
-                    </p>
-                  </div>
-                  <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1 pl-3.5">
-                    <span className={cn("rounded px-1.5 py-0.5 text-[10px] font-semibold leading-none", sourceBadge.className)}>
-                      {sourceBadge.label}
-                    </span>
-                    <span className={cn("rounded px-1.5 py-0.5 text-[10px] font-semibold leading-none", statusClass(session.status))}>
-                      {session.status}
-                    </span>
-                    {session.historyOnly ? (
-                      <span className="rounded bg-control px-1.5 py-0.5 text-[10px] font-semibold leading-none text-foreground/65">
-                        history
-                      </span>
-                    ) : null}
-                    {session.scheduled ? (
-                      <span className="rounded bg-brand-soft px-1.5 py-0.5 text-[10px] font-semibold leading-none text-brand">
-                        scheduled
-                      </span>
-                    ) : null}
-                    <span className="min-w-0 truncate text-[11px] leading-none text-foreground/45">
-                      {new Date(session.updatedAt).toLocaleTimeString()}
-                    </span>
-                  </div>
-                </button>
-              </div>
-            );
-          })}
-
-          {canLoadMoreSessions ? (
-            <Button
+          <section aria-label="Recents">
+            <button
               type="button"
-              variant="ghost"
-              size="sm"
-              onClick={onLoadMoreVisibleSessions}
-              disabled={loadingMoreRuns}
-              className="w-full"
+              aria-expanded={recentsOpen}
+              onClick={() => setRecentsOpen((open) => !open)}
+              className="mb-1 flex min-h-8 items-center gap-1.5 rounded-md px-2 text-xs font-semibold text-foreground/65 hover:bg-control-hover focus-visible:outline focus-visible:outline-brand"
             >
+              <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", recentsOpen && "rotate-90")} aria-hidden="true" />
+              Recents
+            </button>
+            {recentsOpen ? (
+              <SidebarSessionRows sessions={recents} sessionReviews={sessionReviews} selectedSessionId={selectedSessionId} onSelectSession={onSelectSession} />
+            ) : null}
+          </section>
+
+          {!loadingRunList && sessions.length === 0 && !hasMoreRuns ? (
+            <p className="px-2 text-xs text-foreground/60">
+              {sessionFilterValue === "all" ? "No sessions yet" : "No sessions match this filter"}
+            </p>
+          ) : null}
+
+          {hasMoreRuns ? (
+            <Button type="button" variant="ghost" size="sm" onClick={() => void onLoadMoreRuns()} disabled={loadingMoreRuns || loadingRunList} className="w-full">
               {loadingMoreRuns ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
-              Load more
+              Load more sessions
             </Button>
           ) : null}
-        </div>
-      </div>
+        </nav>
       )}
 
       <div className="relative z-10 p-3 shadow-[0_-14px_28px_-28px_rgba(0,0,0,0.9)]">
+        {onOpenRemoteMacs ? (
+          <button type="button"
+            className="mb-1 flex min-h-9 w-full items-center gap-2 rounded-md px-2 text-left text-sm text-foreground/80 hover:bg-control-hover focus-visible:outline focus-visible:outline-brand"
+            onClick={onOpenRemoteMacs}>
+            <Laptop className="h-4 w-4 text-foreground/65" aria-hidden="true" />Remote Macs
+          </button>
+        ) : null}
         <div ref={accountMenuRef} className="relative">
           {accountMenuOpen ? (
             <div className="absolute bottom-full left-0 right-0 mb-2 overflow-hidden rounded-md border border-card-border bg-surface-1 p-1 text-sm shadow-[0_16px_42px_-20px_rgba(0,0,0,0.95)]">
+              <button
+                type="button"
+                className="flex h-9 w-full items-center gap-2 rounded px-2 text-left text-foreground/80 transition hover:bg-control-hover"
+                onClick={() => {
+                  setMode(mode === "code" ? "agents" : "code");
+                  setAccountMenuOpen(false);
+                }}
+              >
+                {mode === "code" ? <Bot className="h-4 w-4 text-foreground/55" /> : <MessageSquare className="h-4 w-4 text-foreground/55" />}
+                <span>{mode === "code" ? "Agents" : "Sessions"}</span>
+              </button>
+              <button
+                type="button"
+                className="flex h-9 w-full items-center gap-2 rounded px-2 text-left text-foreground/80 transition hover:bg-control-hover"
+                onClick={() => {
+                  setAccountMenuOpen(false);
+                  onCloseSidebar();
+                }}
+              >
+                <PanelLeft className="h-4 w-4 text-foreground/55" />
+                <span>Close sidebar</span>
+              </button>
               <button
                 type="button"
                 className="flex h-9 w-full items-center gap-2 rounded px-2 text-left text-foreground/80 transition hover:bg-control-hover"
@@ -5309,6 +5627,14 @@ function SessionsPanel({
                 <Settings className="mr-1 inline h-3.5 w-3.5 align-[-2px]" />
                 Settings
               </div>
+              <button
+                type="button"
+                className="flex h-9 w-full items-center gap-2 rounded px-2 text-left text-foreground/80 transition hover:bg-control-hover"
+                onClick={() => { setAccountMenuOpen(false); onOpenVoiceSettings(); }}
+              >
+                <Mic className="h-4 w-4 text-foreground/55" />
+                <span>Voice settings</span>
+              </button>
               <button
                 type="button"
                 className="flex h-9 w-full items-center gap-2 rounded px-2 text-left text-foreground/80 transition hover:bg-control-hover"
@@ -5530,6 +5856,7 @@ type CenterPanelProps = {
   activeWorkspace: string;
   runner: RunRunner;
   setRunner: (value: RunRunner) => void;
+  unavailableRunners: RunRunner[];
   model: string;
   setModel: (value: string) => void;
   reasoningEffort: ReasoningEffort;
@@ -5589,10 +5916,14 @@ type CenterPanelProps = {
   queueItems: QueuedMessage[];
   processingQueueItemId: string | null;
   onRemoveQueueItem: (messageId: string) => void;
+  onRetryQueueItem: (messageId: string) => void;
   onRetryMessage: (entry: TimelineEntry) => Promise<void>;
   onSelectAttachments: (files: FileList | null) => Promise<void>;
   onRemovePendingAttachment: (attachmentId: string) => void;
-  voiceSupported: boolean;
+  voiceNeedsSetup: boolean;
+  voiceSettingsLoading: boolean;
+  voicePhase: "idle" | "starting" | "recording" | "transcribing";
+  onCancelDictation: () => void;
   voiceListening: boolean;
   voiceError: string | null;
   voiceRecordingSeconds: number;
@@ -5606,6 +5937,7 @@ type CenterPanelProps = {
 };
 
 function CenterPanel(props: CenterPanelProps): JSX.Element {
+  const { modelOptionsForRunner, reasoningEffortOptionsForRunner, modelSupportsEffort, modelLabel, effortForModel } = useModelOptions();
   const sourceBadge = props.selectedSession ? getSessionSourceBadge(props.selectedSession) : null;
   const [copiedEntryKey, setCopiedEntryKey] = useState<string | null>(null);
   const [attachmentDropActive, setAttachmentDropActive] = useState(false);
@@ -5635,7 +5967,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
   const composerModelSelectOptions = composerModelOptions.includes(props.model)
     ? composerModelOptions
     : [props.model, ...composerModelOptions];
-  const composerEffortSupported = props.runner !== "cursor" || cursorModelSupportsEffort(props.model, props.cursorModels);
+  const composerEffortSupported = props.runner === "cursor" ? cursorModelSupportsEffort(props.model, props.cursorModels) : modelSupportsEffort(props.runner, props.model);
   const composerRunnerLabel = runnerLabel(props.runner);
   const composerDirection = useMemo(
     () => (props.prompt.trim() ? resolveTextDirection(props.prompt) : "auto"),
@@ -5654,12 +5986,6 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
     >
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-5">
         {props.loading ? <p className="text-sm text-foreground/70">Loading...</p> : null}
-
-        {!props.loading && !props.selectedSession ? (
-          <div className="mx-auto max-w-3xl rounded-md border border-dashed border-card-border bg-surface-2 px-4 py-3 text-sm text-foreground/75">
-            Start a new session or pick one from chats.
-          </div>
-        ) : null}
 
         {props.hiddenTimelineCount > 0 ? (
           <div className="flex justify-center">
@@ -5938,14 +6264,14 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           <FileCode2 className="h-4 w-4 shrink-0 text-foreground/70" />
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-2">
-              <h1 className="truncate text-sm font-semibold" title={props.selectedSession ? props.selectedSession.summary : "No active chat"} dir="auto">
-                {props.selectedSession ? props.selectedSession.summary : "No active chat"}
+              <h1 className="truncate text-sm font-semibold" title={props.selectedSession?.summary} dir="auto">
+                {props.selectedSession?.summary || "New session"}
               </h1>
             </div>
-            <div className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-foreground/55">
-              {props.selectedSession ? <span className="truncate font-mono">{props.selectedSession.id}</span> : <span>Create or select a session</span>}
-              {props.selectedSession ? <span>{props.selectedSession.status}</span> : null}
-              {sourceBadge ? <span>{sourceBadge.label}</span> : null}
+            <div className="flex min-w-0 items-center gap-2 text-[11px] text-foreground/55">
+              <ProjectSessionControls key={props.selectedSession?.id ?? "draft"} />
+              {props.selectedSession ? <span className="truncate" title={props.selectedSession.id}>{props.selectedSession.status}</span> : null}
+              {sourceBadge ? <span className="shrink-0">{sourceBadge.label}</span> : null}
             </div>
           </div>
         </div>
@@ -6018,22 +6344,22 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               title="Runner"
             >
               {runnerOptions.map((runnerOption) => (
-                <option key={runnerOption} value={runnerOption}>
+                <option key={runnerOption} value={runnerOption} disabled={props.unavailableRunners.includes(runnerOption)}>
                   {runnerLabel(runnerOption)}
                 </option>
               ))}
             </select>
             <select
               className="h-6 appearance-none rounded-md border-0 bg-control px-2 text-xs text-foreground outline-none hover:bg-control-hover focus:ring-2 focus:ring-brand/20"
-              style={{ width: compactSelectWidth(props.model) }}
+              style={{ width: compactSelectWidth(modelLabel(props.runner, props.model)), maxWidth: "min(60vw, 22rem)" }}
               value={props.model}
               onChange={(event) => props.setModel(event.target.value)}
               aria-label="Model"
-              title="Model"
+              title={modelLabel(props.runner, props.model)}
             >
               {composerModelSelectOptions.map((modelOption) => (
                 <option key={modelOption} value={modelOption}>
-                  {modelOption}
+                  {modelLabel(props.runner, modelOption)}
                 </option>
               ))}
             </select>
@@ -6044,16 +6370,13 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               disabled={!composerEffortSupported}
               onChange={(event) => props.setReasoningEffort(event.target.value as ReasoningEffort)}
               aria-label="Thinking effort"
-              title={composerEffortSupported ? "Thinking effort" : "This Cursor model has no effort control"}
+              title={composerEffortSupported ? "Thinking effort" : "This model has no effort control"}
             >
-              {reasoningEffortOptionsForRunner(props.runner).map((option) => (
-                <option key={option} value={option}>
-                  {reasoningEffortLabel(option)}
-                </option>
-              ))}
+              <ModelEffortOptions runner={props.runner} model={props.model} value={props.reasoningEffort} />
             </select>
+            <ModelCatalogRefresh runner={props.runner} compact />
             {props.runner === "claude" && !props.claudeEffortFlagSupported ? (
-              <span className="rounded-md bg-amber-500/12 px-2 py-1 text-[11px] text-amber-700 dark:text-amber-300" title="This Claude CLI rejected --effort; Luma uses CLAUDE_CODE_EFFORT_LEVEL instead.">
+              <span className="rounded-md bg-amber-500/12 px-2 py-1 text-[11px] text-amber-700 dark:text-amber-300" title="Claude effort flag support was not detected; Luma uses CLAUDE_CODE_EFFORT_LEVEL. Check model discovery for CLI errors.">
                 env fallback
               </span>
             ) : null}
@@ -6074,6 +6397,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             ) : null}
           </div>
 
+          <ModelCatalogNotice runner={props.runner} />
           {props.askMode && props.runner === "cursor" && props.planSessionState === "idle" ? (
             <div className="mb-2 flex items-start justify-between gap-3 rounded-md border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-sm text-foreground/80">
               <span className="min-w-0">Ask mode is on. Cursor will answer in read-only mode without editing files.</span>
@@ -6201,7 +6525,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
             <div className="mb-2 rounded-md border border-card-border bg-surface-1 p-2">
               <div className="mb-1 flex items-center justify-between gap-2">
                 <div className="text-xs font-semibold text-foreground/80">Queued messages ({props.queueItems.length})</div>
-                {selectedSessionBusy ? (
+                {selectedSessionBusy && !props.queueItems[0]?.deliveryError ? (
                   <div className="text-[11px] text-foreground/60">Will send after current run finishes</div>
                 ) : null}
               </div>
@@ -6222,6 +6546,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                           </span>
                         ) : null}
                       </div>
+                      {item.deliveryError ? <div role="alert" className="text-[11px] text-danger-fg">{item.deliveryError}</div> : null}
                       {item.attachments.length > 0 ? (
                         <div className="text-[11px] text-foreground/60">{formatAttachmentSummary(item.attachments)}</div>
                       ) : null}
@@ -6232,6 +6557,11 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
                         <div className="text-[11px] text-foreground/60">{formatAgentSummary(item.agents, props.agentCatalog)}</div>
                       ) : null}
                     </div>
+                    {item.deliveryError ? (
+                      <button type="button" className="rounded px-2 py-1 text-xs text-brand hover:bg-control-hover" onClick={() => props.onRetryQueueItem(item.id)}>
+                        Retry
+                      </button>
+                    ) : null}
                     <button
                       type="button"
                       className="rounded p-1 text-foreground/70 transition hover:bg-black/5 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-control-hover/70"
@@ -6412,13 +6742,13 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 
             <Button
               type="button"
-              disabled={props.submitting || props.isUploadingAttachments}
-              aria-label={selectedSessionBusy ? "Queue message" : "Send message"}
-              title={selectedSessionBusy ? "Queue message" : "Send message"}
+              disabled={!props.prompt.trim() || (!props.selectedSession && props.submitting) || props.isUploadingAttachments || props.voicePhase !== "idle"}
+              aria-label={selectedSessionBusy || (props.selectedSession && props.submitting) ? "Queue message" : "Send message"}
+              title={selectedSessionBusy || (props.selectedSession && props.submitting) ? "Queue message" : "Send message"}
               onClick={props.onSendButtonClick}
               className="h-[44px] w-[44px] shrink-0 rounded-lg p-0"
             >
-              {props.submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              {!props.selectedSession && props.submitting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
             </Button>
           </div>
 
@@ -6454,14 +6784,16 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
               variant="ghost"
               size="sm"
               onClick={props.onToggleVoiceRecording}
-              disabled={!props.voiceSupported}
-              aria-label={props.voiceListening ? "Stop recording" : "Start recording"}
-              title={props.voiceListening ? "Stop recording" : props.voiceError || "Start recording"}
+              disabled={props.voiceSettingsLoading || props.voicePhase === "starting" || props.voicePhase === "transcribing"}
+              aria-label={props.voiceListening ? "Stop recording" : props.voiceNeedsSetup ? "Set up dictation" : "Start recording"}
+              title={props.voiceListening ? "Stop recording" : props.voiceNeedsSetup ? "Set up dictation" : "Start recording"}
             >
-              {props.voiceListening ? <MicOff className="mr-1.5 h-4 w-4" /> : <Mic className="mr-1.5 h-4 w-4" />}
-              {props.voiceListening ? `Stop ${formatRecordingDuration(props.voiceRecordingSeconds)}` : "Record"}
+              {props.voicePhase === "starting" || props.voicePhase === "transcribing" ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : props.voiceListening ? <MicOff className="mr-1.5 h-4 w-4" /> : <Mic className="mr-1.5 h-4 w-4" />}
+              {props.voicePhase === "transcribing" ? "Transcribing…" : props.voicePhase === "starting" ? "Opening microphone…" : props.voiceListening ? `Stop ${formatRecordingDuration(props.voiceRecordingSeconds)}` : props.voiceNeedsSetup ? "Set up dictation" : "Record"}
             </Button>
+            {props.voicePhase !== "idle" ? <Button type="button" variant="ghost" size="sm" onClick={props.onCancelDictation}>Cancel dictation</Button> : null}
           </div>
+          {props.voiceError ? <p role="alert" className="mt-2 text-xs text-danger-fg">{props.voiceError}</p> : null}
           </div>
 
         </form>
@@ -6479,6 +6811,7 @@ type ClaudeRightPanelProps = {
   onChangeWorkspace: (workspace: string) => Promise<void>;
   runner: RunRunner;
   setRunner: (value: RunRunner) => void;
+  unavailableRunners: RunRunner[];
   model: string;
   setModel: (value: string) => void;
   reasoningEffort: ReasoningEffort;
@@ -6513,11 +6846,12 @@ type ClaudeRightPanelProps = {
 };
 
 function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
+  const { modelOptionsForRunner, reasoningEffortOptionsForRunner, modelSupportsEffort, modelLabel, effortForModel } = useModelOptions();
   const activeModelOptions = modelOptionsForRunner(props.runner, props.cursorModels);
   const [useCustomModel, setUseCustomModel] = useState(() => !activeModelOptions.includes(props.model));
   const [terminalHistoryCursor, setTerminalHistoryCursor] = useState<number | null>(null);
   const terminalRunning = props.selectedTerminal?.status === "running";
-  const effortSupported = props.runner !== "cursor" || cursorModelSupportsEffort(props.model, props.cursorModels);
+  const effortSupported = props.runner === "cursor" ? cursorModelSupportsEffort(props.model, props.cursorModels) : modelSupportsEffort(props.runner, props.model);
   const terminalBusy = props.terminalAction === "starting" || props.terminalAction === "stopping";
   const selectedSessionSourceBadge = props.selectedSession ? getSessionSourceBadge(props.selectedSession) : null;
   const activeTabLabel = {
@@ -6529,7 +6863,7 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
     if (!modelOptionsForRunner(props.runner, props.cursorModels).includes(props.model)) {
       setUseCustomModel(true);
     }
-  }, [props.model, props.runner, props.cursorModels]);
+  }, [props.model, props.runner, props.cursorModels, modelOptionsForRunner]);
 
   useEffect(() => {
     if (props.rightPanelTab !== "terminal") return;
@@ -6790,10 +7124,11 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
             </div>
 
             <div className="rounded-md border border-card-border bg-surface-2 p-3">
-              <h3 className="mb-2 text-sm font-semibold">Run defaults</h3>
+              <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-semibold">Run defaults</h3><ModelCatalogRefresh runner={props.runner} /></div>
+              <ModelCatalogNotice runner={props.runner} />
               <div className="space-y-2">
                 <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.runner} onChange={(event) => props.setRunner(event.target.value as RunRunner)}>
-                  {runnerOptions.map((runnerOption) => <option key={runnerOption} value={runnerOption}>{runnerLabel(runnerOption)}</option>)}
+                  {runnerOptions.map((runnerOption) => <option key={runnerOption} value={runnerOption} disabled={props.unavailableRunners.includes(runnerOption)}>{runnerLabel(runnerOption)}</option>)}
                 </select>
                 <select
                   className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none"
@@ -6808,12 +7143,12 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
                     props.setModel(next);
                   }}
                 >
-                  {activeModelOptions.map((modelOption) => <option key={modelOption} value={modelOption}>{modelOption}</option>)}
+                  {activeModelOptions.map((modelOption) => <option key={modelOption} value={modelOption}>{modelLabel(props.runner, modelOption)}</option>)}
                   <option value="__custom__">Custom model...</option>
                 </select>
                 {useCustomModel ? <input className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.model} onChange={(event) => props.setModel(event.target.value)} placeholder="Custom model id" /> : null}
                 <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none disabled:opacity-50" value={props.reasoningEffort} disabled={!effortSupported} onChange={(event) => props.setReasoningEffort(event.target.value as ReasoningEffort)}>
-                  {reasoningEffortOptionsForRunner(props.runner).map((option) => <option key={option} value={option}>{reasoningEffortLabel(option)}</option>)}
+                  <ModelEffortOptions runner={props.runner} model={props.model} value={props.reasoningEffort} />
                 </select>
                 <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.sandbox} onChange={(event) => props.setSandbox(event.target.value as SandboxMode)}>
                   {sandboxOptions.map((option) => <option key={option} value={option}>{option}</option>)}
@@ -6907,6 +7242,7 @@ function executionStatusClass(status: AgentScheduleExecution["status"]): string 
 
 function deploymentLabel(): "Local" | "Deployed" {
   if (typeof window === "undefined") return "Local";
+  if (isDesktopLocal) return "Local";
   const hostname = window.location.hostname.toLowerCase();
   return hostname === "localhost" || hostname === "0.0.0.0" || hostname === "::1" || hostname.startsWith("127.")
     ? "Local"
@@ -6920,6 +7256,7 @@ function backendConnectionClass(status: BackendConnectionStatus): string {
 }
 
 function AgentsPanel(props: AgentsPanelProps): JSX.Element {
+  const { modelOptionsForRunner, reasoningEffortOptionsForRunner, modelSupportsEffort, modelLabel, effortForModel } = useModelOptions();
   const selectedAgent = props.agents.find((agent) => agent.id === props.selectedAgentId) || null;
   const selectedSkillRefs = props.selectedSkills.map(selectedSkillRef);
   const syncConflictCount = props.skillSyncResult?.conflicts.length || 0;
@@ -6928,7 +7265,6 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
   const visibleExecutions = props.executions.slice(0, visibleExecutionCount);
   const hasHiddenExecutions = visibleExecutionCount < props.executions.length;
   const createModelOptions = modelOptionsForRunner(props.scheduleRunner, props.cursorModels);
-  const createEffortOptions = reasoningEffortOptionsForRunner(props.scheduleRunner);
   const createModelChoices = createModelOptions.includes(props.scheduleModel)
     ? createModelOptions
     : [props.scheduleModel, ...createModelOptions];
@@ -6937,9 +7273,6 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
     setVisibleExecutionCount(sidebarListPageSize);
   }, [props.executions.length]);
 
-  const createEffortValue = createEffortOptions.includes(props.scheduleEffort)
-    ? props.scheduleEffort
-    : "high";
 
   return (
     <div className={cn(props.compact ? "space-y-2" : "space-y-3")}>
@@ -6949,6 +7282,7 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
             <Bot className="h-4 w-4" />
             Agent schedule
           </h3>
+          <ModelCatalogRefresh runner={props.scheduleRunner} compact />
           <Button size="sm" variant="ghost" onClick={() => void props.onReload()} disabled={props.loading}>
             {props.loading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
           </Button>
@@ -7000,11 +7334,11 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
               <select
                 className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
                 value={props.scheduleModel}
-                onChange={(event) => props.setScheduleModel(event.target.value)}
+                onChange={(event) => { props.setScheduleModel(event.target.value); props.setScheduleEffort(effortForModel(props.scheduleRunner, event.target.value, props.scheduleEffort)); }}
               >
                 {createModelChoices.map((modelOption) => (
                   <option key={modelOption} value={modelOption}>
-                    {modelOption}
+                    {modelLabel(props.scheduleRunner, modelOption)}
                   </option>
                 ))}
               </select>
@@ -7013,14 +7347,11 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
               <label className="mb-1 block text-xs font-semibold text-foreground/75">Reasoning effort</label>
               <select
                 className="h-10 w-full rounded-xl border border-card-border bg-surface-1 px-3 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
-                value={createEffortValue}
+                value={props.scheduleEffort}
+                disabled={!modelSupportsEffort(props.scheduleRunner, props.scheduleModel)}
                 onChange={(event) => props.setScheduleEffort(event.target.value as ReasoningEffort)}
               >
-                {createEffortOptions.map((option) => (
-                  <option key={option} value={option}>
-                    {reasoningEffortLabel(option)}
-                  </option>
-                ))}
+                <ModelEffortOptions runner={props.scheduleRunner} model={props.scheduleModel} value={props.scheduleEffort} />
               </select>
             </div>
           </div>
@@ -7072,7 +7403,6 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
           {props.schedules.map((schedule) => {
             const scheduleRunner = normalizeRunRunnerValue(schedule.runConfig.runner);
             const scheduleModelOptions = modelOptionsForRunner(scheduleRunner, props.cursorModels);
-            const scheduleEffortOptions = reasoningEffortOptionsForRunner(scheduleRunner);
             const scheduleModelChoices = scheduleModelOptions.includes(schedule.runConfig.model)
               ? scheduleModelOptions
               : [schedule.runConfig.model, ...scheduleModelOptions];
@@ -7099,29 +7429,23 @@ function AgentsPanel(props: AgentsPanelProps): JSX.Element {
                     className="h-9 w-full rounded-lg border border-card-border bg-surface-1 px-2 text-xs outline-none focus:border-brand"
                     value={schedule.runConfig.model}
                     disabled={busy}
-                    onChange={(event) => void props.onUpdateScheduleConfig(schedule, { model: event.target.value })}
+                    onChange={(event) => void props.onUpdateScheduleConfig(schedule, { model: event.target.value, reasoningEffort: effortForModel(scheduleRunner, event.target.value, schedule.runConfig.reasoningEffort) })}
                     aria-label={`${schedule.agentName} model`}
                   >
                     {scheduleModelChoices.map((modelOption) => (
                       <option key={modelOption} value={modelOption}>
-                        {modelOption}
+                        {modelLabel(scheduleRunner, modelOption)}
                       </option>
                     ))}
                   </select>
                   <select
                     className="h-9 w-full rounded-lg border border-card-border bg-surface-1 px-2 text-xs outline-none focus:border-brand"
-                    value={scheduleEffortOptions.includes(schedule.runConfig.reasoningEffort)
-                      ? schedule.runConfig.reasoningEffort
-                      : "high"}
-                    disabled={busy}
+                    value={schedule.runConfig.reasoningEffort}
+                    disabled={busy || !modelSupportsEffort(scheduleRunner, schedule.runConfig.model)}
                     onChange={(event) => void props.onUpdateScheduleConfig(schedule, { reasoningEffort: event.target.value as ReasoningEffort })}
                     aria-label={`${schedule.agentName} reasoning effort`}
                   >
-                    {scheduleEffortOptions.map((option) => (
-                      <option key={option} value={option}>
-                        {reasoningEffortLabel(option)}
-                      </option>
-                    ))}
+                    <ModelEffortOptions runner={scheduleRunner} model={schedule.runConfig.model} value={schedule.runConfig.reasoningEffort} />
                   </select>
                 </div>
                 <div className="mt-2 grid grid-cols-3 gap-1">

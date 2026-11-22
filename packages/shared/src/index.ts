@@ -1,4 +1,6 @@
 import { z } from "zod";
+export * from "./projects.js";
+export * from "./remote.js";
 
 export const runStatusSchema = z.enum(["queued", "running", "completed", "failed", "stopped"]);
 export type RunStatus = z.infer<typeof runStatusSchema>;
@@ -18,7 +20,7 @@ export type RunRunner = z.infer<typeof runRunnerSchema>;
 export const cursorAgentModeSchema = z.enum(["agent", "plan", "ask"]);
 export type CursorAgentMode = z.infer<typeof cursorAgentModeSchema>;
 
-export const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
+export const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max", "ultra"]);
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
 
 export const attachmentKindSchema = z.enum(["image", "text", "file"]);
@@ -101,6 +103,7 @@ export const agentScheduleSchema = z.object({
   updatedAt: z.number().int().nonnegative(),
   lastRunAt: z.number().int().nonnegative().nullable(),
   runConfig: z.object({
+    projectId: z.string().min(1).nullable().optional(),
     runner: runRunnerSchema.default("codex"),
     workspace: z.string().min(1),
     model: z.string().min(1),
@@ -130,6 +133,7 @@ export const agentScheduleExecutionSchema = z.object({
 export type AgentScheduleExecution = z.infer<typeof agentScheduleExecutionSchema>;
 
 export const createAgentScheduleSchema = z.object({
+  projectId: z.string().min(1).nullable().optional(),
   agentId: z.string().min(1),
   hour: z.number().int().min(0).max(23),
   minute: z.number().int().min(0).max(59),
@@ -185,6 +189,8 @@ export type AgentListResponse = {
 };
 
 export const runConfigSchema = z.object({
+  projectId: z.string().min(1).nullable().optional(),
+  memorySessionId: z.string().optional(),
   runner: runRunnerSchema.default("codex"),
   workspace: z.string().min(1),
   prompt: z.string().min(1),
@@ -202,6 +208,7 @@ export const runConfigSchema = z.object({
 export type RunConfig = z.infer<typeof runConfigSchema>;
 
 export const startRunSchema = z.object({
+  projectId: z.string().min(1).nullable().optional(),
   runner: runRunnerSchema.default("codex"),
   prompt: z.string().min(1),
   workspace: z.string().min(1),
@@ -219,6 +226,7 @@ export const startRunSchema = z.object({
 export type StartRunInput = z.infer<typeof startRunSchema>;
 
 export const sendMessageSchema = z.object({
+  projectId: z.string().min(1).nullable().optional(),
   clientMessageId: z.string().min(1),
   sessionId: z.string().optional(),
   text: z.string().min(1),
@@ -331,6 +339,7 @@ export type SessionTranscriptResponse = {
 };
 
 export type RunListItem = {
+  projectId?: string | null;
   id: string;
   name: string;
   status: RunStatus;
@@ -393,6 +402,7 @@ export type RunMessagesResponse = {
 };
 
 export type SessionListItem = {
+  projectId?: string | null;
   id: string;
   title: string;
   status: RunStatus;
@@ -480,6 +490,27 @@ export type CursorModelInfo = {
   supportsEffort?: boolean;
 };
 
+export type RunnerModelInfo = {
+  id: string;
+  displayName: string;
+  resolvedModel?: string;
+  supportedEfforts?: ReasoningEffort[];
+  defaultEffort?: ReasoningEffort;
+  supportsEffort?: boolean;
+};
+
+export type RunnerModelCatalog = {
+  models: RunnerModelInfo[];
+  source: "live" | "cache" | "fallback";
+  updatedAt: number | null;
+  checkedAt: number | null;
+  refreshing: boolean;
+  error: string | null;
+  cliVersion: string | null;
+};
+
+export type RunnerModelCatalogs = Record<"codex" | "claude", RunnerModelCatalog>;
+
 export type AppBootstrap = {
   defaults: {
     runner: RunRunner;
@@ -488,6 +519,7 @@ export type AppBootstrap = {
     claudeModel: string;
     cursorModel: string;
     claudeEffortFlagSupported: boolean;
+    claudeAvailable?: boolean;
     cursorAvailable: boolean;
     cursorModels: CursorModelInfo[];
     reasoningEffort: ReasoningEffort;
@@ -507,6 +539,7 @@ export type AppBootstrapLite = {
     claudeModel: string;
     cursorModel: string;
     claudeEffortFlagSupported: boolean;
+    claudeAvailable?: boolean;
     cursorAvailable: boolean;
     cursorModels: CursorModelInfo[];
     reasoningEffort: ReasoningEffort;
@@ -564,6 +597,8 @@ export type ApiResponse<T> =
     };
 
 export const sseEventKinds = [
+  "project.updated",
+  "memory.updated",
   "run.started",
   "run.stdout",
   "run.stderr",

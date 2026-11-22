@@ -1,0 +1,21 @@
+{
+  "name": "@luma/desktop",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Luma Desktop for macOS",
+  "main": "src/main.cjs",
+  "lumaRuntimeDependencies": {
+    "better-sqlite3": "13.2.0",
+    "node-pty": "1.1.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "start": "node scripts/start.cjs",
+    "package": "node scripts/build.cjs --package",
+    "test": "npm run build -w @luma/shared && npm run build -w @luma/server && node --test test/*.test.cjs"
+  },
+  "devDependencies": {
+    "electron": "45.4.1",
+    "electron-builder": "26.18.1"
+  }
+}

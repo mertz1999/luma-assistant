@@ -24,6 +24,7 @@ import type {
   CreateAgentScheduleInput,
   UpdateAgentScheduleInput,
   TerminalSessionSnapshot,
+  RunnerModelCatalogs,
 } from "@luma/shared";
 
 type ApiResponse<T> =
@@ -41,20 +42,18 @@ function emitUnauthorized(): void {
   window.dispatchEvent(new CustomEvent("luma:unauthorized"));
 }
 
-async function request<T>(url: string, init?: RequestInit): Promise<T> {
+export async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
+  const sentToken = authToken;
   if (!headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  if (authToken) {
-    headers.set("Authorization", `Bearer ${authToken}`);
+  if (sentToken && url !== "/api/auth/login") {
+    headers.set("Authorization", `Bearer ${sentToken}`);
   }
 
   const response = await fetch(url, { ...init, headers });
-  if (response.status === 401) {
-    emitUnauthorized();
-    throw new Error("Unauthorized");
-  }
+  if (response.status === 401 && sentToken && sentToken === authToken && url !== "/api/auth/login") emitUnauthorized();
 
   const payload = (await response.json()) as ApiResponse<T>;
   if (!payload.ok) {
@@ -90,11 +89,19 @@ export async function fetchAttachmentBlob(attachment: AttachmentRef, workspace: 
   return response.blob();
 }
 
-export function loginWithPassword(password: string): Promise<{ token: string; expiresAt: number; expiresInSeconds: number }> {
+export function loginWithPassword(password: string): Promise<{ token: string; expiresAt: number; expiresInSeconds: number; idleTimeoutMs?: number }> {
   return request("/api/auth/login", {
     method: "POST",
     body: JSON.stringify({ password }),
   });
+}
+
+export function recordCloudActivity(signal: AbortSignal): Promise<{ expiresAt: number }> {
+  return request("/api/auth/activity", { method: "POST", signal });
+}
+
+export function revokeCloudSession(): Promise<{ signedOut: boolean }> {
+  return request("/api/auth/logout", { method: "POST", keepalive: true });
 }
 
 export function getBootstrap(): Promise<AppBootstrap> {
@@ -103,6 +110,12 @@ export function getBootstrap(): Promise<AppBootstrap> {
 
 export function getBootstrapLite(): Promise<AppBootstrapLite> {
   return request<AppBootstrapLite>("/api/bootstrap-lite");
+}
+
+export function getModelCatalogs(refreshRunner?: "codex" | "claude"): Promise<RunnerModelCatalogs> {
+  return refreshRunner
+    ? request("/api/models/refresh", { method: "POST", body: JSON.stringify({ runner: refreshRunner }) })
+    : request("/api/models");
 }
 
 export function getCursorModels(): Promise<{
@@ -326,6 +339,8 @@ export function connectEvents(onEvent: (evt: SseEvent) => void): EventSource {
   const query = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
   const es = new EventSource(`/api/events${query}`);
   const names = [
+    "project.updated",
+    "memory.updated",
     "run.started",
     "run.stdout",
     "run.stderr",

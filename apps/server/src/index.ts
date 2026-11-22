@@ -1,8 +1,14 @@
 import fs from "node:fs";
+import { ProjectStore, ProjectError } from "./project-store.js";
+import { createProjectRouter, projectApiError } from "./project-api.js";
+import { MemoryRuntime } from "./memory-runtime.js";
+import { codexMemoryArgs, claudeMemoryConfig, ensureCursorMemoryConfig, scopedRunnerEnvironment } from "./runner-memory.js";
+import { desktopMode, desktopWorkspaces, assertDesktopWorkspace, assertDesktopFile, desktopCommand, desktopProbeCommand, desktopRunnerEnvironment, inside } from "./desktop-policy.js";
 import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import cors from "cors";
@@ -11,12 +17,18 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import type { IPty } from "node-pty";
 import { openMessageDatabase, type MessageDatabase } from "./message-db.js";
+import { ModelCatalogService } from "./model-catalog.js";
+import { CloudSessions } from "./cloud-sessions.js";
+import { RemoteRelay } from "./remote-relay.js";
+import { createSpeechRouter } from "./speech.js";
+import { CodexCommandLoop, codexExitStatus, codexInterruptedMessage, codexLoopStopMessage } from "./codex-run.js";
 import { createSessionTelegramBridge, isSessionTelegramBridgeConfigured } from "./session-telegram-bridge.js";
 import {
   approvalPolicySchema,
   attachmentRefSchema,
   createAgentScheduleSchema,
   rerunSchema,
+  remoteCommandSchema,
   sendMessageSchema,
   setWorkspaceSchema,
   startRunSchema,
@@ -68,23 +80,27 @@ import {
   type WorkspaceOption,
 } from "@luma/shared";
 
-const rootDir = path.resolve(process.env.INIT_CWD || process.cwd());
-dotenv.config({ path: path.resolve(rootDir, ".env") });
+const rootDir = path.resolve(process.env.LUMA_ROOT_DIR || process.env.INIT_CWD || process.cwd());
+if (!desktopMode) dotenv.config({ path: path.resolve(rootDir, ".env") });
+const dataDir = path.resolve(process.env.LUMA_DATA_DIR || path.join(rootDir, "data"));
 const require = createRequire(import.meta.url);
+const projectStore = new ProjectStore(path.join(dataDir, "projects.sqlite"));
+const memoryRuntime = new MemoryRuntime(projectStore);
+const RUNNER_MCP_DIR = path.join(dataDir, "private-mcp");
 
-const APP_STATE_PATH = path.resolve(rootDir, "data/ui-state.json");
-const RUNS_PATH = path.resolve(rootDir, "data/runs.json");
-const RUN_EVENTS_DIR = path.resolve(rootDir, "data/runs");
+const APP_STATE_PATH = path.resolve(dataDir, "ui-state.json");
+const RUNS_PATH = path.resolve(dataDir, "runs.json");
+const RUN_EVENTS_DIR = path.resolve(dataDir, "runs");
 const AGENTS_DIR = path.resolve(rootDir, "agents");
 const CLAUDE_BYPASS_AS_ROOT = process.env.CLAUDE_BYPASS_AS_ROOT === "1";
 const REPO_SKILLS_DIR = path.resolve(rootDir, "skills");
-const AGENT_SCHEDULES_PATH = path.resolve(rootDir, "data/agent-schedules.json");
-const SESSION_INDEX_PATH = path.resolve(rootDir, "data/session-index.json");
-const MESSAGE_STORE_META_PATH = path.resolve(rootDir, "data/message-store-meta.json");
-const MESSAGE_OUTBOX_PATH = path.resolve(rootDir, "data/message-outbox.json");
-const MESSAGE_LOG_DIR = path.resolve(rootDir, "data/messages");
-const MESSAGE_DB_PATH = path.resolve(rootDir, "data/messages.sqlite");
-const SESSION_IMAGE_DIR = path.resolve(rootDir, "data/session-images");
+const AGENT_SCHEDULES_PATH = path.resolve(dataDir, "agent-schedules.json");
+const SESSION_INDEX_PATH = path.resolve(dataDir, "session-index.json");
+const MESSAGE_STORE_META_PATH = path.resolve(dataDir, "message-store-meta.json");
+const MESSAGE_OUTBOX_PATH = path.resolve(dataDir, "message-outbox.json");
+const MESSAGE_LOG_DIR = path.resolve(dataDir, "messages");
+const MESSAGE_DB_PATH = path.resolve(dataDir, "messages.sqlite");
+const SESSION_IMAGE_DIR = path.resolve(dataDir, "session-images");
 
 const API_PORT = Number(process.env.API_PORT || 9001);
 const WEB_PORT = Number(process.env.WEB_PORT || 5175);
@@ -131,6 +147,9 @@ const AUTH_PASSWORD = process.env.PASSWORD || process.env.APP_PASSWORD || "";
 const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
 const AUTH_TOKEN_TTL_SECONDS = Number(process.env.AUTH_TOKEN_TTL_SECONDS || 24 * 60 * 60);
 const JWT_SECRET = process.env.JWT_SECRET || AUTH_PASSWORD || "luma-assistant-default-jwt-secret";
+const cloudSessions = AUTH_ENABLED && !desktopMode
+  ? new CloudSessions(path.join(dataDir, "cloud-sessions.sqlite"), JWT_SECRET)
+  : null;
 const PLAN_MODE_FILE_PATH = path.resolve(rootDir, "plan.md");
 const ATTACHMENT_STAGING_DIR = path.join(".agentic", "attachments");
 const ATTACHMENT_MAX_BYTES = Number(process.env.ATTACHMENT_MAX_BYTES || 100 * 1024 * 1024);
@@ -275,6 +294,10 @@ type CodexActiveRun = {
   process: ChildProcess;
   stdoutBuffer: string;
   stopRequested: boolean;
+  stopMessage?: string;
+  turn?: "completed" | "failed" | "interrupted";
+  cliError?: string;
+  commands?: CodexCommandLoop;
 };
 
 type ClaudeActiveRun = {
@@ -339,6 +362,7 @@ type SessionState = {
 type OutboxStatus = "pending" | "processing" | "failed";
 
 type MessageOutboxItem = {
+  projectId?: string | null;
   id: string;
   sessionId: string;
   provisionalSession: boolean;
@@ -436,7 +460,7 @@ function normalizeDefaultRunner(input: unknown): RunRunner {
 }
 
 function normalizeReasoningEffort(input: unknown): ReasoningEffort {
-  return input === "low" || input === "medium" || input === "high" || input === "xhigh" || input === "max"
+  return input === "low" || input === "medium" || input === "high" || input === "xhigh" || input === "max" || input === "ultra"
     ? input
     : "high";
 }
@@ -675,6 +699,7 @@ function createStoredAttachmentRelativePath(workspace: string, attachmentId: str
 
 function resolveStoredAttachmentPath(workspace: string, relativePath: string): string {
   const absolutePath = path.resolve(workspace, relativePath);
+  assertDesktopFile(workspace, absolutePath);
   if (!ensurePathInsideWorkspace(workspace, absolutePath)) {
     throw new Error(`Attachment path is outside the workspace: ${relativePath}`);
   }
@@ -693,7 +718,7 @@ function createStoredSessionImageRelativePath(attachmentId: string, name: string
 }
 
 function resolveStoredSessionImagePath(relativePath: string): string {
-  const absolutePath = path.resolve(rootDir, "data", relativePath);
+  const absolutePath = path.resolve(dataDir, relativePath);
   const relative = path.relative(SESSION_IMAGE_DIR, absolutePath);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     throw new Error("Image path is outside Luma image storage.");
@@ -868,13 +893,18 @@ function parseSkillMetadata(content: string, skillPath: string): { name: string;
 
 function getSkillRoots(workspace: string): Array<{ root: string; source: string; scope: string }> {
   return [
+    ...(!desktopMode ? [
     { root: path.join(os.homedir(), ".codex", "skills"), source: "codex", scope: "user" },
     { root: path.join(os.homedir(), ".claude", "skills"), source: "claude", scope: "user" },
     { root: path.join(os.homedir(), ".cursor", "skills-cursor"), source: "cursor", scope: "user" },
+    ] : []),
     { root: path.join(workspace, ".codex", "skills"), source: "codex repo", scope: "repo" },
     { root: path.join(workspace, ".claude", "skills"), source: "claude repo", scope: "repo" },
     { root: path.join(workspace, ".cursor", "skills"), source: "cursor repo", scope: "repo" },
-  ];
+  ].filter(root => {
+    if (!desktopMode) return true;
+    try { assertDesktopFile(workspace, root.root); return true; } catch { return false; }
+  });
 }
 
 function scanSkillRoot(root: string, source: string, scope: string, seenPaths: Set<string>, seenDirs: Set<string>): SkillListItem[] {
@@ -1162,6 +1192,7 @@ function syncRepoSkills(): SkillSyncResult {
     conflicts: [],
     errors: [],
   };
+  if (desktopMode) return result;
   const targets = [
     { root: path.join(os.homedir(), ".codex", "skills"), label: "codex" },
     { root: path.join(os.homedir(), ".claude", "skills"), label: "claude" },
@@ -1390,6 +1421,20 @@ function cursorCliAvailable(): boolean {
   return commandExists(executable);
 }
 
+function claudeCliAvailable(): boolean {
+  const executable = CLAUDE_CODE_EXECUTABLE || "claude";
+  return executable.includes(path.sep) ? fs.existsSync(executable) : commandExists(executable);
+}
+
+function assertDesktopRunnerAvailable(runner: RunRunner): void {
+  if (runner === "claude" && !claudeCliAvailable()) {
+    throw new Error("Install Claude Code on this Mac and reopen Luma Desktop.");
+  }
+  if (runner === "cursor" && !cursorCliAvailable()) {
+    throw new Error("Install Cursor Agent CLI on this Mac and reopen Luma Desktop.");
+  }
+}
+
 function mapCursorSandbox(sandbox: RunConfig["sandbox"]): "enabled" | "disabled" {
   return sandbox === "danger-full-access" ? "disabled" : "enabled";
 }
@@ -1430,6 +1475,7 @@ function resolveCursorModelArg(model: string, effort: ReasoningEffort, catalog?:
 }
 
 function buildCursorEnvironment(): NodeJS.ProcessEnv {
+  if (desktopMode) return desktopRunnerEnvironment("cursor");
   const env: NodeJS.ProcessEnv = { ...process.env };
   const localBin = path.join(os.homedir(), ".local/bin");
   const pathParts = String(env.PATH || "")
@@ -1455,7 +1501,10 @@ function listCursorModelsFromCli(): CursorModelInfo[] {
   });
   const output = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
   if (result.status !== 0 || !output) return [...DEFAULT_CURSOR_MODELS];
+  return parseCursorModelList(output);
+}
 
+function parseCursorModelList(output: string): CursorModelInfo[] {
   const models: CursorModelInfo[] = [];
   const seen = new Set<string>();
   for (const line of output.split(/\r?\n/)) {
@@ -1493,7 +1542,28 @@ function listCursorModelsFromCli(): CursorModelInfo[] {
 }
 
 let cachedCursorModels: { at: number; models: CursorModelInfo[] } | null = null;
+let pendingDesktopCursorModels: Promise<CursorModelInfo[]> | null = null;
+function refreshDesktopCursorModels(): Promise<CursorModelInfo[]> {
+  if (pendingDesktopCursorModels) return pendingDesktopCursorModels;
+  if (!cursorCliAvailable()) return Promise.resolve([...DEFAULT_CURSOR_MODELS]);
+  pendingDesktopCursorModels = (async () => {
+    try {
+      const command = desktopProbeCommand("cursor", CURSOR_EXECUTABLE, cursorCliArgs(["--list-models"]));
+      const { stdout } = await promisify(execFile)(command.executable, command.args, {
+        cwd: command.cwd, env: buildCursorEnvironment(), timeout: 20_000, maxBuffer: 1024 * 1024,
+      });
+      const models = parseCursorModelList(stdout);
+      cachedCursorModels = { at: Date.now(), models };
+      return models;
+    } catch {
+      return cachedCursorModels?.models || [...DEFAULT_CURSOR_MODELS];
+    }
+  })().finally(() => { pendingDesktopCursorModels = null; });
+  return pendingDesktopCursorModels;
+}
+
 function getCursorModels(force = false): CursorModelInfo[] {
+  if (desktopMode) return cachedCursorModels?.models || [...DEFAULT_CURSOR_MODELS];
   const now = Date.now();
   if (!force && cachedCursorModels && now - cachedCursorModels.at < 5 * 60_000) {
     return cachedCursorModels.models;
@@ -1503,21 +1573,26 @@ function getCursorModels(force = false): CursorModelInfo[] {
   return models;
 }
 
-const claudeEffortSupportCache = new Map<string, boolean>();
+const claudeEffortSupportCache = new Map<string, { supported: boolean; at: number }>();
 
 function claudeCliSupportsEffort(executable: string): boolean {
   const command = executable || "claude";
   const cached = claudeEffortSupportCache.get(command);
-  if (cached !== undefined) return cached;
+  if (cached && Date.now() - cached.at < 5 * 60_000) return cached.supported;
 
-  const result = spawnSync(command, ["-p", "--help"], { encoding: "utf8", timeout: 5000 });
+  const args = ["-p", "--help"];
+  const probe = desktopMode ? desktopProbeCommand("claude", command, args) : { executable: command, args, cwd: rootDir };
+  const result = spawnSync(probe.executable, probe.args, { cwd: probe.cwd, env: buildClaudeEnvironment(), encoding: "utf8", timeout: 5000 });
   const output = `${result.stdout || ""}\n${result.stderr || ""}`;
   const supported = !result.error && output.includes("--effort");
-  claudeEffortSupportCache.set(command, supported);
+  // A missing executable, permission error, or timeout is not evidence of an old CLI.
+  // Retry these failures instead of caching them for the lifetime of the server.
+  if (!result.error && result.status === 0) claudeEffortSupportCache.set(command, { supported, at: Date.now() });
   return supported;
 }
 
 function buildClaudeEnvironment(): Record<string, string | undefined> {
+  if (desktopMode) return desktopRunnerEnvironment("claude");
   const env: Record<string, string | undefined> = { ...process.env };
 
   if (CLAUDE_AUTH_MODE === "oauth") {
@@ -1530,6 +1605,19 @@ function buildClaudeEnvironment(): Record<string, string | undefined> {
   env.CLAUDE_AGENT_SDK_CLIENT_APP = process.env.CLAUDE_AGENT_SDK_CLIENT_APP || "luma-assistant";
   return env;
 }
+
+const modelCatalogService = new ModelCatalogService({
+  cachePath: path.resolve(dataDir, "model-catalog.json"),
+  cwd: rootDir,
+  codex: {
+    executable: CODEX_PATH, defaultModel: DEFAULT_CODEX_MODEL, env: desktopRunnerEnvironment,
+    command: desktopMode ? (args) => desktopProbeCommand("codex", CODEX_PATH, args) : undefined,
+  },
+  claude: {
+    executable: CLAUDE_CODE_EXECUTABLE || "claude", defaultModel: DEFAULT_CLAUDE_MODEL, env: buildClaudeEnvironment,
+    command: desktopMode ? (args) => desktopProbeCommand("claude", CLAUDE_CODE_EXECUTABLE || "claude", args) : undefined,
+  },
+});
 
 function getChildPids(pid: number): number[] {
   const result = spawnSync("pgrep", ["-P", String(pid)], { encoding: "utf8" });
@@ -1580,10 +1668,17 @@ class RunManager extends EventEmitter {
     const now = Date.now();
     const staleRunIds = new Set<string>();
     let healedBenignFailures = 0;
+    let correctedIncompleteRuns = 0;
     for (const run of runs) {
       const staleActiveRun = run.status === "queued" || run.status === "running";
       if (staleActiveRun) staleRunIds.add(run.id);
-      const restartMessage = "Server restarted before this run completed. Marked as failed because no live Codex process is attached.";
+      const localCodex = desktopMode && normalizeRunRunner(run.config?.runner) === "codex";
+      const recoveredStatus = localCodex
+        ? staleActiveRun ? "stopped" : recoverIncompleteCodexRun(run)
+        : null;
+      if (recoveredStatus && !staleActiveRun) correctedIncompleteRuns += 1;
+      const restartMessage = localCodex ? "Luma Desktop restarted before Codex finished the turn."
+        : "Server restarted before this run completed. Marked as failed because no live process is attached.";
       if (staleActiveRun) {
         appendRunEventToDisk(run.id, {
           id: `evt_${now}_${Math.random().toString(36).slice(2, 8)}`,
@@ -1596,7 +1691,7 @@ class RunManager extends EventEmitter {
       if (healedFromSkillsWarning) healedBenignFailures += 1;
       this.runs.set(run.id, {
         ...run,
-        status: staleActiveRun ? "failed" : healedFromSkillsWarning ? "completed" : run.status,
+        status: recoveredStatus ?? (staleActiveRun ? "failed" : healedFromSkillsWarning ? "completed" : run.status),
         updatedAt: staleActiveRun ? now : run.updatedAt,
         config: {
           ...run.config,
@@ -1610,6 +1705,8 @@ class RunManager extends EventEmitter {
         events: [],
         lastError: staleActiveRun
           ? restartMessage
+          : recoveredStatus === "stopped" ? codexInterruptedMessage
+          : recoveredStatus === "failed" ? "Codex reported a failed turn."
           : healedFromSkillsWarning
             ? null
             : run.lastError,
@@ -1625,7 +1722,7 @@ class RunManager extends EventEmitter {
       if (staleRunIds.has(item.runId)) continue;
       this.approvals.set(item.id, item);
     }
-    if (staleRunIds.size > 0 || healedBenignFailures > 0) this.persistState();
+    if (staleRunIds.size > 0 || healedBenignFailures > 0 || correctedIncompleteRuns > 0) this.persistState();
     if (healedBenignFailures > 0) {
       // eslint-disable-next-line no-console
       console.log(`[luma-assistant/server] healed ${healedBenignFailures} runs falsely failed by skills budget warning`);
@@ -1726,6 +1823,17 @@ class RunManager extends EventEmitter {
     }
 
     const effectiveConfig = resolveEffectiveRunConfig(config);
+    const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const binding = (effectiveConfig.memorySessionId ? projectStore.session(effectiveConfig.memorySessionId) : null) || projectStore.ensureSession(effectiveConfig.sessionId || runId, effectiveConfig.projectId);
+    effectiveConfig.projectId = binding.projectId;
+    effectiveConfig.memorySessionId = binding.id;
+    projectStore.attachAlias(binding.id, runId);
+    if (desktopMode && effectiveConfig.sessionId) {
+      const previous = this.getSessionRuns(effectiveConfig.sessionId)[0];
+      if (previous && assertDesktopWorkspace(previous.config.workspace) !== assertDesktopWorkspace(effectiveConfig.workspace)) {
+        throw new Error("This session belongs to a different folder. Start a new session to change folders.");
+      }
+    }
     const resolvedAttachments = resolveRunAttachments(effectiveConfig);
     const resolvedSkills = resolveSelectedSkills(effectiveConfig.workspace, effectiveConfig.skills);
     const resolvedAgents = resolveSelectedAgents(effectiveConfig.agents);
@@ -1740,14 +1848,16 @@ class RunManager extends EventEmitter {
       : promptBase;
     const promptWithAgents = buildAgentBackedPrompt(promptWithPlan, resolvedAgents);
     const promptWithSkills = buildSkillBackedPrompt(promptWithAgents, resolvedSkills);
+    const projectContext = binding.projectId ? projectStore.context(runId, binding.id, binding.projectId, effectiveConfig.prompt).prompt : "";
+    const contextualPrompt = projectContext ? `${projectContext}\n\nCurrent user request:\n${promptWithSkills}` : promptWithSkills;
     const prompt = effectiveConfig.runner === "cursor"
-      ? buildCursorRuntimePrompt(promptWithSkills)
-      : promptWithSkills;
+      ? buildCursorRuntimePrompt(contextualPrompt)
+      : desktopMode && effectiveConfig.runner === "codex"
+        ? `${contextualPrompt}\n\nReuse prior check results while the underlying state is unchanged. If progress is blocked, report what you verified and what is blocking the work.`
+        : contextualPrompt;
     const imageArgs = resolvedAttachments
       .filter((attachment) => attachment.ref.kind === "image")
       .flatMap((attachment) => ["-i", attachment.absolutePath]);
-    const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
     const record: RunRecord = {
       id: runId,
       createdAt: Date.now(),
@@ -1764,8 +1874,12 @@ class RunManager extends EventEmitter {
       usage: null,
     };
 
+    if (binding.projectId) {
+      if (!memoryRuntime.url) throw new ProjectError("Project memory service is starting. Retry this message.", 503);
+      memoryRuntime.issue({ runId, sessionId: binding.id, projectId: binding.projectId, writable: !effectiveConfig.planMode && !effectiveConfig.askMode });
+    }
     this.runs.set(runId, record);
-
+    try {
     if (effectiveConfig.runner === "claude") {
       this.startClaudeExecution(runId, effectiveConfig, prompt);
       this.persistState();
@@ -1778,6 +1892,9 @@ class RunManager extends EventEmitter {
       return record;
     }
 
+    // The outer macOS sandbox enforces desktop permissions for the complete process
+    // tree. Avoid asking Codex to install a second, nested Seatbelt sandbox.
+    const codexSandbox = desktopMode ? "danger-full-access" : effectiveConfig.sandbox;
     const args = effectiveConfig.sessionId
       ? [
           "exec",
@@ -1791,7 +1908,7 @@ class RunManager extends EventEmitter {
           "-c",
           `approval_policy=${JSON.stringify(effectiveConfig.approvalPolicy)}`,
           "-c",
-          `sandbox_mode=${JSON.stringify(effectiveConfig.sandbox)}`,
+          `sandbox_mode=${JSON.stringify(codexSandbox)}`,
           ...imageArgs,
           "--",
           effectiveConfig.sessionId,
@@ -1808,7 +1925,7 @@ class RunManager extends EventEmitter {
           "-c",
           `model_reasoning_effort=${JSON.stringify(effectiveConfig.reasoningEffort)}`,
           "-s",
-          effectiveConfig.sandbox,
+          codexSandbox,
           "-c",
           `approval_policy=${JSON.stringify(effectiveConfig.approvalPolicy)}`,
           ...imageArgs,
@@ -1816,15 +1933,21 @@ class RunManager extends EventEmitter {
           prompt,
         ];
 
-    const child = spawn(this.codexPath, args, {
+    if (binding.projectId) args.splice(args.indexOf("--"), 0, ...codexMemoryArgs(memoryRuntime.url));
+    const command = desktopCommand(this.codexPath, args, effectiveConfig.workspace, effectiveConfig.sandbox === "read-only");
+    const child = spawn(command.executable, command.args, {
       cwd: effectiveConfig.workspace,
       stdio: ["ignore", "pipe", "pipe"],
+      env: scopedRunnerEnvironment(desktopRunnerEnvironment(), memoryRuntime.environment(runId)),
     });
     if (!child.stdout || !child.stderr) {
       throw new Error("Failed to initialize codex process streams");
     }
 
-    this.activeRuns.set(runId, { runner: "codex", process: child, stdoutBuffer: "", stopRequested: false });
+    this.activeRuns.set(runId, {
+      runner: "codex", process: child, stdoutBuffer: "", stopRequested: false,
+      commands: desktopMode ? new CodexCommandLoop() : undefined,
+    });
     this.updateRun(runId, { status: "running" });
     this.emitSse({ kind: "run.started", runId, at: Date.now(), payload: { config: effectiveConfig } });
     const startedRun = this.runs.get(runId);
@@ -1832,10 +1955,11 @@ class RunManager extends EventEmitter {
       this.emit("run.lifecycle", { kind: "started", run: startedRun, previous: null } as RunLifecycleEvent);
     }
 
-    child.stdout.on("data", (chunk: Buffer) => {
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
       const active = this.activeRuns.get(runId);
       if (!active || active.runner !== "codex") return;
-      active.stdoutBuffer += chunk.toString("utf8");
+      active.stdoutBuffer += chunk;
       let idx = active.stdoutBuffer.indexOf("\n");
       while (idx >= 0) {
         const line = active.stdoutBuffer.slice(0, idx).trim();
@@ -1853,6 +1977,8 @@ class RunManager extends EventEmitter {
         const rendered = truncateText(`${line}\n`, STORED_EVENT_TEXT_MAX_CHARS);
         this.appendEvent(runId, { source: "stderr", text: rendered });
         this.emitSse({ kind: "run.stderr", runId, at: Date.now(), payload: { text: rendered } });
+        const active = this.activeRuns.get(runId);
+        if (active?.runner === "codex" && !active.cliError && /^\s*error:/i.test(line)) active.cliError = truncateText(line.trim(), 600);
         const currentRun = this.runs.get(runId);
         if (currentRun) {
           this.emit("run.stderrLine", { runId, run: currentRun, text: rendered } as RunStderrEvent);
@@ -1861,47 +1987,50 @@ class RunManager extends EventEmitter {
       }
     });
 
-    child.on("exit", (code) => {
+    child.on("error", (error) => {
       const active = this.activeRuns.get(runId);
-      const stopRequested = Boolean(active?.stopRequested);
-      this.activeRuns.delete(runId);
-
-      const run = this.runs.get(runId);
-      if (!run) return;
-
-      if (stopRequested) {
-        this.updateRun(runId, { status: "stopped" });
-        this.emitSse({ kind: "run.stopped", runId, at: Date.now() });
-        const stoppedRun = this.runs.get(runId);
-        if (stoppedRun) {
-          this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous: run } as RunLifecycleEvent);
-        }
-      } else if (code === 0 && run.status !== "stopped") {
-        // A clean process exit wins over soft mid-stream error items (e.g. skills budget warnings).
-        this.updateRun(runId, {
-          status: "completed",
-          ...(run.lastError && isBenignCodexErrorItemText(run.lastError) ? { lastError: null } : {}),
-        });
-        this.emitSse({ kind: "run.completed", runId, at: Date.now() });
-        const completedRun = this.runs.get(runId);
-        if (completedRun) {
-          this.emit("run.lifecycle", { kind: "completed", run: completedRun, previous: run } as RunLifecycleEvent);
-        }
-      } else if (run.status !== "stopped") {
-        this.updateRun(runId, { status: "failed" });
-        this.emitSse({ kind: "run.failed", runId, at: Date.now(), payload: { code } });
-        const failedRun = this.runs.get(runId);
-        if (failedRun) {
-          this.emit("run.lifecycle", { kind: "failed", run: failedRun, previous: run } as RunLifecycleEvent);
-        }
-      }
-
-      this.releaseCachedEvents(runId);
-      this.persistState();
+      if (active?.runner === "codex") active.cliError = `Could not start Codex: ${error.message}`;
     });
+    child.once("exit", (code, signal) => {
+      // Give the JSON stream time to drain. A detached tool can keep a pipe open.
+      const drain = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        this.finishCodexRun(runId, code, signal);
+      }, 1000).unref();
+      child.once("close", () => clearTimeout(drain));
+    });
+    child.on("close", (code, signal) => this.finishCodexRun(runId, code, signal));
 
     this.persistState();
     return record;
+    } catch (error) {
+      memoryRuntime.revokeRun(runId);
+      fs.rmSync(path.join(RUNNER_MCP_DIR, `${runId}.json`), { force: true });
+      if (!this.activeRuns.has(runId)) this.runs.delete(runId);
+      throw error;
+    }
+  }
+
+  private finishCodexRun(runId: string, code: number | null, signal: NodeJS.Signals | null): void {
+    const active = this.activeRuns.get(runId);
+    if (active?.runner !== "codex") return;
+    const trailing = active.stdoutBuffer.trim();
+    if (trailing) this.handleStdoutLine(runId, trailing);
+    this.activeRuns.delete(runId);
+
+    const previous = this.runs.get(runId);
+    if (!previous) return;
+    const status = codexExitStatus({ turn: active.turn, stopRequested: active.stopRequested, code, signal });
+    const message = status === "stopped" ? active.stopMessage || codexInterruptedMessage
+      : status === "failed" ? active.cliError || "Codex exited before completing the turn." : null;
+    if (message) this.appendEvent(runId, { source: "system", text: message });
+    this.updateRun(runId, { status, lastError: message });
+    this.emitSse({ kind: `run.${status}`, runId, at: Date.now(), payload: { code, signal, message } });
+    const run = this.runs.get(runId);
+    if (run) this.emit("run.lifecycle", { kind: status, run, previous } as RunLifecycleEvent);
+    this.releaseCachedEvents(runId);
+    this.persistState();
   }
 
   private startCursorExecution(runId: string, effectiveConfig: RunConfig, prompt: string): void {
@@ -1918,6 +2047,7 @@ class RunManager extends EventEmitter {
       return;
     }
 
+    if (effectiveConfig.projectId) ensureCursorMemoryConfig();
     const modelArg = resolveCursorModelArg(effectiveConfig.model, effectiveConfig.reasoningEffort, getCursorModels());
     const argsAfterAgent = [
       "-p",
@@ -1930,7 +2060,7 @@ class RunManager extends EventEmitter {
       "--model",
       modelArg,
       "--sandbox",
-      mapCursorSandbox(effectiveConfig.sandbox),
+      desktopMode ? "disabled" : mapCursorSandbox(effectiveConfig.sandbox),
     ];
 
     if (CURSOR_APPROVE_MCPS) argsAfterAgent.push("--approve-mcps");
@@ -1952,11 +2082,11 @@ class RunManager extends EventEmitter {
     }
     argsAfterAgent.push(prompt);
     const args = cursorCliArgs(argsAfterAgent);
-
-    const child = spawn(executable, args, {
+    const command = desktopCommand(executable, args, effectiveConfig.workspace, effectiveConfig.sandbox === "read-only", "cursor");
+    const child = spawn(command.executable, command.args, {
       cwd: effectiveConfig.workspace,
       stdio: ["ignore", "pipe", "pipe"],
-      env: buildCursorEnvironment(),
+      env: scopedRunnerEnvironment(buildCursorEnvironment(), memoryRuntime.environment(runId)),
     });
 
     if (!child.stdout || !child.stderr) {
@@ -2271,7 +2401,7 @@ class RunManager extends EventEmitter {
     const executable = CLAUDE_CODE_EXECUTABLE || "claude";
     const effort = resolveClaudeCliEffort(effectiveConfig.reasoningEffort);
     const supportsEffort = claudeCliSupportsEffort(executable);
-    const env = buildClaudeEnvironment();
+    const env = scopedRunnerEnvironment(buildClaudeEnvironment(), memoryRuntime.environment(runId));
     const permissionMode = effectiveConfig.planMode ? "dontAsk" : "bypassPermissions";
     const args = [
       "-p",
@@ -2294,6 +2424,10 @@ class RunManager extends EventEmitter {
       }
     }
 
+    const memoryConfigFile = effectiveConfig.projectId
+      ? claudeMemoryConfig(RUNNER_MCP_DIR, runId, memoryRuntime.url, memoryRuntime.environment(runId).LUMA_MEMORY_TOKEN!)
+      : undefined;
+    if (memoryConfigFile) args.push("--mcp-config", memoryConfigFile);
     if (supportsEffort) {
       args.push("--effort", effort);
     } else {
@@ -2301,14 +2435,15 @@ class RunManager extends EventEmitter {
     }
 
     if (effectiveConfig.planMode) {
-      args.push("--allowedTools", CLAUDE_PLAN_ALLOWED_TOOLS.join(","));
+      args.push("--allowedTools", [...CLAUDE_PLAN_ALLOWED_TOOLS, ...(effectiveConfig.projectId ? ["mcp__luma-memory__memory_search", "mcp__luma-memory__memory_get", "mcp__luma-memory__memory_history"] : [])].join(","));
       args.push("--disallowedTools", CLAUDE_PLAN_DISALLOWED_TOOLS.join(","));
     }
 
     if (effectiveConfig.sessionId) args.push("--resume", effectiveConfig.sessionId);
+    if (desktopMode) args.push("--settings", '{"sandbox":{"enabled":false}}');
     args.push("--", prompt);
-
-    const child = spawn(executable, args, {
+    const command = desktopCommand(executable, args, effectiveConfig.workspace, effectiveConfig.sandbox === "read-only", "claude", memoryConfigFile);
+    const child = spawn(command.executable, command.args, {
       cwd: effectiveConfig.workspace,
       stdio: ["ignore", "pipe", "pipe"],
       env,
@@ -2667,18 +2802,20 @@ class RunManager extends EventEmitter {
     }
   }
 
-  stopRun(runId: string): boolean {
+  stopRun(runId: string, reason?: string): boolean {
     const active = this.activeRuns.get(runId);
     if (!active) {
       const run = this.runs.get(runId);
       if (run && (run.status === "running" || run.status === "queued")) {
-        this.forceStopRun(runId);
+        this.forceStopRun(runId, reason);
         return true;
       }
       return false;
     }
 
+    if (active.stopRequested) return true;
     active.stopRequested = true;
+    if (active.runner === "codex") active.stopMessage = reason;
     this.killActiveRunProcess(active);
 
     setTimeout(() => {
@@ -2696,7 +2833,7 @@ class RunManager extends EventEmitter {
   }
 
   /** Immediately stop a run and mark it stopped (used by session delete / stuck Cursor). */
-  forceStopRun(runId: string): void {
+  forceStopRun(runId: string, reason?: string): void {
     const active = this.activeRuns.get(runId);
     if (active) {
       active.stopRequested = true;
@@ -2709,8 +2846,9 @@ class RunManager extends EventEmitter {
     if (run.status !== "running" && run.status !== "queued") return;
 
     const previous = run;
-    this.updateRun(runId, { status: "stopped" });
-    this.emitSse({ kind: "run.stopped", runId, at: Date.now() });
+    if (reason) this.appendEvent(runId, { source: "system", text: reason });
+    this.updateRun(runId, { status: "stopped", ...(reason ? { lastError: reason } : {}) });
+    this.emitSse({ kind: "run.stopped", runId, at: Date.now(), payload: { message: reason } });
     const stoppedRun = this.runs.get(runId);
     if (stoppedRun) {
       this.emit("run.lifecycle", { kind: "stopped", run: stoppedRun, previous } as RunLifecycleEvent);
@@ -2842,6 +2980,20 @@ class RunManager extends EventEmitter {
     if (!run) return;
 
     const type = typeof parsed.type === "string" ? parsed.type : "";
+    const running = this.activeRuns.get(runId);
+    const active = running?.runner === "codex" ? running : null;
+    if (active) {
+      if (type === "turn.completed") active.turn = "completed";
+      if (type === "turn.interrupted" || type === "turn.cancelled") active.turn = "interrupted";
+      if (type === "turn.failed") {
+        active.turn = "failed";
+        const error = isRecord(parsed.error) ? parsed.error.message : parsed.message;
+        if (typeof error === "string" && error.trim()) active.cliError = truncateText(error, 600);
+      }
+      if (type === "error" && typeof parsed.message === "string" && !/^Reconnecting\b/i.test(parsed.message)) {
+        active.cliError = truncateText(parsed.message, 600);
+      }
+    }
     if (type === "thread.started" && typeof parsed.thread_id === "string") {
       const patch: Partial<RunRecord> = { threadId: parsed.thread_id };
       if (!run.sessionId) {
@@ -2875,6 +3027,7 @@ class RunManager extends EventEmitter {
 
       if (itemType === "file_change") {
         const changes = Array.isArray(item?.changes) ? item.changes : [];
+        if (type === "item.completed" && changes.length && item?.status !== "failed") active?.commands?.reset();
         const current = new Set(run.changedFiles);
         for (const change of changes) {
           const row = change as Record<string, unknown>;
@@ -2887,15 +3040,17 @@ class RunManager extends EventEmitter {
         const output = typeof item?.aggregated_output === "string" ? item.aggregated_output : "";
         const status = typeof item?.status === "string" ? item.status : "";
         if (status === "failed" && output) {
-          this.updateRun(runId, { lastError: output.slice(0, 600) });
           this.checkApprovalSignal(runId, output, item || null);
+        }
+        if (item && type === "item.completed" && active && !active.turn && !active.stopRequested && active.commands?.record(item)) {
+          this.stopRun(runId, codexLoopStopMessage);
         }
       }
 
       if (itemType === "error") {
         const message = typeof item?.message === "string" ? item.message : "Unknown error";
-        if (!isBenignCodexErrorItemText(message)) {
-          this.updateRun(runId, { lastError: message, status: "failed" });
+        if (active && type === "item.completed" && !isBenignCodexErrorItemText(message)) {
+          active.cliError = truncateText(message, 600);
           this.checkApprovalSignal(runId, message, item || null);
         }
       }
@@ -3123,6 +3278,7 @@ class AgentScheduleManager {
   }
 
   create(input: {
+    projectId?: string | null;
     agentId: string;
     hour: number;
     minute: number;
@@ -3134,6 +3290,7 @@ class AgentScheduleManager {
     reasoningEffort: ReasoningEffort;
     skills: SelectedSkillRef[];
   }): AgentSchedule {
+    if (input.projectId) projectStore.getProject(input.projectId);
     const agent = discoverAgents().find((item) => item.id === input.agentId);
     if (!agent) throw new Error("Agent not found");
 
@@ -3155,6 +3312,7 @@ class AgentScheduleManager {
       updatedAt: now,
       lastRunAt: null,
       runConfig: {
+        projectId: input.projectId,
         runner: normalizeRunRunner(input.runner),
         workspace: input.workspace,
         model: input.model,
@@ -3408,6 +3566,7 @@ class AgentScheduleManager {
 
 class TerminalManager extends EventEmitter {
   private terminals = new Map<string, ActiveTerminal>();
+  private desktopReadOnly = new Map<string, boolean>();
 
   constructor(private readonly getDefaultWorkspace: () => string) {
     super();
@@ -3419,13 +3578,14 @@ class TerminalManager extends EventEmitter {
     return { ...active.session };
   }
 
-  startSession(sessionId: string, workspace: string): TerminalSessionSnapshot {
+  startSession(sessionId: string, workspace: string, readOnly = false): TerminalSessionSnapshot {
     const existing = this.terminals.get(sessionId);
     if (existing?.session.status === "running") {
-      return { ...existing.session };
+      if (!desktopMode || this.desktopReadOnly.get(sessionId) === readOnly) return { ...existing.session };
+      this.removeSession(sessionId);
     }
 
-    const resolvedWorkspace = path.resolve(workspace || this.getDefaultWorkspace());
+    const resolvedWorkspace = assertDesktopWorkspace(path.resolve(workspace || this.getDefaultWorkspace()));
     const shell = resolveTerminalShell();
     const shellName = path.basename(shell).toLowerCase();
     const useShellRc = process.env.TERMINAL_USE_SHELL_RC === "1";
@@ -3440,9 +3600,10 @@ class TerminalManager extends EventEmitter {
       }
     }
 
+    const shellCommand = desktopCommand(shell, shellArgs, resolvedWorkspace, readOnly);
     const usePty = process.env.TERMINAL_DISABLE_PTY !== "1" && nodePty !== null;
     const terminalEnv: NodeJS.ProcessEnv = {
-      ...process.env,
+      ...desktopRunnerEnvironment(),
       TERM: process.env.TERM || "xterm-256color",
       COLORTERM: process.env.COLORTERM || "truecolor",
       PS1: process.env.TERMINAL_PS1 || "$ ",
@@ -3467,7 +3628,7 @@ class TerminalManager extends EventEmitter {
 
     if (usePty && nodePty) {
       try {
-        const pty = nodePty.spawn(shell, shellArgs, {
+        const pty = nodePty.spawn(shellCommand.executable, shellCommand.args, {
           name: process.env.TERM || "xterm-256color",
           cols: Number(process.env.TERMINAL_COLS || 160),
           rows: Number(process.env.TERMINAL_ROWS || 40),
@@ -3483,7 +3644,7 @@ class TerminalManager extends EventEmitter {
 
     if (!active) {
       try {
-        const child = spawn(shell, shellArgs, {
+        const child = spawn(shellCommand.executable, shellCommand.args, {
           cwd: resolvedWorkspace,
           detached: process.platform !== "win32",
           stdio: ["pipe", "pipe", "pipe"],
@@ -3513,6 +3674,7 @@ class TerminalManager extends EventEmitter {
     }
 
     this.terminals.set(sessionId, active);
+    this.desktopReadOnly.set(sessionId, readOnly);
     this.emitSse({
       kind: "terminal.started",
       at: now,
@@ -3522,24 +3684,32 @@ class TerminalManager extends EventEmitter {
 
     if (active.mode === "pty") {
       const pty = active.pty;
+      const isCurrent = () => {
+        const current = this.terminals.get(sessionId);
+        return current?.mode === "pty" && current.pty === pty;
+      };
       pty.onData((chunk: string) => {
-        this.handleOutputChunk(sessionId, "stdout", chunk);
+        if (isCurrent()) this.handleOutputChunk(sessionId, "stdout", chunk);
       });
       pty.onExit((event: { exitCode: number; signal?: number }) => {
-        this.onTerminalExit(sessionId, event.exitCode ?? null, event.signal ?? null);
+        if (isCurrent()) this.onTerminalExit(sessionId, event.exitCode ?? null, event.signal ?? null);
       });
     } else {
       const child = active.child;
+      const isCurrent = () => {
+        const current = this.terminals.get(sessionId);
+        return current?.mode === "process" && current.child === child;
+      };
       child.stdout?.on("data", (chunk: Buffer) => {
-        this.handleOutputChunk(sessionId, "stdout", chunk.toString("utf8"));
+        if (isCurrent()) this.handleOutputChunk(sessionId, "stdout", chunk.toString("utf8"));
       });
 
       child.stderr?.on("data", (chunk: Buffer) => {
-        this.handleOutputChunk(sessionId, "stderr", chunk.toString("utf8"));
+        if (isCurrent()) this.handleOutputChunk(sessionId, "stderr", chunk.toString("utf8"));
       });
 
       child.on("exit", (code, signal) => {
-        this.onTerminalExit(sessionId, code ?? null, signal ?? null);
+        if (isCurrent()) this.onTerminalExit(sessionId, code ?? null, signal ?? null);
       });
     }
 
@@ -3615,6 +3785,18 @@ class TerminalManager extends EventEmitter {
       this.sendSignal(active, "SIGKILL");
     }
     this.terminals.delete(sessionId);
+    this.desktopReadOnly.delete(sessionId);
+  }
+
+  shutdown(): void {
+    for (const [sessionId, active] of this.terminals) {
+      if (active.session.status === "running") {
+        if (active.mode === "process") this.signalProcessTree(active.child.pid, "SIGKILL");
+        this.sendSignal(active, "SIGKILL");
+      }
+      this.terminals.delete(sessionId);
+      this.desktopReadOnly.delete(sessionId);
+    }
   }
 
   private handleOutputChunk(sessionId: string, stream: "stdout" | "stderr", text: string): void {
@@ -3803,6 +3985,11 @@ function buildCursorRuntimePrompt(prompt: string): string {
 }
 
 function resolveEffectiveRunConfig(config: RunConfig): RunConfig {
+  if (desktopMode) {
+    assertDesktopWorkspace(config.workspace);
+    assertDesktopRunnerAvailable(normalizeRunRunner(config.runner));
+    if (config.sandbox === "danger-full-access") throw new Error("Unrestricted execution is disabled for local desktop sessions. Choose workspace-write or read-only.");
+  }
   const attachments = normalizeAttachmentRefs(config.attachments);
   const skills = normalizeSelectedSkillRefs(config.skills);
   const agents = normalizeSelectedAgentRefs(config.agents);
@@ -4317,7 +4504,7 @@ function loadPersistedRuns(): { runs: RunRecord[]; approvals: ApprovalQueueItem[
   });
 
   if (migratedInlineEvents) {
-    const backupDir = path.resolve(rootDir, "data/backups");
+    const backupDir = path.resolve(dataDir, "backups");
     fs.mkdirSync(backupDir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     fs.copyFileSync(RUNS_PATH, path.join(backupDir, `runs-before-events-split-${stamp}.json`));
@@ -4349,6 +4536,7 @@ function findUpFile(startDir: string, fileName: string): string | null {
 }
 
 function resolveConfigWorkspaces(): { defaultWorkspace: string; options: WorkspaceOption[] } {
+  if (desktopMode) return { defaultWorkspace: desktopWorkspaces()[0] || "", options: [] };
   const configPath = findUpFile(rootDir, "config.yaml") || path.resolve(rootDir, "config.yaml");
   if (!fs.existsSync(configPath)) {
     const cwd = process.cwd();
@@ -4538,7 +4726,7 @@ function extractFirstUserMessage(lines: string[]): string {
 }
 
 function getCodexSessionsRoot(): string {
-  return path.join(os.homedir(), ".codex", "sessions");
+  return path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "sessions");
 }
 
 function listCodexSessionFiles(): string[] {
@@ -5254,6 +5442,7 @@ function isBenignCodexErrorItemText(text: string): boolean {
   if (normalized.includes("skill descriptions were shortened to fit the skills context budget")) {
     return true;
   }
+  if (normalized.includes("model metadata for") && normalized.includes("defaulting to fallback metadata")) return true;
   // Codex often drops the OpenAI WebSocket mid-turn and continues over HTTPS.
   // Treat that transport notice as non-fatal so the UI does not show a hard Error.
   if (normalized.includes("falling back from websockets to https transport")) {
@@ -5277,21 +5466,27 @@ function isSuppressedCodexErrorText(text: string): boolean {
  * fallback). Older Luma builds marked those runs failed even when the turn finished.
  */
 function shouldHealBenignSkillsBudgetFailure(run: RunRecord): boolean {
-  if (run.status !== "failed") return false;
-  if (run.lastError && isBenignCodexErrorItemText(run.lastError)) return true;
+  if (run.status !== "failed" || run.config?.runner !== "codex") return false;
+  const events = readRunEventsFromDisk(run.id);
+  const hasWarning = (run.lastError && isBenignCodexErrorItemText(run.lastError))
+    || events.some(event => isBenignCodexErrorItemText(event.text || ""));
+  return Boolean(hasWarning && codexTurnEvents(events).at(-1) === "turn.completed");
+}
 
-  const eventsPath = runEventsPath(run.id);
-  if (!fs.existsSync(eventsPath)) return false;
-  try {
-    const text = fs.readFileSync(eventsPath, "utf8");
-    const hasBenignNotice = text.includes("Skill descriptions were shortened to fit the skills context budget")
-      || text.toLowerCase().includes("falling back from websockets to https transport")
-      || text.toLowerCase().includes("websocket closed by server before response.completed");
-    if (!hasBenignNotice) return false;
-    return text.includes("\"type\":\"turn.completed\"") || Boolean(run.summary && run.summary.trim());
-  } catch {
-    return false;
-  }
+function recoverIncompleteCodexRun(run: RunRecord): "failed" | "stopped" | null {
+  if (run.status !== "completed" || run.usage) return null;
+  const events = codexTurnEvents(readRunEventsFromDisk(run.id));
+  const terminal = events.at(-1);
+  if (terminal === "turn.failed") return "failed";
+  return events.includes("turn.started") && terminal !== "turn.completed" ? "stopped" : null;
+}
+
+function codexTurnEvents(events: RunEventEntry[]): string[] {
+  return events.flatMap(event => {
+    if (event.source !== "stdout") return [];
+    const parsed = safeJsonParse<{ type?: string } | null>(event.text || "", null);
+    return typeof parsed?.type === "string" && parsed.type.startsWith("turn.") ? [parsed.type] : [];
+  });
 }
 
 function buildTranscriptMessageEntries(transcript: SessionTranscriptResponse): RunMessageEntry[] {
@@ -5569,13 +5764,13 @@ function markScheduledSessionListItems(items: SessionListItem[]): SessionListIte
 function readSessionListItems(includeHistory: boolean): SessionListItem[] {
   // Read path must stay O(index): never reconcile/scan runs or message jsonl here.
   // Index freshness comes from write-time updates + startup/repair reconcile.
-  const localItems = markScheduledSessionListItems(messageStore.listLocalSessions());
+  const localItems = markScheduledSessionListItems(messageStore.listLocalSessions()).map(item => ({ ...item, projectId: projectStore.projectForSession(item.id) }));
   if (!includeHistory) return localItems;
 
   const localIds = new Set(localItems.map((item) => item.id));
   const historyItems = loadCodexSessionHistory(0, { includeExec: true })
     .filter((entry) => !localIds.has(entry.id))
-    .map((entry) => buildHistorySessionListItem(entry));
+    .map((entry) => ({ ...buildHistorySessionListItem(entry), projectId: projectStore.projectForSession(entry.id) }));
 
   return markScheduledSessionListItems([...localItems, ...historyItems]).sort((a, b) => b.updatedAt - a.updatedAt);
 }
@@ -6726,20 +6921,19 @@ class OutboxProcessor {
     }, Math.max(0, delayMs));
   }
 
+  private runnableQueueHeads(): MessageOutboxItem[] {
+    const heads = new Map<string, MessageOutboxItem>();
+    for (const item of this.items) {
+      if (item.status !== "pending" || heads.has(item.sessionId)) continue;
+      if (this.busySessionIds.has(item.sessionId) || this.runManager.isSessionActive(item.sessionId)) continue;
+      heads.set(item.sessionId, item);
+    }
+    return [...heads.values()];
+  }
+
   private async processReadyItems(): Promise<void> {
     const now = Date.now();
-    const ready = this.items
-      .filter((item) => item.status === "pending" && (item.nextAttemptAt ?? 0) <= now)
-      .sort((a, b) => a.createdAt - b.createdAt);
-
-    if (ready.length === 0) {
-      const nextAt = this.items
-        .filter((item) => item.status === "pending" && typeof item.nextAttemptAt === "number")
-        .map((item) => item.nextAttemptAt as number)
-        .sort((a, b) => a - b)[0];
-      if (typeof nextAt === "number") this.scheduleProcessing(Math.max(0, nextAt - now));
-      return;
-    }
+    const ready = this.runnableQueueHeads().filter((item) => (item.nextAttemptAt ?? 0) <= now);
 
     for (const item of ready) {
       if (this.busySessionIds.has(item.sessionId) || this.runManager.isSessionActive(item.sessionId)) {
@@ -6753,6 +6947,8 @@ class OutboxProcessor {
 
       try {
         const run = this.runManager.startRun({
+          projectId: item.projectId,
+          memorySessionId: projectStore.ensureSession(item.sessionId, item.projectId).id,
           runner: item.runner,
           workspace: item.workspace,
           prompt: item.text,
@@ -6798,13 +6994,10 @@ class OutboxProcessor {
       }
     }
 
-    const nextPending = this.items
-      .filter((item) => item.status === "pending" && typeof item.nextAttemptAt === "number")
-      .map((item) => item.nextAttemptAt as number)
-      .sort((a, b) => a - b)[0];
-    if (typeof nextPending === "number") {
-      this.scheduleProcessing(Math.max(0, nextPending - Date.now()));
-    }
+    // A run's completion wakes blocked sessions. Only schedule a timer for
+    // messages that can actually start, so busy sessions do not spin at 0ms.
+    const nextPending = this.runnableQueueHeads().reduce((earliest, item) => Math.min(earliest, item.nextAttemptAt ?? 0), Infinity);
+    if (Number.isFinite(nextPending)) this.scheduleProcessing(Math.max(0, nextPending - Date.now()));
   }
 }
 
@@ -6846,18 +7039,19 @@ class MessageProjector {
       this.sessionIdByRunId.delete(event.run.id);
     }
 
-    if (event.kind === "failed" && event.run.lastError && !isSuppressedCodexErrorText(event.run.lastError)) {
-      const messageId = `${event.run.id}_failed`;
+    const stoppedWithReason = event.kind === "stopped" && event.run.config.runner === "codex";
+    if ((event.kind === "failed" || stoppedWithReason) && event.run.lastError && !isSuppressedCodexErrorText(event.run.lastError)) {
+      const messageId = `${event.run.id}_${event.kind}`;
       this.messageStore.upsertGeneratedMessage(resolvedSessionId, {
         id: messageId,
         clientMessageId: null,
         runId: event.run.id,
-        role: "error",
-        kind: "error",
-        title: "Error",
+        role: stoppedWithReason ? "system" : "error",
+        kind: stoppedWithReason ? "system" : "error",
+        title: stoppedWithReason ? "Stopped" : "Error",
         text: event.run.lastError,
         createdAt: event.run.updatedAt,
-        deliveryStatus: "failed",
+        deliveryStatus: stoppedWithReason ? "sent" : "failed",
         attachments: [],
         meta: { runId: event.run.id, errorMessage: event.run.lastError },
       });
@@ -7090,8 +7284,12 @@ class MessageProjector {
 
 const { defaultWorkspace, options: configWorkspaceOptions } = resolveConfigWorkspaces();
 let uiState = loadPersistedUiState(defaultWorkspace);
+if (desktopMode && !desktopWorkspaces().includes(uiState.activeWorkspace)) {
+  uiState = { activeWorkspace: desktopWorkspaces()[0] || "", manualWorkspaces: [] };
+}
 
 const app = express();
+const remoteRelay = cloudSessions ? new RemoteRelay(path.join(dataDir, "remote-devices.sqlite"), JWT_SECRET) : null;
 app.use(express.json({ limit: "5mb" }));
 app.use(
   cors({
@@ -7122,6 +7320,12 @@ app.post("/api/auth/login", (req, res) => {
     return;
   }
 
+  res.setHeader("Cache-Control", "no-store");
+  if (cloudSessions) {
+    res.json(apiOk(cloudSessions.issue()));
+    return;
+  }
+
   const nowSeconds = Math.floor(Date.now() / 1000);
   const expiresIn = Math.max(60, AUTH_TOKEN_TTL_SECONDS);
   const token = jwt.sign(
@@ -7141,15 +7345,68 @@ app.post("/api/auth/login", (req, res) => {
   );
 });
 
+app.all("/api/mcp/memory", (req, res) => { void memoryRuntime.handle(req, res); });
+if (remoteRelay) app.use("/api/remote/device", remoteRelay.pairing);
 app.use(requireAuth);
+if (remoteRelay) app.use("/api/remote", remoteRelay.devices);
+if (AUTH_ENABLED) app.use("/api/speech", createSpeechRouter(path.join(dataDir, "speech-settings.json")));
+app.post("/api/auth/activity", (_req, res) => {
+  const token = res.locals.cloudSessionToken as string | undefined;
+  const expiresAt = token && cloudSessions?.recordActivity(token);
+  if (!expiresAt) {
+    res.status(401).json(apiErr("Session expired."));
+    return;
+  }
+  for (const client of sseClients) {
+    if (client.locals.cloudSessionToken === token) client.locals.cloudSessionExpiresAt = expiresAt;
+  }
+  res.setHeader("Cache-Control", "no-store").json(apiOk({ expiresAt }));
+});
+app.post("/api/auth/logout", (_req, res) => {
+  const token = res.locals.cloudSessionToken as string | undefined;
+  if (token) {
+    cloudSessions?.revoke(token);
+    for (const client of sseClients) {
+      if (client.locals.cloudSessionToken !== token) continue;
+      sseClients.delete(client);
+      client.end();
+    }
+  }
+  res.setHeader("Cache-Control", "no-store").json(apiOk({ signedOut: true }));
+});
+app.get("/api/health", (_req, res) => res.json(apiOk({ ready: true, desktop: desktopMode })));
+if (desktopMode) {
+  app.use((req, res, next) => {
+    const requested = req.body?.workspace || req.query.workspace;
+    try {
+      if (typeof requested === "string" && requested) assertDesktopWorkspace(requested);
+      if (req.body?.runner === "claude" || req.body?.runner === "cursor") assertDesktopRunnerAvailable(req.body.runner);
+      if (req.body?.sandbox === "danger-full-access") throw new Error("Unrestricted local execution is disabled.");
+      next();
+    } catch (error) { res.status(403).json(apiErr(error instanceof Error ? error.message : "Folder access denied")); }
+  });
+}
 
 const runManager = new RunManager(CODEX_PATH);
 const persisted = loadPersistedRuns();
 runManager.loadPersisted(persisted.runs, persisted.approvals);
 const sseClients = new Set<express.Response>();
+projectStore.onChange = change => broadcastSse({ kind: change.kind, at: Date.now(), payload: { ...change } });
 function broadcastSse(event: SseEvent): void {
+  if (event.kind === "session.upsert" && event.payload?.session) {
+    const session = event.payload.session as unknown as SessionListItem;
+    event = { ...event, payload: { ...event.payload, session: { ...session, projectId: projectStore.projectForSession(session.id) } } };
+  }
   const data = `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`;
-  for (const client of sseClients) client.write(data);
+  const now = Date.now();
+  for (const client of sseClients) {
+    if (client.locals.cloudSessionExpiresAt <= now) {
+      sseClients.delete(client);
+      client.end();
+    } else {
+      client.write(data);
+    }
+  }
 }
 
 const messageDb = openMessageDatabase(MESSAGE_DB_PATH);
@@ -7312,6 +7569,7 @@ const terminalManager = new TerminalManager(() => uiState.activeWorkspace);
 let latestSkillSyncResult = syncRepoSkills();
 const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, prompt, execution) => {
   const sessionId = `agent_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const projectBinding = projectStore.ensureSession(sessionId, schedule.runConfig.projectId);
   const message = messageStore.acceptOutgoingMessage(sessionId, {
     clientMessageId: execution.id,
     sessionId,
@@ -7331,6 +7589,8 @@ const agentScheduleManager = new AgentScheduleManager(runManager, (schedule, pro
 
   try {
     const run = runManager.startRun({
+      memorySessionId: projectBinding.id,
+      projectId: projectBinding.projectId,
       runner: schedule.runConfig.runner,
       workspace: schedule.runConfig.workspace,
       prompt,
@@ -7360,6 +7620,10 @@ runManager.on("sse", (event: SseEvent) => {
   broadcastSse(event);
 });
 runManager.on("run.lifecycle", (event: RunLifecycleEvent) => {
+  if (["completed", "failed", "stopped"].includes(event.kind)) {
+    memoryRuntime.revokeRun(event.run.id);
+    fs.rmSync(path.join(RUNNER_MCP_DIR, `${event.run.id}.json`), { force: true });
+  }
   try {
     messageProjector.onLifecycle(event);
   } catch (error) {
@@ -7380,6 +7644,10 @@ runManager.on("run.lifecycle", (event: RunLifecycleEvent) => {
   }
 });
 runManager.on("run.parsed", (event: RunParsedEvent) => {
+  if (event.parsed.type === "thread.started" && typeof event.parsed.thread_id === "string" && event.run.config.memorySessionId) {
+    try { projectStore.attachAlias(event.run.config.memorySessionId, event.parsed.thread_id); }
+    catch (error) { runManager.forceStopRun(event.run.id); return; }
+  }
   messageProjector.onParsed(event);
 });
 terminalManager.on("sse", (event: SseEvent) => {
@@ -7391,6 +7659,15 @@ setInterval(() => {
   broadcastSse(evt);
   runManager.sweepIdleCursorRuns();
 }, 10000);
+
+app.use("/api", createProjectRouter(projectStore, {
+  sessionExists: id => Boolean(messageStore.getLocalSession(id) || loadCodexSessionTranscript(id)),
+  sessionBusy: id => {
+    const stable = projectStore.session(id)?.id;
+    return Boolean(messageStore.getLocalSession(id)?.status === "queued") || runManager.isSessionActive(id)
+      || Boolean(stable && runManager.getRuns(false).some(run => ["running", "queued"].includes(run.status) && run.config.memorySessionId === stable));
+  },
+}));
 
 function apiOk<T>(data: T): ApiResponse<T> {
   return { ok: true, data };
@@ -7431,7 +7708,22 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
   }
 
   try {
-    jwt.verify(token, JWT_SECRET);
+    if (token.startsWith("luma_cloud_")) {
+      const expiresAt = cloudSessions?.expiresAt(token);
+      if (!expiresAt) {
+        res.status(401).json(apiErr("Unauthorized"));
+        return;
+      }
+      res.locals.cloudSessionToken = token;
+      res.locals.cloudSessionExpiresAt = expiresAt;
+      next();
+      return;
+    }
+    const claims = jwt.verify(token, JWT_SECRET);
+    if (typeof claims === "string" || claims.sub !== "luma-assistant-user" || claims.scope !== undefined) {
+      res.status(401).json(apiErr("Unauthorized"));
+      return;
+    }
     next();
   } catch {
     res.status(401).json(apiErr("Unauthorized"));
@@ -7503,6 +7795,7 @@ function resolveTokenStatus(accountStatus: CodexCommandStatus): CodexTokenStatus
 }
 
 function getWorkspaces(): WorkspaceOption[] {
+  if (desktopMode) return desktopWorkspaces().map(folder => ({ id: `desktop_${folder}`, name: path.basename(folder), path: folder, source: "manual" }));
   const merged = new Map<string, WorkspaceOption>();
   for (const option of configWorkspaceOptions) merged.set(option.path, option);
 
@@ -7536,7 +7829,8 @@ app.get("/api/bootstrap", (_req, res) => {
       codexModel: DEFAULT_CODEX_MODEL,
       claudeModel: DEFAULT_CLAUDE_MODEL,
       cursorModel: DEFAULT_CURSOR_MODEL,
-      claudeEffortFlagSupported: claudeCliSupportsEffort(CLAUDE_CODE_EXECUTABLE || "claude"),
+      claudeEffortFlagSupported: claudeCliAvailable() && claudeCliSupportsEffort(CLAUDE_CODE_EXECUTABLE || "claude"),
+      claudeAvailable: claudeCliAvailable(),
       cursorAvailable: cursorCliAvailable(),
       cursorModels,
       reasoningEffort: DEFAULT_REASONING_EFFORT,
@@ -7559,7 +7853,8 @@ app.get("/api/bootstrap-lite", (_req, res) => {
       codexModel: DEFAULT_CODEX_MODEL,
       claudeModel: DEFAULT_CLAUDE_MODEL,
       cursorModel: DEFAULT_CURSOR_MODEL,
-      claudeEffortFlagSupported: claudeCliSupportsEffort(CLAUDE_CODE_EXECUTABLE || "claude"),
+      claudeEffortFlagSupported: claudeCliAvailable() && claudeCliSupportsEffort(CLAUDE_CODE_EXECUTABLE || "claude"),
+      claudeAvailable: claudeCliAvailable(),
       cursorAvailable: cursorCliAvailable(),
       cursorModels,
       reasoningEffort: DEFAULT_REASONING_EFFORT,
@@ -7572,8 +7867,22 @@ app.get("/api/bootstrap-lite", (_req, res) => {
   res.json(apiOk(payload));
 });
 
-app.get("/api/cursor/models", (_req, res) => {
-  const models = getCursorModels(true);
+app.get("/api/models", (_req, res) => {
+  void modelCatalogService.refresh();
+  res.json(apiOk(modelCatalogService.snapshot()));
+});
+
+app.post("/api/models/refresh", async (req, res) => {
+  const runner = req.body?.runner;
+  if (runner !== undefined && runner !== "codex" && runner !== "claude") {
+    res.status(400).json(apiErr("Runner must be codex or claude."));
+    return;
+  }
+  res.json(apiOk(await modelCatalogService.refresh(true, runner)));
+});
+
+app.get("/api/cursor/models", async (_req, res) => {
+  const models = desktopMode ? await refreshDesktopCursorModels() : getCursorModels(true);
   res.json(apiOk({
     available: cursorCliAvailable(),
     executable: CURSOR_EXECUTABLE || "cursor",
@@ -7663,6 +7972,7 @@ app.post("/api/agent-schedules", (req, res) => {
 
   try {
     const schedule = agentScheduleManager.create({
+      projectId: parsed.data.projectId,
       agentId: parsed.data.agentId,
       hour: parsed.data.hour,
       minute: parsed.data.minute,
@@ -7788,7 +8098,10 @@ app.get("/api/sessions/list", (req, res) => {
   const cursor = typeof req.query.cursor === "string" ? req.query.cursor : null;
   const includeHistory = req.query.includeHistory === "1" || req.query.includeHistory === "true";
   const startedAt = Date.now();
-  const payload = sliceRunListItems(readSessionListItems(includeHistory), limit, cursor);
+  const requestedProject = typeof req.query.projectId === "string" ? req.query.projectId : undefined;
+  const sessionItems = readSessionListItems(includeHistory);
+  const filtered = requestedProject === undefined ? sessionItems : sessionItems.filter(item => requestedProject === "inbox" ? !item.projectId : item.projectId === requestedProject);
+  const payload = sliceRunListItems(filtered, limit, cursor);
   const response: SessionListResponse = {
     items: payload.items,
     nextCursor: payload.nextCursor,
@@ -7970,10 +8283,31 @@ app.post("/api/session-images", (req, res) => {
   }
 });
 
-app.post("/api/messages/send", (req, res) => {
+app.post("/api/messages/send", handleSendMessage);
+
+function handleSendMessage(req: express.Request, res: express.Response): void {
   const parsed = sendMessageSchema.safeParse(req.body || {});
   if (!parsed.success) {
     res.status(400).json(apiErr(parsed.error.issues[0]?.message || "Invalid message payload"));
+    return;
+  }
+
+  const requestedSession = parsed.data.sessionId?.trim();
+  const existingMessage = messageDb.getMessageByClientId(parsed.data.clientMessageId);
+  if (existingMessage) {
+    const binding = projectStore.session(existingMessage.sessionId);
+    const sameSession = !requestedSession || requestedSession === existingMessage.sessionId
+      || Boolean(binding && projectStore.session(requestedSession)?.id === binding.id);
+    if (!sameSession || existingMessage.text !== parsed.data.text) {
+      res.status(409).json(apiErr("This message ID is already in use."));
+      return;
+    }
+    res.json(apiOk<SendMessageAccepted>({
+      sessionId: existingMessage.sessionId,
+      message: existingMessage,
+      queueStatus: "accepted",
+      latestRunId: messageStore.getLocalSession(existingMessage.sessionId)?.latestRunId || null,
+    }));
     return;
   }
 
@@ -8008,8 +8342,11 @@ app.post("/api/messages/send", (req, res) => {
   }
 
   const startedAt = Date.now();
-  const sessionId = parsed.data.sessionId?.trim() || `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const provisionalSession = !parsed.data.sessionId?.trim();
+  const sessionId = requestedSession || `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const provisionalSession = !requestedSession;
+  let projectBinding: { id: string; projectId: string | null };
+  try { projectBinding = projectStore.ensureSession(sessionId, parsed.data.projectId); }
+  catch (error) { projectApiError(error, res); return; }
   const acceptedMessage = messageStore.acceptOutgoingMessage(sessionId, {
     ...parsed.data,
     workspace,
@@ -8019,6 +8356,7 @@ app.post("/api/messages/send", (req, res) => {
   });
 
   outboxProcessor?.enqueue({
+    projectId: projectBinding.projectId,
     sessionId,
     provisionalSession,
     messageId: acceptedMessage.id,
@@ -8061,7 +8399,128 @@ app.post("/api/messages/send", (req, res) => {
   }
 
   res.json(apiOk(response));
-});
+}
+
+if (desktopMode && process.env.LUMA_DESKTOP_REMOTE_SECRET) {
+  app.post("/api/remote/internal", (req, res) => {
+    if (req.headers["x-luma-remote-secret"] !== process.env.LUMA_DESKTOP_REMOTE_SECRET) {
+      res.status(403).json(apiErr("Remote bridge access denied."));
+      return;
+    }
+    const parsed = remoteCommandSchema.safeParse(req.body?.command);
+    if (!parsed.success || !Array.isArray(req.body?.folders)) {
+      res.status(400).json(apiErr("Invalid remote session request."));
+      return;
+    }
+    const selectedFolders: unknown[] = req.body.folders;
+    const approved = desktopWorkspaces().filter(folder => selectedFolders.includes(folder));
+    const checkedWorkspaces = new Map<string, boolean>();
+    const canShare = (workspace: string) => {
+      const cached = checkedWorkspaces.get(workspace);
+      if (cached !== undefined) return cached;
+      let allowed = false;
+      try {
+        // Compare against the canonical folder the user actually shared.
+        const real = fs.realpathSync(workspace);
+        allowed = approved.some(folder => inside(folder, real));
+      } catch { /* A missing workspace cannot be shared. */ }
+      checkedWorkspaces.set(workspace, allowed);
+      return allowed;
+    };
+    const command = parsed.data;
+    const canControl = req.body.canControl === true;
+    if (command.kind === "sessions") {
+      const items = readSessionListItems(false).filter(item => !item.historyOnly && canShare(item.workspace));
+      const page = sliceRunListItems(items, 60, command.cursor ?? null);
+      const projects = new Map(projectStore.listProjects().map(project => [project.id, project.name]));
+      res.json(apiOk({
+        nextCursor: page.nextCursor,
+        items: page.items.map(item => ({
+          id: item.id,
+          title: item.title,
+          projectName: item.projectId ? projects.get(item.projectId) ?? null : null,
+          runner: item.runner,
+          status: item.status,
+          latestRunId: item.latestRunId,
+          canSend: Boolean(item.latestRunId) && !isProvisionalRemoteSession(item.id),
+        })),
+      }));
+      return;
+    }
+
+    const session = messageStore.getLocalSession(command.sessionId);
+    if (!session || session.historyOnly || !canShare(session.workspace)) {
+      res.status(404).json(apiErr("This session is unavailable or its folder is no longer shared."));
+      return;
+    }
+    if (command.kind === "messages") {
+      const page = messageStore.getMessagesPage(session.id, command.before ?? null, 24);
+      if (!page) {
+        res.status(404).json(apiErr("Session messages not found."));
+        return;
+      }
+      res.json(apiOk({
+        nextCursor: page.nextCursor,
+        messages: page.messages.filter(message => message.role !== "tool").map(message => ({
+          id: message.id,
+          role: message.role,
+          text: message.text.length > 12_000 ? `${message.text.slice(0, 11_999)}…` : message.text,
+          deliveryStatus: message.deliveryStatus,
+        })),
+      }));
+      return;
+    }
+
+    if (!canControl) {
+      res.status(403).json(apiErr("This Mac allows viewing only."));
+      return;
+    }
+    const run = session.latestRunId && runManager.getRun(session.latestRunId);
+    if (!run || !canShare(run.config.workspace) || run.archivedAt !== null || runSessionId(run) !== session.id) {
+      res.status(409).json(apiErr("This session is not ready for remote control."));
+      return;
+    }
+    if (command.kind === "stop") {
+      if (command.runId !== run.id || !runManager.stopRun(run.id)) {
+        res.status(409).json(apiErr("This run is no longer active."));
+        return;
+      }
+      res.json(apiOk({ stopped: true }));
+      return;
+    }
+    if (isProvisionalRemoteSession(session.id)) {
+      res.status(409).json(apiErr("Wait for this session to finish starting, then try again."));
+      return;
+    }
+    if (run.config.sandbox !== "read-only" && run.config.sandbox !== "workspace-write") {
+      res.status(403).json(apiErr("This session must use read-only or workspace-write on the Mac."));
+      return;
+    }
+    try { assertDesktopRunnerAvailable(run.config.runner); }
+    catch (error) {
+      res.status(403).json(apiErr(error instanceof Error ? error.message : "The runner is unavailable."));
+      return;
+    }
+    req.body = {
+      sessionId: session.id,
+      clientMessageId: command.clientMessageId,
+      text: command.text,
+      workspace: run.config.workspace,
+      runner: run.config.runner,
+      model: run.config.model,
+      reasoningEffort: run.config.reasoningEffort,
+      sandbox: run.config.sandbox,
+      approvalPolicy: run.config.approvalPolicy,
+      planMode: run.config.planMode,
+      askMode: run.config.askMode,
+    } satisfies Partial<SendMessageInput>;
+    handleSendMessage(req, res);
+  });
+}
+
+function isProvisionalRemoteSession(sessionId: string): boolean {
+  return sessionId.startsWith("local_");
+}
 
 app.post("/api/messages/:messageId/retry", (req, res) => {
   const retried = outboxProcessor?.retryFailedMessage(req.params.messageId);
@@ -8088,6 +8547,7 @@ app.post("/api/runs/start", (req, res) => {
 
   try {
     const run = runManager.startRun({
+      projectId: parsed.data.projectId,
       runner: parsed.data.runner,
       workspace,
       prompt: parsed.data.prompt,
@@ -8313,7 +8773,12 @@ app.post("/api/terminals/:sessionId/start", (req, res) => {
   }
 
   try {
-    const terminal = terminalManager.startSession(req.params.sessionId, workspace);
+    const localSession = desktopMode ? messageStore.getLocalSession(req.params.sessionId) : null;
+    const latestRun = localSession?.latestRunId ? runManager.getRun(localSession.latestRunId) : null;
+    if (desktopMode && localSession && assertDesktopWorkspace(localSession.workspace) !== assertDesktopWorkspace(workspace)) {
+      throw new Error("The terminal must use its session's folder.");
+    }
+    const terminal = terminalManager.startSession(req.params.sessionId, workspace, desktopMode && latestRun?.config.sandbox === "read-only");
     res.json(apiOk({ terminal }));
   } catch (error) {
     res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to start terminal"));
@@ -8460,29 +8925,49 @@ function flushPersistentStateSync(): void {
   agentScheduleManager.flushSync();
 }
 
+function stopDesktopProcesses(): void {
+  if (!desktopMode) return;
+  for (const run of runManager.getRuns(false)) {
+    if (run.status === "running" || run.status === "queued") {
+      runManager.forceStopRun(run.id, run.config.runner === "codex" ? "Luma Desktop quit before Codex finished the turn." : undefined);
+    }
+  }
+  terminalManager.shutdown();
+}
+
 process.on("beforeExit", () => {
   flushPersistentStateSync();
 });
 
 process.on("SIGINT", () => {
+  stopDesktopProcesses();
+  modelCatalogService.stop();
   sessionTelegramBridge?.stop();
   flushPersistentStateSync();
   process.exit(0);
 });
 
 process.on("SIGTERM", () => {
+  stopDesktopProcesses();
+  modelCatalogService.stop();
   sessionTelegramBridge?.stop();
   flushPersistentStateSync();
   process.exit(0);
 });
 
-app.listen(API_PORT, HOST, () => {
+const httpServer = app.listen(API_PORT, HOST, () => {
+  const address = httpServer.address();
+  const listeningPort = address && typeof address === "object" ? address.port : API_PORT;
   // eslint-disable-next-line no-console
   console.log(
-    `[luma-assistant/server] listening on http://${HOST}:${API_PORT} | auth=${AUTH_ENABLED ? "enabled" : "disabled"}`,
+    `[luma-assistant/server] listening on http://${HOST}:${listeningPort} | auth=${AUTH_ENABLED ? "enabled" : "disabled"}`,
   );
+  memoryRuntime.url = `http://127.0.0.1:${listeningPort}/api/mcp/memory`;
   sessionTelegramBridge?.start();
+  modelCatalogService.start();
+  if (desktopMode) void refreshDesktopCursorModels();
 });
+remoteRelay?.attach(httpServer);
 
 process.on("exit", () => {
   sessionTelegramBridge?.stop();

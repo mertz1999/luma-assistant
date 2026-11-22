@@ -25,11 +25,13 @@ It keeps the core coding-agent workflow available in the app: runner selection, 
 - `English and Farsi rendering`: detect right-to-left Farsi messages, including mixed Farsi/English replies and messages that begin with code paths, while keeping code and Latin content readable.
 - `Workspace-aware sessions`: switch among configured repositories, start a clean draft, and see each session's workspace, runner, source, model, effort, status, and last update.
 - `Session history and management`: browse local and imported Codex CLI history, filter by run status, reveal scheduled sessions or all history, page through older chats, inspect token usage, and archive or permanently delete local sessions.
+- `Projects and shared memory`: name projects, group their sessions, and maintain shared instructions and memories. Sessions can add, update, remove, and undo memory items with revision history and source attribution. See [projects and memory](docs/projects-memory.md).
+- `Mac desktop`: connect to your Luma cloud or run Codex, Claude Code, and Cursor Agent in enabled folders. Projects and memory work in both environments, with separate data. See [desktop setup](docs/desktop.md).
 - `Reliable message delivery`: acknowledge sends immediately, persist pending messages in a server-side outbox, retry transient failures, expose retry for failed messages, and preserve per-session browser queues across reloads.
 - `Run controls`: stop an active run, rerun a completed or failed request, and keep subsequent prompts queued behind the active run for that session.
 - `Rich transcript controls`: copy assistant or user messages and expand grouped shell commands, MCP calls, web searches, file changes, reasoning/plan entries, and tool output inline.
 - `File attachments`: select or drag and drop as many as 10 image or text/code files per message. Attachments are scoped to the selected workspace; images can be previewed, opened in a lightbox, or downloaded.
-- `Browser voice input`: dictate into the composer with the browser's Web Speech API, with recording state, elapsed time, and a `/speech` compatibility check. Availability and whether recognition is local or remote depend on the browser.
+- `Voice input`: configure an OpenAI-compatible transcription provider in **Voice settings**, or use the browser's built-in recognition when available. Recordings sent to a configured provider become editable drafts.
 - `Slash commands`: use `/plan`, `/status`, `/account`, `/mcp`, `/speech`, and `/help` for planning and local runtime diagnostics.
 
 ### Agentic Workflows
@@ -60,7 +62,7 @@ It keeps the core coding-agent workflow available in the app: runner selection, 
 
 - `Durable history`: store chat messages in SQLite with indexed page seeks, migrate older JSONL message logs automatically, keep run events in append-only JSONL files, and maintain a small session index for fast startup and chat opening.
 - `Long-running server safeguards`: cap hot in-memory sessions and active-run event buffers, limit concurrent runs, auto-archive old finished runs, and suppress benign Codex warnings that should not fail a run.
-- `Authentication`: protect the assistant with password/JWT login, browser-persisted sessions, expiration handling, and sign-out.
+- `Authentication`: protect the assistant with password login, sessions that expire after 48 hours of inactivity, and sign-out.
 - `Safe migrations`: run idempotent persistence migrations during deployment and write backups before changing existing task-manager data.
 - `Production tooling`: build and run all services with npm workspaces and Make targets, manage processes with PM2, and use the included Nginx HTTPS/SSE reverse-proxy example.
 - `Public landing site`: build and deploy the independent React/Vite landing page to GitHub Pages without exposing private runtime conversations.
@@ -118,7 +120,6 @@ HOST=0.0.0.0
 CODEX_PATH=codex
 PASSWORD=change_me
 JWT_SECRET=change_me_too
-AUTH_TOKEN_TTL_SECONDS=86400
 DEFAULT_MODEL=gpt-5.6-sol
 DEFAULT_RUNNER=codex
 CLAUDE_DEFAULT_MODEL=sonnet
@@ -164,6 +165,18 @@ Important variables:
 - `TERMINAL_SHELL=/bin/bash`: choose the shell used by session terminals.
 
 Legacy browser storage keys and local session sources are tolerated so existing sessions, auth, theme, and queued prompts are not dropped during upgrades.
+
+## Automatic Model Discovery
+
+Claude and Codex model menus are loaded from the installed CLI using the same account and environment as runs. Luma requests metadata only: discovery does not send a prompt or start a model turn. Codex uses the app-server `model/list` protocol; Claude uses the initialize catalog exposed by the Agent SDK's `supportedModels()`.
+
+The backend refreshes both catalogs at startup and every 15 minutes. The browser checks for updates every minute, and **Refresh models** requests an immediate refresh. Chats, run defaults, and agent schedules share the catalog and each model's supported effort levels. Claude aliases show their resolved version when the CLI provides it. Existing model IDs, custom IDs, and saved effort selections remain available after a refresh.
+
+The last successful catalog is saved in `data/model-catalog.json` and reused after restarts or discovery failures. The UI reports cached/fallback results and CLI errors. Configured defaults remain usable if no catalog has been saved. Each runner refreshes independently; metadata queries have a 30-second timeout and concurrent requests share a single query.
+
+New model availability can depend on the account, provider configuration, and CLI version. Keep the pod's CLIs current; refreshing the menu does not upgrade them. Set `CLAUDE_CODE_EXECUTABLE` and `CODEX_PATH` to executables accessible to the user running Luma (for example `/home/agent/.local/bin/claude`, rather than a root user's installation).
+
+Run discovery, cache, and model-menu tests with `npm run test:model-catalog`.
 
 ## Claude Code Runner
 
