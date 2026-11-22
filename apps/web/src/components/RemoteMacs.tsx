@@ -211,7 +211,7 @@ function RemoteMacsBody({ workspace }: { workspace: RemoteWorkspace }) {
               </select>
             </label>
           ) : null}
-          <Button type="button" variant="soft" size="sm" disabled={pair.isPending} onClick={() => pair.mutate()}>Pair a Mac</Button>
+          <Button type="button" variant="soft" size="sm" disabled={pair.isPending || !devices.isSuccess} onClick={() => pair.mutate()}>Pair a Mac</Button>
           {device ? (
             <Button type="button" variant="ghost" size="sm" disabled={remove.isPending} onClick={() => setConfirmRemove(true)}>Remove Mac</Button>
           ) : null}
