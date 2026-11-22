@@ -51,9 +51,9 @@ Remote access requires Luma Desktop 0.3.0 and the matching Luma Cloud release.
 
 1. Sign in to the Luma Cloud PWA, open **Remote Macs** from the sidebar, and select **Pair a Mac**.
 2. Open **Desktop settings → Remote access**. Enter the same Luma Cloud HTTPS URL, name the Mac, paste the one-time code, and choose which enabled folders to share. Select **Pair this Mac** within five minutes.
-3. In the PWA, choose the Mac and open a session. Titles, statuses, and text messages refresh while the view is open.
+3. In the PWA, open **Remote Macs** from the Chats sidebar. Choose the Mac, then select a session from its projects or Recents. The conversation opens in the main chat area. Titles, statuses, and text messages refresh while the view is open.
 4. To send follow-ups and stop runs, turn on **Allow sending messages and stopping runs from Luma Cloud** in Desktop settings and select **Save remote access**.
-5. Choose **Unpair this Mac** in Desktop or **Remove Mac** in the PWA to revoke access.
+5. Choose **Unpair this Mac** in Desktop or **Manage Macs → Remove Mac** in the PWA to revoke access.
 
 The Mac opens an outbound WebSocket to `/api/remote/connect`. TLS reverse proxies must forward WebSocket upgrades to the Luma API. The cloud relay stores device registrations and short-lived pairing codes. It holds requests and responses in memory while forwarding them; session history stays in Desktop's database. The Mac uses its Keychain to encrypt the device credential. Existing sessions keep their Mac-side runner, project memory, workspace, and sandbox when you send a follow-up. The cloud view supports existing sessions and text follow-ups.
 

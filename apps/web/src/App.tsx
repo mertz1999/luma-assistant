@@ -1,13 +1,13 @@
 import { ModelCatalogContext, ModelCatalogRefresh, ModelCatalogNotice, ModelEffortOptions, useModelCatalogState, useModelOptions } from "./lib/model-catalog";
-import { isValidElement, useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { useQuery } from "@tanstack/react-query";
 import { VoiceSettings } from "@/components/VoiceSettings";
-import { RemoteMacs } from "@/components/RemoteMacs";
+import { RemoteMacs, RemoteSidebar, RemoteConversation, RemoteConversationHeader, useRemoteWorkspace } from "@/components/RemoteMacs";
+import { chatComposerClass, chatEntriesClass, chatHeaderClass, chatMessageAlignment, chatMessageClass, chatTimelineClass, MarkdownMessage, ThinkingDots } from "@/components/ChatPresentation";
+import { SessionRows } from "@/components/SessionRows";
 import { getSpeechSettings, speechSettingsQueryKey, useApiDictation } from "@/lib/speech";
 import Convert from "ansi-to-html";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
   AtSign,
   Bot,
@@ -1586,93 +1586,6 @@ function collectSessionDebugLogs(runs: RunRecord[]): DebugLogEntry[] {
   return entries;
 }
 
-function flattenMarkdownText(children: ReactNode): string {
-  if (typeof children === "string" || typeof children === "number") {
-    return String(children);
-  }
-  if (Array.isArray(children)) {
-    return children.map((child) => flattenMarkdownText(child)).join("");
-  }
-  if (isValidElement(children)) {
-    return flattenMarkdownText(children.props.children);
-  }
-  return "";
-}
-
-function MarkdownMessage({ text }: { text: string }): JSX.Element {
-  const direction = resolveTextDirection(text);
-  return (
-    <div className="rich-text" dir={direction} lang={direction === "rtl" ? "fa" : undefined}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-          h1: ({ children }) => <h1 className="mb-2 text-lg font-bold">{children}</h1>,
-          h2: ({ children }) => <h2 className="mb-2 text-base font-bold">{children}</h2>,
-          h3: ({ children }) => <h3 className="mb-2 text-sm font-semibold">{children}</h3>,
-          ul: ({ children }) => <ul className="mb-2 list-disc space-y-1 ps-5 last:mb-0">{children}</ul>,
-          ol: ({ children }) => <ol className="mb-2 list-decimal space-y-1 ps-5 last:mb-0">{children}</ol>,
-          li: ({ children }) => <li className="leading-relaxed">{children}</li>,
-          blockquote: ({ children }) => (
-            <blockquote className="my-2 border-s-2 border-foreground/30 ps-3 italic text-foreground/80">{children}</blockquote>
-          ),
-          a: ({ href, children }) => (
-            <a
-              href={href}
-              target="_blank"
-              rel="noreferrer"
-              className="font-medium text-brand underline underline-offset-2 hover:text-brand-dark dark:text-[#8fc5ff] dark:hover:text-[#bddcff]"
-            >
-              {children}
-            </a>
-          ),
-          table: ({ children }) => (
-            <div className="claude-table my-2 overflow-x-auto rounded-md">
-              <table className="min-w-full border-collapse text-xs">{children}</table>
-            </div>
-          ),
-          th: ({ children }) => <th className="px-2 py-1.5 text-start font-semibold text-foreground/80">{children}</th>,
-          td: ({ children }) => <td className="px-2 py-1.5 align-top text-start text-foreground/90">{children}</td>,
-          code: ({ className, children }) => {
-            const raw = flattenMarkdownText(children).replace(/\n$/, "");
-            const isBlock = Boolean(className) || raw.includes("\n");
-            return (
-              <code
-                className={cn(
-                  isBlock
-                    ? "block whitespace-pre-wrap break-words bg-transparent font-mono text-[0.95em] leading-relaxed text-foreground"
-                    : "rounded bg-surface-2 px-1 py-0.5 font-mono text-[0.92em] text-foreground",
-                  className,
-                )}
-                dir="ltr"
-              >
-                {raw}
-              </code>
-            );
-          },
-          pre: ({ children }) => <pre className="my-1.5 overflow-x-auto rounded-md border border-card-border bg-surface-2 px-3 py-2" dir="ltr">{children}</pre>,
-        }}
-      >
-        {text}
-      </ReactMarkdown>
-    </div>
-  );
-}
-
-function ThinkingDots({ label = "Thinking" }: { label?: string }): JSX.Element {
-  return (
-    <div className="inline-flex items-center gap-2 text-sm text-foreground/70">
-      <span className="h-1.5 w-1.5 rounded-full bg-brand shadow-[0_0_0_3px_rgba(234,111,55,0.12)]" />
-      <span className="font-medium">{label}</span>
-      <span className="dot-wave" aria-label={`${label} in progress`} role="status">
-        <span>.</span>
-        <span>.</span>
-        <span>.</span>
-      </span>
-    </div>
-  );
-}
-
 type StructuredMessageProps = {
   entryKey: string;
   text: string;
@@ -2249,6 +2162,7 @@ export function App(): JSX.Element {
   const [terminalAction, setTerminalAction] = useState<"starting" | "stopping" | "sending" | null>(null);
   const [voiceSettingsOpen, setVoiceSettingsOpen] = useState(false);
   const [remoteMacsOpen, setRemoteMacsOpen] = useState(false);
+  const [remoteWorkspaceOpen, setRemoteWorkspaceOpen] = useState(false);
   const [voiceSupported, setVoiceSupported] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
@@ -2310,6 +2224,7 @@ export function App(): JSX.Element {
   const appDefaultsRequestRef = useRef<Promise<string> | null>(null);
   const appDefaultsLoadedRef = useRef(false);
   const isAuthenticated = isDesktopLocal || Boolean(authToken && authExpiresAt > Date.now());
+  const remoteWorkspace = useRemoteWorkspace(isAuthenticated && !isDesktopLocal && remoteWorkspaceOpen);
   const speechSettings = useQuery({
     queryKey: speechSettingsQueryKey,
     queryFn: getSpeechSettings,
@@ -3120,6 +3035,7 @@ export function App(): JSX.Element {
     updateAuthSession(null);
     setAuthPasswordInput("");
     setRemoteMacsOpen(false);
+    setRemoteWorkspaceOpen(false);
     setAuthError(null);
     setBackendConnectionStatus("disconnected");
   }
@@ -4795,13 +4711,27 @@ export function App(): JSX.Element {
     );
   }
 
+  const showContextDock = rightDockOpen && !remoteWorkspaceOpen;
   const desktopGridColumns = leftSidebarOpen
-    ? rightDockOpen
+    ? showContextDock
       ? "lg:grid-cols-[382px_minmax(0,1fr)_410px]"
       : "lg:grid-cols-[382px_minmax(0,1fr)]"
-    : rightDockOpen
+    : showContextDock
       ? "lg:grid-cols-[minmax(0,1fr)_410px]"
       : "lg:grid-cols-1";
+
+  const remoteTitle = remoteWorkspace.selected?.title || remoteWorkspace.device?.name || "Remote Macs";
+  const remoteSidebar = remoteWorkspaceOpen ? (
+    <RemoteSidebar
+      workspace={remoteWorkspace}
+      onCloud={() => setRemoteWorkspaceOpen(false)}
+      onManage={() => { setMobileThreadsOpen(false); setRemoteMacsOpen(true); }}
+      onSelect={id => {
+        remoteWorkspace.selectSession(id);
+        setMobileThreadsOpen(false);
+      }}
+    />
+  ) : null;
 
   return (
     <ProjectsContext.Provider value={{ ...projectState,
@@ -4827,11 +4757,16 @@ export function App(): JSX.Element {
             <PanelLeft className="mr-1.5 h-4 w-4" /> Chats
           </Button>
           <div className="flex min-w-0 flex-1 flex-col items-center">
-            <div className="max-w-full truncate text-center text-sm font-semibold leading-4" title={mobileHeaderTitle} dir="auto">
-              {mobileHeaderTitle}
+            <div className="max-w-full truncate text-center text-sm font-semibold leading-4" title={remoteWorkspaceOpen ? remoteTitle : mobileHeaderTitle} dir="auto">
+              {remoteWorkspaceOpen ? remoteTitle : mobileHeaderTitle}
             </div>
-            <ProjectSessionControls key={selectedSessionId ?? "draft"} />
+            {remoteWorkspaceOpen ? remoteWorkspace.selected && remoteWorkspace.device ? (
+              <span className="max-w-full truncate text-[11px] text-foreground/60">
+                {remoteWorkspace.device.name}
+              </span>
+            ) : null : <ProjectSessionControls key={selectedSessionId ?? "draft"} />}
           </div>
+          {!remoteWorkspaceOpen ? (
           <div className="flex shrink-0 items-center gap-0.5">
             <Button
               size="sm"
@@ -4848,6 +4783,7 @@ export function App(): JSX.Element {
               <PanelRight className="mr-1.5 h-4 w-4" /> Tools
             </Button>
           </div>
+          ) : null}
         </div>
       </header>
 
@@ -4859,7 +4795,7 @@ export function App(): JSX.Element {
       >
         {leftSidebarOpen ? (
         <aside className="hidden min-h-0 flex-col overflow-hidden rounded-lg bg-surface-1 shadow-[10px_0_26px_-26px_rgba(0,0,0,0.9)] lg:flex">
-          <SessionsPanel
+          {remoteSidebar ?? <SessionsPanel
             sessions={filteredSessions}
             sessionReviews={sessionReviews}
             expandedProjects={expandedProjects}
@@ -4882,15 +4818,39 @@ export function App(): JSX.Element {
             theme={theme}
             setTheme={setTheme}
             onSignOut={onSignOut}
-            onOpenRemoteMacs={isDesktopLocal ? undefined : () => setRemoteMacsOpen(true)}
+            onOpenRemoteMacs={isDesktopLocal ? undefined : () => setRemoteWorkspaceOpen(true)}
             onOpenVoiceSettings={openVoiceSettings}
             onCloseSidebar={() => setLeftSidebarOpen(false)}
-          />
+          />}
         </aside>
         ) : null}
 
         <main className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-background lg:rounded-lg">
-          <CenterPanel
+          {remoteWorkspaceOpen ? (
+            remoteWorkspace.device && remoteWorkspace.selected && !remoteWorkspace.devices.isError && !remoteWorkspace.sessions.isError ? (
+              <RemoteConversation
+                key={`${remoteWorkspace.device.id}:${remoteWorkspace.selected.id}`}
+                device={remoteWorkspace.device}
+                session={remoteWorkspace.selected}
+                leftSidebarOpen={leftSidebarOpen}
+                onOpenSidebar={() => setLeftSidebarOpen(true)}
+              />
+            ) : (
+              <>
+                <RemoteConversationHeader title={remoteTitle} leftSidebarOpen={leftSidebarOpen} onOpenSidebar={() => setLeftSidebarOpen(true)} />
+                <div className="grid min-h-0 flex-1 place-items-center px-6 text-center">
+                  <p role="status" className="text-sm text-foreground/70">
+                    {remoteWorkspace.devices.isError ? "Could not load paired Macs."
+                      : remoteWorkspace.devices.isPending ? "Checking paired Macs…"
+                      : !remoteWorkspace.device ? "Pair a Mac from Chats to see its sessions."
+                      : !remoteWorkspace.device.online ? `${remoteWorkspace.device.name} is offline.`
+                      : remoteWorkspace.sessions.isError ? "Could not load sessions from this Mac."
+                      : "Choose a Mac session from Chats."}
+                  </p>
+                </div>
+              </>
+            )
+          ) : <CenterPanel
             loading={loading || Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId] && timeline.length === 0)}
             loadingOlderMessages={Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId] && timeline.length > 0)}
             selectedSession={selectedSession}
@@ -4978,10 +4938,10 @@ export function App(): JSX.Element {
             onAnswerPlanQuestions={onAnswerPlanQuestions}
             onApprovePlanImplementation={onApprovePlanImplementation}
             onSubmitPlanFeedback={onSubmitPlanFeedback}
-          />
+          />}
         </main>
 
-        {rightDockOpen ? (
+        {showContextDock ? (
         <aside className="hidden min-h-0 flex-col overflow-hidden rounded-lg bg-surface-1 shadow-[-10px_0_26px_-26px_rgba(0,0,0,0.9)] lg:flex">
           <ClaudeRightPanel
             rightPanelTab={rightPanelTab}
@@ -5029,7 +4989,7 @@ export function App(): JSX.Element {
       </div>
 
       <ProjectMemoryDialog />
-      {!isDesktopLocal ? <RemoteMacs open={remoteMacsOpen} setOpen={setRemoteMacsOpen} /> : null}
+      {!isDesktopLocal ? <RemoteMacs open={remoteMacsOpen} setOpen={setRemoteMacsOpen} workspace={remoteWorkspace} /> : null}
       <VoiceSettings open={voiceSettingsOpen} setOpen={setVoiceSettingsOpen} settings={speechSettings.data} loading={speechSettings.isLoading} />
       <Dialog.Root open={newSessionDialogOpen} onOpenChange={setNewSessionDialogOpen}>
         <Dialog.Portal>
@@ -5205,7 +5165,7 @@ export function App(): JSX.Element {
             <Dialog.Title className="sr-only">Chats Drawer</Dialog.Title>
             <Dialog.Description className="sr-only">Session list and chat selection panel for mobile.</Dialog.Description>
             <div className="flex h-full min-h-0 flex-col overflow-hidden animate-slide-in">
-              <SessionsPanel
+              {remoteSidebar ?? <SessionsPanel
                 sessions={filteredSessions}
                 sessionReviews={sessionReviews}
                 expandedProjects={expandedProjects}
@@ -5228,13 +5188,10 @@ export function App(): JSX.Element {
                 theme={theme}
                 setTheme={setTheme}
                 onSignOut={onSignOut}
-                onOpenRemoteMacs={isDesktopLocal ? undefined : () => {
-                  setMobileThreadsOpen(false);
-                  setRemoteMacsOpen(true);
-                }}
+                onOpenRemoteMacs={isDesktopLocal ? undefined : () => setRemoteWorkspaceOpen(true)}
                 onOpenVoiceSettings={openVoiceSettings}
                 onCloseSidebar={() => setMobileThreadsOpen(false)}
-              />
+              />}
             </div>
           </Dialog.Content>
         </Dialog.Portal>
@@ -5316,42 +5273,18 @@ function SidebarSessionRows({
   selectedSessionId,
   onSelectSession,
 }: Pick<SessionsPanelProps, "sessions" | "sessionReviews" | "selectedSessionId" | "onSelectSession">): JSX.Element | null {
-  if (sessions.length === 0) return null;
   return (
-    <ul className="space-y-0.5">
-      {sessions.map((session) => {
-        const needsReview = needsSessionReview(session, sessionReviews);
-        const running = session.status === "running" && !session.historyOnly;
-        return (
-          <li key={session.id}>
-            <button
-              type="button"
-              className={cn(
-                "flex min-h-9 w-full items-center gap-2 rounded-md px-2 text-left text-sm focus-visible:outline focus-visible:outline-brand",
-                selectedSessionId === session.id ? "bg-brand-soft text-brand" : "text-foreground/80 hover:bg-control-hover",
-                needsReview && "font-bold",
-              )}
-              aria-current={selectedSessionId === session.id ? "true" : undefined}
-              aria-description={needsReview ? "Ready to review" : running ? "Running" : undefined}
-              onClick={() => onSelectSession(session.id)}
-              title={`${session.summary || "Session"} · ${session.status}${needsReview ? " · Ready to review" : ""}`}
-            >
-              <span className="relative flex h-3 w-3 shrink-0 items-center justify-center" aria-hidden="true">
-                {running ? (
-                  <span className="absolute inset-0 rounded-full border border-brand/70 motion-safe:animate-spin motion-safe:border-r-transparent" />
-                ) : null}
-                <span className={cn(
-                  "h-1.5 w-1.5 rounded-full",
-                  running || session.status === "queued" ? "bg-brand" :
-                    session.status === "failed" ? "bg-danger-fg" : "bg-foreground/30",
-                )} />
-              </span>
-              <span className="min-w-0 flex-1 truncate" dir="auto">{session.summary || "Session"}</span>
-            </button>
-          </li>
-        );
-      })}
-    </ul>
+    <SessionRows
+      sessions={sessions.map(session => ({
+        id: session.id,
+        title: session.summary,
+        status: session.status,
+        running: session.status === "running" && !session.historyOnly,
+        needsReview: needsSessionReview(session, sessionReviews),
+      }))}
+      selectedSessionId={selectedSessionId}
+      onSelectSession={onSelectSession}
+    />
   );
 }
 
@@ -5982,9 +5915,9 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
     <div
       ref={props.timelineScrollRef}
       onScroll={() => timelineActionsRef.current.onTimelineScroll()}
-      className="scrollbar-thin min-h-0 flex-1 overflow-auto px-4 pb-4 pt-4 lg:px-8"
+      className={chatTimelineClass}
     >
-      <div className="mx-auto flex w-full max-w-5xl flex-col gap-5">
+      <div className={chatEntriesClass}>
         {props.loading ? <p className="text-sm text-foreground/70">Loading...</p> : null}
 
         {props.hiddenTimelineCount > 0 ? (
@@ -6014,26 +5947,9 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
           const canRetryUserMessage = entry.role === "user" && entry.deliveryStatus === "failed";
           const canCopyMessage = (entry.role === "assistant" || entry.role === "plan" || entry.role === "user")
             && Boolean(entry.text.trim());
-          const messageAlignment = entry.role === "user"
-            ? "items-end"
-            : entry.role === "system"
-              ? "items-center"
-              : "items-start";
-
           return (
-            <div key={entry.key} className={cn("flex w-full flex-col animate-fade-up", messageAlignment)}>
-              <article
-                className={cn(
-                  "relative shadow-none",
-                  entry.role === "user" && "ml-auto max-w-[min(760px,82%)] rounded-lg border border-card-border bg-control px-3 py-2 text-foreground",
-                  entry.role === "user" && entry.deliveryStatus === "failed" && "border-rose-500/60 bg-danger-bg text-danger-fg",
-                  entry.role === "assistant" && "mr-auto w-full bg-transparent px-0 py-0 text-foreground/90",
-                  entry.role === "plan" && "mr-auto w-full rounded-md border border-card-border bg-surface-1 px-3 py-2",
-                  entry.role === "tool" && "w-full bg-transparent px-0 py-0",
-                  entry.role === "system" && "mx-auto max-w-fit rounded-md border border-card-border bg-surface-1 px-3 py-1 text-xs text-foreground/75",
-                  entry.role === "error" && "mr-auto max-w-[90%] rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-rose-900 dark:border-danger-fg/40 dark:bg-danger-bg/90 dark:text-danger-fg",
-                )}
-              >
+            <div key={entry.key} className={chatMessageAlignment(entry.role)}>
+              <article className={chatMessageClass(entry.role, entry.deliveryStatus === "failed")}>
                 {entry.role !== "system" && entry.role !== "assistant" && entry.role !== "user" && entry.title ? (
                   <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-foreground/70">{entry.title}</div>
                 ) : null}
@@ -6246,7 +6162,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 
   return (
     <>
-      <div className="relative z-10 hidden h-12 shrink-0 items-center justify-between gap-3 bg-background/95 px-4 shadow-[0_14px_32px_-28px_rgba(0,0,0,0.95)] lg:flex">
+      <div className={chatHeaderClass}>
         <div className="flex min-w-0 items-center gap-2">
           {!props.leftSidebarOpen ? (
             <Button
@@ -6306,7 +6222,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
 
         <form
           className={cn(
-            "relative bg-background px-4 py-3 shadow-[0_-16px_34px_-30px_rgba(0,0,0,0.95)] transition lg:px-8",
+            chatComposerClass,
             attachmentDropActive && "border-brand bg-brand-soft/25",
           )}
           onDragEnter={onAttachmentDragEnter}

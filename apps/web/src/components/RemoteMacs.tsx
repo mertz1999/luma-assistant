@@ -1,11 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Copy, Laptop, LoaderCircle, Send, Square, X } from "lucide-react";
+import { ArrowLeft, Check, Copy, Folder, Laptop, LoaderCircle, PanelLeft, RefreshCw, Send, Square, X } from "lucide-react";
 import type { RemoteCommand, RemoteDevice, RemoteResult, RemoteSession } from "@luma/shared";
 import { request } from "../lib/api";
 import { cn } from "../lib/utils";
 import { Button } from "./ui/button";
+import { SessionRows } from "./SessionRows";
+import { chatComposerClass, chatEntriesClass, chatHeaderClass, chatMessageAlignment, chatMessageClass, chatTimelineClass, MarkdownMessage, ThinkingDots } from "./ChatPresentation";
 
 const refreshMs = 2000;
 const devicesKey = ["remote-macs"] as const;
@@ -22,40 +24,160 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "Something went wrong. Try again.";
 }
 
-export function RemoteMacs({ open, setOpen }: { open: boolean; setOpen(open: boolean): void }) {
+export function useRemoteWorkspace(open: boolean) {
+  const [deviceId, setDeviceId] = useState("");
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [pages, setPages] = useState<(string | null)[]>([null]);
+  const devices = useQuery({
+    queryKey: devicesKey,
+    queryFn: ({ signal }) => request<{ devices: RemoteDevice[] }>("/api/remote/devices", { signal }),
+    enabled: open,
+    refetchInterval: open ? refreshMs : false,
+    gcTime: 0,
+    retry: false,
+  });
+  const deviceList = devices.data?.devices ?? [];
+  const device = deviceList.find(item => item.id === deviceId) ?? deviceList[0];
+  const currentPages = deviceId === device?.id ? pages : [null];
+  const cursor = currentPages[currentPages.length - 1];
+  const sessions = useQuery({
+    queryKey: ["remote-sessions", device?.id, cursor],
+    queryFn: ({ signal }) => deviceRequest(device!.id, { kind: "sessions", cursor }, signal),
+    enabled: open && Boolean(device?.online),
+    refetchInterval: open && device?.online ? refreshMs : false,
+    gcTime: 0,
+    retry: false,
+  });
+  const items = sessions.data?.items ?? [];
+  const selected = deviceId === device?.id ? items.find(item => item.id === sessionId) : undefined;
+  const next = sessions.data?.nextCursor;
+
+  function switchDevice(id: string) {
+    setDeviceId(id);
+    setSessionId(null);
+    setPages([null]);
+  }
+
+  return {
+    devices, deviceList, device, sessions, items, sessionId, selected,
+    switchDevice,
+    selectSession(id: string) {
+      if (device) setDeviceId(device.id);
+      setSessionId(id);
+    },
+    hasPrevious: currentPages.length > 1,
+    hasNext: Boolean(next),
+    previousPage() {
+      setSessionId(null);
+      setPages(current => current.slice(0, -1));
+    },
+    nextPage() {
+      if (!next || !device) return;
+      setDeviceId(device.id);
+      setSessionId(null);
+      setPages([...currentPages, next]);
+    },
+  };
+}
+
+type RemoteWorkspace = ReturnType<typeof useRemoteWorkspace>;
+
+export function RemoteSidebar({ workspace, onCloud, onManage, onSelect }: {
+  workspace: RemoteWorkspace;
+  onCloud(): void;
+  onManage(): void;
+  onSelect(id: string): void;
+}) {
+  const { device, deviceList, devices, sessions } = workspace;
+  const projects = new Map<string | null, RemoteSession[]>();
+  for (const session of workspace.items) {
+    const group = projects.get(session.projectName) ?? [];
+    group.push(session);
+    projects.set(session.projectName, group);
+  }
+  const projectNames = [...projects.keys()].filter(name => name !== null).sort((a, b) => a.localeCompare(b));
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-card-border px-3 py-2">
+        <Button type="button" variant="ghost" className="h-10" onClick={onCloud}>
+          <ArrowLeft className="mr-1.5 h-4 w-4" /> Cloud sessions
+        </Button>
+        <Button type="button" variant="ghost" size="sm" onClick={onManage}>{deviceList.length ? "Manage Macs" : "Pair a Mac"}</Button>
+      </div>
+      {device ? (
+        <div className="border-b border-card-border px-3 py-2">
+          <select aria-label="Mac" value={device.id} onChange={event => workspace.switchDevice(event.target.value)}
+            className="h-9 w-full rounded-md border border-card-border bg-control px-2 text-sm">
+            {deviceList.map(item => <option key={item.id} value={item.id}>{item.name} · {item.online ? "Online" : "Offline"}</option>)}
+          </select>
+        </div>
+      ) : null}
+      <nav aria-label="Mac sessions" className="scrollbar-thin min-h-0 flex-1 space-y-4 overflow-auto px-3 py-3">
+        {devices.isPending ? <p className="px-2 text-sm text-foreground/65">Checking paired Macs…</p> : null}
+        {devices.error || (device?.online && sessions.error) ? (
+          <p role="alert" className="px-2 text-sm text-danger-fg">{errorText(devices.error || sessions.error)}</p>
+        ) : null}
+        {device?.online && !devices.isError ? <>
+          {sessions.isPending ? <p className="px-2 text-sm text-foreground/65">Loading sessions…</p> : null}
+          {projectNames.map(name => (
+            <details key={name} open>
+              <summary className="cursor-pointer rounded-md px-2 py-1.5 text-sm font-medium text-foreground/85 hover:bg-control-hover">
+                <span className="ml-1 inline-flex max-w-[90%] items-center gap-2 align-middle">
+                  <Folder className="h-4 w-4 shrink-0 text-brand" />
+                  <span className="truncate" dir="auto">{name}</span>
+                </span>
+              </summary>
+              <div className="ml-4 border-l border-card-border pl-2">
+                <SessionRows sessions={projects.get(name)!} selectedSessionId={workspace.sessionId} onSelectSession={onSelect} />
+              </div>
+            </details>
+          ))}
+          {projects.has(null) ? (
+            <section aria-label="Recents">
+              <h2 className="mb-1.5 px-2 text-xs font-semibold text-foreground/65">Recents</h2>
+              <SessionRows sessions={projects.get(null)!} selectedSessionId={workspace.sessionId} onSelectSession={onSelect} />
+            </section>
+          ) : null}
+          {sessions.isSuccess && !workspace.items.length ? <p className="px-2 text-sm text-foreground/65">No shared sessions.</p> : null}
+          {workspace.hasPrevious || workspace.hasNext ? <div className="flex gap-1">
+            {workspace.hasPrevious ? <Button type="button" variant="ghost" size="sm" onClick={workspace.previousPage}>Newer sessions</Button> : null}
+            {workspace.hasNext ? <Button type="button" variant="ghost" size="sm" onClick={workspace.nextPage}>Older sessions</Button> : null}
+          </div> : null}
+        </> : null}
+      </nav>
+    </div>
+  );
+}
+
+export function RemoteMacs({ open, setOpen, workspace }: {
+  open: boolean;
+  setOpen(open: boolean): void;
+  workspace: RemoteWorkspace;
+}) {
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-[80] bg-black/55" />
-        <Dialog.Content className="fixed inset-x-2 top-[50%] z-[81] mx-auto flex max-h-[calc(100dvh-16px)] max-w-4xl -translate-y-1/2 flex-col overflow-hidden rounded-lg border border-card-border bg-surface-1 shadow-xl outline-none">
-          <header className="flex shrink-0 items-start justify-between gap-4 border-b border-card-border px-4 py-3">
+        <Dialog.Content className="fixed inset-x-2 top-1/2 z-[81] mx-auto max-h-[calc(100dvh-16px)] max-w-md -translate-y-1/2 overflow-auto rounded-lg border border-card-border bg-surface-1 shadow-xl outline-none">
+          <header className="flex items-start justify-between gap-4 border-b border-card-border px-4 py-3">
             <div>
-              <Dialog.Title className="flex items-center gap-2 font-semibold"><Laptop className="h-4 w-4" /> Remote Macs</Dialog.Title>
-              <Dialog.Description className="mt-1 text-xs text-foreground/65">Open sessions running in Luma Desktop.</Dialog.Description>
+              <Dialog.Title className="flex items-center gap-2 font-semibold"><Laptop className="h-4 w-4" /> Manage Macs</Dialog.Title>
+              <Dialog.Description className="mt-1 text-xs text-foreground/65">Pair or remove a Mac.</Dialog.Description>
             </div>
-            <Dialog.Close asChild><Button variant="ghost" size="sm" aria-label="Close Remote Macs"><X className="h-4 w-4" /></Button></Dialog.Close>
+            <Dialog.Close asChild><Button type="button" variant="ghost" size="sm" aria-label="Close Manage Macs"><X className="h-4 w-4" /></Button></Dialog.Close>
           </header>
-          {open ? <RemoteMacsBody /> : null}
+          {open ? <RemoteMacsBody workspace={workspace} /> : null}
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
   );
 }
 
-function RemoteMacsBody() {
+function RemoteMacsBody({ workspace }: { workspace: RemoteWorkspace }) {
   const client = useQueryClient();
-  const [deviceId, setDeviceId] = useState("");
   const [copied, setCopied] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
-  const devices = useQuery({
-    queryKey: devicesKey,
-    queryFn: ({ signal }) => request<{ devices: RemoteDevice[] }>("/api/remote/devices", { signal }),
-    refetchInterval: refreshMs,
-    gcTime: 0,
-    retry: false,
-  });
-  const deviceList = devices.data?.devices ?? [];
-  const device = deviceList.find(item => item.id === deviceId) ?? deviceList.find(item => item.online) ?? deviceList[0];
+  const { device, deviceList, devices } = workspace;
   const pair = useMutation({
     mutationFn: async () => {
       const existingIds = deviceList.map(item => item.id);
@@ -78,13 +200,12 @@ function RemoteMacsBody() {
   });
 
   return (
-    <div className="min-h-0 overflow-y-auto">
-      <div className="space-y-3 border-b border-card-border p-4">
+    <div className="space-y-3 p-4">
         <div className="flex flex-wrap items-end gap-2">
           {device ? (
             <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs font-medium">
               Mac
-              <select value={device.id} onChange={event => { setDeviceId(event.target.value); setConfirmRemove(false); }}
+              <select aria-label="Mac to manage" value={device.id} onChange={event => { workspace.switchDevice(event.target.value); setConfirmRemove(false); }}
                 className="h-9 min-w-0 rounded-md border border-card-border bg-control px-2 text-sm">
                 {deviceList.map(item => <option key={item.id} value={item.id}>{item.name} · {item.online ? "Online" : "Offline"}</option>)}
               </select>
@@ -117,69 +238,50 @@ function RemoteMacsBody() {
           ? <p role="alert" className="text-sm text-danger-fg">{errorText(devices.error || pair.error || remove.error)}</p> : null}
         {devices.isPending ? <p className="text-sm text-foreground/65">Checking paired Macs…</p> : null}
         {!devices.isPending && !devices.isError && !device && !pairingCode ? <p className="text-sm text-foreground/65">Pair a Mac to see its shared sessions here.</p> : null}
-      </div>
-      {device && !devices.isError ? <RemoteSessions key={device.id} device={device} /> : null}
-      {device && !device.online ? (
-        <p role="status" className="p-4 text-sm text-foreground/75">{device.name} is offline. Keep Luma Desktop open and the Mac awake and connected.</p>
-      ) : null}
     </div>
   );
 }
 
-function RemoteSessions({ device }: { device: RemoteDevice }) {
-  const [sessionId, setSessionId] = useState("");
-  const [pages, setPages] = useState<(string | null)[]>([null]);
-  const cursor = pages[pages.length - 1];
-  const sessions = useQuery({
-    queryKey: ["remote-sessions", device.id, cursor],
-    queryFn: ({ signal }) => deviceRequest(device.id, { kind: "sessions", cursor }, signal),
-    enabled: device.online,
-    refetchInterval: refreshMs,
-    gcTime: 0,
-    retry: false,
-  });
-  const items = sessions.data?.items ?? [];
-  const selected = items.find(session => session.id === sessionId);
-
+export function RemoteConversationHeader({
+  title, subtitle, leftSidebarOpen, onOpenSidebar, actions,
+}: {
+  title: string;
+  subtitle?: string;
+  leftSidebarOpen: boolean;
+  onOpenSidebar(): void;
+  actions?: React.ReactNode;
+}) {
   return (
-    <div className={cn("min-h-[16rem] sm:grid-cols-[minmax(12rem,17rem)_minmax(0,1fr)]", device.online ? "grid" : "hidden")}>
-      <nav aria-label="Mac sessions" className="min-w-0 border-b border-card-border p-3 sm:border-b-0 sm:border-r">
-        <h3 className="mb-2 text-xs font-semibold text-foreground/70">Sessions</h3>
-        <ul className="max-h-48 space-y-1 overflow-auto sm:max-h-[55dvh]">
-          {items.map(session => (
-            <li key={session.id}>
-              <button type="button" aria-current={session.id === sessionId ? "true" : undefined}
-                className={cn("flex w-full min-w-0 items-start gap-2 rounded-md p-2 text-left text-sm hover:bg-control-hover", session.id === sessionId && "bg-brand-soft")}
-                onClick={() => setSessionId(session.id)}>
-                {session.status === "running" ? <LoaderCircle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-brand motion-safe:animate-spin" /> : null}
-                <span className="min-w-0">
-                  <span className="block truncate" dir="auto">{session.title}</span>
-                  <span className="block truncate text-xs text-foreground/65">
-                    {session.projectName ? `${session.projectName} · ` : ""}<span className="capitalize">{session.status}</span>
-                  </span>
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
-        {sessions.isPending ? <p className="text-sm text-foreground/65">Loading sessions…</p> : null}
-        {sessions.error ? <p role="alert" className="text-sm text-danger-fg">{errorText(sessions.error)}</p> : null}
-        {sessions.isSuccess && !items.length ? <p className="text-sm text-foreground/65">No shared sessions on this page.</p> : null}
-        {cursor || sessions.data?.nextCursor ? <div className="mt-2 flex gap-1">
-          {cursor ? <Button type="button" variant="ghost" size="sm" onClick={() => { setSessionId(""); setPages(pages.slice(0, -1)); }}>Newer</Button> : null}
-          {sessions.data?.nextCursor ? <Button type="button" variant="ghost" size="sm" onClick={() => { setSessionId(""); setPages([...pages, sessions.data!.nextCursor!]); }}>Older</Button> : null}
-        </div> : null}
-      </nav>
-      {selected && !sessions.isError ? <RemoteConversation key={selected.id} device={device} session={selected} />
-        : <p className="p-4 text-sm text-foreground/65">Choose a session to see its messages.</p>}
+    <div className={chatHeaderClass}>
+      <div className="flex min-w-0 items-center gap-2">
+        {!leftSidebarOpen ? (
+          <Button type="button" variant="ghost" size="sm" className="h-7 w-7 shrink-0 p-0"
+            onClick={onOpenSidebar} aria-label="Open left sidebar"><PanelLeft className="h-3.5 w-3.5" /></Button>
+        ) : null}
+        <Laptop className="h-4 w-4 shrink-0 text-foreground/70" />
+        <div className="min-w-0">
+          <h1 className="truncate text-sm font-semibold" title={title} dir="auto">{title}</h1>
+          {subtitle ? <div className="truncate text-[11px] text-foreground/60" title={subtitle}>{subtitle}</div> : null}
+        </div>
+      </div>
+      {actions}
     </div>
   );
 }
 
-function RemoteConversation({ device, session }: { device: RemoteDevice; session: RemoteSession }) {
+export function RemoteConversation({ device, session, leftSidebarOpen, onOpenSidebar }: {
+  device: RemoteDevice;
+  session: RemoteSession;
+  leftSidebarOpen: boolean;
+  onOpenSidebar(): void;
+}) {
   const client = useQueryClient();
   const [pages, setPages] = useState<(string | null)[]>([null]);
   const [draft, setDraft] = useState("");
+  const [copiedId, setCopiedId] = useState("");
+  const timeline = useRef<HTMLDivElement>(null);
+  const stickToBottom = useRef(true);
+  const scrollToTop = useRef(false);
   const sendAttempt = useRef<{ id: string; text: string } | null>(null);
   const sending = useRef(false);
   const before = pages[pages.length - 1];
@@ -213,54 +315,125 @@ function RemoteConversation({ device, session }: { device: RemoteDevice; session
     action.mutate(command);
   }
 
+  useLayoutEffect(() => {
+    const node = timeline.current;
+    if (!node || !messages.data) return;
+    if (scrollToTop.current) {
+      node.scrollTop = 0;
+      scrollToTop.current = false;
+    } else if (stickToBottom.current) {
+      node.scrollTop = node.scrollHeight;
+    }
+  }, [messages.data, device.online]);
+
+  function changeMessagePage(next: (string | null)[]) {
+    const latestPage = next.length === 1;
+    stickToBottom.current = latestPage;
+    scrollToTop.current = !latestPage;
+    setPages(next);
+  }
+
+  function sendDraft() {
+    const text = draft.trim();
+    if (!text || sending.current || !device.online || !device.canControl || !session.canSend) return;
+    if (!sendAttempt.current || sendAttempt.current.text !== text) sendAttempt.current = { id: crypto.randomUUID(), text };
+    stickToBottom.current = true;
+    scrollToTop.current = false;
+    perform({ kind: "send", sessionId: session.id, text, clientMessageId: sendAttempt.current.id });
+  }
+
+  const runner = { codex: "Codex", claude: "Claude Code", cursor: "Cursor" }[session.runner];
   return (
-    <section aria-label="Mac conversation" className="min-w-0 p-3 sm:p-4">
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <h3 className="break-words text-sm font-semibold" dir="auto">{session.title}</h3>
-          <p role="status" className="text-xs capitalize text-foreground/65">{session.runner} · {session.status}</p>
-        </div>
-        {device.canControl && active ? (
-          <Button type="button" variant="soft" size="sm" disabled={action.isPending}
-            onClick={() => perform({ kind: "stop", sessionId: session.id, runId: latestRunId })}>
-            <Square className="mr-1 h-3 w-3" />Stop run
+    <section aria-label="Mac conversation" className="flex min-h-0 flex-1 flex-col">
+      <RemoteConversationHeader
+        title={session.title} leftSidebarOpen={leftSidebarOpen} onOpenSidebar={onOpenSidebar}
+        subtitle={[device.name, session.projectName, runner, device.online ? session.status : "Offline"].filter(Boolean).join(" · ")}
+        actions={device.online ? (
+          <Button type="button" size="sm" variant="ghost" className="h-7 w-7 shrink-0 p-0"
+            aria-label="Reload chat" title="Reload chat" onClick={() => void messages.refetch()}>
+            <RefreshCw className={cn("h-3.5 w-3.5", messages.isFetching && "motion-safe:animate-spin")} />
           </Button>
         ) : null}
-      </div>
-      {before || messages.data?.nextCursor ? <div className="my-2 flex gap-1">
-        {before ? <Button type="button" variant="ghost" size="sm" onClick={() => setPages(pages.slice(0, -1))}>Newer messages</Button> : null}
-        {messages.data?.nextCursor ? (
-          <Button type="button" variant="ghost" size="sm" onClick={() => setPages([...pages, messages.data!.nextCursor!])}>Older messages</Button>
-        ) : null}
-      </div> : null}
-      <div className="my-2 max-h-[42dvh] min-h-24 space-y-3 overflow-auto p-1" aria-label="Messages">
-        {messages.isPending ? <p className="text-sm text-foreground/65">Loading messages…</p> : null}
-        {messages.error ? <p role="alert" className="text-sm text-danger-fg">{errorText(messages.error)}</p> : null}
-        {messages.isSuccess && !messages.data.messages.length ? <p className="text-sm text-foreground/65">No messages on this page.</p> : null}
-        {!messages.isError ? messages.data?.messages.map(message => (
-          <article key={message.id} className={cn("rounded-md bg-surface-2 px-3 py-2", message.role === "user" && "bg-brand-soft")}>
-            <p className="mb-1 text-xs font-semibold capitalize text-foreground/70">{message.role === "user" ? "You" : message.role}{message.deliveryStatus === "pending" ? " · Queued" : ""}</p>
-            <p dir="auto" className="whitespace-pre-wrap break-words text-sm">{message.text}</p>
-          </article>
-        )) : null}
-      </div>
-      {device.canControl && session.canSend && !messages.isError ? (
-        <form className="space-y-2" onSubmit={event => {
-          event.preventDefault();
-          const text = draft.trim();
-          if (!text || sending.current) return;
-          if (!sendAttempt.current || sendAttempt.current.text !== text) sendAttempt.current = { id: crypto.randomUUID(), text };
-          perform({ kind: "send", sessionId: session.id, text, clientMessageId: sendAttempt.current.id });
+      />
+      {device.online ? <>
+        <div ref={timeline} className={chatTimelineClass} aria-label="Messages" onScroll={event => {
+          const node = event.currentTarget;
+          stickToBottom.current = node.scrollHeight - node.scrollTop - node.clientHeight < 72;
         }}>
-          <textarea className="min-h-14 w-full rounded-md border border-card-border bg-control px-2 py-1.5 text-sm"
-            aria-label="Message to this Mac" placeholder="Send a follow-up…" maxLength={8000} value={draft}
-            disabled={action.isPending} onChange={event => setDraft(event.target.value)} />
-          <Button type="submit" size="sm" disabled={!draft.trim() || action.isPending}>
-            <Send className="mr-1.5 h-3.5 w-3.5" />Send message
-          </Button>
-        </form>
-      ) : <p className="text-xs text-foreground/60">{device.canControl ? "Follow-ups are available after this session starts." : "Viewing only. Enable remote control in Desktop settings to send or stop."}</p>}
-      {action.error ? <p role="alert" className="mt-2 text-sm text-danger-fg">{errorText(action.error)}</p> : null}
+          <div className={chatEntriesClass}>
+            {before || messages.data?.nextCursor ? <div className="flex flex-wrap justify-center gap-2">
+              {before ? <Button type="button" variant="ghost" size="sm" onClick={() => changeMessagePage(pages.slice(0, -1))}>Newer messages</Button> : null}
+              {messages.data?.nextCursor ? (
+                <Button type="button" variant="ghost" size="sm" onClick={() => changeMessagePage([...pages, messages.data!.nextCursor!])}>Load older messages</Button>
+              ) : null}
+            </div> : null}
+            {messages.isPending ? <p className="text-sm text-foreground/65">Loading messages…</p> : null}
+            {messages.error ? <p role="alert" className="text-sm text-danger-fg">{errorText(messages.error)}</p> : null}
+            {messages.isSuccess && !messages.data.messages.length ? <p className="text-sm text-foreground/65">No messages on this page.</p> : null}
+            {!messages.isError ? messages.data?.messages.map(message => (
+              <div key={message.id} className={chatMessageAlignment(message.role)}>
+                <article className={chatMessageClass(message.role, message.deliveryStatus === "failed")}>
+                  {message.role === "assistant" || message.role === "plan" ? (
+                    <div className="break-words text-[15px] leading-7"><MarkdownMessage text={message.text} allowImages={false} /></div>
+                  ) : <p dir="auto" className="whitespace-pre-wrap break-words">{message.text}</p>}
+                  {message.role === "user" && message.deliveryStatus !== "sent" ? (
+                    <div className="mt-1 text-right text-[11px] text-foreground/70">
+                      {message.deliveryStatus === "failed" ? "Failed to send" : "Sending…"}
+                    </div>
+                  ) : null}
+                </article>
+                {(message.role === "user" || message.role === "assistant" || message.role === "plan") && message.text.trim() ? (
+                  <button type="button"
+                    className="mt-1 inline-flex h-6 w-6 items-center justify-center rounded-md text-foreground/40 hover:bg-control-hover hover:text-foreground/75"
+                    aria-label={copiedId === message.id ? "Message copied" : "Copy message"}
+                    onClick={() => void navigator.clipboard?.writeText(message.text).then(() => setCopiedId(message.id), () => setCopiedId(""))}>
+                    {copiedId === message.id ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                  </button>
+                ) : null}
+              </div>
+            )) : null}
+            {active && !before ? <ThinkingDots /> : null}
+          </div>
+        </div>
+        <div className={chatComposerClass}>
+          <div className="mx-auto w-full max-w-5xl space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <p role="status" className="min-w-0 truncate text-xs text-foreground/65">
+                {runner} · <span className="capitalize">{session.status}</span>
+              </p>
+              {device.canControl && active ? (
+                <Button type="button" variant="ghost" size="sm" disabled={action.isPending}
+                  onClick={() => perform({ kind: "stop", sessionId: session.id, runId: latestRunId })}>
+                  <Square className="mr-1 h-3 w-3" />Stop run
+                </Button>
+              ) : null}
+            </div>
+            {device.canControl && session.canSend && !messages.isError ? (
+              <form className="flex items-end gap-2" onSubmit={event => { event.preventDefault(); sendDraft(); }}>
+                <textarea aria-label="Message to this Mac" placeholder="Send a follow-up…" rows={1} maxLength={8000}
+                  className="max-h-40 min-h-11 min-w-0 flex-1 resize-y rounded-lg border border-card-border bg-control px-3 py-2.5 text-base outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 md:text-sm"
+                  disabled={action.isPending} value={draft} onChange={event => setDraft(event.target.value)} dir="auto"
+                  onKeyDown={event => {
+                    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || window.matchMedia("(pointer: coarse)").matches) return;
+                    event.preventDefault();
+                    sendDraft();
+                  }} />
+                <Button type="submit" aria-label="Send message" title="Send message" className="h-11 w-11 shrink-0 p-0"
+                  disabled={!draft.trim() || action.isPending}>
+                  <Send className="h-4 w-4" />
+                </Button>
+              </form>
+            ) : !device.canControl ? (
+              <p className="text-xs text-foreground/65">View only. Enable remote control in Desktop settings to send messages or stop runs.</p>
+            ) : !session.canSend ? <p className="text-xs text-foreground/65">Follow-ups are available after this session starts.</p> : null}
+            {action.error ? <p role="alert" className="text-sm text-danger-fg">{errorText(action.error)}</p> : null}
+          </div>
+        </div>
+      </> : (
+        <div className="grid min-h-0 flex-1 place-items-center px-6">
+          <p role="status" className="text-sm text-foreground/70">{device.name} is offline.</p>
+        </div>
+      )}
     </section>
   );
 }
