@@ -3,7 +3,7 @@ import { ProjectStore, ProjectError } from "./project-store.js";
 import { createProjectRouter, projectApiError } from "./project-api.js";
 import { MemoryRuntime } from "./memory-runtime.js";
 import { codexMemoryArgs, claudeMemoryConfig, ensureCursorMemoryConfig, scopedRunnerEnvironment } from "./runner-memory.js";
-import { desktopMode, desktopWorkspaces, assertDesktopWorkspace, assertDesktopFile, desktopCommand, desktopProbeCommand, desktopRunnerEnvironment, inside } from "./desktop-policy.js";
+import { desktopMode, desktopWorkspaces, assertDesktopWorkspace, assertDesktopFile, desktopCommand, desktopDefaultSandbox, desktopProbeCommand, desktopRunnerEnvironment, inside } from "./desktop-policy.js";
 import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
@@ -1474,8 +1474,8 @@ function resolveCursorModelArg(model: string, effort: ReasoningEffort, catalog?:
   return `${trimmed}[effort=${mapCursorEffort(effort)}]`;
 }
 
-function buildCursorEnvironment(): NodeJS.ProcessEnv {
-  if (desktopMode) return desktopRunnerEnvironment("cursor");
+function buildCursorEnvironment(sandbox?: RunConfig["sandbox"]): NodeJS.ProcessEnv {
+  if (desktopMode) return desktopRunnerEnvironment("cursor", sandbox);
   const env: NodeJS.ProcessEnv = { ...process.env };
   const localBin = path.join(os.homedir(), ".local/bin");
   const pathParts = String(env.PATH || "")
@@ -1591,8 +1591,8 @@ function claudeCliSupportsEffort(executable: string): boolean {
   return supported;
 }
 
-function buildClaudeEnvironment(): Record<string, string | undefined> {
-  if (desktopMode) return desktopRunnerEnvironment("claude");
+function buildClaudeEnvironment(sandbox?: RunConfig["sandbox"]): Record<string, string | undefined> {
+  if (desktopMode) return desktopRunnerEnvironment("claude", sandbox);
   const env: Record<string, string | undefined> = { ...process.env };
 
   if (CLAUDE_AUTH_MODE === "oauth") {
@@ -1892,8 +1892,7 @@ class RunManager extends EventEmitter {
       return record;
     }
 
-    // The outer macOS sandbox enforces desktop permissions for the complete process
-    // tree. Avoid asking Codex to install a second, nested Seatbelt sandbox.
+    // Restricted desktop runs use one macOS sandbox for the complete process tree.
     const codexSandbox = desktopMode ? "danger-full-access" : effectiveConfig.sandbox;
     const args = effectiveConfig.sessionId
       ? [
@@ -1934,11 +1933,11 @@ class RunManager extends EventEmitter {
         ];
 
     if (binding.projectId) args.splice(args.indexOf("--"), 0, ...codexMemoryArgs(memoryRuntime.url));
-    const command = desktopCommand(this.codexPath, args, effectiveConfig.workspace, effectiveConfig.sandbox === "read-only");
+    const command = desktopCommand(this.codexPath, args, effectiveConfig.workspace, effectiveConfig.sandbox);
     const child = spawn(command.executable, command.args, {
       cwd: effectiveConfig.workspace,
       stdio: ["ignore", "pipe", "pipe"],
-      env: scopedRunnerEnvironment(desktopRunnerEnvironment(), memoryRuntime.environment(runId)),
+      env: scopedRunnerEnvironment(desktopRunnerEnvironment("codex", effectiveConfig.sandbox), memoryRuntime.environment(runId)),
     });
     if (!child.stdout || !child.stderr) {
       throw new Error("Failed to initialize codex process streams");
@@ -2082,11 +2081,11 @@ class RunManager extends EventEmitter {
     }
     argsAfterAgent.push(prompt);
     const args = cursorCliArgs(argsAfterAgent);
-    const command = desktopCommand(executable, args, effectiveConfig.workspace, effectiveConfig.sandbox === "read-only", "cursor");
+    const command = desktopCommand(executable, args, effectiveConfig.workspace, effectiveConfig.sandbox, "cursor");
     const child = spawn(command.executable, command.args, {
       cwd: effectiveConfig.workspace,
       stdio: ["ignore", "pipe", "pipe"],
-      env: scopedRunnerEnvironment(buildCursorEnvironment(), memoryRuntime.environment(runId)),
+      env: scopedRunnerEnvironment(buildCursorEnvironment(effectiveConfig.sandbox), memoryRuntime.environment(runId)),
     });
 
     if (!child.stdout || !child.stderr) {
@@ -2401,7 +2400,7 @@ class RunManager extends EventEmitter {
     const executable = CLAUDE_CODE_EXECUTABLE || "claude";
     const effort = resolveClaudeCliEffort(effectiveConfig.reasoningEffort);
     const supportsEffort = claudeCliSupportsEffort(executable);
-    const env = scopedRunnerEnvironment(buildClaudeEnvironment(), memoryRuntime.environment(runId));
+    const env = scopedRunnerEnvironment(buildClaudeEnvironment(effectiveConfig.sandbox), memoryRuntime.environment(runId));
     const permissionMode = effectiveConfig.planMode ? "dontAsk" : "bypassPermissions";
     const args = [
       "-p",
@@ -2442,7 +2441,7 @@ class RunManager extends EventEmitter {
     if (effectiveConfig.sessionId) args.push("--resume", effectiveConfig.sessionId);
     if (desktopMode) args.push("--settings", '{"sandbox":{"enabled":false}}');
     args.push("--", prompt);
-    const command = desktopCommand(executable, args, effectiveConfig.workspace, effectiveConfig.sandbox === "read-only", "claude", memoryConfigFile);
+    const command = desktopCommand(executable, args, effectiveConfig.workspace, effectiveConfig.sandbox, "claude", memoryConfigFile);
     const child = spawn(command.executable, command.args, {
       cwd: effectiveConfig.workspace,
       stdio: ["ignore", "pipe", "pipe"],
@@ -3566,7 +3565,7 @@ class AgentScheduleManager {
 
 class TerminalManager extends EventEmitter {
   private terminals = new Map<string, ActiveTerminal>();
-  private desktopReadOnly = new Map<string, boolean>();
+  private desktopSandbox = new Map<string, RunConfig["sandbox"]>();
 
   constructor(private readonly getDefaultWorkspace: () => string) {
     super();
@@ -3578,10 +3577,10 @@ class TerminalManager extends EventEmitter {
     return { ...active.session };
   }
 
-  startSession(sessionId: string, workspace: string, readOnly = false): TerminalSessionSnapshot {
+  startSession(sessionId: string, workspace: string, sandbox: RunConfig["sandbox"] = "workspace-write"): TerminalSessionSnapshot {
     const existing = this.terminals.get(sessionId);
     if (existing?.session.status === "running") {
-      if (!desktopMode || this.desktopReadOnly.get(sessionId) === readOnly) return { ...existing.session };
+      if (!desktopMode || this.desktopSandbox.get(sessionId) === sandbox) return { ...existing.session };
       this.removeSession(sessionId);
     }
 
@@ -3600,10 +3599,10 @@ class TerminalManager extends EventEmitter {
       }
     }
 
-    const shellCommand = desktopCommand(shell, shellArgs, resolvedWorkspace, readOnly);
+    const shellCommand = desktopCommand(shell, shellArgs, resolvedWorkspace, sandbox);
     const usePty = process.env.TERMINAL_DISABLE_PTY !== "1" && nodePty !== null;
     const terminalEnv: NodeJS.ProcessEnv = {
-      ...desktopRunnerEnvironment(),
+      ...desktopRunnerEnvironment("codex", sandbox),
       TERM: process.env.TERM || "xterm-256color",
       COLORTERM: process.env.COLORTERM || "truecolor",
       PS1: process.env.TERMINAL_PS1 || "$ ",
@@ -3674,7 +3673,7 @@ class TerminalManager extends EventEmitter {
     }
 
     this.terminals.set(sessionId, active);
-    this.desktopReadOnly.set(sessionId, readOnly);
+    this.desktopSandbox.set(sessionId, sandbox);
     this.emitSse({
       kind: "terminal.started",
       at: now,
@@ -3785,7 +3784,7 @@ class TerminalManager extends EventEmitter {
       this.sendSignal(active, "SIGKILL");
     }
     this.terminals.delete(sessionId);
-    this.desktopReadOnly.delete(sessionId);
+    this.desktopSandbox.delete(sessionId);
   }
 
   shutdown(): void {
@@ -3795,7 +3794,7 @@ class TerminalManager extends EventEmitter {
         this.sendSignal(active, "SIGKILL");
       }
       this.terminals.delete(sessionId);
-      this.desktopReadOnly.delete(sessionId);
+      this.desktopSandbox.delete(sessionId);
     }
   }
 
@@ -3988,7 +3987,6 @@ function resolveEffectiveRunConfig(config: RunConfig): RunConfig {
   if (desktopMode) {
     assertDesktopWorkspace(config.workspace);
     assertDesktopRunnerAvailable(normalizeRunRunner(config.runner));
-    if (config.sandbox === "danger-full-access") throw new Error("Unrestricted execution is disabled for local desktop sessions. Choose workspace-write or read-only.");
   }
   const attachments = normalizeAttachmentRefs(config.attachments);
   const skills = normalizeSelectedSkillRefs(config.skills);
@@ -7381,7 +7379,6 @@ if (desktopMode) {
     try {
       if (typeof requested === "string" && requested) assertDesktopWorkspace(requested);
       if (req.body?.runner === "claude" || req.body?.runner === "cursor") assertDesktopRunnerAvailable(req.body.runner);
-      if (req.body?.sandbox === "danger-full-access") throw new Error("Unrestricted local execution is disabled.");
       next();
     } catch (error) { res.status(403).json(apiErr(error instanceof Error ? error.message : "Folder access denied")); }
   });
@@ -7834,7 +7831,7 @@ app.get("/api/bootstrap", (_req, res) => {
       cursorAvailable: cursorCliAvailable(),
       cursorModels,
       reasoningEffort: DEFAULT_REASONING_EFFORT,
-      sandbox: DEFAULT_SANDBOX as "read-only" | "workspace-write" | "danger-full-access",
+      sandbox: desktopDefaultSandbox(DEFAULT_SANDBOX),
     },
     activeWorkspace: uiState.activeWorkspace,
     workspaces: getWorkspaces(),
@@ -7858,7 +7855,7 @@ app.get("/api/bootstrap-lite", (_req, res) => {
       cursorAvailable: cursorCliAvailable(),
       cursorModels,
       reasoningEffort: DEFAULT_REASONING_EFFORT,
-      sandbox: DEFAULT_SANDBOX as "read-only" | "workspace-write" | "danger-full-access",
+      sandbox: desktopDefaultSandbox(DEFAULT_SANDBOX),
     },
     activeWorkspace: uiState.activeWorkspace,
     workspaces: getWorkspaces(),
@@ -8493,7 +8490,7 @@ if (desktopMode && process.env.LUMA_DESKTOP_REMOTE_SECRET) {
       return;
     }
     if (run.config.sandbox !== "read-only" && run.config.sandbox !== "workspace-write") {
-      res.status(403).json(apiErr("This session must use read-only or workspace-write on the Mac."));
+      res.status(403).json(apiErr("Continue this session in Luma Desktop. To send remotely, first run it with workspace-write or read-only on the Mac."));
       return;
     }
     try { assertDesktopRunnerAvailable(run.config.runner); }
@@ -8778,7 +8775,7 @@ app.post("/api/terminals/:sessionId/start", (req, res) => {
     if (desktopMode && localSession && assertDesktopWorkspace(localSession.workspace) !== assertDesktopWorkspace(workspace)) {
       throw new Error("The terminal must use its session's folder.");
     }
-    const terminal = terminalManager.startSession(req.params.sessionId, workspace, desktopMode && latestRun?.config.sandbox === "read-only");
+    const terminal = terminalManager.startSession(req.params.sessionId, workspace, latestRun?.config.sandbox);
     res.json(apiOk({ terminal }));
   } catch (error) {
     res.status(409).json(apiErr(error instanceof Error ? error.message : "Failed to start terminal"));

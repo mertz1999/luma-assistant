@@ -24,7 +24,7 @@ Native SQLite and PTY dependencies are installed and rebuilt in a repository-spe
 
 1. Open Luma Desktop and choose **This Mac**.
 2. Choose a project folder through the native macOS folder picker.
-3. Choose Codex, Claude Code, or Cursor Agent when creating a session. Select **workspace-write** or **read-only** in session settings.
+3. Choose Codex, Claude Code, or Cursor Agent when creating a session. Under **Run defaults → Sandbox**, choose **workspace-write**, **read-only**, or **danger-full-access**. Luma remembers the choice for local runs on this Mac. New installs start with **workspace-write**.
 4. Add or remove enabled folders in Desktop settings. Stop active local runs before removing a folder. Removing a folder restarts the engine to revoke open-terminal grants; existing chat history is retained.
 
 The app detects Codex, Claude Code, and the standalone Cursor Agent CLI from the Mac's PATH and common install locations. Reopen Luma after installing a CLI. A missing CLI appears in Desktop settings. Install and sign in to Codex normally, then quit and reopen Luma. The app imports an existing file-based Codex login into private app storage without copying global MCP settings. File-based credentials are stored with owner-only permissions; Keychain-only provider logins are not imported in this version. If login needs refreshing, run `CODEX_HOME="$HOME/Library/Application Support/Luma Desktop/runtime/codex" codex login` in Terminal while Luma is closed.
@@ -57,7 +57,7 @@ Remote access requires Luma Desktop 0.3.0 and the matching Luma Cloud release.
 4. To send follow-ups and stop runs, turn on **Allow sending messages and stopping runs from Luma Cloud** in Desktop settings and select **Save remote access**.
 5. Choose **Unpair this Mac** in Desktop or **Manage Macs → Remove Mac** in the PWA to revoke access.
 
-The Mac opens an outbound WebSocket to `/api/remote/connect`. TLS reverse proxies must forward WebSocket upgrades to the Luma API. The cloud relay stores device registrations and short-lived pairing codes. It holds requests and responses in memory while forwarding them; session history stays in Desktop's database. The Mac uses its Keychain to encrypt the device credential. Existing sessions keep their Mac-side runner, project memory, workspace, and sandbox when you send a follow-up. The cloud view supports existing sessions and text follow-ups.
+The Mac opens an outbound WebSocket to `/api/remote/connect`. TLS reverse proxies must forward WebSocket upgrades to the Luma API. The cloud relay stores device registrations and short-lived pairing codes. It holds requests and responses in memory while forwarding them; session history stays in Desktop's database. The Mac uses its Keychain to encrypt the device credential. Existing sessions keep their Mac-side runner, project memory, workspace, and sandbox when you send a follow-up. Cloud follow-ups require the latest run to use **workspace-write** or **read-only**. Paired users with control access can still stop a full-access run.
 
 A paired Mac is accessible to signed-in members of that Luma Cloud instance. The current password sign-in represents a single shared account. Pair only to a cloud instance whose signed-in users are allowed to access the selected sessions.
 
@@ -65,9 +65,11 @@ Desktop reconnects after a network interruption. Keep the Mac awake and Luma Des
 
 ## Folder enforcement and limits
 
-The local API checks selected workspaces against the native picker allowlist and resolves attachment symlinks before accessing files. Agent subprocesses and terminals run under a macOS Seatbelt filesystem profile. Only the current workspace is granted project-content access. The profile also grants access to the current runner's profile, private temporary files, and required system/runtime directories. Read-only sessions cannot write project files. Unrestricted sessions are rejected. Luma applies the outer sandbox to all three runners.
+The local API checks selected workspaces against the native picker allowlist and resolves attachment symlinks before accessing files. **workspace-write** and **read-only** run agent subprocesses and terminals under a macOS Seatbelt filesystem profile. The profile grants access to the current workspace, the current runner's profile, private temporary files, and required system directories. In **read-only**, project files cannot be changed. Plan and Ask use read-only.
 
-This is a filesystem boundary, not network isolation or a virtual machine. Network/model access and OS services remain available; project tools and external services need their own trust review. macOS's `sandbox-exec` is required and the app fails closed if it is unavailable. Claude Code can read its global configuration and the login Keychain database. Codex and Cursor use app-private profiles. Review any project-owned agent/tool configuration before enabling a folder. System/runtime exceptions include `/System`, `/usr`, `/Library`, `/Applications`, `/opt`, and the runner's executable directory; avoid placing private projects in these runtime locations. Git can read its standard global configuration/ignore files, and Apple's command-line tools can maintain their narrowly named `xcrun_db-*` cache files. These exceptions do not grant access to other project folders.
+In **danger-full-access**, the three runners and the run's terminal use the macOS account's filesystem permissions without the Luma sandbox. Luma passes through the Mac's SSH agent when available. The enabled folder still sets the run's starting directory.
+
+Network access and OS services remain available in all three modes. The restricted modes require macOS's `sandbox-exec`. Claude Code can read its global configuration and the login Keychain database. Codex and Cursor use app-private profiles. Review any project-owned agent/tool configuration before enabling a folder. In restricted modes, system and runtime exceptions include `/System`, `/usr`, `/Library`, `/Applications`, `/opt`, and the runner's executable directory. Git can read its standard global configuration and ignore files, and Apple's command-line tools can maintain their narrowly named `xcrun_db-*` cache files.
 
 ## Validation
 

@@ -2,9 +2,20 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
-import type { RunRunner } from "@luma/shared";
+import type { RunRunner, SandboxMode } from "@luma/shared";
 
 export const desktopMode = process.env.LUMA_DESKTOP === "1";
+
+export function desktopDefaultSandbox(fallback: SandboxMode): SandboxMode {
+  const file = process.env.LUMA_DESKTOP_SETTINGS_FILE;
+  if (!desktopMode || !file) return fallback;
+  try {
+    const mode: unknown = JSON.parse(fs.readFileSync(file, "utf8")).defaultSandbox;
+    if (mode === "read-only" || mode === "workspace-write" || mode === "danger-full-access") return mode;
+  } catch { /* Use the configured default. */ }
+  return fallback;
+}
+
 let systemTemporaryDirectory = "";
 if (desktopMode && process.platform === "darwin") {
   const result = spawnSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], { encoding: "utf8" });
@@ -103,9 +114,11 @@ function sandboxCommand(executable: string, args: string[], root: string, readOn
   return { executable: "/usr/bin/sandbox-exec", args: ["-p", desktopSandboxProfile(root, executable, readOnly, runner, readableFile), executable, ...args] };
 }
 
-export function desktopCommand(executable: string, args: string[], workspace: string, readOnly = false, runner: RunRunner = "codex", readableFile?: string) {
+export function desktopCommand(executable: string, args: string[], workspace: string, sandbox: SandboxMode = "workspace-write", runner: RunRunner = "codex", readableFile?: string) {
   if (!desktopMode) return { executable, args };
-  return sandboxCommand(executable, args, assertDesktopWorkspace(workspace), readOnly, runner, readableFile);
+  const root = assertDesktopWorkspace(workspace);
+  if (sandbox === "danger-full-access") return { executable, args };
+  return sandboxCommand(executable, args, root, sandbox === "read-only", runner, readableFile);
 }
 
 export function desktopProbeCommand(runner: RunRunner, executable: string, args: string[]) {
@@ -113,9 +126,10 @@ export function desktopProbeCommand(runner: RunRunner, executable: string, args:
   return { ...sandboxCommand(executable, args, cwd, true, runner), cwd };
 }
 
-export function desktopRunnerEnvironment(runner: RunRunner = "codex"): NodeJS.ProcessEnv {
+export function desktopRunnerEnvironment(runner: RunRunner = "codex", sandbox: SandboxMode = "workspace-write"): NodeJS.ProcessEnv {
   if (!desktopMode) return { ...process.env };
   const allowed = ["HOME", "PATH", "LANG", "LC_ALL", "SHELL", "TMPDIR", "TERM", "COLORTERM", profileVariables[runner]];
+  if (sandbox === "danger-full-access") allowed.push("SSH_AUTH_SOCK");
   if (runner === "cursor") allowed.push("CURSOR_DATA_DIR");
   const env = Object.fromEntries(allowed.flatMap(key => process.env[key] ? [[key, process.env[key]]] : []));
   if (runner === "claude") {

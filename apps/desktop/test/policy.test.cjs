@@ -38,9 +38,36 @@ test('agent and terminal environments exclude backend authentication secrets', (
   for (const key of ['PASSWORD', 'JWT_SECRET', 'LUMA_DESKTOP_FOLDERS_FILE']) assert.equal(env[key], undefined);
 });
 
+test('the local default sandbox follows saved preferences and falls back on invalid data', () => {
+  const file = path.join(temporary, 'settings.json');
+  process.env.LUMA_DESKTOP_SETTINGS_FILE = file;
+  assert.equal(policy.desktopDefaultSandbox('workspace-write'), 'workspace-write');
+  fs.writeFileSync(file, JSON.stringify({ defaultSandbox: 'danger-full-access' }));
+  assert.equal(policy.desktopDefaultSandbox('workspace-write'), 'danger-full-access');
+  fs.writeFileSync(file, JSON.stringify({ defaultSandbox: 'unknown' }));
+  assert.equal(policy.desktopDefaultSandbox('workspace-write'), 'workspace-write');
+});
+
+test('all desktop runners can access files outside the workspace in full-access mode', () => {
+  process.env.SSH_AUTH_SOCK = path.join(temporary, 'test-agent.sock');
+  for (const runner of ['codex', 'claude', 'cursor']) {
+    const env = policy.desktopRunnerEnvironment(runner, 'danger-full-access');
+    assert.equal(env.SSH_AUTH_SOCK, process.env.SSH_AUTH_SOCK);
+    assert.equal(env.PASSWORD, undefined);
+    assert.equal(env.JWT_SECRET, undefined);
+    assert.equal(policy.desktopRunnerEnvironment(runner).SSH_AUTH_SOCK, undefined);
+    const args = ['-c', 'cat "$1" > "$2"', 'test', path.join(outside, 'secret.txt'), path.join(outside, runner)];
+    const command = policy.desktopCommand('/bin/sh', args, workspace, 'danger-full-access', runner);
+    const result = spawnSync(command.executable, command.args, { encoding: 'utf8', cwd: workspace, env });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(path.join(outside, runner), 'utf8'), 'test-private-content');
+    assert.throws(() => policy.desktopCommand('/bin/sh', args, outside, 'danger-full-access', runner));
+  }
+});
+
 test('macOS sandbox allows workspace work and rejects reads and writes outside it', { skip: process.platform !== 'darwin' }, () => {
-  const run = (executable, args, readOnly = false) => {
-    const command = policy.desktopCommand(executable, args, workspace, readOnly);
+  const run = (executable, args, sandbox = 'workspace-write') => {
+    const command = policy.desktopCommand(executable, args, workspace, sandbox);
     return spawnSync(command.executable, command.args, { encoding: 'utf8', cwd: workspace, env: policy.desktopRunnerEnvironment() });
   };
   const allowed = run('/bin/sh', ['-c', 'printf allowed > "$1/result.txt"; cat "$1/result.txt"', 'test', workspace]);
@@ -54,7 +81,7 @@ test('macOS sandbox allows workspace work and rejects reads and writes outside i
   assert.equal(fs.existsSync(path.join(outside, 'new.txt')), false);
   const deniedLink = run('/bin/cat', [path.join(workspace, 'escape/secret.txt')]);
   assert.notEqual(deniedLink.status, 0);
-  const readOnly = run('/usr/bin/touch', [path.join(workspace, 'readonly.txt')], true);
+  const readOnly = run('/usr/bin/touch', [path.join(workspace, 'readonly.txt')], 'read-only');
   assert.notEqual(readOnly.status, 0);
   assert.equal(fs.existsSync(path.join(workspace, 'readonly.txt')), false);
 });
@@ -121,14 +148,14 @@ test('desktop Claude can use the default CLI profile and only its run-specific m
     const readConfig = spawnSync(probe.executable, probe.args, { encoding: 'utf8', cwd: probe.cwd, env });
     assert.equal(readConfig.stdout, 'cli-account');
     const claudeTemp = path.join(env.CLAUDE_CODE_TMPDIR, `claude-${process.getuid()}`, 'test-workspace');
-    const mkdir = policy.desktopCommand('/bin/mkdir', ['-p', claudeTemp], workspace, true, 'claude');
+    const mkdir = policy.desktopCommand('/bin/mkdir', ['-p', claudeTemp], workspace, 'read-only', 'claude');
     const tempResult = spawnSync(mkdir.executable, mkdir.args, { encoding: 'utf8', cwd: workspace, env });
     assert.equal(tempResult.status, 0, tempResult.stderr);
     assert(fs.statSync(claudeTemp).isDirectory());
     const command = policy.desktopCommand('/bin/sh', [
       '-c', 'cat "$1" && ! cat "$2" && ! cat "$3" && ! touch "$4"', 'test',
       memory, path.join(outside, 'other-mcp.json'), unrelated, path.join(workspace, 'blocked-write'),
-    ], workspace, true, 'claude', memory);
+    ], workspace, 'read-only', 'claude', memory);
     const result = spawnSync(command.executable, command.args, { encoding: 'utf8', cwd: workspace, env });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout, 'run-config');

@@ -23,9 +23,9 @@ test('private settings persist, corrupt settings recover, and folders resolve sy
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'luma-desktop-config-'));
   try {
     const file = path.join(temporary, 'settings.json');
-    assert.deepEqual(readSettings(file), { mode: 'local', cloudUrl: '' });
-    writePrivateJson(file, { mode: 'cloud', cloudUrl: 'https://example.com/' });
-    assert.deepEqual(readSettings(file), { mode: 'cloud', cloudUrl: 'https://example.com' });
+    assert.deepEqual(readSettings(file), { mode: 'local', cloudUrl: '', defaultSandbox: 'workspace-write' });
+    writePrivateJson(file, { mode: 'cloud', cloudUrl: 'https://example.com/', defaultSandbox: 'danger-full-access' });
+    assert.deepEqual(readSettings(file), { mode: 'cloud', cloudUrl: 'https://example.com', defaultSandbox: 'danger-full-access' });
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     fs.writeFileSync(file, '{broken');
     assert.equal(readSettings(file).mode, 'local');

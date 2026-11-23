@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
+const sandboxModes = ['read-only', 'workspace-write', 'danger-full-access'];
 
 function normalizeCloudUrl(input) {
   const url = new URL(String(input).trim());
@@ -18,8 +19,9 @@ function readSettings(file) {
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
     const cloudUrl = data.cloudUrl ? normalizeCloudUrl(data.cloudUrl) : '';
-    return { mode: data.mode === 'cloud' && cloudUrl ? 'cloud' : 'local', cloudUrl };
-  } catch { return { mode: 'local', cloudUrl: '' }; }
+    const defaultSandbox = sandboxModes.includes(data.defaultSandbox) ? data.defaultSandbox : 'workspace-write';
+    return { mode: data.mode === 'cloud' && cloudUrl ? 'cloud' : 'local', cloudUrl, defaultSandbox };
+  } catch { return { mode: 'local', cloudUrl: '', defaultSandbox: 'workspace-write' }; }
 }
 
 function writePrivateJson(file, value) {
@@ -45,4 +47,4 @@ function readFolders(file) {
   } catch { return []; }
 }
 
-module.exports = { normalizeCloudUrl, connectionHost, readSettings, writePrivateJson, canonicalFolder, readFolders };
+module.exports = { normalizeCloudUrl, connectionHost, readSettings, writePrivateJson, canonicalFolder, readFolders, sandboxModes };

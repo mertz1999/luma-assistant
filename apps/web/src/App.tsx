@@ -185,7 +185,7 @@ type SessionCard = {
 
 type PlanSessionState = "idle" | "armed" | "active";
 
-const sandboxOptions: SandboxMode[] = isDesktopLocal ? ["read-only", "workspace-write"] : ["read-only", "workspace-write", "danger-full-access"];
+const sandboxOptions: SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
 const runnerOptions: RunRunner[] = ["codex", "claude", "cursor"];
 function normalizeRunRunnerValue(input: unknown): RunRunner {
   if (input === "claude" || input === "cursor") return input;
@@ -2143,6 +2143,8 @@ export function App(): JSX.Element {
   const [askMode, setAskMode] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("high");
   const [sandbox, setSandbox] = useState<SandboxMode>(isDesktopLocal ? "workspace-write" : "danger-full-access");
+  const sandboxRef = useRef(sandbox);
+  const sandboxTouchedRef = useRef(false);
   const approvalPolicy: ApprovalPolicy = "never";
   const [planFlowBySession, setPlanFlowBySession] = useState<Record<string, PlanSessionState>>({});
 
@@ -2759,9 +2761,9 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     if (!authReady || !isAuthenticated) return;
-    if (!newSessionDialogOpen && !mobileContextOpen) return;
+    if (!newSessionDialogOpen && !mobileContextOpen && !(isDesktopLocal && rightDockOpen && rightPanelTab === "context")) return;
     void ensureAppDefaults();
-  }, [authReady, isAuthenticated, newSessionDialogOpen, mobileContextOpen]);
+  }, [authReady, isAuthenticated, newSessionDialogOpen, mobileContextOpen, rightDockOpen, rightPanelTab]);
 
   useEffect(() => {
     const options = modelOptionsForRunner(runner, cursorModels);
@@ -3121,6 +3123,9 @@ export function App(): JSX.Element {
         setReasoningEffort(payload.defaults.reasoningEffort);
         setAgentScheduleModel(payload.defaults.model || "gpt-5.4");
         setAgentScheduleEffort(payload.defaults.reasoningEffort);
+      }
+      if (!sandboxTouchedRef.current && (isDesktopLocal || !modelControlsTouchedRef.current)) {
+        sandboxRef.current = payload.defaults.sandbox;
         setSandbox(payload.defaults.sandbox);
       }
       appDefaultsLoadedRef.current = true;
@@ -3494,8 +3499,15 @@ export function App(): JSX.Element {
   }
 
   function chooseSandbox(next: SandboxMode): void {
-    modelControlsTouchedRef.current = true;
+    if (!isDesktopLocal) modelControlsTouchedRef.current = true;
+    sandboxTouchedRef.current = true;
+    sandboxRef.current = next;
     setSandbox(next);
+    if (isDesktopLocal) {
+      void window.lumaDesktop!.setDefaultSandbox(next).catch((error: unknown) => {
+        window.alert(error instanceof Error ? error.message : "Could not save the local sandbox setting.");
+      });
+    }
   }
 
   function chooseModel(next: string): void {
@@ -3596,7 +3608,7 @@ export function App(): JSX.Element {
       runner: requestRunner,
       model: requestModel,
       reasoningEffort: requestReasoningEffort,
-      sandbox: overrides?.sandbox ?? (planMode || nextAskMode ? "read-only" : sandbox),
+      sandbox: overrides?.sandbox ?? (planMode || nextAskMode ? "read-only" : sandboxRef.current),
       approvalPolicy: overrides?.approvalPolicy ?? (planMode || nextAskMode ? "never" : approvalPolicy),
       planMode,
       askMode: nextAskMode,
@@ -4249,7 +4261,7 @@ export function App(): JSX.Element {
         runner,
         model: agentScheduleModel.trim() || model,
         reasoningEffort: agentScheduleEffort,
-        sandbox,
+        sandbox: sandboxRef.current,
         approvalPolicy,
         skills: selectedSkills.map(selectedSkillRef),
       });
@@ -4468,10 +4480,11 @@ export function App(): JSX.Element {
     const previousState = resolvePlanState(sessionTimelineKey);
     setPlanState(sessionTimelineKey, "idle");
     try {
+      if (isDesktopLocal) await ensureAppDefaults();
       await submitSessionMessage("Final approval granted. Implement the approved plan now.", {
         sessionKey: sessionTimelineKey,
         planMode: false,
-        sandbox,
+        sandbox: sandboxRef.current,
         approvalPolicy,
         onError: (message) => window.alert(message),
       });
@@ -7102,10 +7115,13 @@ function ClaudeRightPanel(props: ClaudeRightPanelProps): JSX.Element {
                 <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none disabled:opacity-50" value={props.reasoningEffort} disabled={!effortSupported} onChange={(event) => props.setReasoningEffort(event.target.value as ReasoningEffort)}>
                   <ModelEffortOptions runner={props.runner} model={props.model} value={props.reasoningEffort} />
                 </select>
-                <select className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.sandbox} onChange={(event) => props.setSandbox(event.target.value as SandboxMode)}>
+                <select aria-label="Sandbox" className="h-9 w-full rounded-md border border-card-border bg-control px-3 text-sm outline-none" value={props.sandbox} onChange={(event) => props.setSandbox(event.target.value as SandboxMode)}>
                   {sandboxOptions.map((option) => <option key={option} value={option}>{option}</option>)}
                 </select>
               </div>
+              {isDesktopLocal && props.sandbox === "danger-full-access" ? (
+                <p className="mt-2 text-xs text-muted">Runners can access files outside the selected folder using your macOS account.</p>
+              ) : null}
             </div>
 
             <div className="rounded-md border border-card-border bg-surface-2 p-3">

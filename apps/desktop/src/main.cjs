@@ -5,7 +5,7 @@ const os = require('node:os');
 const { createHash, randomBytes } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const { spawnSync } = require('node:child_process');
-const { normalizeCloudUrl, connectionHost, readSettings, writePrivateJson, canonicalFolder, readFolders } = require('./config.cjs');
+const { normalizeCloudUrl, connectionHost, readSettings, writePrivateJson, canonicalFolder, readFolders, sandboxModes } = require('./config.cjs');
 const { RemoteDesktop } = require('./remote.cjs');
 
 app.setName('Luma Desktop');
@@ -94,6 +94,17 @@ function resolveRunner(executablePath, configured, names) {
   return '';
 }
 
+function findSshAgentSocket() {
+  const isSocket = candidate => {
+    try { return Boolean(candidate && fs.statSync(candidate, { throwIfNoEntry: false })?.isSocket()); }
+    catch { return false; }
+  };
+  const inherited = process.env.SSH_AUTH_SOCK;
+  if (isSocket(inherited)) return inherited;
+  const launchd = spawnSync('/bin/launchctl', ['getenv', 'SSH_AUTH_SOCK'], { encoding: 'utf8', timeout: 2000 }).stdout?.trim();
+  return isSocket(launchd) ? launchd : '';
+}
+
 function shortCursorDataPath() {
   // Cursor needs a stable, short path for its project sessions and Unix sockets.
   const uid = process.getuid();
@@ -173,11 +184,14 @@ async function startEngine() {
     engineState = { ...engineState, codexPath, claudePath, cursorPath, claudeHome, cursorHome, cursorData, authAvailable: fs.existsSync(privateAuth) };
     const password = randomBytes(32).toString('hex');
     localPassword = password;
+    const sshAgentSocket = findSshAgentSocket();
     const env = {
       HOME: os.homedir(), PATH: executablePath, LANG: process.env.LANG || 'en_US.UTF-8', SHELL: '/bin/zsh',
       TMPDIR: `${temporaryDir}/`, CODEX_HOME: codexHome, CURSOR_CONFIG_DIR: cursorHome, CURSOR_DATA_DIR: cursorData,
       ...(claudeConfigOverride ? { CLAUDE_CONFIG_DIR: claudeConfigOverride } : {}),
+      ...(sshAgentSocket ? { SSH_AUTH_SOCK: sshAgentSocket } : {}),
       LUMA_DESKTOP: '1', LUMA_DESKTOP_FOLDERS_FILE: foldersFile, LUMA_DESKTOP_REMOTE_SECRET: remoteSecret,
+      LUMA_DESKTOP_SETTINGS_FILE: settingsFile,
       LUMA_ROOT_DIR: root, LUMA_DATA_DIR: path.join(userData, 'data'),
       HOST: '127.0.0.1', API_PORT: '0', PASSWORD: password, JWT_SECRET: randomBytes(32).toString('hex'),
       CODEX_PATH: codexPath || 'codex', CLAUDE_CODE_EXECUTABLE: claudePath || 'claude', CURSOR_PATH: cursorPath || 'cursor-agent',
@@ -266,6 +280,12 @@ function installIpc() {
   const handle = (name, handler) => ipcMain.handle(name, async (event, ...args) => { trustedFrame(event); return handler(...args); });
   handle('luma:state', () => publicState());
   handle('luma:keep-screen-on', setKeepScreenOn);
+  handle('luma:set-default-sandbox', defaultSandbox => {
+    if (settings.mode !== 'local' || !sandboxModes.includes(defaultSandbox)) throw new Error('Invalid local sandbox setting.');
+    const next = { ...settings, defaultSandbox };
+    writePrivateJson(settingsFile, next);
+    settings = next;
+  });
   handle('luma:local-auth', () => settings.mode === 'local' ? ensureLocalAuth() : null);
   handle('luma:retry-local', async () => { await startEngine(); return publicState(); });
   handle('luma:remote-pair', input => remote.pair(input));
@@ -273,7 +293,7 @@ function installIpc() {
   handle('luma:remote-unpair', () => remote.unpair());
   handle('luma:switch', async input => {
     if (!input || !['local', 'cloud'].includes(input.mode)) throw new Error('Invalid connection.');
-    const next = { mode: input.mode, cloudUrl: input.cloudUrl ? normalizeCloudUrl(input.cloudUrl) : settings.cloudUrl };
+    const next = { ...settings, mode: input.mode, cloudUrl: input.cloudUrl ? normalizeCloudUrl(input.cloudUrl) : settings.cloudUrl };
     if (next.mode === 'cloud' && !next.cloudUrl) throw new Error('Enter your Luma cloud URL.');
     settings = next;
     writePrivateJson(settingsFile, settings);

@@ -1,3 +1,5 @@
+import type { SandboxMode } from "@luma/shared";
+
 export type DesktopState = {
   mode: "local" | "cloud";
   cloudUrl: string;
@@ -30,6 +32,7 @@ export type DesktopBridge = {
   isLocal: boolean;
   getState(): Promise<DesktopState>;
   setKeepScreenOn(enabled: boolean): Promise<boolean>;
+  setDefaultSandbox(mode: SandboxMode): Promise<void>;
   localAuth(): Promise<{ token: string; expiresAt: number } | null>;
   switchConnection(mode: "local" | "cloud", cloudUrl?: string): Promise<boolean>;
   chooseFolder(): Promise<string | null>;
