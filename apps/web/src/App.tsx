@@ -2163,6 +2163,8 @@ export function App(): JSX.Element {
   const [voiceSettingsOpen, setVoiceSettingsOpen] = useState(false);
   const [remoteMacsOpen, setRemoteMacsOpen] = useState(false);
   const [remoteWorkspaceOpen, setRemoteWorkspaceOpen] = useState(false);
+  const [keepScreenOn, setKeepScreenOn] = useState(false);
+  const screenWakeLockRef = useRef<ReturnType<typeof createScreenWakeLockController> | null>(null);
   const [voiceSupported, setVoiceSupported] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
@@ -2506,10 +2508,14 @@ export function App(): JSX.Element {
   }, [authReady, isAuthenticated, showAllHistory]);
 
   useEffect(() => {
-    if (!authReady || typeof window === "undefined" || window.lumaDesktop) return;
+    if (!authReady || !isAuthenticated || window.lumaDesktop) {
+      setKeepScreenOn(false);
+      return;
+    }
     const controller = createScreenWakeLockController();
-    controller.setEnabled(isAuthenticated);
+    screenWakeLockRef.current = controller;
     return () => {
+      screenWakeLockRef.current = null;
       controller.dispose();
     };
   }, [authReady, isAuthenticated]);
@@ -4721,6 +4727,26 @@ export function App(): JSX.Element {
       : "lg:grid-cols-1";
 
   const remoteTitle = remoteWorkspace.selected?.title || remoteWorkspace.device?.name || "Remote Macs";
+  const keepScreenOnAction = !window.lumaDesktop ? (
+    <Button
+      type="button"
+      size="sm"
+      variant={keepScreenOn ? "soft" : "ghost"}
+      className={cn("shrink-0 gap-1.5 px-2 lg:px-2.5", keepScreenOn && "border border-brand/40 text-brand")}
+      aria-label="Keep screen on"
+      aria-pressed={keepScreenOn}
+      title={keepScreenOn ? "Allow the screen to sleep" : "Keep the screen on while Luma is visible"}
+      onClick={() => {
+        const controller = screenWakeLockRef.current;
+        if (!controller) return;
+        controller.setEnabled(!keepScreenOn);
+        setKeepScreenOn(!keepScreenOn);
+      }}
+    >
+      <Sun className="h-4 w-4" aria-hidden="true" />
+      <span className="hidden lg:inline">Keep screen on</span>
+    </Button>
+  ) : null;
   const remoteSidebar = remoteWorkspaceOpen ? (
     <RemoteSidebar
       workspace={remoteWorkspace}
@@ -4766,8 +4792,9 @@ export function App(): JSX.Element {
               </span>
             ) : null : <ProjectSessionControls key={selectedSessionId ?? "draft"} />}
           </div>
-          {!remoteWorkspaceOpen ? (
           <div className="flex shrink-0 items-center gap-0.5">
+            {keepScreenOnAction}
+            {!remoteWorkspaceOpen ? <>
             <Button
               size="sm"
               variant="ghost"
@@ -4782,8 +4809,8 @@ export function App(): JSX.Element {
             <Button size="sm" variant="ghost" onClick={() => setMobileContextOpen(true)}>
               <PanelRight className="mr-1.5 h-4 w-4" /> Tools
             </Button>
+            </> : null}
           </div>
-          ) : null}
         </div>
       </header>
 
@@ -4834,10 +4861,16 @@ export function App(): JSX.Element {
                 session={remoteWorkspace.selected}
                 leftSidebarOpen={leftSidebarOpen}
                 onOpenSidebar={() => setLeftSidebarOpen(true)}
+                headerAction={keepScreenOnAction}
               />
             ) : (
               <>
-                <RemoteConversationHeader title={remoteTitle} leftSidebarOpen={leftSidebarOpen} onOpenSidebar={() => setLeftSidebarOpen(true)} />
+                <RemoteConversationHeader
+                  title={remoteTitle}
+                  leftSidebarOpen={leftSidebarOpen}
+                  onOpenSidebar={() => setLeftSidebarOpen(true)}
+                  actions={keepScreenOnAction}
+                />
                 <div className="grid min-h-0 flex-1 place-items-center px-6 text-center">
                   <p role="status" className="text-sm text-foreground/70">
                     {remoteWorkspace.devices.isError ? "Could not load paired Macs."
@@ -4851,6 +4884,7 @@ export function App(): JSX.Element {
               </>
             )
           ) : <CenterPanel
+            headerAction={keepScreenOnAction}
             loading={loading || Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId] && timeline.length === 0)}
             loadingOlderMessages={Boolean(selectedSessionId && loadingMessagesByRunId[selectedSessionId] && timeline.length > 0)}
             selectedSession={selectedSession}
@@ -5783,6 +5817,7 @@ function ImageAttachmentPreview({ attachment, workspace }: ImageAttachmentPrevie
 }
 
 type CenterPanelProps = {
+  headerAction?: ReactNode;
   loading: boolean;
   loadingOlderMessages: boolean;
   selectedSession: SessionCard | null;
@@ -6193,6 +6228,7 @@ function CenterPanel(props: CenterPanelProps): JSX.Element {
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
+          {props.headerAction}
           <Button
             type="button"
             variant="ghost"

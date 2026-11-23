@@ -32,6 +32,7 @@ It keeps the core coding-agent workflow available in the app: runner selection, 
 - `Rich transcript controls`: copy assistant or user messages and expand grouped shell commands, MCP calls, web searches, file changes, reasoning/plan entries, and tool output inline.
 - `File attachments`: select or drag and drop as many as 10 image or text/code files per message. Attachments are scoped to the selected workspace; images can be previewed, opened in a lightbox, or downloaded.
 - `Voice input`: configure an OpenAI-compatible transcription provider in **Voice settings**, or use the browser's built-in recognition when available. Recordings sent to a configured provider become editable drafts.
+- `Keep screen on`: opt in from the toolbar to prevent idle display sleep. In the PWA, it starts off on each page load and releases while the page is hidden.
 - `Slash commands`: use `/plan`, `/status`, `/account`, `/mcp`, `/speech`, and `/help` for planning and local runtime diagnostics.
 
 ### Agentic Workflows

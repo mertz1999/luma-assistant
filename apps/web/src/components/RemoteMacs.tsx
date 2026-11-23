@@ -269,11 +269,12 @@ export function RemoteConversationHeader({
   );
 }
 
-export function RemoteConversation({ device, session, leftSidebarOpen, onOpenSidebar }: {
+export function RemoteConversation({ device, session, leftSidebarOpen, onOpenSidebar, headerAction }: {
   device: RemoteDevice;
   session: RemoteSession;
   leftSidebarOpen: boolean;
   onOpenSidebar(): void;
+  headerAction?: React.ReactNode;
 }) {
   const client = useQueryClient();
   const [pages, setPages] = useState<(string | null)[]>([null]);
@@ -348,12 +349,17 @@ export function RemoteConversation({ device, session, leftSidebarOpen, onOpenSid
       <RemoteConversationHeader
         title={session.title} leftSidebarOpen={leftSidebarOpen} onOpenSidebar={onOpenSidebar}
         subtitle={[device.name, session.projectName, runner, device.online ? session.status : "Offline"].filter(Boolean).join(" · ")}
-        actions={device.online ? (
-          <Button type="button" size="sm" variant="ghost" className="h-7 w-7 shrink-0 p-0"
-            aria-label="Reload chat" title="Reload chat" onClick={() => void messages.refetch()}>
-            <RefreshCw className={cn("h-3.5 w-3.5", messages.isFetching && "motion-safe:animate-spin")} />
-          </Button>
-        ) : null}
+        actions={(
+          <div className="flex shrink-0 items-center gap-1">
+            {headerAction}
+            {device.online ? (
+              <Button type="button" size="sm" variant="ghost" className="h-7 w-7 shrink-0 p-0"
+                aria-label="Reload chat" title="Reload chat" onClick={() => void messages.refetch()}>
+                <RefreshCw className={cn("h-3.5 w-3.5", messages.isFetching && "motion-safe:animate-spin")} />
+              </Button>
+            ) : null}
+          </div>
+        )}
       />
       {device.online ? <>
         <div ref={timeline} className={chatTimelineClass} aria-label="Messages" onScroll={event => {
